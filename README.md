@@ -24,7 +24,7 @@ Adjust those values for your AWS account as needed.
 
 ## Build
 
-Build the Linux ARM64 Lambda executable:
+Build the stripped, single-threaded, ReleaseSafe Linux ARM64 Lambda executable:
 
 ```sh
 zig build --release -Darch=arm

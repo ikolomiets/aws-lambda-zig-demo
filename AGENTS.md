@@ -104,7 +104,8 @@ the AWS CLI query that retrieves it instead of recording the value itself.
 Use these local checks:
 
 - `zig fmt --check build.zig src/main.zig`: verify Zig formatting.
-- `zig build --release -Darch=arm`: build the Linux ARM64 Lambda `bootstrap`.
+- `zig build --release -Darch=arm`: build the stripped, single-threaded,
+  ReleaseSafe Linux ARM64 Lambda `bootstrap`.
 - `zip -qj lambda.zip zig-out/bin/bootstrap`: refresh the deployable package
   when a new package is required.
 - `sam validate --template-file template.yaml --region ca-central-1`: validate

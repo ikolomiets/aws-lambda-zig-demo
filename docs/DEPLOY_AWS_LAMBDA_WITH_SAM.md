@@ -35,7 +35,8 @@ arn:aws:sts::<account-id>:assumed-role/AWSReservedSSO_.../<user>
 
 ## 2. Build and package the Zig Lambda
 
-Build the Lambda executable for AWS Lambda ARM64.
+Build the stripped, single-threaded, ReleaseSafe Lambda executable for AWS
+Lambda ARM64.
 
 ```sh
 zig build --release -Darch=arm

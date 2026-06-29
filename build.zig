@@ -3,7 +3,7 @@ const lambda = @import("aws_lambda");
 
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{
-        .preferred_optimize_mode = .ReleaseFast,
+        .preferred_optimize_mode = .ReleaseSafe,
     });
     const target = lambda.resolveTargetQuery(b, lambda.archOption(b));
     const runtime = b.dependency("aws_lambda", .{}).module("lambda");
