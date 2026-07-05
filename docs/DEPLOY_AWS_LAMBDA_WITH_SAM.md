@@ -180,6 +180,16 @@ sam deploy \
   --parameter-overrides FunctionName=aws-lambda-zig-hello
 ```
 
+The repository also includes a scripted shortcut for the same build, package,
+validation, and non-interactive deploy flow:
+
+```sh
+./deploy.sh
+```
+
+Use `./deploy.sh --dry-run` to run the local checks, rebuild `lambda.zip`, and
+validate `template.yaml` without deploying to AWS.
+
 ## 7. Read the Function URL output
 
 After deployment, SAM prints stack outputs. Look for:
@@ -210,7 +220,14 @@ curl -L <FunctionUrl>
 Expected response:
 
 ```text
-Hello, world!
+ConfigMeta
+...
+
+RequestMeta
+...
+
+Environment
+...
 ```
 
 The response should render directly in a browser because the handler returns:

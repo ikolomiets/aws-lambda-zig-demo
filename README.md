@@ -3,8 +3,9 @@
 A minimal AWS Lambda Function URL demo written in Zig.
 
 The function builds a custom `provided.al2023` Lambda runtime executable named
-`bootstrap`. The handler returns a plain-text `Hello, world!` response through
-the `aws-lambda-zig` runtime package.
+`bootstrap`. The handler returns a plain-text response with Lambda config
+metadata, request metadata, and environment variables through the
+`aws-lambda-zig` runtime package.
 
 ## Requirements
 
@@ -83,7 +84,14 @@ curl -L <FunctionUrl>
 Expected response:
 
 ```text
-Hello, world!
+ConfigMeta
+...
+
+RequestMeta
+...
+
+Environment
+...
 ```
 
 The template intentionally creates a public Function URL for demo HTTP GET

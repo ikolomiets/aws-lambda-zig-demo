@@ -33,7 +33,7 @@
     // internet connectivity.
     .dependencies = .{
         .aws_lambda = .{
-            .url = "git+https://github.com/by-nir/aws-lambda-zig?ref=0.6.1#f35a6f7059b3e95ec9552721001a5947599daace",
+            .url = "git+https://github.com/ikolomiets/aws-lambda-zig?ref=c1bd144db63a0a6b4fbdcbed8254e358bde2fe3f#c1bd144db63a0a6b4fbdcbed8254e358bde2fe3f",
             .hash = "aws_lambda-0.6.1-AMNperHkAQCbP7W44mgEFfcEZCky4HLXZs3HABrMzGOF",
         },
     },

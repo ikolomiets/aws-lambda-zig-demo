@@ -128,10 +128,16 @@ Read the response payload.
 cat /tmp/aws-lambda-zig-hello-invoke.json
 ```
 
-Expected response shape:
+Expected response shape, with the response body shortened:
 
 ```json
-{"statusCode":200,"headers":{"Content-Type":"text/plain; charset=utf-8"},"body":"Hello, world!"}
+{
+  "statusCode": 200,
+  "headers": {
+    "Content-Type": "text/plain; charset=utf-8"
+  },
+  "body": "ConfigMeta\n...\nRequestMeta\n...\nEnvironment\n..."
+}
 ```
 
 ## 6. Create a public Lambda Function URL
@@ -202,7 +208,14 @@ curl -L "$FUNCTION_URL"
 Expected response:
 
 ```text
-Hello, world!
+ConfigMeta
+...
+
+RequestMeta
+...
+
+Environment
+...
 ```
 
 ## Updating the deployed code
