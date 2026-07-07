@@ -1,19 +1,23 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Deploy the aws-lambda-zig Hello World function with a public Lambda Function URL.
+Description: Deploy the aws-lambda-zig demo function with a public Lambda Function URL.
 
 Parameters:
   FunctionName:
     Type: String
-    Default: aws-lambda-zig-hello
+    Default: aws-lambda-zig-demo
     Description: Name of the Lambda function to create.
+  LambdaPrincipal:
+    Type: String
+    Default: "*"
+    Description: Value exposed to the function as LAMBDA_PRINCIPAL.
 
 Resources:
-  HelloFunction:
+  DemoFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Ref FunctionName
-      Description: Hello World demo built with aws-lambda-zig.
+      Description: Demo function built with aws-lambda-zig.
       CodeUri: lambda.zip
       Runtime: provided.al2023
       Handler: bootstrap
@@ -23,11 +27,14 @@ Resources:
       Timeout: 3
       Policies:
         - AWSLambdaBasicExecutionRole
+      Environment:
+        Variables:
+          LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
 
-  HelloFunctionUrl:
+  DemoFunctionUrl:
     Type: AWS::Lambda::Url
     Properties:
-      TargetFunctionArn: !GetAtt HelloFunction.Arn
+      TargetFunctionArn: !GetAtt DemoFunction.Arn
       AuthType: NONE
       InvokeMode: BUFFERED
       Cors:
@@ -40,18 +47,18 @@ Resources:
 
   FunctionUrlInvokeFunctionUrlPermission:
     Type: AWS::Lambda::Permission
-    DependsOn: HelloFunctionUrl
+    DependsOn: DemoFunctionUrl
     Properties:
-      FunctionName: !Ref HelloFunction
+      FunctionName: !Ref DemoFunction
       Action: lambda:InvokeFunctionUrl
       Principal: "*"
       FunctionUrlAuthType: NONE
 
   FunctionUrlInvokeFunctionPermission:
     Type: AWS::Lambda::Permission
-    DependsOn: HelloFunctionUrl
+    DependsOn: DemoFunctionUrl
     Properties:
-      FunctionName: !Ref HelloFunction
+      FunctionName: !Ref DemoFunction
       Action: lambda:InvokeFunction
       Principal: "*"
       InvokedViaFunctionUrl: true
@@ -59,10 +66,10 @@ Resources:
 Outputs:
   FunctionName:
     Description: Deployed Lambda function name.
-    Value: !Ref HelloFunction
+    Value: !Ref DemoFunction
   FunctionArn:
     Description: Deployed Lambda function ARN.
-    Value: !GetAtt HelloFunction.Arn
+    Value: !GetAtt DemoFunction.Arn
   FunctionUrl:
     Description: Public Lambda Function URL.
-    Value: !GetAtt HelloFunctionUrl.FunctionUrl
+    Value: !GetAtt DemoFunctionUrl.FunctionUrl

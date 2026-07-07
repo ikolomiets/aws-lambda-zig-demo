@@ -3,8 +3,9 @@ set -euo pipefail
 
 PROFILE="${PROFILE:-dev}"
 REGION="${REGION:-ca-central-1}"
-STACK_NAME="${STACK_NAME:-aws-lambda-zig-hello}"
-FUNCTION_NAME="${FUNCTION_NAME:-aws-lambda-zig-hello}"
+STACK_NAME="${STACK_NAME:-aws-lambda-zig-demo}"
+FUNCTION_NAME="${FUNCTION_NAME:-aws-lambda-zig-demo}"
+LAMBDA_PRINCIPAL="${LAMBDA_PRINCIPAL:-*}"
 DRY_RUN=0
 CHECK_URL=1
 
@@ -17,14 +18,16 @@ Build, package, validate, and deploy the Zig Lambda with AWS SAM.
 Options:
   --profile NAME         AWS CLI profile. Defaults to $PROFILE or dev.
   --region NAME          AWS region. Defaults to $REGION or ca-central-1.
-  --stack-name NAME      CloudFormation stack name. Defaults to aws-lambda-zig-hello.
-  --function-name NAME   Lambda function name. Defaults to aws-lambda-zig-hello.
+  --stack-name NAME      CloudFormation stack name. Defaults to aws-lambda-zig-demo.
+  --function-name NAME   Lambda function name. Defaults to aws-lambda-zig-demo.
+  --lambda-principal VALUE
+                         LAMBDA_PRINCIPAL environment value. Defaults to *.
   --dry-run              Run local checks, build, package, and validation only.
   --no-url-check         Skip the post-deploy Function URL HTTP status check.
   -h, --help             Show this help.
 
 Environment overrides:
-  PROFILE, REGION, STACK_NAME, FUNCTION_NAME
+  PROFILE, REGION, STACK_NAME, FUNCTION_NAME, LAMBDA_PRINCIPAL
 EOF
 }
 
@@ -86,6 +89,16 @@ while [ "$#" -gt 0 ]; do
         --function-name=*)
             FUNCTION_NAME="${1#*=}"
             [ -n "$FUNCTION_NAME" ] || fail "empty value for --function-name"
+            shift
+            ;;
+        --lambda-principal)
+            need_value "$1" "${2:-}"
+            LAMBDA_PRINCIPAL="$2"
+            shift 2
+            ;;
+        --lambda-principal=*)
+            LAMBDA_PRINCIPAL="${1#*=}"
+            [ -n "$LAMBDA_PRINCIPAL" ] || fail "empty value for --lambda-principal"
             shift
             ;;
         --dry-run)
@@ -183,7 +196,9 @@ sam deploy \
     --no-confirm-changeset \
     --no-fail-on-empty-changeset \
     --no-progressbar \
-    --parameter-overrides "FunctionName=$FUNCTION_NAME"
+    --parameter-overrides \
+    "FunctionName=$FUNCTION_NAME" \
+    "LambdaPrincipal=$LAMBDA_PRINCIPAL"
 
 printf '==> Stack status\n'
 aws cloudformation describe-stacks \

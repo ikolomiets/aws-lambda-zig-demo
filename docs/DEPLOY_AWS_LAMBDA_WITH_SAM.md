@@ -12,6 +12,8 @@ SAM deploys the Lambda function as a CloudFormation-managed stack. It creates th
 - `template.yaml` exists in this repository.
 - `lambda.zip` exists and contains a Linux ARM64 executable named `bootstrap`.
 - The Lambda Function URL is intentionally public for demo HTTP GET testing.
+- `LAMBDA_PRINCIPAL` defaults to `'*'` unless you override the
+  `LambdaPrincipal` template parameter.
 
 ## 1. Refresh AWS SSO credentials
 
@@ -86,8 +88,8 @@ Both commands should report that `template.yaml` is valid.
 
 `template.yaml` defines these resources:
 
-- `HelloFunction`: `AWS::Serverless::Function`
-- `HelloFunctionUrl`: `AWS::Lambda::Url`
+- `DemoFunction`: `AWS::Serverless::Function`
+- `DemoFunctionUrl`: `AWS::Lambda::Url`
 - `FunctionUrlInvokeFunctionUrlPermission`: allows `lambda:InvokeFunctionUrl`
 - `FunctionUrlInvokeFunctionPermission`: allows `lambda:InvokeFunction` only through the Function URL
 
@@ -102,6 +104,9 @@ MemorySize: 128
 Timeout: 3
 Policies:
   - AWSLambdaBasicExecutionRole
+Environment:
+  Variables:
+    LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
 ```
 
 The Function URL settings are:
@@ -120,15 +125,27 @@ Cors:
 
 `AuthType: NONE` and `Principal: "*"` make the Function URL public.
 
-## 5. Choose the function name
+`LambdaPrincipal` configures only the `LAMBDA_PRINCIPAL` environment variable
+inside the function. It does not change the Function URL resource permissions.
+
+## 5. Choose the function name and principal environment value
 
 The template defaults to:
 
 ```text
-aws-lambda-zig-hello
+aws-lambda-zig-demo
 ```
 
 You can keep the default or override it during deployment with the `FunctionName` parameter.
+
+The `LambdaPrincipal` parameter defaults to:
+
+```text
+*
+```
+
+You can keep the default or override it during deployment to set the
+`LAMBDA_PRINCIPAL` environment variable.
 
 ## 6. Deploy with SAM guided mode
 
@@ -140,15 +157,18 @@ sam deploy --guided \
   --profile dev \
   --region ca-central-1 \
   --capabilities CAPABILITY_IAM \
-  --parameter-overrides FunctionName=aws-lambda-zig-hello
+  --parameter-overrides \
+    FunctionName=aws-lambda-zig-demo \
+    LambdaPrincipal='*'
 ```
 
 Recommended guided answers:
 
 ```text
-Stack Name: aws-lambda-zig-hello
+Stack Name: aws-lambda-zig-demo
 AWS Region: ca-central-1
-Parameter FunctionName: aws-lambda-zig-hello
+Parameter FunctionName: aws-lambda-zig-demo
+Parameter LambdaPrincipal: *
 Confirm changes before deploy: Y
 Allow SAM CLI IAM role creation: Y
 Disable rollback: N
@@ -170,14 +190,16 @@ Equivalent non-interactive deployment command:
 ```sh
 sam deploy \
   --template-file template.yaml \
-  --stack-name aws-lambda-zig-hello \
+  --stack-name aws-lambda-zig-demo \
   --profile dev \
   --region ca-central-1 \
   --capabilities CAPABILITY_IAM \
   --resolve-s3 \
   --no-confirm-changeset \
   --no-fail-on-empty-changeset \
-  --parameter-overrides FunctionName=aws-lambda-zig-hello
+  --parameter-overrides \
+    FunctionName=aws-lambda-zig-demo \
+    LambdaPrincipal='*'
 ```
 
 The repository also includes a scripted shortcut for the same build, package,
@@ -185,6 +207,13 @@ validation, and non-interactive deploy flow:
 
 ```sh
 ./deploy.sh
+```
+
+Override the environment value with either form:
+
+```sh
+LAMBDA_PRINCIPAL='<lambda-principal>' ./deploy.sh
+./deploy.sh --lambda-principal '<lambda-principal>'
 ```
 
 Use `./deploy.sh --dry-run` to run the local checks, rebuild `lambda.zip`, and
@@ -202,7 +231,7 @@ You can also query it later with CloudFormation:
 
 ```sh
 aws cloudformation describe-stacks \
-  --stack-name aws-lambda-zig-hello \
+  --stack-name aws-lambda-zig-demo \
   --query "Stacks[0].Outputs[?OutputKey=='FunctionUrl'].OutputValue" \
   --output text \
   --profile dev \
@@ -227,6 +256,7 @@ RequestMeta
 ...
 
 Environment
+LAMBDA_PRINCIPAL=*
 ...
 ```
 
@@ -259,7 +289,7 @@ To remove the SAM-managed function, role, Function URL, and permissions:
 
 ```sh
 sam delete \
-  --stack-name aws-lambda-zig-hello \
+  --stack-name aws-lambda-zig-demo \
   --profile dev \
   --region ca-central-1
 ```

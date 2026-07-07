@@ -19,7 +19,7 @@ The deployment docs use:
 
 - AWS profile: `dev`
 - Region: `ca-central-1`
-- Function name: `aws-lambda-zig-hello`
+- Function name: `aws-lambda-zig-demo`
 
 Adjust those values for your AWS account as needed.
 
@@ -64,8 +64,14 @@ sam deploy --guided \
   --profile dev \
   --region ca-central-1 \
   --capabilities CAPABILITY_IAM \
-  --parameter-overrides FunctionName=aws-lambda-zig-hello
+  --parameter-overrides \
+    FunctionName=aws-lambda-zig-demo \
+    LambdaPrincipal='*'
 ```
+
+`LambdaPrincipal` sets the Lambda runtime environment variable
+`LAMBDA_PRINCIPAL`. The default `'*'` preserves the public demo behavior; pass a
+different value when the function should see a narrower principal string.
 
 See [docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md)
 for the full SAM workflow.
