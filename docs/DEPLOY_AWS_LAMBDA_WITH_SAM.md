@@ -219,6 +219,10 @@ LAMBDA_PRINCIPAL='<lambda-principal>' ./deploy.sh
 Use `./deploy.sh --dry-run` to run the local checks, rebuild `lambda.zip`, and
 validate `template.yaml` without deploying to AWS.
 
+Use `./deploy.sh --dry-run --use-local-libs` to build with local dependency
+checkouts. The `aws_lambda` checkout defaults to `../aws-lambda-zig`; override
+it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
+
 ## 7. Read the Function URL output
 
 After deployment, SAM prints stack outputs. Look for:

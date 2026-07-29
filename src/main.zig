@@ -190,6 +190,7 @@ fn environmentKeySensitive(key: []const u8) bool {
     if (std.mem.eql(u8, key, "AWS_ACCESS_KEY_ID")) return true;
     if (std.mem.eql(u8, key, "AWS_SECRET_ACCESS_KEY")) return true;
     if (std.mem.eql(u8, key, "AWS_SESSION_TOKEN")) return true;
+    if (std.mem.eql(u8, key, "PASETO_PRIVATE_KEY")) return true;
 
     return false;
 }
@@ -341,6 +342,7 @@ test "environment body includes keys and redacts AWS credentials" {
     try env.put("AWS_REGION", "ca-central-1");
     try env.put("CUSTOM_VALUE", "demo");
     try env.put("AWS_SECRET_ACCESS_KEY", "secret-value");
+    try env.put("PASETO_PRIVATE_KEY", "private-key-value");
 
     const body = try environmentBody(std.testing.allocator, &env);
     defer std.testing.allocator.free(body);
@@ -349,7 +351,9 @@ test "environment body includes keys and redacts AWS credentials" {
     try expectContains(body, "AWS_REGION=ca-central-1\n");
     try expectContains(body, "CUSTOM_VALUE=demo\n");
     try expectContains(body, "AWS_SECRET_ACCESS_KEY=<redacted>\n");
+    try expectContains(body, "PASETO_PRIVATE_KEY=<redacted>\n");
     try expectNotContains(body, "secret-value");
+    try expectNotContains(body, "private-key-value");
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {

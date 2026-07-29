@@ -36,6 +36,10 @@
             .url = "git+https://github.com/ikolomiets/aws-lambda-zig?ref=c1bd144db63a0a6b4fbdcbed8254e358bde2fe3f#c1bd144db63a0a6b4fbdcbed8254e358bde2fe3f",
             .hash = "aws_lambda-0.6.1-AMNperHkAQCbP7W44mgEFfcEZCky4HLXZs3HABrMzGOF",
         },
+        .zig_paseto = .{
+            .url = "git+https://github.com/deatil/zig-paseto?ref=d5d43e20c5ba128b879fcb913c96894466bee0ac#d5d43e20c5ba128b879fcb913c96894466bee0ac",
+            .hash = "zig_paseto-1.1.5-hHOU6rOfBAC8c9AR96sTctAf_LIc31QHfHsKL1xil_LQ",
+        },
     },
     .paths = .{
         "build.zig",

@@ -2,10 +2,11 @@
 
 A minimal AWS Lambda Function URL demo written in Zig.
 
-The function builds a custom `provided.al2023` Lambda runtime executable named
-`bootstrap`. The handler returns a plain-text response with Lambda config
-metadata, request metadata, and environment variables through the
-`aws-lambda-zig` runtime package.
+The project builds a custom `provided.al2023` Lambda runtime executable named
+`bootstrap` and a host-native PASETO v4.public utility named `paseto`. The
+handler returns a plain-text response with Lambda config metadata, request
+metadata, and environment variables through the `aws-lambda-zig` runtime
+package.
 
 ## Requirements
 
@@ -31,6 +32,9 @@ Build the stripped, single-threaded, ReleaseSafe Linux ARM64 Lambda executable:
 zig build --release -Darch=arm
 ```
 
+This also installs the host-native `zig-out/bin/paseto` developer utility. The
+Lambda `bootstrap` does not link PASETO code.
+
 Verify that the output is a statically linked ARM64 Linux executable:
 
 ```sh
@@ -51,6 +55,44 @@ zip -qj lambda.zip zig-out/bin/bootstrap
 
 `lambda.zip` is intentionally ignored by Git because it is a generated
 deployment artifact.
+
+## PASETO CLI
+
+Generate an Ed25519 signing key pair with OS cryptographic randomness:
+
+```sh
+zig-out/bin/paseto keygen
+```
+
+The command prints padded standard-Base64 values for
+`PASETO_PRIVATE_KEY` and `PASETO_PUBLIC_KEY`, plus the public key's standard
+PASERK `k4.pid` identifier. Copy the private value into the signing
+environment and the public value into the verification environment:
+
+```sh
+export PASETO_PRIVATE_KEY='<private-key-from-keygen>'
+token="$(
+  zig-out/bin/paseto issue \
+    --subject 'example-user' \
+    --ttl-seconds 300
+)"
+
+unset PASETO_PRIVATE_KEY
+export PASETO_PUBLIC_KEY='<public-key-from-keygen>'
+printf '%s\n' "$token" | zig-out/bin/paseto verify
+```
+
+`issue` creates only the `sub` and integer `exp` claims. `verify` requires the
+explicit public key, authenticates the PASERK identifier in the footer, accepts
+one token of at most 16 KiB from standard input, and enforces `now < exp`
+without clock-skew allowance.
+
+Treat `PASETO_PRIVATE_KEY` as a secret. Do not put it in the Lambda environment
+or logs, source it from untrusted shell output, commit it, or pass it on a
+command line. The demo handler redacts the exact `PASETO_PRIVATE_KEY` variable
+if one is present, but that safeguard is not a secret-management system and
+does not cover differently named variables. Verification needs only
+`PASETO_PUBLIC_KEY`; it never falls back to the private key.
 
 ## Deploy
 
@@ -107,8 +149,9 @@ policies, or a fronting layer such as API Gateway or CloudFront.
 ## Project Layout
 
 - `src/main.zig`: Lambda entrypoint and request handler.
-- `build.zig`: Zig build graph for the `bootstrap` executable.
-- `build.zig.zon`: package metadata and `aws-lambda-zig` dependency.
+- `src/paseto_cli.zig`: host PASETO v4.public CLI and its tests.
+- `build.zig`: Zig build graph for `bootstrap`, `paseto`, and both test roots.
+- `build.zig.zon`: package metadata and pinned dependencies.
 - `template.yaml`: SAM template for the Lambda, Function URL, and permissions.
 - `docs/`: deployment guides and the Zig style reference.
 - `AGENTS.md`: repository guidance for coding agents.
@@ -118,7 +161,26 @@ policies, or a fronting layer such as API Gateway or CloudFront.
 Run formatting checks before committing Zig changes:
 
 ```sh
-zig fmt --check build.zig src/main.zig
+zig fmt --check build.zig src/main.zig src/paseto_cli.zig
+```
+
+Run the handler and PASETO integration tests with:
+
+```sh
+zig build test
+```
+
+When developing against a sibling checkout of `aws-lambda-zig`, keep
+`build.zig.zon` pinned and override the dependency at build time:
+
+```sh
+zig build --fork=../aws-lambda-zig --release -Darch=arm
+```
+
+Use the same local checkout in the deployment helper with:
+
+```sh
+./deploy.sh --dry-run --use-local-libs
 ```
 
 Zig code in this repository should follow

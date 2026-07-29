@@ -6,8 +6,10 @@ REGION="${REGION:-ca-central-1}"
 STACK_NAME="${STACK_NAME:-aws-lambda-zig-demo}"
 FUNCTION_NAME="${FUNCTION_NAME:-aws-lambda-zig-demo}"
 LAMBDA_PRINCIPAL="${LAMBDA_PRINCIPAL:-*}"
+LOCAL_AWS_LAMBDA_ROOT="${LOCAL_AWS_LAMBDA_ROOT:-../aws-lambda-zig}"
 DRY_RUN=0
 CHECK_URL=1
+USE_LOCAL_LIBS=0
 
 usage() {
     cat <<'EOF'
@@ -22,12 +24,15 @@ Options:
   --function-name NAME   Lambda function name. Defaults to aws-lambda-zig-demo.
   --lambda-principal VALUE
                          LAMBDA_PRINCIPAL environment value. Defaults to *.
+  --use-local-libs       Use local dependency checkouts with zig build --fork.
+                         aws_lambda defaults to ../aws-lambda-zig.
   --dry-run              Run local checks, build, package, and validation only.
   --no-url-check         Skip the post-deploy Function URL HTTP status check.
   -h, --help             Show this help.
 
 Environment overrides:
-  PROFILE, REGION, STACK_NAME, FUNCTION_NAME, LAMBDA_PRINCIPAL
+  PROFILE, REGION, STACK_NAME, FUNCTION_NAME, LAMBDA_PRINCIPAL,
+  LOCAL_AWS_LAMBDA_ROOT
 EOF
 }
 
@@ -101,6 +106,10 @@ while [ "$#" -gt 0 ]; do
             [ -n "$LAMBDA_PRINCIPAL" ] || fail "empty value for --lambda-principal"
             shift
             ;;
+        --use-local-libs)
+            USE_LOCAL_LIBS=1
+            shift
+            ;;
         --dry-run)
             DRY_RUN=1
             shift
@@ -132,14 +141,17 @@ if [ "$DRY_RUN" -eq 0 ]; then
     fi
 fi
 
-LAMBDA_ROOT=""
-for path in zig-pkg/aws_lambda-*; do
-    if [ -d "$path" ]; then
-        LAMBDA_ROOT="$path"
-        break
-    fi
-done
-[ -n "$LAMBDA_ROOT" ] || fail "vendored aws_lambda package not found under zig-pkg/"
+LOCAL_FORKS=()
+if [ "$USE_LOCAL_LIBS" -eq 1 ]; then
+    [ -d "$LOCAL_AWS_LAMBDA_ROOT" ] ||
+        fail "local aws_lambda checkout not found: $LOCAL_AWS_LAMBDA_ROOT"
+    [ -f "$LOCAL_AWS_LAMBDA_ROOT/build.zig.zon" ] ||
+        fail "local aws_lambda checkout missing build.zig.zon: $LOCAL_AWS_LAMBDA_ROOT"
+    [ -f "$LOCAL_AWS_LAMBDA_ROOT/src/root.zig" ] ||
+        fail "local aws_lambda checkout missing src/root.zig: $LOCAL_AWS_LAMBDA_ROOT"
+
+    LOCAL_FORKS+=("$LOCAL_AWS_LAMBDA_ROOT")
+fi
 
 CACHE_DIR=".zig-cache-deploy"
 GLOBAL_CACHE_DIR=".zig-global-cache-deploy"
@@ -149,18 +161,25 @@ cleanup() {
 trap cleanup EXIT
 
 printf '==> Checking Zig formatting\n'
-zig fmt --check build.zig src/main.zig
+zig fmt --check build.zig src/main.zig src/paseto_cli.zig
+
+ZIG_BUILD_ARGS=(
+    --cache-dir "$CACHE_DIR"
+    --global-cache-dir "$GLOBAL_CACHE_DIR"
+)
+if [ "${#LOCAL_FORKS[@]}" -gt 0 ]; then
+    printf '==> Using local Zig package forks\n'
+    for path in "${LOCAL_FORKS[@]}"; do
+        printf '    %s\n' "$path"
+        ZIG_BUILD_ARGS+=(--fork="$path")
+    done
+fi
 
 printf '==> Running Zig tests\n'
-zig test \
-    --cache-dir "$CACHE_DIR" \
-    --global-cache-dir "$GLOBAL_CACHE_DIR" \
-    --dep aws-lambda \
-    -Mroot=src/main.zig \
-    -Maws-lambda="$LAMBDA_ROOT/src/root.zig"
+zig build test "${ZIG_BUILD_ARGS[@]}"
 
 printf '==> Building Linux ARM64 Lambda bootstrap\n'
-zig build --global-cache-dir "$GLOBAL_CACHE_DIR" --release -Darch=arm
+zig build "${ZIG_BUILD_ARGS[@]}" --release -Darch=arm
 
 artifact_type="$(file zig-out/bin/bootstrap)"
 case "$artifact_type" in
