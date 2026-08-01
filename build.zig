@@ -75,6 +75,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .imports = &.{
             .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "paseto", .module = host_paseto },
         },
     });
     const lambda_tests = b.addTest(.{

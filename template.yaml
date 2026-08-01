@@ -11,6 +11,9 @@ Parameters:
     Type: String
     Default: "*"
     Description: Value exposed to the function as LAMBDA_PRINCIPAL.
+  PasetoPublicKey:
+    Type: String
+    Description: Padded Base64 Ed25519 public key used to verify PASETO tokens.
 
 Resources:
   DemoFunction:
@@ -30,6 +33,7 @@ Resources:
       Environment:
         Variables:
           LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
+          PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 
   DemoFunctionUrl:
     Type: AWS::Lambda::Url

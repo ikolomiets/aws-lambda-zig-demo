@@ -14,6 +14,9 @@ SAM deploys the Lambda function as a CloudFormation-managed stack. It creates th
 - The Lambda Function URL is intentionally public for demo HTTP GET testing.
 - `LAMBDA_PRINCIPAL` defaults to `'*'` unless you override the
   `LambdaPrincipal` template parameter.
+- `PASETO_PUBLIC_KEY` contains the padded Base64 Ed25519 public key generated
+  by `zig-out/bin/paseto keygen`. The corresponding private key remains only
+  in the token-signing environment.
 
 ## 1. Refresh AWS SSO credentials
 
@@ -107,6 +110,7 @@ Policies:
 Environment:
   Variables:
     LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
+    PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 ```
 
 The Function URL settings are:
@@ -128,7 +132,11 @@ Cors:
 `LambdaPrincipal` configures only the `LAMBDA_PRINCIPAL` environment variable
 inside the function. It does not change the Function URL resource permissions.
 
-## 5. Choose the function name and principal environment value
+`PasetoPublicKey` is a required parameter that configures the
+`PASETO_PUBLIC_KEY` used by the handler to verify PASETO v4.public bearer
+tokens.
+
+## 5. Choose the function name and environment values
 
 The template defaults to:
 
@@ -147,6 +155,21 @@ The `LambdaPrincipal` parameter defaults to:
 You can keep the default or override it during deployment to set the
 `LAMBDA_PRINCIPAL` environment variable.
 
+Generate a signing key pair if you do not already have one:
+
+```sh
+zig-out/bin/paseto keygen
+```
+
+Export only the printed public key in the deployment shell:
+
+```sh
+export PASETO_PUBLIC_KEY='<public-key-from-keygen>'
+```
+
+`PasetoPublicKey` has no default. Deployment must provide it, and tokens must
+be signed by the corresponding private key.
+
 ## 6. Deploy with SAM guided mode
 
 Run:
@@ -159,7 +182,8 @@ sam deploy --guided \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
     FunctionName=aws-lambda-zig-demo \
-    LambdaPrincipal='*'
+    LambdaPrincipal='*' \
+    PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
 
 Recommended guided answers:
@@ -169,6 +193,7 @@ Stack Name: aws-lambda-zig-demo
 AWS Region: ca-central-1
 Parameter FunctionName: aws-lambda-zig-demo
 Parameter LambdaPrincipal: *
+Parameter PasetoPublicKey: <public-key-from-keygen>
 Confirm changes before deploy: Y
 Allow SAM CLI IAM role creation: Y
 Disable rollback: N
@@ -199,14 +224,15 @@ sam deploy \
   --no-fail-on-empty-changeset \
   --parameter-overrides \
     FunctionName=aws-lambda-zig-demo \
-    LambdaPrincipal='*'
+    LambdaPrincipal='*' \
+    PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
 
 The repository also includes a scripted shortcut for the same build, package,
 validation, and non-interactive deploy flow:
 
 ```sh
-./deploy.sh
+PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh
 ```
 
 Override the environment value with either form:
@@ -216,12 +242,16 @@ LAMBDA_PRINCIPAL='<lambda-principal>' ./deploy.sh
 ./deploy.sh --lambda-principal '<lambda-principal>'
 ```
 
-Use `./deploy.sh --dry-run` to run the local checks, rebuild `lambda.zip`, and
-validate `template.yaml` without deploying to AWS.
+`deploy.sh` reads the required `PASETO_PUBLIC_KEY` from the host environment and
+passes it as the `PasetoPublicKey` SAM parameter. Use
+`PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run` to run the
+local checks, rebuild `lambda.zip`, and validate `template.yaml` without
+deploying to AWS.
 
-Use `./deploy.sh --dry-run --use-local-libs` to build with local dependency
-checkouts. The `aws_lambda` checkout defaults to `../aws-lambda-zig`; override
-it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
+Use
+`PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run --use-local-libs`
+to build with local dependency checkouts. The `aws_lambda` checkout defaults
+to `../aws-lambda-zig`; override it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
 
 ## 7. Read the Function URL output
 
@@ -247,10 +277,33 @@ aws cloudformation describe-stacks \
 Call the Function URL returned by SAM.
 
 ```sh
-curl -L <FunctionUrl>
+curl -i -L <FunctionUrl>
 ```
 
-Expected response:
+An unauthenticated request is rejected by the handler:
+
+```text
+HTTP/2 401
+WWW-Authenticate: Bearer
+```
+
+Issue a short-lived token using the private key that corresponds to the
+deployed public key:
+
+```sh
+token="$(
+  PASETO_PRIVATE_KEY='<private-key-from-keygen>' \
+    zig-out/bin/paseto issue --subject 'example-user' --ttl-seconds 300
+)"
+```
+
+Send the token in the authorization header:
+
+```sh
+curl -L -H "Authorization: Bearer $token" <FunctionUrl>
+```
+
+Expected authenticated response:
 
 ```text
 ConfigMeta
@@ -261,6 +314,7 @@ RequestMeta
 
 Environment
 LAMBDA_PRINCIPAL=*
+PASETO_PUBLIC_KEY=<public-key-from-keygen>
 ...
 ```
 
@@ -302,4 +356,7 @@ This deletes only resources owned by the SAM stack.
 
 ## Security note
 
-This demo intentionally creates a public Lambda Function URL. For production, prefer a stricter authorization model, narrower IAM policies, or an API Gateway/CloudFront layer depending on the use case.
+This demo intentionally creates a publicly reachable Lambda Function URL, and
+the handler requires a valid PASETO bearer token. For production, consider
+combining application authentication with stricter infrastructure
+authorization, narrower IAM policies, or an API Gateway/CloudFront layer.

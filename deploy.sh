@@ -6,6 +6,7 @@ REGION="${REGION:-ca-central-1}"
 STACK_NAME="${STACK_NAME:-aws-lambda-zig-demo}"
 FUNCTION_NAME="${FUNCTION_NAME:-aws-lambda-zig-demo}"
 LAMBDA_PRINCIPAL="${LAMBDA_PRINCIPAL:-*}"
+PASETO_PUBLIC_KEY="${PASETO_PUBLIC_KEY:-}"
 LOCAL_AWS_LAMBDA_ROOT="${LOCAL_AWS_LAMBDA_ROOT:-../aws-lambda-zig}"
 DRY_RUN=0
 CHECK_URL=1
@@ -32,7 +33,7 @@ Options:
 
 Environment overrides:
   PROFILE, REGION, STACK_NAME, FUNCTION_NAME, LAMBDA_PRINCIPAL,
-  LOCAL_AWS_LAMBDA_ROOT
+  PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT
 EOF
 }
 
@@ -130,6 +131,9 @@ done
 
 cd "$(dirname "$0")"
 
+[ -n "$PASETO_PUBLIC_KEY" ] ||
+    fail "PASETO_PUBLIC_KEY is required; generate one with: zig-out/bin/paseto keygen"
+
 need_command zig
 need_command zip
 need_command file
@@ -161,7 +165,7 @@ cleanup() {
 trap cleanup EXIT
 
 printf '==> Checking Zig formatting\n'
-zig fmt --check build.zig src/main.zig src/paseto_cli.zig
+zig fmt --check build.zig src/main.zig src/paseto.zig src/paseto_cli.zig
 
 ZIG_BUILD_ARGS=(
     --cache-dir "$CACHE_DIR"
@@ -217,7 +221,8 @@ sam deploy \
     --no-progressbar \
     --parameter-overrides \
     "FunctionName=$FUNCTION_NAME" \
-    "LambdaPrincipal=$LAMBDA_PRINCIPAL"
+    "LambdaPrincipal=$LAMBDA_PRINCIPAL" \
+    "PasetoPublicKey=$PASETO_PUBLIC_KEY"
 
 printf '==> Stack status\n'
 aws cloudformation describe-stacks \
@@ -237,6 +242,9 @@ FUNCTION_URL="$(aws cloudformation describe-stacks \
 printf 'FunctionUrl: %s\n' "$FUNCTION_URL"
 
 if [ "$CHECK_URL" -eq 1 ]; then
-    printf '==> Checking Function URL status\n'
-    curl -L -sS -o /dev/null -w 'HTTP %{http_code} %{content_type}\n' "$FUNCTION_URL"
+    printf '==> Checking unauthenticated Function URL status\n'
+    HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' "$FUNCTION_URL")"
+    [ "$HTTP_STATUS" = 401 ] ||
+        fail "unauthenticated Function URL returned HTTP $HTTP_STATUS; expected 401"
+    printf 'HTTP %s (expected 401)\n' "$HTTP_STATUS"
 fi

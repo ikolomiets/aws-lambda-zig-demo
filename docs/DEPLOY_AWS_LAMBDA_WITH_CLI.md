@@ -11,6 +11,9 @@ This guide documents the successful AWS CLI flow used to deploy the compiled Zig
 - The Lambda is intentionally exposed through a public Function URL for simple HTTP GET testing.
 - `LAMBDA_PRINCIPAL` defaults to `'*'` unless you set a different value before
   creating or updating the function configuration.
+- `PASETO_PUBLIC_KEY` contains the padded Base64 Ed25519 public key generated
+  by `zig-out/bin/paseto keygen`. Keep the corresponding private key only in
+  the token-signing environment.
 
 ## Resource names
 
@@ -20,6 +23,7 @@ REGION=ca-central-1
 FUNCTION_NAME=aws-lambda-zig-demo
 ROLE_NAME=aws-lambda-zig-demo-role
 LAMBDA_PRINCIPAL='*'
+PASETO_PUBLIC_KEY='<public-key-from-keygen>'
 ACCOUNT_ID=$(aws sts get-caller-identity --profile "$PROFILE" --query Account --output text)
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 ```
@@ -98,7 +102,8 @@ aws lambda create-function \
   --handler bootstrap \
   --architectures arm64 \
   --role "$ROLE_ARN" \
-  --environment "Variables={LAMBDA_PRINCIPAL=${LAMBDA_PRINCIPAL}}" \
+  --environment \
+    "Variables={LAMBDA_PRINCIPAL=${LAMBDA_PRINCIPAL},PASETO_PUBLIC_KEY=${PASETO_PUBLIC_KEY}}" \
   --zip-file fileb://lambda.zip \
   --profile "$PROFILE" \
   --region "$REGION"
@@ -106,6 +111,8 @@ aws lambda create-function \
 
 `LAMBDA_PRINCIPAL` is a runtime environment variable visible to the function.
 It does not change the Function URL resource permissions.
+`PASETO_PUBLIC_KEY` is required by the handler to verify PASETO v4.public
+bearer tokens.
 
 Wait until the function is active.
 
@@ -118,7 +125,9 @@ aws lambda wait function-active-v2 \
 
 ## 5. Verify direct Lambda invocation
 
-Invoke the function through the Lambda API before exposing it over HTTP.
+Invoke the function through the Lambda API before exposing it over HTTP. An
+empty event has no authorization header and exercises the credential failure
+response.
 
 ```sh
 aws lambda invoke \
@@ -135,15 +144,16 @@ Read the response payload.
 cat /tmp/aws-lambda-zig-demo-invoke.json
 ```
 
-Expected response shape, with the response body shortened:
+Expected response:
 
 ```json
 {
-  "statusCode": 200,
+  "statusCode": 401,
   "headers": {
-    "Content-Type": "text/plain; charset=utf-8"
+    "Content-Type": "text/plain; charset=utf-8",
+    "WWW-Authenticate": "Bearer"
   },
-  "body": "ConfigMeta\n...\nRequestMeta\n...\nEnvironment\nLAMBDA_PRINCIPAL=*\n..."
+  "body": "Unauthorized\n"
 }
 ```
 
@@ -209,10 +219,32 @@ FUNCTION_URL=$(aws lambda get-function-url-config \
   --profile "$PROFILE" \
   --region "$REGION")
 
-curl -L "$FUNCTION_URL"
+curl -i -L "$FUNCTION_URL"
 ```
 
-Expected response:
+Expected unauthenticated response:
+
+```text
+HTTP/2 401
+WWW-Authenticate: Bearer
+```
+
+Issue a short-lived token using the corresponding private key:
+
+```sh
+TOKEN="$(
+  PASETO_PRIVATE_KEY='<private-key-from-keygen>' \
+    zig-out/bin/paseto issue --subject 'example-user' --ttl-seconds 300
+)"
+```
+
+Call the Function URL with the bearer token:
+
+```sh
+curl -L -H "Authorization: Bearer $TOKEN" "$FUNCTION_URL"
+```
+
+Expected authenticated response:
 
 ```text
 ConfigMeta
@@ -223,6 +255,7 @@ RequestMeta
 
 Environment
 LAMBDA_PRINCIPAL=*
+PASETO_PUBLIC_KEY=<public-key-from-keygen>
 ...
 ```
 
@@ -247,19 +280,26 @@ aws lambda wait function-updated-v2 \
   --region "$REGION"
 ```
 
-To change `LAMBDA_PRINCIPAL` on an existing function, update the function
-configuration:
+To change `LAMBDA_PRINCIPAL` or rotate the PASETO public key on an existing
+function, update the function configuration. AWS replaces the complete
+environment map, so provide both values:
 
 ```sh
 LAMBDA_PRINCIPAL='<lambda-principal>'
+PASETO_PUBLIC_KEY='<public-key-from-keygen>'
 
 aws lambda update-function-configuration \
   --function-name "$FUNCTION_NAME" \
-  --environment "Variables={LAMBDA_PRINCIPAL=${LAMBDA_PRINCIPAL}}" \
+  --environment \
+    "Variables={LAMBDA_PRINCIPAL=${LAMBDA_PRINCIPAL},PASETO_PUBLIC_KEY=${PASETO_PUBLIC_KEY}}" \
   --profile "$PROFILE" \
   --region "$REGION"
 ```
 
 ## Security note
 
-`--auth-type NONE` and `--principal '*'` make the Function URL public. This is useful for a demo, but production endpoints should usually use stricter authorization, narrower IAM policies, or an API Gateway/CloudFront layer depending on the use case.
+`--auth-type NONE` and `--principal '*'` make the Function URL publicly
+reachable, while the handler requires a valid PASETO bearer token. For
+production, consider combining application authentication with stricter
+infrastructure authorization, narrower IAM policies, or an API
+Gateway/CloudFront layer.

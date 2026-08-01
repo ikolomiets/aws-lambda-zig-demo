@@ -1,25 +1,144 @@
 const std = @import("std");
 const lambda = @import("aws-lambda");
+const paseto = @import("paseto");
 
+const authorization_header_count_max = 256;
+const content_type = "text/plain; charset=utf-8";
 const environment_count_max = 512;
+const internal_server_error_body = "Internal Server Error\n";
+const internal_server_error_response =
+    "{\"statusCode\":500,\"headers\":{\"Content-Type\":\"" ++ content_type ++
+    "\"},\"body\":\"Internal Server Error\\n\"}";
 const redacted_value = "<redacted>";
+const unauthorized_body = "Unauthorized\n";
 
 pub fn main(init: std.process.Init) void {
     lambda.handle(init, handler, .{});
 }
 
-fn handler(ctx: lambda.Context, _: []const u8) ![]const u8 {
-    const body = try handlerBody(
+fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
+    const now = std.Io.Clock.real.now(ctx.io).toSeconds();
+    return handleInvocation(
         ctx.arena,
+        event,
         ctx.config,
         ctx.request,
         @field(ctx, "_").kv,
+        now,
     );
+}
 
-    return lambda.url.encodeResponse(ctx.arena, .{
-        .content_type = "text/plain; charset=utf-8",
-        .body = .{ .textual = body },
-    });
+fn handleInvocation(
+    allocator: std.mem.Allocator,
+    event: []const u8,
+    cfg: lambda.Context.ConfigMeta,
+    req: lambda.Context.RequestMeta,
+    env: *const std.process.Environ.Map,
+    now: i64,
+) []const u8 {
+    const outcome = invocationOutcome(allocator, event, cfg, req, env, now);
+    return encodeOutcome(allocator, outcome) catch internal_server_error_response;
+}
+
+const InvocationOutcome = union(enum) {
+    success: []const u8,
+    unauthorized,
+    internal_server_error,
+};
+
+fn invocationOutcome(
+    allocator: std.mem.Allocator,
+    event: []const u8,
+    cfg: lambda.Context.ConfigMeta,
+    req: lambda.Context.RequestMeta,
+    env: *const std.process.Environ.Map,
+    now: i64,
+) InvocationOutcome {
+    const request = lambda.url.parseRequest(allocator, event) catch {
+        return .internal_server_error;
+    };
+    defer request.deinit(allocator);
+    const token = bearerToken(&request) catch return .unauthorized;
+    const public_key_encoded = env.get("PASETO_PUBLIC_KEY") orelse {
+        return .internal_server_error;
+    };
+    const public_key = paseto.decodePublicKey(public_key_encoded) catch {
+        return .internal_server_error;
+    };
+    var claims = paseto.verify(allocator, token, public_key, now) catch |err| {
+        return switch (err) {
+            error.InvalidToken => .unauthorized,
+            else => .internal_server_error,
+        };
+    };
+    defer claims.deinit();
+
+    const body = handlerBody(allocator, cfg, req, env) catch {
+        return .internal_server_error;
+    };
+    return .{ .success = body };
+}
+
+fn bearerToken(request: *const lambda.url.Request) error{InvalidCredentials}![]const u8 {
+    if (request.headers.len > authorization_header_count_max) {
+        return error.InvalidCredentials;
+    }
+
+    var authorization: ?[]const u8 = null;
+    for (request.headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.key, "Authorization")) continue;
+        if (authorization != null) return error.InvalidCredentials;
+        authorization = header.value;
+    }
+    const value = authorization orelse return error.InvalidCredentials;
+    const scheme = "Bearer";
+    if (value.len <= scheme.len) return error.InvalidCredentials;
+    if (!std.ascii.eqlIgnoreCase(value[0..scheme.len], scheme)) {
+        return error.InvalidCredentials;
+    }
+
+    var token_start = scheme.len;
+    if (value[token_start] != ' ') return error.InvalidCredentials;
+    while (token_start < value.len) : (token_start += 1) {
+        if (value[token_start] != ' ') break;
+    }
+    if (token_start == value.len) return error.InvalidCredentials;
+    const token = value[token_start..];
+    if (token.len > paseto.token_size_max) return error.InvalidCredentials;
+    if (std.mem.indexOfAny(u8, token, " \t\r\n") != null) {
+        return error.InvalidCredentials;
+    }
+    std.debug.assert(token.len > 0);
+    std.debug.assert(token.len <= paseto.token_size_max);
+    return token;
+}
+
+fn encodeOutcome(
+    allocator: std.mem.Allocator,
+    outcome: InvocationOutcome,
+) ![]const u8 {
+    return switch (outcome) {
+        .success => |body| success: {
+            defer allocator.free(body);
+            break :success lambda.url.encodeResponse(allocator, .{
+                .content_type = content_type,
+                .body = .{ .textual = body },
+            });
+        },
+        .unauthorized => lambda.url.encodeResponse(allocator, .{
+            .content_type = content_type,
+            .status_code = .unauthorized,
+            .headers = &.{
+                .{ .key = "WWW-Authenticate", .value = "Bearer" },
+            },
+            .body = .{ .textual = unauthorized_body },
+        }),
+        .internal_server_error => lambda.url.encodeResponse(allocator, .{
+            .content_type = content_type,
+            .status_code = .internal_server_error,
+            .body = .{ .textual = internal_server_error_body },
+        }),
+    };
 }
 
 fn handlerBody(
@@ -354,6 +473,301 @@ test "environment body includes keys and redacts AWS credentials" {
     try expectContains(body, "PASETO_PRIVATE_KEY=<redacted>\n");
     try expectNotContains(body, "secret-value");
     try expectNotContains(body, "private-key-value");
+}
+
+test "authorization header and Bearer scheme are case insensitive" {
+    var key_pair = testKeyPair(0x41);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+
+    const expected_body = try handlerBody(
+        std.testing.allocator,
+        .{},
+        .{},
+        &environment,
+    );
+    defer std.testing.allocator.free(expected_body);
+    const expected_response = try lambda.url.encodeResponse(std.testing.allocator, .{
+        .content_type = content_type,
+        .body = .{ .textual = expected_body },
+    });
+    defer std.testing.allocator.free(expected_response);
+
+    const header_names = [_][]const u8{
+        "Authorization",
+        "authorization",
+        "AUTHORIZATION",
+    };
+    const schemes = [_][]const u8{ "Bearer", "bearer", "bEaReR" };
+    for (header_names) |header_name| {
+        for (schemes) |scheme| {
+            const event = try testAuthorizationEvent(
+                std.testing.allocator,
+                header_name,
+                scheme,
+                token,
+            );
+            defer std.testing.allocator.free(event);
+            const response = handleInvocation(
+                std.testing.allocator,
+                event,
+                .{},
+                .{},
+                &environment,
+                1000,
+            );
+            defer std.testing.allocator.free(response);
+            try std.testing.expectEqualStrings(expected_response, response);
+        }
+    }
+}
+
+test "missing and malformed credentials return a Bearer challenge" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    const missing_event =
+        "{\"version\":\"2.0\",\"routeKey\":\"$default\",\"headers\":{}}";
+    const missing_response = handleInvocation(
+        std.testing.allocator,
+        missing_event,
+        .{},
+        .{},
+        &environment,
+        1000,
+    );
+    defer std.testing.allocator.free(missing_response);
+    try expectUnauthorized(missing_response);
+
+    const malformed_values = [_][]const u8{
+        "",
+        "Bearer",
+        "Bearer ",
+        "Basic token",
+        "Bearertoken",
+        "Bearer token extra",
+        "Bearer\\ttoken",
+    };
+    for (malformed_values) |value| {
+        const event = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"headers\":{{\"Authorization\":\"{s}\"}}}}",
+            .{value},
+        );
+        defer std.testing.allocator.free(event);
+        const response = handleInvocation(
+            std.testing.allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            1000,
+        );
+        defer std.testing.allocator.free(response);
+        try expectUnauthorized(response);
+    }
+
+    const duplicate_event =
+        "{\"headers\":{\"Authorization\":\"Bearer one\"," ++
+        "\"authorization\":\"Bearer two\"}}";
+    const duplicate_response = handleInvocation(
+        std.testing.allocator,
+        duplicate_event,
+        .{},
+        .{},
+        &environment,
+        1000,
+    );
+    defer std.testing.allocator.free(duplicate_response);
+    try expectUnauthorized(duplicate_response);
+}
+
+test "wrong and expired tokens return a sanitized unauthorized response" {
+    var key_pair = testKeyPair(0x51);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    var wrong_key_pair = testKeyPair(0x52);
+    defer paseto.wipeSecretKey(&wrong_key_pair.secret_key);
+    const wrong_token = try testToken(&wrong_key_pair, 1000, 60);
+    defer std.testing.allocator.free(wrong_token);
+    const expired_token = try testToken(&key_pair, 1000, 1);
+    defer std.testing.allocator.free(expired_token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+
+    const tokens = [_][]const u8{ wrong_token, expired_token };
+    for (tokens) |token| {
+        const event = try testAuthorizationEvent(
+            std.testing.allocator,
+            "Authorization",
+            "Bearer",
+            token,
+        );
+        defer std.testing.allocator.free(event);
+        const response = handleInvocation(
+            std.testing.allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            1001,
+        );
+        defer std.testing.allocator.free(response);
+        try expectUnauthorized(response);
+        try expectNotContains(response, token);
+    }
+}
+
+test "missing and invalid public key configuration return sanitized errors" {
+    var key_pair = testKeyPair(0x61);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1000, 60);
+    defer std.testing.allocator.free(token);
+    const event = try testAuthorizationEvent(
+        std.testing.allocator,
+        "Authorization",
+        "Bearer",
+        token,
+    );
+    defer std.testing.allocator.free(event);
+
+    var missing_environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer missing_environment.deinit();
+    const missing_response = handleInvocation(
+        std.testing.allocator,
+        event,
+        .{},
+        .{},
+        &missing_environment,
+        1000,
+    );
+    defer std.testing.allocator.free(missing_response);
+    try expectInternalServerError(missing_response);
+
+    const key_marker = "invalid-public-key-marker";
+    var invalid_environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer invalid_environment.deinit();
+    try invalid_environment.put("PASETO_PUBLIC_KEY", key_marker);
+    const invalid_response = handleInvocation(
+        std.testing.allocator,
+        event,
+        .{},
+        .{},
+        &invalid_environment,
+        1000,
+    );
+    defer std.testing.allocator.free(invalid_response);
+    try expectInternalServerError(invalid_response);
+    try expectNotContains(invalid_response, key_marker);
+    try expectNotContains(invalid_response, token);
+}
+
+test "internal failures return only the static sanitized response" {
+    const event_marker = "malformed-event-marker";
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    const malformed_response = handleInvocation(
+        std.testing.allocator,
+        "{\"headers\":" ++ event_marker,
+        .{},
+        .{},
+        &environment,
+        1000,
+    );
+    defer std.testing.allocator.free(malformed_response);
+    try expectInternalServerError(malformed_response);
+    try expectNotContains(malformed_response, event_marker);
+
+    var failing_allocator = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    const allocation_response = handleInvocation(
+        failing_allocator.allocator(),
+        "{}",
+        .{},
+        .{},
+        &environment,
+        1000,
+    );
+    try std.testing.expectEqualStrings(
+        internal_server_error_response,
+        allocation_response,
+    );
+}
+
+fn testAuthorizationEvent(
+    allocator: std.mem.Allocator,
+    header_name: []const u8,
+    scheme: []const u8,
+    token: []const u8,
+) ![]u8 {
+    std.debug.assert(header_name.len > 0);
+    std.debug.assert(scheme.len > 0);
+    std.debug.assert(token.len > 0);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"version\":\"2.0\",\"routeKey\":\"$default\"," ++
+            "\"headers\":{{\"{s}\":\"{s} {s}\"}}}}",
+        .{ header_name, scheme, token },
+    );
+}
+
+fn testKeyPair(seed_byte: u8) paseto.Ed25519.KeyPair {
+    const seed = [_]u8{seed_byte} ** paseto.Ed25519.KeyPair.seed_length;
+    const key_pair = paseto.Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
+    std.debug.assert(
+        key_pair.secret_key.toBytes().len == paseto.Ed25519.SecretKey.encoded_length,
+    );
+    std.debug.assert(
+        key_pair.public_key.toBytes().len == paseto.Ed25519.PublicKey.encoded_length,
+    );
+    return key_pair;
+}
+
+fn testToken(
+    key_pair: *const paseto.Ed25519.KeyPair,
+    now: i64,
+    ttl_seconds: i64,
+) ![]u8 {
+    std.debug.assert(ttl_seconds > 0);
+    var random = std.Random.DefaultPrng.init(0x4c414d4244415554);
+    return paseto.issue(
+        std.testing.allocator,
+        random.random(),
+        &key_pair.secret_key,
+        .{
+            .subject = "lambda-test-user",
+            .now = now,
+            .ttl_seconds = ttl_seconds,
+        },
+    );
+}
+
+fn putTestPublicKey(
+    environment: *std.process.Environ.Map,
+    public_key: paseto.Ed25519.PublicKey,
+) !void {
+    var buffer: [paseto.public_key_base64_size]u8 = undefined;
+    const encoded = paseto.encodePublicKey(public_key, &buffer);
+    try environment.put("PASETO_PUBLIC_KEY", encoded);
+    std.debug.assert(environment.get("PASETO_PUBLIC_KEY") != null);
+    std.debug.assert(encoded.len == paseto.public_key_base64_size);
+}
+
+fn expectUnauthorized(response: []const u8) !void {
+    try std.testing.expectEqualStrings(
+        "{\"statusCode\":401,\"headers\":{\"Content-Type\":\"" ++ content_type ++
+            "\",\"WWW-Authenticate\":\"Bearer\"},\"body\":\"Unauthorized\\n\"}",
+        response,
+    );
+}
+
+fn expectInternalServerError(response: []const u8) !void {
+    try std.testing.expectEqualStrings(internal_server_error_response, response);
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
