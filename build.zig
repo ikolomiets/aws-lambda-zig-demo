@@ -5,7 +5,18 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{
         .preferred_optimize_mode = .ReleaseSafe,
     });
+    // Propagate the project's preferred mode to dependencies for bare `--release` builds.
+    if (b.release_mode == .any) {
+        std.debug.assert(optimize == .ReleaseSafe);
+        b.release_mode = .safe;
+    }
     const lambda_target = lambda.resolveTargetQuery(b, lambda.archOption(b));
+    const lambda_aws_sdk = b.dependency("aws_sdk", .{
+        .target = lambda_target,
+        .optimize = optimize,
+    });
+    const lambda_aws = lambda_aws_sdk.module("aws");
+    const lambda_dynamodb = lambda_aws_sdk.module("dynamodb");
     const lambda_runtime = b.dependency("aws_lambda", .{
         .target = lambda_target,
     }).module("lambda");
@@ -28,7 +39,9 @@ pub fn build(b: *std.Build) void {
         .strip = true,
         .single_threaded = true,
         .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
             .{ .name = "aws-lambda", .module = lambda_runtime },
+            .{ .name = "dynamodb", .module = lambda_dynamodb },
             .{ .name = "paseto", .module = lambda_paseto },
         },
     });
@@ -40,6 +53,12 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(lambda_exe);
 
+    const host_aws_sdk = b.dependency("aws_sdk", .{
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const host_aws = host_aws_sdk.module("aws");
+    const host_dynamodb = host_aws_sdk.module("dynamodb");
     const host_paseto_implementation = b.dependency("zig_paseto", .{
         .target = b.graph.host,
     }).module("zig-paseto");
@@ -74,7 +93,9 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
         .root_source_file = b.path("src/main.zig"),
         .imports = &.{
+            .{ .name = "aws", .module = host_aws },
             .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "dynamodb", .module = host_dynamodb },
             .{ .name = "paseto", .module = host_paseto },
         },
     });

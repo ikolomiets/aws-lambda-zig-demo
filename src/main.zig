@@ -1,4 +1,6 @@
 const std = @import("std");
+const aws = @import("aws");
+const dynamodb = @import("dynamodb");
 const lambda = @import("aws-lambda");
 const paseto = @import("paseto");
 
@@ -316,6 +318,13 @@ fn environmentKeySensitive(key: []const u8) bool {
 
 fn writerCountToUsize(count: u64) !usize {
     return std.math.cast(usize, count) orelse return error.BodyTooLarge;
+}
+
+test "AWS SDK exposes runtime configuration and DynamoDB client types" {
+    comptime {
+        std.debug.assert(@TypeOf(aws.Config) == type);
+        std.debug.assert(@TypeOf(dynamodb.Client) == type);
+    }
 }
 
 test "config metadata body includes config fields" {

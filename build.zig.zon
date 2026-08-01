@@ -32,6 +32,10 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        .aws_sdk = .{
+            .url = "git+https://github.com/cloudboss/aws-sdk-zig?ref=896cb3984e0b44600520ba6f2e076322d016eb8e#896cb3984e0b44600520ba6f2e076322d016eb8e",
+            .hash = "aws_sdk-0.0.1-ApQSL9zeixB-xOOhA9ebi9LeB_QwhadSONKaXY_Ys8CS",
+        },
         .aws_lambda = .{
             .url = "git+https://github.com/ikolomiets/aws-lambda-zig?ref=c1bd144db63a0a6b4fbdcbed8254e358bde2fe3f#c1bd144db63a0a6b4fbdcbed8254e358bde2fe3f",
             .hash = "aws_lambda-0.6.1-AMNperHkAQCbP7W44mgEFfcEZCky4HLXZs3HABrMzGOF",
