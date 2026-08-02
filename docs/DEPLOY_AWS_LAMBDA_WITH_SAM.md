@@ -11,7 +11,7 @@ SAM deploys the Lambda function as a CloudFormation-managed stack. It creates th
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
 - `lambda.zip` exists and contains a Linux ARM64 executable named `bootstrap`.
-- The Lambda Function URL is intentionally public for demo HTTP GET testing.
+- The Lambda Function URL is intentionally public for demo HTTP GET and POST testing.
 - `LAMBDA_PRINCIPAL` defaults to `'*'` unless you override the
   `LambdaPrincipal` template parameter.
 - `PASETO_PUBLIC_KEY` contains the padded Base64 Ed25519 public key generated
@@ -123,6 +123,7 @@ Cors:
     - "*"
   AllowMethods:
     - GET
+    - POST
   AllowHeaders:
     - "*"
 ```
@@ -272,7 +273,7 @@ aws cloudformation describe-stacks \
   --region ca-central-1
 ```
 
-## 8. Test HTTP GET
+## 8. Test HTTP GET and POST
 
 Call the Function URL returned by SAM.
 
@@ -324,6 +325,29 @@ The response should render directly in a browser because the handler returns:
 
 ```text
 Content-Type: text/plain; charset=utf-8
+```
+
+POST an Operation JSON document with the same bearer token:
+
+```sh
+curl -L \
+  -H "Authorization: Bearer $token" \
+  -H "Content-Type: application/json" \
+  --data '{"id":"00112233-4455-6677-8899-aabbccddeeff","name":"echo","body":{"message":"hello","count":2}}' \
+  <FunctionUrl>
+```
+
+The handler returns the Operation output view with `NEW` state, the invocation
+timestamp, and its stable hash. It omits the input body:
+
+```json
+{
+  "id": "00112233-4455-6677-8899-aabbccddeeff",
+  "name": "echo",
+  "state": "NEW",
+  "last_updated": 1700000000,
+  "hash": "ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662"
+}
 ```
 
 ## 9. Update the deployed Lambda code

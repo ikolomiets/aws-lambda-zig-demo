@@ -4,9 +4,10 @@ A minimal AWS Lambda Function URL demo written in Zig.
 
 The project builds a custom `provided.al2023` Lambda runtime executable named
 `bootstrap` and a host-native PASETO v4.public utility named `paseto`. The
-handler returns a plain-text response with Lambda config metadata, request
-metadata, and environment variables through the `aws-lambda-zig` runtime
-package after authenticating a PASETO v4.public bearer token.
+handler authenticates a PASETO v4.public bearer token before serving GET and
+POST requests through the `aws-lambda-zig` runtime package. GET returns a
+plain-text Lambda environment dump, while POST validates and hashes an
+Operation JSON document and returns its output view without the body.
 
 ## Requirements
 
@@ -105,6 +106,8 @@ Header names and the `Bearer` scheme are case-insensitive. Missing, malformed,
 expired, or unverifiable credentials receive `401 Unauthorized` with
 `WWW-Authenticate: Bearer`. Missing or invalid public-key configuration and
 internal failures receive a sanitized `500 Internal Server Error`.
+Invalid POST operation documents receive `400 Bad Request`. Authenticated
+methods other than GET and POST receive `405 Method Not Allowed`.
 
 ## Deploy
 
@@ -163,7 +166,7 @@ token="$(
 curl -L -H "Authorization: Bearer $token" <FunctionUrl>
 ```
 
-The authenticated response preserves the demo output:
+The authenticated GET response preserves the demo output:
 
 ```text
 Hello, example-user!
@@ -178,8 +181,32 @@ Environment
 ...
 ```
 
+POST an Operation JSON document with the same bearer token:
+
+```sh
+curl -L \
+  -H "Authorization: Bearer $token" \
+  -H "Content-Type: application/json" \
+  --data '{"id":"00112233-4455-6677-8899-aabbccddeeff","name":"echo","body":{"message":"hello","count":2}}' \
+  <FunctionUrl>
+```
+
+The response has `NEW` state, the invocation timestamp, and the stable
+BLAKE3-256 operation hash. The input body is intentionally omitted:
+
+```json
+{
+  "id": "00112233-4455-6677-8899-aabbccddeeff",
+  "name": "echo",
+  "state": "NEW",
+  "last_updated": 1700000000,
+  "hash": "ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662"
+}
+```
+
 The template intentionally creates a publicly reachable Function URL for demo
-HTTP GET testing, while the handler enforces PASETO bearer authentication.
+HTTP GET and POST testing, while the handler enforces PASETO bearer
+authentication.
 Production endpoints should also consider stricter infrastructure
 authorization, narrower IAM policies, or a fronting layer such as API Gateway
 or CloudFront.
@@ -187,6 +214,7 @@ or CloudFront.
 ## Project Layout
 
 - `src/main.zig`: Lambda entrypoint and request handler.
+- `src/operation.zig`: Operation JSON model, validation, and hash contract.
 - `src/paseto.zig`: shared PASETO v4.public issuance and verification.
 - `src/paseto_cli.zig`: host PASETO v4.public CLI and its tests.
 - `build.zig`: Zig build graph for `bootstrap`, `paseto`, and both test roots.
@@ -200,7 +228,7 @@ or CloudFront.
 Run formatting checks before committing Zig changes:
 
 ```sh
-zig fmt --check build.zig src/main.zig src/paseto.zig src/paseto_cli.zig
+zig fmt --check build.zig src/main.zig src/operation.zig src/paseto.zig src/paseto_cli.zig
 ```
 
 Run the handler and PASETO integration tests with:

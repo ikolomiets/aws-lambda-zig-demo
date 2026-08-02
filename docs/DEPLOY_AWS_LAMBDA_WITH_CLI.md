@@ -8,7 +8,7 @@ This guide documents the successful AWS CLI flow used to deploy the compiled Zig
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `lambda.zip` already exists and contains a Linux ARM64 `bootstrap` executable.
-- The Lambda is intentionally exposed through a public Function URL for simple HTTP GET testing.
+- The Lambda is intentionally exposed through a public Function URL for simple HTTP GET and POST testing.
 - `LAMBDA_PRINCIPAL` defaults to `'*'` unless you set a different value before
   creating or updating the function configuration.
 - `PASETO_PUBLIC_KEY` contains the padded Base64 Ed25519 public key generated
@@ -159,13 +159,13 @@ Expected response:
 
 ## 6. Create a public Lambda Function URL
 
-Create an unauthenticated Function URL and limit CORS methods to `GET` for browser testing.
+Create an unauthenticated Function URL and limit CORS methods to `GET` and `POST` for browser testing.
 
 ```sh
 aws lambda create-function-url-config \
   --function-name "$FUNCTION_NAME" \
   --auth-type NONE \
-  --cors '{"AllowOrigins":["*"],"AllowMethods":["GET"],"AllowHeaders":["*"]}' \
+  --cors '{"AllowOrigins":["*"],"AllowMethods":["GET","POST"],"AllowHeaders":["*"]}' \
   --profile "$PROFILE" \
   --region "$REGION"
 ```
@@ -207,7 +207,7 @@ aws lambda add-permission \
   --region "$REGION"
 ```
 
-## 8. Test HTTP GET
+## 8. Test HTTP GET and POST
 
 Query the Function URL if it is not already in your shell, then call it.
 
@@ -259,6 +259,29 @@ Environment
 LAMBDA_PRINCIPAL=*
 PASETO_PUBLIC_KEY=<public-key-from-keygen>
 ...
+```
+
+POST an Operation JSON document with the same bearer token:
+
+```sh
+curl -L \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"id":"00112233-4455-6677-8899-aabbccddeeff","name":"echo","body":{"message":"hello","count":2}}' \
+  "$FUNCTION_URL"
+```
+
+The handler returns the Operation output view with `NEW` state, the invocation
+timestamp, and its stable hash. It omits the input body:
+
+```json
+{
+  "id": "00112233-4455-6677-8899-aabbccddeeff",
+  "name": "echo",
+  "state": "NEW",
+  "last_updated": 1700000000,
+  "hash": "ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662"
+}
 ```
 
 ## Updating the deployed code

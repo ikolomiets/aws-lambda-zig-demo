@@ -2,15 +2,19 @@ const std = @import("std");
 const aws = @import("aws");
 const dynamodb = @import("dynamodb");
 const lambda = @import("aws-lambda");
+const operation = @import("operation.zig");
 const paseto = @import("paseto");
 
 const authorization_header_count_max = 256;
-const content_type = "text/plain; charset=utf-8";
+const bad_request_body = "Bad Request\n";
+const content_type_json = "application/json";
+const content_type_text = "text/plain; charset=utf-8";
 const environment_count_max = 512;
 const internal_server_error_body = "Internal Server Error\n";
 const internal_server_error_response =
-    "{\"statusCode\":500,\"headers\":{\"Content-Type\":\"" ++ content_type ++
+    "{\"statusCode\":500,\"headers\":{\"Content-Type\":\"" ++ content_type_text ++
     "\"},\"body\":\"Internal Server Error\\n\"}";
+const method_not_allowed_body = "Method Not Allowed\n";
 const redacted_value = "<redacted>";
 const unauthorized_body = "Unauthorized\n";
 
@@ -43,9 +47,16 @@ fn handleInvocation(
 }
 
 const InvocationOutcome = union(enum) {
-    success: []const u8,
+    success: Success,
+    bad_request,
+    method_not_allowed,
     unauthorized,
     internal_server_error,
+};
+
+const Success = struct {
+    body: []const u8,
+    content_type: []const u8,
 };
 
 fn invocationOutcome(
@@ -75,10 +86,73 @@ fn invocationOutcome(
     };
     defer claims.deinit();
 
-    const body = handlerBody(allocator, claims.sub, cfg, req, env) catch {
+    const method = request.request_context.http.method orelse {
+        return .method_not_allowed;
+    };
+    return switch (method) {
+        .GET => get_invocation_outcome(allocator, claims.sub, cfg, req, env),
+        .POST => post_invocation_outcome(allocator, &request, now),
+        else => .method_not_allowed,
+    };
+}
+
+fn get_invocation_outcome(
+    allocator: std.mem.Allocator,
+    subject: []const u8,
+    cfg: lambda.Context.ConfigMeta,
+    req: lambda.Context.RequestMeta,
+    env: *const std.process.Environ.Map,
+) InvocationOutcome {
+    const body = get_handler_body(allocator, subject, cfg, req, env) catch {
         return .internal_server_error;
     };
-    return .{ .success = body };
+    return .{ .success = .{
+        .body = body,
+        .content_type = content_type_text,
+    } };
+}
+
+fn post_invocation_outcome(
+    allocator: std.mem.Allocator,
+    request: *const lambda.url.Request,
+    now: operation.UnixSeconds,
+) InvocationOutcome {
+    const input_json = request.body orelse return .bad_request;
+    const parsed = operation.parseInputJSON(
+        allocator,
+        allocator,
+        input_json,
+        now,
+    ) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => .internal_server_error,
+            else => .bad_request,
+        };
+    };
+    defer allocator.free(parsed.name);
+    defer allocator.free(parsed.body.?);
+
+    const body = post_handler_body(allocator, &parsed) catch {
+        return .internal_server_error;
+    };
+    return .{ .success = .{
+        .body = body,
+        .content_type = content_type_json,
+    } };
+}
+
+fn post_handler_body(
+    allocator: std.mem.Allocator,
+    parsed: *const operation.Operation,
+) ![]const u8 {
+    std.debug.assert(parsed.state == .new);
+    std.debug.assert(parsed.last_updated != null);
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try operation.writeOutputJSON(allocator, &output.writer, parsed);
+    std.debug.assert(output.written().len > 0);
+    return output.toOwnedSlice();
 }
 
 fn bearerToken(request: *const lambda.url.Request) error{InvalidCredentials}![]const u8 {
@@ -120,15 +194,28 @@ fn encodeOutcome(
     outcome: InvocationOutcome,
 ) ![]const u8 {
     return switch (outcome) {
-        .success => |body| success: {
-            defer allocator.free(body);
+        .success => |response| success: {
+            defer allocator.free(response.body);
             break :success lambda.url.encodeResponse(allocator, .{
-                .content_type = content_type,
-                .body = .{ .textual = body },
+                .content_type = response.content_type,
+                .body = .{ .textual = response.body },
             });
         },
+        .bad_request => lambda.url.encodeResponse(allocator, .{
+            .content_type = content_type_text,
+            .status_code = .bad_request,
+            .body = .{ .textual = bad_request_body },
+        }),
+        .method_not_allowed => lambda.url.encodeResponse(allocator, .{
+            .content_type = content_type_text,
+            .status_code = .method_not_allowed,
+            .headers = &.{
+                .{ .key = "Allow", .value = "GET, POST" },
+            },
+            .body = .{ .textual = method_not_allowed_body },
+        }),
         .unauthorized => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type,
+            .content_type = content_type_text,
             .status_code = .unauthorized,
             .headers = &.{
                 .{ .key = "WWW-Authenticate", .value = "Bearer" },
@@ -136,14 +223,14 @@ fn encodeOutcome(
             .body = .{ .textual = unauthorized_body },
         }),
         .internal_server_error => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type,
+            .content_type = content_type_text,
             .status_code = .internal_server_error,
             .body = .{ .textual = internal_server_error_body },
         }),
     };
 }
 
-fn handlerBody(
+fn get_handler_body(
     allocator: std.mem.Allocator,
     subject: []const u8,
     cfg: lambda.Context.ConfigMeta,
@@ -155,7 +242,7 @@ fn handlerBody(
 
     var count_buffer: [1024]u8 = undefined;
     var counter: std.Io.Writer.Discarding = .init(&count_buffer);
-    try handlerBodyWrite(&counter.writer, subject, cfg, req, env);
+    try get_handler_body_write(&counter.writer, subject, cfg, req, env);
 
     const output_len = try writerCountToUsize(counter.fullCount());
     std.debug.assert(output_len > 0);
@@ -164,13 +251,13 @@ fn handlerBody(
     errdefer allocator.free(output);
 
     var writer: std.Io.Writer = .fixed(output);
-    try handlerBodyWrite(&writer, subject, cfg, req, env);
+    try get_handler_body_write(&writer, subject, cfg, req, env);
     std.debug.assert(writer.buffered().len == output.len);
 
     return output;
 }
 
-fn handlerBodyWrite(
+fn get_handler_body_write(
     writer: *std.Io.Writer,
     subject: []const u8,
     cfg: lambda.Context.ConfigMeta,
@@ -399,7 +486,7 @@ test "handler body includes config request and environment sections in order" {
 
     try env.put("CUSTOM_VALUE", "demo");
 
-    const body = try handlerBody(std.testing.allocator, "example-user", .{
+    const body = try get_handler_body(std.testing.allocator, "example-user", .{
         .func_name = "demo-function",
         .func_version = "$LATEST",
         .func_size = 256,
@@ -444,7 +531,7 @@ test "handler body allocates final body once" {
     };
     const allocator = allocation_counter.allocator();
 
-    const body = try handlerBody(allocator, "example-user", .{
+    const body = try get_handler_body(allocator, "example-user", .{
         .func_name = "demo-function",
         .func_version = "$LATEST",
         .func_size = 256,
@@ -507,7 +594,7 @@ test "valid credentials include subject greeting and accept case insensitive aut
     defer environment.deinit();
     try putTestPublicKey(&environment, key_pair.public_key);
 
-    const expected_body = try handlerBody(
+    const expected_body = try get_handler_body(
         std.testing.allocator,
         "lambda-test-user",
         .{},
@@ -516,7 +603,7 @@ test "valid credentials include subject greeting and accept case insensitive aut
     );
     defer std.testing.allocator.free(expected_body);
     const expected_response = try lambda.url.encodeResponse(std.testing.allocator, .{
-        .content_type = content_type,
+        .content_type = content_type_text,
         .body = .{ .textual = expected_body },
     });
     defer std.testing.allocator.free(expected_response);
@@ -548,6 +635,161 @@ test "valid credentials include subject greeting and accept case insensitive aut
             try std.testing.expectEqualStrings(expected_response, response);
             try expectContains(response, "Hello, lambda-test-user!");
         }
+    }
+}
+
+test "authenticated POST returns a new operation without its body" {
+    var key_pair = testKeyPair(0x42);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1_700_000_000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+
+    const inputs = [_][]const u8{
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}," ++
+            "\"state\":\"NEW\"}",
+    };
+    const expected =
+        "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
+        "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
+        "\\\"name\\\":\\\"echo\\\",\\\"state\\\":\\\"NEW\\\"," ++
+        "\\\"last_updated\\\":1700000000," ++
+        "\\\"hash\\\":\\\"ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662\\\"}\"}";
+
+    for (inputs) |input| {
+        const event = try test_authorization_request_event(
+            std.testing.allocator,
+            .POST,
+            "Authorization",
+            "Bearer",
+            token,
+            input,
+        );
+        defer std.testing.allocator.free(event);
+        const response = handleInvocation(
+            std.testing.allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            1_700_000_000,
+        );
+        defer std.testing.allocator.free(response);
+
+        try std.testing.expectEqualStrings(expected, response);
+        try expectNotContains(response, "message");
+        try expectNotContains(response, "count");
+    }
+}
+
+test "authenticated POST rejects missing and invalid operation JSON" {
+    var key_pair = testKeyPair(0x43);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+
+    const invalid_inputs = [_]?[]const u8{
+        null,
+        "{invalid-json-marker",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"name\":\"echo\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"name\":\"echo\",\"body\":null,\"state\":\"SUBMITTED\"}",
+    };
+    for (invalid_inputs) |input| {
+        const event = try test_authorization_request_event(
+            std.testing.allocator,
+            .POST,
+            "Authorization",
+            "Bearer",
+            token,
+            input,
+        );
+        defer std.testing.allocator.free(event);
+        const response = handleInvocation(
+            std.testing.allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            1000,
+        );
+        defer std.testing.allocator.free(response);
+
+        try expectBadRequest(response);
+        try expectNotContains(response, "invalid-json-marker");
+        try expectNotContains(response, "SUBMITTED");
+    }
+}
+
+test "authentication precedes method routing" {
+    var key_pair = testKeyPair(0x44);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+
+    const unsupported_event = try test_authorization_request_event(
+        std.testing.allocator,
+        .PUT,
+        "Authorization",
+        "Bearer",
+        token,
+        null,
+    );
+    defer std.testing.allocator.free(unsupported_event);
+    const unsupported_response = handleInvocation(
+        std.testing.allocator,
+        unsupported_event,
+        .{},
+        .{},
+        &environment,
+        1000,
+    );
+    defer std.testing.allocator.free(unsupported_response);
+    try expectMethodNotAllowed(unsupported_response);
+
+    const missing_method_event = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"headers\":{{\"Authorization\":\"Bearer {s}\"}}}}",
+        .{token},
+    );
+    defer std.testing.allocator.free(missing_method_event);
+    const missing_method_response = handleInvocation(
+        std.testing.allocator,
+        missing_method_event,
+        .{},
+        .{},
+        &environment,
+        1000,
+    );
+    defer std.testing.allocator.free(missing_method_response);
+    try expectMethodNotAllowed(missing_method_response);
+
+    const unauthenticated_events = [_][]const u8{
+        "{\"requestContext\":{\"http\":{\"method\":\"POST\"}}}",
+        "{\"requestContext\":{\"http\":{\"method\":\"PUT\"}}}",
+    };
+    for (unauthenticated_events) |event| {
+        const response = handleInvocation(
+            std.testing.allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            1000,
+        );
+        defer std.testing.allocator.free(response);
+        try expectUnauthorized(response);
     }
 }
 
@@ -730,15 +972,50 @@ fn testAuthorizationEvent(
     scheme: []const u8,
     token: []const u8,
 ) ![]u8 {
+    return test_authorization_request_event(
+        allocator,
+        .GET,
+        header_name,
+        scheme,
+        token,
+        null,
+    );
+}
+
+fn test_authorization_request_event(
+    allocator: std.mem.Allocator,
+    method: std.http.Method,
+    header_name: []const u8,
+    scheme: []const u8,
+    token: []const u8,
+    body: ?[]const u8,
+) ![]u8 {
     std.debug.assert(header_name.len > 0);
     std.debug.assert(scheme.len > 0);
     std.debug.assert(token.len > 0);
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"version\":\"2.0\",\"routeKey\":\"$default\"," ++
-            "\"headers\":{{\"{s}\":\"{s} {s}\"}}}}",
-        .{ header_name, scheme, token },
-    );
+
+    var event: std.Io.Writer.Allocating = .init(allocator);
+    errdefer event.deinit();
+    try event.writer.writeAll("{\"version\":\"2.0\",\"routeKey\":\"$default\",");
+    try event.writer.writeAll("\"headers\":{");
+    try std.json.Stringify.encodeJsonString(header_name, .{}, &event.writer);
+    try event.writer.writeByte(':');
+    try event.writer.writeByte('"');
+    try event.writer.writeAll(scheme);
+    try event.writer.writeByte(' ');
+    try event.writer.writeAll(token);
+    try event.writer.writeByte('"');
+    try event.writer.writeAll("},\"requestContext\":{\"http\":{\"method\":");
+    try std.json.Stringify.encodeJsonString(@tagName(method), .{}, &event.writer);
+    try event.writer.writeAll("}}");
+    if (body) |value| {
+        try event.writer.writeAll(",\"body\":");
+        try std.json.Stringify.encodeJsonString(value, .{}, &event.writer);
+    }
+    try event.writer.writeByte('}');
+    std.debug.assert(event.written().len > token.len);
+    std.debug.assert(event.written().len > header_name.len);
+    return event.toOwnedSlice();
 }
 
 fn testKeyPair(seed_byte: u8) paseto.Ed25519.KeyPair {
@@ -785,8 +1062,24 @@ fn putTestPublicKey(
 
 fn expectUnauthorized(response: []const u8) !void {
     try std.testing.expectEqualStrings(
-        "{\"statusCode\":401,\"headers\":{\"Content-Type\":\"" ++ content_type ++
+        "{\"statusCode\":401,\"headers\":{\"Content-Type\":\"" ++ content_type_text ++
             "\",\"WWW-Authenticate\":\"Bearer\"},\"body\":\"Unauthorized\\n\"}",
+        response,
+    );
+}
+
+fn expectBadRequest(response: []const u8) !void {
+    try std.testing.expectEqualStrings(
+        "{\"statusCode\":400,\"headers\":{\"Content-Type\":\"" ++ content_type_text ++
+            "\"},\"body\":\"Bad Request\\n\"}",
+        response,
+    );
+}
+
+fn expectMethodNotAllowed(response: []const u8) !void {
+    try std.testing.expectEqualStrings(
+        "{\"statusCode\":405,\"headers\":{\"Content-Type\":\"" ++ content_type_text ++
+            "\",\"Allow\":\"GET, POST\"},\"body\":\"Method Not Allowed\\n\"}",
         response,
     );
 }

@@ -46,6 +46,7 @@ Resources:
           - "*"
         AllowMethods:
           - GET
+          - POST
         AllowHeaders:
           - "*"
 
