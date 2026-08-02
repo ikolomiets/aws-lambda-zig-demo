@@ -104,6 +104,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_lambda_tests = b.addRunArtifact(lambda_tests);
 
+    const operation_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .root_source_file = b.path("src/operation.zig"),
+    });
+    const operation_tests = b.addTest(.{
+        .root_module = operation_test_mod,
+    });
+    const run_operation_tests = b.addRunArtifact(operation_tests);
+
     const paseto_test_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .Debug,
@@ -132,6 +142,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_lambda_tests.step);
+    test_step.dependOn(&run_operation_tests.step);
     test_step.dependOn(&run_paseto_tests.step);
     test_step.dependOn(&run_cli_tests.step);
 }
