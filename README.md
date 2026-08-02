@@ -166,6 +166,8 @@ curl -L -H "Authorization: Bearer $token" <FunctionUrl>
 The authenticated response preserves the demo output:
 
 ```text
+Hello, example-user!
+
 ConfigMeta
 ...
 

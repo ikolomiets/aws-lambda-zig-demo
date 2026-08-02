@@ -75,7 +75,7 @@ fn invocationOutcome(
     };
     defer claims.deinit();
 
-    const body = handlerBody(allocator, cfg, req, env) catch {
+    const body = handlerBody(allocator, claims.sub, cfg, req, env) catch {
         return .internal_server_error;
     };
     return .{ .success = body };
@@ -145,13 +145,17 @@ fn encodeOutcome(
 
 fn handlerBody(
     allocator: std.mem.Allocator,
+    subject: []const u8,
     cfg: lambda.Context.ConfigMeta,
     req: lambda.Context.RequestMeta,
     env: *const std.process.Environ.Map,
 ) ![]const u8 {
+    std.debug.assert(subject.len > 0);
+    std.debug.assert(subject.len <= paseto.subject_size_max);
+
     var count_buffer: [1024]u8 = undefined;
     var counter: std.Io.Writer.Discarding = .init(&count_buffer);
-    try handlerBodyWrite(&counter.writer, cfg, req, env);
+    try handlerBodyWrite(&counter.writer, subject, cfg, req, env);
 
     const output_len = try writerCountToUsize(counter.fullCount());
     std.debug.assert(output_len > 0);
@@ -160,7 +164,7 @@ fn handlerBody(
     errdefer allocator.free(output);
 
     var writer: std.Io.Writer = .fixed(output);
-    try handlerBodyWrite(&writer, cfg, req, env);
+    try handlerBodyWrite(&writer, subject, cfg, req, env);
     std.debug.assert(writer.buffered().len == output.len);
 
     return output;
@@ -168,10 +172,15 @@ fn handlerBody(
 
 fn handlerBodyWrite(
     writer: *std.Io.Writer,
+    subject: []const u8,
     cfg: lambda.Context.ConfigMeta,
     req: lambda.Context.RequestMeta,
     env: *const std.process.Environ.Map,
 ) !void {
+    std.debug.assert(subject.len > 0);
+    std.debug.assert(subject.len <= paseto.subject_size_max);
+
+    try writer.print("Hello, {s}!\n\n", .{subject});
     try configMetadataBodyWrite(writer, cfg);
     try writer.writeByte('\n');
     try requestMetadataBodyWrite(writer, req);
@@ -390,7 +399,7 @@ test "handler body includes config request and environment sections in order" {
 
     try env.put("CUSTOM_VALUE", "demo");
 
-    const body = try handlerBody(std.testing.allocator, .{
+    const body = try handlerBody(std.testing.allocator, "example-user", .{
         .func_name = "demo-function",
         .func_version = "$LATEST",
         .func_size = 256,
@@ -412,6 +421,11 @@ test "handler body includes config request and environment sections in order" {
     }, &env);
     defer std.testing.allocator.free(body);
 
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        body,
+        "Hello, example-user!\n\nConfigMeta\n",
+    ));
     try expectBefore(body, "ConfigMeta\n", "\nRequestMeta\n");
     try expectBefore(body, "\nRequestMeta\n", "\nEnvironment\n");
     try expectContains(body, "func_name=demo-function\n");
@@ -430,7 +444,7 @@ test "handler body allocates final body once" {
     };
     const allocator = allocation_counter.allocator();
 
-    const body = try handlerBody(allocator, .{
+    const body = try handlerBody(allocator, "example-user", .{
         .func_name = "demo-function",
         .func_version = "$LATEST",
         .func_size = 256,
@@ -484,7 +498,7 @@ test "environment body includes keys and redacts AWS credentials" {
     try expectNotContains(body, "private-key-value");
 }
 
-test "authorization header and Bearer scheme are case insensitive" {
+test "valid credentials include subject greeting and accept case insensitive authorization" {
     var key_pair = testKeyPair(0x41);
     defer paseto.wipeSecretKey(&key_pair.secret_key);
     const token = try testToken(&key_pair, 1000, 60);
@@ -495,6 +509,7 @@ test "authorization header and Bearer scheme are case insensitive" {
 
     const expected_body = try handlerBody(
         std.testing.allocator,
+        "lambda-test-user",
         .{},
         .{},
         &environment,
@@ -531,6 +546,7 @@ test "authorization header and Bearer scheme are case insensitive" {
             );
             defer std.testing.allocator.free(response);
             try std.testing.expectEqualStrings(expected_response, response);
+            try expectContains(response, "Hello, lambda-test-user!");
         }
     }
 }

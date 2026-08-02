@@ -247,6 +247,8 @@ curl -L -H "Authorization: Bearer $TOKEN" "$FUNCTION_URL"
 Expected authenticated response:
 
 ```text
+Hello, example-user!
+
 ConfigMeta
 ...
 
