@@ -31,6 +31,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zig-paseto", .module = lambda_paseto_implementation },
         },
     });
+    const lambda_operation = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/operation.zig"),
+    });
 
     const lambda_mod = b.createModule(.{
         .target = lambda_target,
@@ -42,6 +47,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "aws", .module = lambda_aws },
             .{ .name = "aws-lambda", .module = lambda_runtime },
             .{ .name = "dynamodb", .module = lambda_dynamodb },
+            .{ .name = "operation", .module = lambda_operation },
             .{ .name = "paseto", .module = lambda_paseto },
         },
     });
@@ -55,10 +61,25 @@ pub fn build(b: *std.Build) void {
 
     const host_aws_sdk = b.dependency("aws_sdk", .{
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = optimize,
     });
     const host_aws = host_aws_sdk.module("aws");
     const host_dynamodb = host_aws_sdk.module("dynamodb");
+    const host_operation = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/operation.zig"),
+    });
+    const host_operation_persistence = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/operation_persistence.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "dynamodb", .module = host_dynamodb },
+            .{ .name = "operation", .module = host_operation },
+        },
+    });
     const host_paseto_implementation = b.dependency("zig_paseto", .{
         .target = b.graph.host,
     }).module("zig-paseto");
@@ -85,6 +106,24 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(cli_exe);
 
+    const operation_cli_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/operation_cli.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "dynamodb", .module = host_dynamodb },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "operation_persistence", .module = host_operation_persistence },
+        },
+    });
+    const operation_cli_exe = b.addExecutable(.{
+        .name = "operation",
+        .root_module = operation_cli_mod,
+    });
+
+    b.installArtifact(operation_cli_exe);
+
     const test_runtime = b.dependency("aws_lambda", .{
         .target = b.graph.host,
     }).module("lambda");
@@ -96,6 +135,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "aws", .module = host_aws },
             .{ .name = "aws-lambda", .module = test_runtime },
             .{ .name = "dynamodb", .module = host_dynamodb },
+            .{ .name = "operation", .module = host_operation },
             .{ .name = "paseto", .module = host_paseto },
         },
     });
@@ -104,15 +144,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_lambda_tests = b.addRunArtifact(lambda_tests);
 
-    const operation_test_mod = b.createModule(.{
-        .target = b.graph.host,
-        .optimize = .Debug,
-        .root_source_file = b.path("src/operation.zig"),
-    });
     const operation_tests = b.addTest(.{
-        .root_module = operation_test_mod,
+        .root_module = host_operation,
     });
     const run_operation_tests = b.addRunArtifact(operation_tests);
+
+    const operation_persistence_tests = b.addTest(.{
+        .root_module = host_operation_persistence,
+    });
+    const run_operation_persistence_tests = b.addRunArtifact(operation_persistence_tests);
 
     const paseto_test_mod = b.createModule(.{
         .target = b.graph.host,
@@ -140,9 +180,16 @@ pub fn build(b: *std.Build) void {
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
+    const operation_cli_tests = b.addTest(.{
+        .root_module = operation_cli_mod,
+    });
+    const run_operation_cli_tests = b.addRunArtifact(operation_cli_tests);
+
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_lambda_tests.step);
     test_step.dependOn(&run_operation_tests.step);
+    test_step.dependOn(&run_operation_persistence_tests.step);
     test_step.dependOn(&run_paseto_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_operation_cli_tests.step);
 }

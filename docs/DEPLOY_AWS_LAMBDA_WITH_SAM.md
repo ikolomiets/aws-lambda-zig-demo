@@ -1,6 +1,7 @@
 # Deploy `lambda.zip` to AWS Lambda with SAM
 
-This guide documents how to deploy the Zig Lambda package in this repository using AWS SAM and `template.yaml`.
+This guide documents how to deploy the Zig Lambda package in this repository
+using AWS SAM and `template.yaml`.
 
 SAM deploys the Lambda function as a CloudFormation-managed stack. It creates
 the Lambda function, execution role, DynamoDB operations table, public Function
@@ -97,7 +98,8 @@ Both commands should report that `template.yaml` is valid.
 - `DemoFunction`: `AWS::Serverless::Function`
 - `DemoFunctionUrl`: `AWS::Lambda::Url`
 - `FunctionUrlInvokeFunctionUrlPermission`: allows `lambda:InvokeFunctionUrl`
-- `FunctionUrlInvokeFunctionPermission`: allows `lambda:InvokeFunction` only through the Function URL
+- `FunctionUrlInvokeFunctionPermission`: allows `lambda:InvokeFunction` only
+  through the Function URL
 
 The function settings are:
 
@@ -128,8 +130,9 @@ Environment:
 The inline policy grants the function only `GetItem`, `PutItem`, and
 `UpdateItem` access to this stack's operations table. The
 `OPERATIONS_TABLE_NAME` environment variable contains the
-CloudFormation-generated physical table name. These are infrastructure
-preparation for a future persistence adapter; the current handler does not call
+CloudFormation-generated physical table name. The host-native `operation` CLI
+uses the active persistence adapter and the same table contract. The current
+Lambda handler still validates and returns POST input without calling
 DynamoDB.
 
 The operations table uses on-demand `PAY_PER_REQUEST` billing and has one
@@ -138,7 +141,7 @@ streams, TTL, provisioned capacity, or explicit table name. Point-in-time
 recovery is explicitly disabled, and omitting `SSESpecification` selects
 DynamoDB's default AWS-owned encryption.
 
-The future DynamoDB item contract is:
+The DynamoDB item contract enforced by `src/operation_persistence.zig` is:
 
 | Attribute | DynamoDB type | Contract |
 | --- | --- | --- |
@@ -151,9 +154,12 @@ The future DynamoDB item contract is:
 
 Never persist `body`. The 4,096-byte `result` bound is an application-enforced
 constraint because DynamoDB and CloudFormation cannot enforce a per-attribute
-size limit. A future persistence adapter must call `validatePersistent` before
-every `PutItem` or `UpdateItem` and after decoding every read. It must not try
-to emulate the result-size validation with a DynamoDB condition expression.
+size limit. The adapter validates immediately before every `PutItem` or
+`UpdateItem` and after decoding every read. Creates use
+`attribute_not_exists(id)`. Reads are strongly consistent. Updates condition
+on the previously read snapshot, preserve `id`, `name`, and `hash`, and return
+and validate `ALL_NEW`. Result-size validation remains in the application
+rather than a DynamoDB condition expression.
 
 The Function URL settings are:
 
@@ -247,7 +253,8 @@ SAM configuration environment: default
 
 `CAPABILITY_IAM` is required because SAM creates an IAM execution role for the Lambda function.
 
-After the first guided deployment, SAM can reuse `samconfig.toml`, so future deployments are usually:
+After the first guided deployment, SAM can reuse `samconfig.toml`, so future
+deployments are usually:
 
 ```sh
 sam deploy --profile dev --region ca-central-1
@@ -331,6 +338,19 @@ aws cloudformation describe-stacks \
   --region ca-central-1
 ```
 
+Discover and export the operations table for the host CLI:
+
+```sh
+export OPERATIONS_TABLE_NAME="$(
+  aws cloudformation describe-stacks \
+    --stack-name aws-lambda-zig-demo \
+    --query "Stacks[0].Outputs[?OutputKey=='OperationsTableName'].OutputValue" \
+    --output text \
+    --profile dev \
+    --region ca-central-1
+)"
+```
+
 ## 8. Test HTTP GET and POST
 
 Call the Function URL returned by SAM.
@@ -391,7 +411,9 @@ POST an Operation JSON document with the same bearer token:
 curl -L \
   -H "Authorization: Bearer $token" \
   -H "Content-Type: application/json" \
-  --data '{"id":"00112233-4455-6677-8899-aabbccddeeff","name":"echo","body":{"message":"hello","count":2}}' \
+  --data \
+    '{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
+'"name":"echo","body":{"message":"hello","count":2}}' \
   <FunctionUrl>
 ```
 
@@ -408,7 +430,82 @@ timestamp, and its stable hash. It omits the input body:
 }
 ```
 
-## 9. Update the deployed Lambda code
+## 9. Create, read, and update persisted Operations
+
+Builds install the host-native utility at `zig-out/bin/operation`. It requires
+the table environment variable above and follows standard AWS configuration
+for credentials, region, profile, and endpoint. These examples select the same
+profile and region used for deployment:
+
+```sh
+export AWS_PROFILE=dev
+export AWS_REGION=ca-central-1
+```
+
+Create an Operation from its input JSON view:
+
+```sh
+operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
+'"name":"echo","body":{"message":"hello","count":2}}'
+printf '%s\n' "$operation_json" | zig-out/bin/operation create
+```
+
+Read the persistent output view:
+
+```sh
+zig-out/bin/operation read \
+  --id 00112233-4455-6677-8899-aabbccddeeff
+```
+
+Pending states require empty standard input. Terminal states require a
+non-null JSON result no larger than 4,096 serialized bytes:
+
+```sh
+zig-out/bin/operation update \
+  --id 00112233-4455-6677-8899-aabbccddeeff \
+  --state RUNNING \
+  </dev/null
+
+printf '%s\n' '{"message":"done"}' \
+  | zig-out/bin/operation update \
+      --id 00112233-4455-6677-8899-aabbccddeeff \
+      --state SUCCEEDED
+```
+
+Lifecycle ordering is intentionally not enforced: any valid state may replace
+any previous state, including a same-state update. Exit code `1` means the
+item was missing, already existed during create, or changed concurrently. Exit
+code `2` means invocation, validation, configuration, AWS, or internal failure.
+
+The caller running the host CLI needs `dynamodb:GetItem`, `dynamodb:PutItem`,
+and `dynamodb:UpdateItem` permissions for the table. The Lambda execution
+role's inline policy does not grant permissions to the local AWS identity.
+
+### Troubleshoot Operation CLI configuration
+
+`operation: missing or invalid configuration` is emitted before Operation JSON
+is parsed when `OPERATIONS_TABLE_NAME` is missing or invalid, or when the AWS
+configuration chain cannot resolve settings such as the region or profile.
+Confirm table discovery succeeded without printing the account-specific name:
+
+```sh
+test -n "${OPERATIONS_TABLE_NAME:-}" && printf 'table configured\n'
+```
+
+If this prints nothing, repeat the `OperationsTableName` CloudFormation query
+in section 7. Also confirm `AWS_PROFILE` and `AWS_REGION` are set as shown
+above. Profiles backed by IAM Identity Center may need a refreshed session:
+
+```sh
+aws sso login --profile "$AWS_PROFILE"
+```
+
+Changing the piped Operation JSON cannot fix this diagnostic because command
+configuration is checked before input parsing. Failures encountered while
+calling DynamoDB after configuration loading instead report
+`operation: AWS request failed`.
+
+## 10. Update the deployed Lambda code
 
 After changing Zig source code, rebuild and repackage:
 
@@ -425,7 +522,7 @@ sam deploy --profile dev --region ca-central-1
 
 SAM uploads the new `lambda.zip` and updates the CloudFormation-managed Lambda function.
 
-## 10. Delete the SAM stack
+## 11. Delete the SAM stack
 
 To remove the SAM-managed function, role, operations table, Function URL, and
 permissions:

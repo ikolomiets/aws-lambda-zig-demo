@@ -20,24 +20,36 @@ pub const State = enum {
     running,
     succeeded,
     failed,
-
-    fn terminal(state: State) bool {
-        return switch (state) {
-            .succeeded, .failed => true,
-            .new, .submitted, .running => false,
-        };
-    }
-
-    fn jsonName(state: State) []const u8 {
-        return switch (state) {
-            .new => "NEW",
-            .submitted => "SUBMITTED",
-            .running => "RUNNING",
-            .succeeded => "SUCCEEDED",
-            .failed => "FAILED",
-        };
-    }
 };
+
+/// Parses the uppercase representation shared by JSON and persistent storage.
+pub fn stateFromString(value: []const u8) !State {
+    if (std.mem.eql(u8, value, "NEW")) return .new;
+    if (std.mem.eql(u8, value, "SUBMITTED")) return .submitted;
+    if (std.mem.eql(u8, value, "RUNNING")) return .running;
+    if (std.mem.eql(u8, value, "SUCCEEDED")) return .succeeded;
+    if (std.mem.eql(u8, value, "FAILED")) return .failed;
+    return error.InvalidState;
+}
+
+/// Returns the uppercase representation shared by JSON and persistent storage.
+pub fn stateToString(state: State) []const u8 {
+    return switch (state) {
+        .new => "NEW",
+        .submitted => "SUBMITTED",
+        .running => "RUNNING",
+        .succeeded => "SUCCEEDED",
+        .failed => "FAILED",
+    };
+}
+
+/// Reports whether the state requires a non-null serialized result.
+pub fn stateIsTerminal(state: State) bool {
+    return switch (state) {
+        .succeeded, .failed => true,
+        .new, .submitted, .running => false,
+    };
+}
 
 pub const Operation = struct {
     id: u128,
@@ -127,7 +139,7 @@ pub fn writeOutputJSON(
     try json.objectField("name");
     try json.write(operation.name);
     try json.objectField("state");
-    try json.write(state.jsonName());
+    try json.write(stateToString(state));
     try json.objectField("last_updated");
     try json.write(last_updated);
     if (result_present) {
@@ -286,8 +298,9 @@ fn parseJSONString(temporary: Allocator, json: []const u8) !std.json.Parsed([]co
 fn parseInputState(temporary: Allocator, state_json: []const u8) !State {
     var parsed = try parseJSONString(temporary, state_json);
     defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value, "NEW")) return error.InvalidState;
-    return .new;
+    const state = try stateFromString(parsed.value);
+    if (state != .new) return error.InvalidState;
+    return state;
 }
 
 fn operationHash(
@@ -348,7 +361,7 @@ fn validateView(temporary: Allocator, operation: *const Operation) !bool {
     if (operation.last_updated == null) return error.MissingLastUpdated;
     if (operation.hash == null) return error.MissingHash;
     const result_present = try serializedResultPresent(temporary, operation.result);
-    if (state.terminal()) {
+    if (stateIsTerminal(state)) {
         if (!result_present) return error.MissingResult;
     } else {
         if (result_present) return error.UnexpectedResult;
@@ -427,6 +440,32 @@ fn testOutput(operation: *const Operation) ![]u8 {
     std.debug.assert(output.written().len > operation.name.len);
     std.debug.assert(output.written().len > 0);
     return output.toOwnedSlice();
+}
+
+test "persistent state parsing formatting and terminal classification are exhaustive" {
+    const states = [_]State{
+        .new,
+        .submitted,
+        .running,
+        .succeeded,
+        .failed,
+    };
+    const names = [_][]const u8{
+        "NEW",
+        "SUBMITTED",
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+    };
+    for (states, names, 0..) |state, name, index| {
+        try std.testing.expectEqualStrings(name, stateToString(state));
+        try std.testing.expectEqual(state, try stateFromString(name));
+        try std.testing.expectEqual(index >= 3, stateIsTerminal(state));
+    }
+
+    try std.testing.expectError(error.InvalidState, stateFromString("new"));
+    try std.testing.expectError(error.InvalidState, stateFromString("COMPLETED"));
+    try std.testing.expectError(error.InvalidState, stateFromString(""));
 }
 
 test "UUID conversion is symmetric and output is lowercase" {

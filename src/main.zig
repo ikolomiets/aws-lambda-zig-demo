@@ -2,7 +2,7 @@ const std = @import("std");
 const aws = @import("aws");
 const dynamodb = @import("dynamodb");
 const lambda = @import("aws-lambda");
-const operation = @import("operation.zig");
+const operation = @import("operation");
 const paseto = @import("paseto");
 
 const authorization_header_count_max = 256;
