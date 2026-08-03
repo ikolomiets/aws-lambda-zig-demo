@@ -131,6 +131,14 @@ done
 
 cd "$(dirname "$0")"
 
+if [ "$DRY_RUN" -eq 0 ]; then
+    need_command aws
+
+    printf '==> Verifying AWS profile %s\n' "$PROFILE"
+    aws sts get-caller-identity --profile "$PROFILE" --query Arn --output text >/dev/null ||
+        fail "AWS profile check failed. Run: aws sso login --profile $PROFILE"
+fi
+
 [ -n "$PASETO_PUBLIC_KEY" ] ||
     fail "PASETO_PUBLIC_KEY is required; generate one with: zig-out/bin/paseto keygen"
 
@@ -139,7 +147,6 @@ need_command zip
 need_command file
 need_command sam
 if [ "$DRY_RUN" -eq 0 ]; then
-    need_command aws
     if [ "$CHECK_URL" -eq 1 ]; then
         need_command curl
     fi
@@ -203,10 +210,6 @@ if [ "$DRY_RUN" -eq 1 ]; then
     printf '==> Dry run complete. Skipped SAM deploy.\n'
     exit 0
 fi
-
-printf '==> Verifying AWS profile %s\n' "$PROFILE"
-aws sts get-caller-identity --profile "$PROFILE" --query Arn --output text >/dev/null ||
-    fail "AWS profile check failed. Run: aws sso login --profile $PROFILE"
 
 printf '==> Deploying stack %s to %s\n' "$STACK_NAME" "$REGION"
 sam deploy \
