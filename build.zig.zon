@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .aws_sdk = .{
-            .url = "git+https://github.com/cloudboss/aws-sdk-zig?ref=896cb3984e0b44600520ba6f2e076322d016eb8e#896cb3984e0b44600520ba6f2e076322d016eb8e",
-            .hash = "aws_sdk-0.0.1-ApQSL9zeixB-xOOhA9ebi9LeB_QwhadSONKaXY_Ys8CS",
+            .url = "git+https://github.com/ikolomiets/aws-sdk-zig?ref=agent/parse-modeled-aws-json-errors#778dcfe1423cf3b3a1bfe56e1e461b99b80124bd",
+            .hash = "aws_sdk-0.0.1-ApQSL17Y_xOC5IhLm247KBZKDcbCRU3qf7GiiiRHcrND",
         },
         .aws_lambda = .{
             .url = "git+https://github.com/ikolomiets/aws-lambda-zig?ref=c1bd144db63a0a6b4fbdcbed8254e358bde2fe3f#c1bd144db63a0a6b4fbdcbed8254e358bde2fe3f",

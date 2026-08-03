@@ -156,10 +156,13 @@ Never persist `body`. The 4,096-byte `result` bound is an application-enforced
 constraint because DynamoDB and CloudFormation cannot enforce a per-attribute
 size limit. The adapter validates immediately before every `PutItem` or
 `UpdateItem` and after decoding every read. Creates use
-`attribute_not_exists(id)`. Reads are strongly consistent. Updates condition
-on the previously read snapshot, preserve `id`, `name`, and `hash`, and return
-and validate `ALL_NEW`. Result-size validation remains in the application
-rather than a DynamoDB condition expression.
+`attribute_not_exists(id)` and request `ALL_OLD` when that condition fails. A
+failed create condition succeeds as an idempotent retry only when the returned
+item has the submitted Operation hash and remains in `NEW`; otherwise it is an
+Operation conflict. Reads are strongly consistent. Updates condition on the
+previously read snapshot, preserve `id`, `name`, and `hash`, and return and
+validate `ALL_NEW`. Result-size validation remains in the application rather
+than a DynamoDB condition expression.
 
 The Function URL settings are:
 
@@ -450,6 +453,12 @@ operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 printf '%s\n' "$operation_json" | zig-out/bin/operation create
 ```
 
+Retry create only with the original UUID, name, and body. When the UUID already
+identifies a `NEW` Operation with the same Operation hash, create returns that
+stored Operation, including its original `last_updated`. A different hash or
+any state other than `NEW` returns `operation: operation conflict` with exit
+code `1`.
+
 Read the persistent output view:
 
 ```sh
@@ -473,9 +482,10 @@ printf '%s\n' '{"message":"done"}' \
 ```
 
 Lifecycle ordering is intentionally not enforced: any valid state may replace
-any previous state, including a same-state update. Exit code `1` means the
-item was missing, already existed during create, or changed concurrently. Exit
-code `2` means invocation, validation, configuration, AWS, or internal failure.
+any previous state, including a same-state update. Exit code `1` means the item
+was missing or a create/update conflict occurred. Both conflict paths emit
+`operation: operation conflict`. Exit code `2` means invocation, validation,
+configuration, AWS, or internal failure.
 
 The caller running the host CLI needs `dynamodb:GetItem`, `dynamodb:PutItem`,
 and `dynamodb:UpdateItem` permissions for the table. The Lambda execution

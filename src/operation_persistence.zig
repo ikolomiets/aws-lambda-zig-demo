@@ -34,13 +34,13 @@ pub const Persistence = struct {
         return .{ .client = client, .table_name = table_name };
     }
 
-    /// Creates an item only when no item with the same UUID exists.
+    /// Creates an item or returns the matching existing NEW item for an idempotent retry.
     pub fn create(
         self: *Self,
         allocator: Allocator,
         temporary: Allocator,
         source: *const operation.Operation,
-    ) !void {
+    ) !operation.Operation {
         var persisted = persistentCopy(source);
         try validateStored(temporary, &persisted);
 
@@ -50,10 +50,12 @@ pub const Persistence = struct {
         _ = self.client.putItem(allocator, .{
             .condition_expression = create_condition,
             .item = request.items[0..request.item_count],
+            .return_values_on_condition_check_failure = .all_old,
             .table_name = self.table_name,
         }, .{ .diagnostic = &diagnostic }) catch |err| {
-            return writeError(err, &diagnostic, error.DuplicateOperation);
+            return createError(allocator, temporary, err, &diagnostic, &persisted);
         };
+        return ownedPersistentCopy(allocator, &persisted);
     }
 
     /// Retrieves and validates an item using a strongly consistent read.
@@ -308,6 +310,20 @@ fn persistentCopy(source: *const operation.Operation) operation.Operation {
     return persisted;
 }
 
+fn ownedPersistentCopy(
+    allocator: Allocator,
+    source: *const operation.Operation,
+) !operation.Operation {
+    std.debug.assert(source.body == null);
+    var owned = source.*;
+    owned.name = try allocator.dupe(u8, source.name);
+    errdefer allocator.free(owned.name);
+    if (source.result) |result| owned.result = try allocator.dupe(u8, result);
+    std.debug.assert(owned.body == null);
+    std.debug.assert(owned.name.len == source.name.len);
+    return owned;
+}
+
 fn validateStored(temporary: Allocator, source: *const operation.Operation) !void {
     try operation.validatePersistent(temporary, source);
     const state = source.state.?;
@@ -340,6 +356,28 @@ fn validateUpdateResult(
     if (updated.state != replacement.state) return error.InvalidItem;
     if (updated.last_updated != replacement.last_updated) return error.InvalidItem;
     if (!optionalStringEqual(updated.result, replacement.result)) return error.InvalidItem;
+}
+
+fn createError(
+    allocator: Allocator,
+    temporary: Allocator,
+    err: anyerror,
+    diagnostic: *dynamodb.ServiceError,
+    submitted: *const operation.Operation,
+) anyerror!operation.Operation {
+    if (err != error.ServiceError) return error.AWSFailure;
+    defer diagnostic.deinit();
+    const failure = switch (diagnostic.kind) {
+        .conditional_check_failed_exception => |value| value,
+        else => return error.AWSFailure,
+    };
+    const item = failure.item orelse return error.InvalidItem;
+    const existing = try decodeItem(temporary, item);
+    if (!std.mem.eql(u8, &existing.hash.?, &submitted.hash.?)) {
+        return error.OperationConflict;
+    }
+    if (existing.state.? != .new) return error.OperationConflict;
+    return ownedPersistentCopy(allocator, &existing);
 }
 
 fn writeError(err: anyerror, diagnostic: *dynamodb.ServiceError, outcome: anyerror) anyerror {
@@ -482,7 +520,7 @@ test "items round trip every state without persisting body" {
     }
 }
 
-test "create request uses only the exact item contract and duplicate condition" {
+test "create request uses the exact item contract and returns a failed condition item" {
     const source = testOperation(.new, null);
     var request: CreateRequest = undefined;
     createRequestInit(&request, &source);
@@ -494,6 +532,30 @@ test "create request uses only the exact item contract and duplicate condition" 
         findAttribute(request.items[0..request.item_count], "last_updated").?,
     ));
     try std.testing.expectEqualStrings("attribute_not_exists(id)", create_condition);
+    const input = dynamodb.PutItemInput{
+        .condition_expression = create_condition,
+        .item = request.items[0..request.item_count],
+        .return_values_on_condition_check_failure = .all_old,
+        .table_name = "operations",
+    };
+    try std.testing.expectEqual(
+        dynamodb.types.ReturnValuesOnConditionCheckFailure.all_old,
+        input.return_values_on_condition_check_failure.?,
+    );
+}
+
+test "successful create returns an allocator-owned persistent view" {
+    var source = testOperation(.new, null);
+    source.body = "{\"private\":true}";
+    const persisted = persistentCopy(&source);
+    const created = try ownedPersistentCopy(std.testing.allocator, &persisted);
+    defer std.testing.allocator.free(created.name);
+
+    try std.testing.expect(created.body == null);
+    try std.testing.expectEqual(source.id, created.id);
+    try std.testing.expectEqual(source.state, created.state);
+    try std.testing.expectEqual(source.last_updated, created.last_updated);
+    try std.testing.expectEqualSlices(u8, &source.hash.?, &created.hash.?);
 }
 
 test "read request is strongly consistent and keyed by canonical UUID" {
@@ -657,15 +719,120 @@ test "updates allow same state and reject immutable replacements" {
     );
 }
 
-test "conditional write failures map to duplicate and concurrent outcomes" {
-    var create_diagnostic = dynamodb.ServiceError{
+test "matching NEW create retry returns the stored timestamp and owned fields" {
+    const submitted = testOperation(.new, null);
+    var existing = submitted;
+    existing.last_updated.? -= 10;
+    var diagnostic_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    existing.name = try diagnostic_arena.allocator().dupe(u8, "echo");
+    var request: CreateRequest = undefined;
+    createRequestInit(&request, &existing);
+    var diagnostic = dynamodb.ServiceError{
+        .arena = diagnostic_arena,
+        .kind = .{ .conditional_check_failed_exception = .{
+            .item = request.items[0..request.item_count],
+        } },
+    };
+
+    const created = try createError(
+        std.testing.allocator,
+        std.testing.allocator,
+        error.ServiceError,
+        &diagnostic,
+        &submitted,
+    );
+    defer std.testing.allocator.free(created.name);
+    try std.testing.expectEqual(existing.last_updated, created.last_updated);
+    try std.testing.expectEqualStrings("echo", created.name);
+    try std.testing.expect(created.body == null);
+}
+
+test "create retry conflicts on every hash and non-NEW state mismatch" {
+    const submitted = testOperation(.new, null);
+    var different_hash = submitted;
+    different_hash.hash.?[0] ^= 1;
+    var request: CreateRequest = undefined;
+    createRequestInit(&request, &different_hash);
+    var diagnostic = dynamodb.ServiceError{
+        .kind = .{ .conditional_check_failed_exception = .{
+            .item = request.items[0..request.item_count],
+        } },
+    };
+    try std.testing.expectError(error.OperationConflict, createError(
+        std.testing.allocator,
+        std.testing.allocator,
+        error.ServiceError,
+        &diagnostic,
+        &submitted,
+    ));
+
+    const states = [_]operation.State{ .submitted, .running, .succeeded, .failed };
+    for (states) |state| {
+        var existing = testOperation(state, if (operation.stateIsTerminal(state)) "true" else null);
+        if (state == .failed) existing.hash.?[0] ^= 1;
+        createRequestInit(&request, &existing);
+        diagnostic = .{ .kind = .{ .conditional_check_failed_exception = .{
+            .item = request.items[0..request.item_count],
+        } } };
+        try std.testing.expectError(error.OperationConflict, createError(
+            std.testing.allocator,
+            std.testing.allocator,
+            error.ServiceError,
+            &diagnostic,
+            &submitted,
+        ));
+    }
+}
+
+test "create failure requires a valid returned item and preserves AWS failures" {
+    const submitted = testOperation(.new, null);
+    var missing = dynamodb.ServiceError{
         .kind = .{ .conditional_check_failed_exception = .{} },
     };
-    try std.testing.expectEqual(
-        error.DuplicateOperation,
-        writeError(error.ServiceError, &create_diagnostic, error.DuplicateOperation),
-    );
+    try std.testing.expectError(error.InvalidItem, createError(
+        std.testing.allocator,
+        std.testing.allocator,
+        error.ServiceError,
+        &missing,
+        &submitted,
+    ));
 
+    var request: CreateRequest = undefined;
+    createRequestInit(&request, &submitted);
+    var malformed = dynamodb.ServiceError{
+        .kind = .{ .conditional_check_failed_exception = .{
+            .item = request.items[0..4],
+        } },
+    };
+    try std.testing.expectError(error.InvalidItem, createError(
+        std.testing.allocator,
+        std.testing.allocator,
+        error.ServiceError,
+        &malformed,
+        &submitted,
+    ));
+
+    var unrelated = dynamodb.ServiceError{
+        .kind = .{ .unknown = .{ .http_status = 500 } },
+    };
+    try std.testing.expectError(error.AWSFailure, createError(
+        std.testing.allocator,
+        std.testing.allocator,
+        error.ServiceError,
+        &unrelated,
+        &submitted,
+    ));
+    var unused: dynamodb.ServiceError = undefined;
+    try std.testing.expectError(error.AWSFailure, createError(
+        std.testing.allocator,
+        std.testing.allocator,
+        error.ConnectionFailed,
+        &unused,
+        &submitted,
+    ));
+}
+
+test "conditional update failures map to concurrent outcomes" {
     var update_diagnostic = dynamodb.ServiceError{
         .kind = .{ .conditional_check_failed_exception = .{} },
     };

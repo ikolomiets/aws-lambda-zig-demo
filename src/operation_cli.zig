@@ -104,14 +104,13 @@ const Failure = enum {
     validation,
     configuration,
     missing,
-    duplicate,
     conflict,
     aws,
     internal,
 
     fn code(failure: Failure) u8 {
         return switch (failure) {
-            .missing, .duplicate, .conflict => 1,
+            .missing, .conflict => 1,
             .invocation, .validation, .configuration, .aws, .internal => 2,
         };
     }
@@ -135,8 +134,7 @@ fn writeDiagnostic(stderr: *std.Io.Writer, failure: Failure) void {
         .validation => "operation: invalid operation input\n",
         .configuration => "operation: missing or invalid configuration\n",
         .missing => "operation: operation not found\n",
-        .duplicate => "operation: operation already exists\n",
-        .conflict => "operation: operation changed concurrently\n",
+        .conflict => "operation: operation conflict\n",
         .aws => "operation: AWS request failed\n",
         .internal => "operation: operation failed\n",
     };
@@ -295,7 +293,7 @@ const PersistenceInterface = struct {
             Allocator,
             Allocator,
             *const operation.Operation,
-        ) anyerror!void,
+        ) anyerror!operation.Operation,
         read: *const fn (*anyopaque, Allocator, Allocator, u128) anyerror!operation.Operation,
         update: *const fn (
             *anyopaque,
@@ -318,7 +316,7 @@ const PersistenceInterface = struct {
                 allocator: Allocator,
                 temporary: Allocator,
                 source: *const operation.Operation,
-            ) anyerror!void {
+            ) anyerror!operation.Operation {
                 const self: Pointer = @ptrCast(@alignCast(context));
                 return self.create(allocator, temporary, source);
             }
@@ -359,7 +357,7 @@ const PersistenceInterface = struct {
         allocator: Allocator,
         temporary: Allocator,
         source: *const operation.Operation,
-    ) !void {
+    ) !operation.Operation {
         return self.vtable.create(self.context, allocator, temporary, source);
     }
 
@@ -410,7 +408,6 @@ fn runCommand(command: Command, context: Context, backend: ?PersistenceInterface
 fn classifyError(err: anyerror) Failure {
     return switch (err) {
         error.InvalidInvocation => .invocation,
-        error.DuplicateOperation => .duplicate,
         error.OperationNotFound => .missing,
         error.OperationConflict => .conflict,
         error.AWSFailure, error.InvalidItem => .aws,
@@ -462,8 +459,9 @@ fn executeCreate(context: Context, backend: PersistenceInterface) !void {
         context.stdin,
         context.now,
     );
-    try backend.create(context.allocator, context.allocator, &parsed);
-    try writeOperation(context, &parsed);
+    const created = try backend.create(context.allocator, context.allocator, &parsed);
+    try operation.validatePersistent(context.allocator, &created);
+    try writeOperation(context, &created);
 }
 
 fn executeRead(context: Context, backend: PersistenceInterface, id: u128) !void {
@@ -518,17 +516,22 @@ const FakePersistence = struct {
     update_count: u8 = 0,
     last_id: u128 = 0,
     last_state: ?operation.State = null,
+    create_last_updated: ?operation.UnixSeconds = null,
 
     fn create(
         fake: *FakePersistence,
         _: Allocator,
         _: Allocator,
         source: *const operation.Operation,
-    ) !void {
+    ) !operation.Operation {
         fake.create_count += 1;
         fake.last_id = source.id;
         fake.last_state = source.state;
         if (fake.create_error) |err| return err;
+        var created = source.*;
+        created.body = null;
+        if (fake.create_last_updated) |last_updated| created.last_updated = last_updated;
+        return created;
     }
 
     fn read(
@@ -723,7 +726,30 @@ test "create parses stdin dispatches once and writes canonical JSON" {
     try std.testing.expectEqualStrings("", result.stderr());
 }
 
-test "create bounds stdin and reports duplicate and invalid input outcomes" {
+test "matching create retry writes the authoritative stored timestamp" {
+    var environment = try testEnvironment();
+    defer environment.deinit();
+    var fake: FakePersistence = .{ .create_last_updated = 1_700_000_000 };
+    const input =
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+        "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
+    const result = runForTest(
+        &.{ "operation", "create" },
+        input,
+        &environment,
+        1_700_000_010,
+        &fake,
+    );
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.stdout(),
+        "\"last_updated\":1700000000",
+    ) != null);
+    try std.testing.expectEqualStrings("", result.stderr());
+}
+
+test "create bounds stdin and reports conflict and invalid input outcomes" {
     var environment = try testEnvironment();
     defer environment.deinit();
     var fake: FakePersistence = .{};
@@ -736,8 +762,8 @@ test "create bounds stdin and reports duplicate and invalid input outcomes" {
     try std.testing.expectEqual(@as(u8, 2), invalid.exit_code);
     try std.testing.expectEqualStrings("operation: invalid operation input\n", invalid.stderr());
 
-    fake.create_error = error.DuplicateOperation;
-    const duplicate = runForTest(
+    fake.create_error = error.OperationConflict;
+    const conflict = runForTest(
         &.{ "operation", "create" },
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"echo\",\"body\":null}",
@@ -745,8 +771,8 @@ test "create bounds stdin and reports duplicate and invalid input outcomes" {
         1,
         &fake,
     );
-    try std.testing.expectEqual(@as(u8, 1), duplicate.exit_code);
-    try std.testing.expectEqualStrings("operation: operation already exists\n", duplicate.stderr());
+    try std.testing.expectEqual(@as(u8, 1), conflict.exit_code);
+    try std.testing.expectEqualStrings("operation: operation conflict\n", conflict.stderr());
 }
 
 test "read validates UUID and writes a canonical strongly modeled item" {
@@ -889,7 +915,7 @@ test "update accepts a terminal result at the exact serialized size bound" {
     try std.testing.expect(result.stdout().len > operation.result_size_max);
 }
 
-test "update conflict is distinct and diagnostics do not echo input or configuration" {
+test "update conflict is generic and diagnostics do not echo input or configuration" {
     var environment = try testEnvironment();
     defer environment.deinit();
     const table_marker = "operations-private-marker";
@@ -905,7 +931,7 @@ test "update conflict is distinct and diagnostics do not echo input or configura
     );
     try std.testing.expectEqual(@as(u8, 1), result.exit_code);
     try std.testing.expectEqualStrings(
-        "operation: operation changed concurrently\n",
+        "operation: operation conflict\n",
         result.stderr(),
     );
     try std.testing.expect(std.mem.indexOf(u8, result.stderr(), table_marker) == null);
