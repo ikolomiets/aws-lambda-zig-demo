@@ -33,7 +33,7 @@ Options:
 
 Environment overrides:
   PROFILE, REGION, STACK_NAME, FUNCTION_NAME, LAMBDA_PRINCIPAL,
-  PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT
+  PASETO_PRIVATE_KEY, PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT
 EOF
 }
 
@@ -141,6 +141,10 @@ fi
 
 [ -n "$PASETO_PUBLIC_KEY" ] ||
     fail "PASETO_PUBLIC_KEY is required; generate one with: zig-out/bin/paseto keygen"
+if [ "$DRY_RUN" -eq 0 ] && [ "$CHECK_URL" -eq 1 ]; then
+    [ -n "${PASETO_PRIVATE_KEY:-}" ] ||
+        fail "PASETO_PRIVATE_KEY is required for the authenticated Function URL check"
+fi
 
 need_command zig
 need_command zip
@@ -320,4 +324,15 @@ if [ "$CHECK_URL" -eq 1 ]; then
     [ "$HTTP_STATUS" = 401 ] ||
         fail "unauthenticated Function URL returned HTTP $HTTP_STATUS; expected 401"
     printf 'HTTP %s (expected 401)\n' "$HTTP_STATUS"
+
+    printf '==> Checking authenticated Function URL status\n'
+    PASETO_TOKEN="$(
+        ./zig-out/bin/paseto issue --subject deploy-test --ttl-seconds 10
+    )"
+    HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer ${PASETO_TOKEN}" \
+        "$FUNCTION_URL")"
+    [ "$HTTP_STATUS" = 200 ] ||
+        fail "authenticated Function URL returned HTTP $HTTP_STATUS; expected 200"
+    printf 'HTTP %s (expected 200)\n' "$HTTP_STATUS"
 fi

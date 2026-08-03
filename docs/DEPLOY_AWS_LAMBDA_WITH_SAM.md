@@ -275,7 +275,10 @@ The repository also includes a scripted shortcut for the same build, package,
 validation, and non-interactive deploy flow:
 
 ```sh
-PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh
+export PASETO_PRIVATE_KEY='<private-key-from-keygen>'
+export PASETO_PUBLIC_KEY='<public-key-from-keygen>'
+./deploy.sh
+unset PASETO_PRIVATE_KEY
 ```
 
 Override the environment value with either form:
@@ -286,7 +289,12 @@ LAMBDA_PRINCIPAL='<lambda-principal>' ./deploy.sh
 ```
 
 `deploy.sh` reads the required `PASETO_PUBLIC_KEY` from the host environment and
-passes it as the `PasetoPublicKey` SAM parameter. Use
+passes it as the `PasetoPublicKey` SAM parameter. When the post-deploy Function
+URL check is enabled, it also requires the corresponding `PASETO_PRIVATE_KEY`
+to issue a 10-second test token. It first verifies that an unauthenticated
+request returns HTTP 401, then verifies that the authenticated request returns
+HTTP 200. The private key and test token are not printed or passed to the
+Lambda environment. Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run` to run the
 local checks, rebuild `lambda.zip`, and validate `template.yaml` without
 deploying to AWS.
