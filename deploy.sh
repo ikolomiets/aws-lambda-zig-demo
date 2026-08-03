@@ -232,6 +232,76 @@ aws cloudformation describe-stacks \
     --profile "$PROFILE" \
     --region "$REGION"
 
+OPERATIONS_TABLE_NAME="$(aws cloudformation describe-stacks \
+    --stack-name "$STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='OperationsTableName'].OutputValue | [0]" \
+    --output text \
+    --profile "$PROFILE" \
+    --region "$REGION")"
+
+case "$OPERATIONS_TABLE_NAME" in
+    "" | None)
+        fail "stack output OperationsTableName is missing or empty"
+        ;;
+esac
+
+printf '==> Waiting for DynamoDB table %s\n' "$OPERATIONS_TABLE_NAME"
+aws dynamodb wait table-exists \
+    --table-name "$OPERATIONS_TABLE_NAME" \
+    --profile "$PROFILE" \
+    --region "$REGION"
+
+printf '==> DynamoDB table summary\n'
+aws dynamodb describe-table \
+    --table-name "$OPERATIONS_TABLE_NAME" \
+    --query '{TableName:Table.TableName,TableStatus:Table.TableStatus,BillingMode:Table.BillingModeSummary.BillingMode,AttributeDefinitions:Table.AttributeDefinitions,KeySchema:Table.KeySchema,LocalSecondaryIndexesPresent:length(not_null(Table.LocalSecondaryIndexes, `[]`)) > `0`,GlobalSecondaryIndexesPresent:length(not_null(Table.GlobalSecondaryIndexes, `[]`)) > `0`}' \
+    --output json \
+    --profile "$PROFILE" \
+    --region "$REGION"
+
+TABLE_VALIDATION="$(aws dynamodb describe-table \
+    --table-name "$OPERATIONS_TABLE_NAME" \
+    --query 'Table.[TableName,TableStatus,BillingModeSummary.BillingMode,length(AttributeDefinitions),AttributeDefinitions[0].AttributeName,AttributeDefinitions[0].AttributeType,length(KeySchema),KeySchema[0].AttributeName,KeySchema[0].KeyType,length(not_null(LocalSecondaryIndexes, `[]`)),length(not_null(GlobalSecondaryIndexes, `[]`))]' \
+    --output text \
+    --profile "$PROFILE" \
+    --region "$REGION")"
+
+read -r \
+    ACTUAL_TABLE_NAME \
+    TABLE_STATUS \
+    BILLING_MODE \
+    ATTRIBUTE_COUNT \
+    ATTRIBUTE_NAME \
+    ATTRIBUTE_TYPE \
+    KEY_COUNT \
+    KEY_NAME \
+    KEY_TYPE \
+    LOCAL_INDEX_COUNT \
+    GLOBAL_INDEX_COUNT <<<"$TABLE_VALIDATION"
+
+[ "$ACTUAL_TABLE_NAME" = "$OPERATIONS_TABLE_NAME" ] ||
+    fail "DynamoDB table name $ACTUAL_TABLE_NAME does not match stack output $OPERATIONS_TABLE_NAME"
+[ "$TABLE_STATUS" = ACTIVE ] ||
+    fail "DynamoDB table status is $TABLE_STATUS; expected ACTIVE"
+[ "$BILLING_MODE" = PAY_PER_REQUEST ] ||
+    fail "DynamoDB billing mode is $BILLING_MODE; expected PAY_PER_REQUEST"
+[ "$ATTRIBUTE_COUNT" = 1 ] ||
+    fail "DynamoDB table has $ATTRIBUTE_COUNT attribute definitions; expected 1"
+[ "$ATTRIBUTE_NAME" = id ] ||
+    fail "DynamoDB attribute name is $ATTRIBUTE_NAME; expected id"
+[ "$ATTRIBUTE_TYPE" = S ] ||
+    fail "DynamoDB id attribute type is $ATTRIBUTE_TYPE; expected S"
+[ "$KEY_COUNT" = 1 ] ||
+    fail "DynamoDB table has $KEY_COUNT key schema entries; expected 1"
+[ "$KEY_NAME" = id ] ||
+    fail "DynamoDB key name is $KEY_NAME; expected id"
+[ "$KEY_TYPE" = HASH ] ||
+    fail "DynamoDB id key type is $KEY_TYPE; expected HASH"
+[ "$LOCAL_INDEX_COUNT" = 0 ] ||
+    fail "DynamoDB table has $LOCAL_INDEX_COUNT local secondary indexes; expected 0"
+[ "$GLOBAL_INDEX_COUNT" = 0 ] ||
+    fail "DynamoDB table has $GLOBAL_INDEX_COUNT global secondary indexes; expected 0"
+
 FUNCTION_URL="$(aws cloudformation describe-stacks \
     --stack-name "$STACK_NAME" \
     --query "Stacks[0].Outputs[?OutputKey=='FunctionUrl'].OutputValue | [0]" \

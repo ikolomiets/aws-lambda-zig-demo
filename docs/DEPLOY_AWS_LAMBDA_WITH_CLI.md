@@ -2,6 +2,12 @@
 
 This guide documents the successful AWS CLI flow used to deploy the compiled Zig Lambda package in this repository and expose it through a public Lambda Function URL.
 
+This manual flow remains Lambda-only: it does not create the DynamoDB
+operations table or configure the table-name environment variable and IAM
+permissions. Use the
+[SAM deployment flow](DEPLOY_AWS_LAMBDA_WITH_SAM.md) when the operations table
+is required.
+
 ## Assumptions
 
 - AWS CLI v2 is installed.

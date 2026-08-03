@@ -16,6 +16,21 @@ Parameters:
     Description: Padded Base64 Ed25519 public key used to verify PASETO tokens.
 
 Resources:
+  OperationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+
   DemoFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -30,9 +45,18 @@ Resources:
       Timeout: 3
       Policies:
         - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt OperationsTable.Arn
       Environment:
         Variables:
           LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
+          OPERATIONS_TABLE_NAME: !Ref OperationsTable
           PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 
   DemoFunctionUrl:
@@ -69,6 +93,9 @@ Resources:
       InvokedViaFunctionUrl: true
 
 Outputs:
+  OperationsTableName:
+    Description: CloudFormation-generated DynamoDB operations table name.
+    Value: !Ref OperationsTable
   FunctionName:
     Description: Deployed Lambda function name.
     Value: !Ref DemoFunction

@@ -2,7 +2,9 @@
 
 This guide documents how to deploy the Zig Lambda package in this repository using AWS SAM and `template.yaml`.
 
-SAM deploys the Lambda function as a CloudFormation-managed stack. It creates the Lambda function, execution role, public Function URL, and Function URL permissions.
+SAM deploys the Lambda function as a CloudFormation-managed stack. It creates
+the Lambda function, execution role, DynamoDB operations table, public Function
+URL, and Function URL permissions.
 
 ## Assumptions
 
@@ -91,6 +93,7 @@ Both commands should report that `template.yaml` is valid.
 
 `template.yaml` defines these resources:
 
+- `OperationsTable`: `AWS::DynamoDB::Table`
 - `DemoFunction`: `AWS::Serverless::Function`
 - `DemoFunctionUrl`: `AWS::Lambda::Url`
 - `FunctionUrlInvokeFunctionUrlPermission`: allows `lambda:InvokeFunctionUrl`
@@ -107,11 +110,50 @@ MemorySize: 128
 Timeout: 3
 Policies:
   - AWSLambdaBasicExecutionRole
+  - Version: "2012-10-17"
+    Statement:
+      - Effect: Allow
+        Action:
+          - dynamodb:GetItem
+          - dynamodb:PutItem
+          - dynamodb:UpdateItem
+        Resource: !GetAtt OperationsTable.Arn
 Environment:
   Variables:
     LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
+    OPERATIONS_TABLE_NAME: !Ref OperationsTable
     PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 ```
+
+The inline policy grants the function only `GetItem`, `PutItem`, and
+`UpdateItem` access to this stack's operations table. The
+`OPERATIONS_TABLE_NAME` environment variable contains the
+CloudFormation-generated physical table name. These are infrastructure
+preparation for a future persistence adapter; the current handler does not call
+DynamoDB.
+
+The operations table uses on-demand `PAY_PER_REQUEST` billing and has one
+string partition key named `id`. It has no sort key, secondary indexes,
+streams, TTL, provisioned capacity, or explicit table name. Point-in-time
+recovery is explicitly disabled, and omitting `SSESpecification` selects
+DynamoDB's default AWS-owned encryption.
+
+The future DynamoDB item contract is:
+
+| Attribute | DynamoDB type | Contract |
+| --- | --- | --- |
+| `id` | `S` | Always present; partition key; canonical lowercase hyphenated Operation UUID. |
+| `name` | `S` | Always present. |
+| `state` | `S` | One of `NEW`, `SUBMITTED`, `RUNNING`, `SUCCEEDED`, or `FAILED`. |
+| `last_updated` | `N` | Unix epoch seconds. |
+| `hash` | `S` | 64-character lowercase BLAKE3-256 hexadecimal value. |
+| `result` | `S` | Terminal states only; exact serialized JSON; at most 4,096 UTF-8 bytes. |
+
+Never persist `body`. The 4,096-byte `result` bound is an application-enforced
+constraint because DynamoDB and CloudFormation cannot enforce a per-attribute
+size limit. A future persistence adapter must call `validatePersistent` before
+every `PutItem` or `UpdateItem` and after decoding every read. It must not try
+to emulate the result-size validation with a DynamoDB condition expression.
 
 The Function URL settings are:
 
@@ -249,6 +291,13 @@ passes it as the `PasetoPublicKey` SAM parameter. Use
 local checks, rebuild `lambda.zip`, and validate `template.yaml` without
 deploying to AWS.
 
+After a successful deployment, `deploy.sh` reads the
+`OperationsTableName` stack output, waits for the table to exist, and prints a
+concise table summary. It fails unless the table is active, uses on-demand
+billing, has only the `id` string partition key, and has no local or global
+secondary indexes. The existing stack-status and Function URL checks then
+continue as usual.
+
 Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run --use-local-libs`
 to build with local dependency checkouts. The `aws_lambda` checkout defaults
@@ -260,6 +309,7 @@ After deployment, SAM prints stack outputs. Look for:
 
 ```text
 FunctionUrl
+OperationsTableName
 ```
 
 You can also query it later with CloudFormation:
@@ -369,7 +419,8 @@ SAM uploads the new `lambda.zip` and updates the CloudFormation-managed Lambda f
 
 ## 10. Delete the SAM stack
 
-To remove the SAM-managed function, role, Function URL, and permissions:
+To remove the SAM-managed function, role, operations table, Function URL, and
+permissions:
 
 ```sh
 sam delete \
@@ -378,7 +429,10 @@ sam delete \
   --region ca-central-1
 ```
 
-This deletes only resources owned by the SAM stack.
+This deletes only resources owned by the SAM stack. The operations table has
+`DeletionPolicy: Delete` and `UpdateReplacePolicy: Delete`, so deleting the
+stack or replacing the table permanently deletes its data. Point-in-time
+recovery is disabled; this demo configuration provides no recovery capability.
 
 ## Security note
 
