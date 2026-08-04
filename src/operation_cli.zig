@@ -291,13 +291,11 @@ const PersistenceInterface = struct {
         create: *const fn (
             *anyopaque,
             Allocator,
-            Allocator,
             *const operation.Operation,
         ) anyerror!operation.Operation,
-        read: *const fn (*anyopaque, Allocator, Allocator, u128) anyerror!operation.Operation,
+        read: *const fn (*anyopaque, Allocator, u128) anyerror!operation.Operation,
         update: *const fn (
             *anyopaque,
-            Allocator,
             Allocator,
             *const operation.Operation,
             *const operation.Operation,
@@ -314,32 +312,29 @@ const PersistenceInterface = struct {
             fn create(
                 context: *anyopaque,
                 allocator: Allocator,
-                temporary: Allocator,
                 source: *const operation.Operation,
             ) anyerror!operation.Operation {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.create(allocator, temporary, source);
+                return self.create(allocator, source);
             }
 
             fn read(
                 context: *anyopaque,
                 allocator: Allocator,
-                temporary: Allocator,
                 id: u128,
             ) anyerror!operation.Operation {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.read(allocator, temporary, id);
+                return self.read(allocator, id);
             }
 
             fn update(
                 context: *anyopaque,
                 allocator: Allocator,
-                temporary: Allocator,
                 snapshot: *const operation.Operation,
                 replacement: *const operation.Operation,
             ) anyerror!operation.Operation {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.update(allocator, temporary, snapshot, replacement);
+                return self.update(allocator, snapshot, replacement);
             }
         };
         return .{
@@ -355,32 +350,28 @@ const PersistenceInterface = struct {
     fn create(
         self: PersistenceInterface,
         allocator: Allocator,
-        temporary: Allocator,
         source: *const operation.Operation,
     ) !operation.Operation {
-        return self.vtable.create(self.context, allocator, temporary, source);
+        return self.vtable.create(self.context, allocator, source);
     }
 
     fn read(
         self: PersistenceInterface,
         allocator: Allocator,
-        temporary: Allocator,
         id: u128,
     ) !operation.Operation {
-        return self.vtable.read(self.context, allocator, temporary, id);
+        return self.vtable.read(self.context, allocator, id);
     }
 
     fn update(
         self: PersistenceInterface,
         allocator: Allocator,
-        temporary: Allocator,
         snapshot: *const operation.Operation,
         replacement: *const operation.Operation,
     ) !operation.Operation {
         return self.vtable.update(
             self.context,
             allocator,
-            temporary,
             snapshot,
             replacement,
         );
@@ -455,18 +446,17 @@ fn executeCommand(
 fn executeCreate(context: Context, backend: PersistenceInterface) !void {
     const parsed = try operation.parseInputJSON(
         context.allocator,
-        context.allocator,
         context.stdin,
         context.now,
     );
-    const created = try backend.create(context.allocator, context.allocator, &parsed);
-    try operation.validatePersistent(context.allocator, &created);
+    const created = try backend.create(context.allocator, &parsed);
+    try operation.validatePersistent(&created);
     try writeOperation(context, &created);
 }
 
 fn executeRead(context: Context, backend: PersistenceInterface, id: u128) !void {
-    const stored = try backend.read(context.allocator, context.allocator, id);
-    try operation.validatePersistent(context.allocator, &stored);
+    const stored = try backend.read(context.allocator, id);
+    try operation.validatePersistent(&stored);
     try writeOperation(context, &stored);
 }
 
@@ -475,25 +465,27 @@ fn executeUpdate(
     backend: PersistenceInterface,
     options: UpdateOptions,
 ) !void {
-    const snapshot = try backend.read(context.allocator, context.allocator, options.id);
-    try operation.validatePersistent(context.allocator, &snapshot);
+    const snapshot = try backend.read(context.allocator, options.id);
+    try operation.validatePersistent(&snapshot);
     var replacement = snapshot;
     replacement.state = options.state;
     replacement.last_updated = context.now;
-    replacement.result = if (operation.stateIsTerminal(options.state)) context.stdin else null;
-    try operation.validatePersistent(context.allocator, &replacement);
+    replacement.result = if (operation.stateIsTerminal(options.state))
+        try operation.parseResultJSON(context.allocator, context.stdin)
+    else
+        null;
+    try operation.validatePersistent(&replacement);
     const updated = try backend.update(
-        context.allocator,
         context.allocator,
         &snapshot,
         &replacement,
     );
-    try operation.validatePersistent(context.allocator, &updated);
+    try operation.validatePersistent(&updated);
     try writeOperation(context, &updated);
 }
 
 fn writeOperation(context: Context, source: *const operation.Operation) !void {
-    try operation.writeOutputJSON(context.allocator, context.stdout, source);
+    try operation.writeOutputJSON(context.stdout, source);
     try context.stdout.writeByte('\n');
 }
 
@@ -521,7 +513,6 @@ const FakePersistence = struct {
     fn create(
         fake: *FakePersistence,
         _: Allocator,
-        _: Allocator,
         source: *const operation.Operation,
     ) !operation.Operation {
         fake.create_count += 1;
@@ -537,7 +528,6 @@ const FakePersistence = struct {
     fn read(
         fake: *FakePersistence,
         _: Allocator,
-        _: Allocator,
         id: u128,
     ) !operation.Operation {
         fake.read_count += 1;
@@ -548,7 +538,6 @@ const FakePersistence = struct {
 
     fn update(
         fake: *FakePersistence,
-        _: Allocator,
         _: Allocator,
         _: *const operation.Operation,
         replacement: *const operation.Operation,
@@ -834,8 +823,8 @@ test "update accepts every target including jumps same state and terminal remova
     for (targets) |state| {
         var fake: FakePersistence = .{};
         fake.stored.state = .failed;
-        fake.stored.result = "{\"old\":true}";
-        const input = if (operation.stateIsTerminal(state)) "{\"new\":true}" else "";
+        fake.stored.result = .{ .bool = true };
+        const input = if (operation.stateIsTerminal(state)) "{ \"new\" : true }" else "";
         const result = runForTest(
             &.{ "operation", "update", "--state", operation.stateToString(state), "--id", test_id },
             input,
@@ -857,6 +846,13 @@ test "update accepts every target including jumps same state and terminal remova
             result.stdout(),
             "\"result\"",
         ) != null);
+        if (operation.stateIsTerminal(state)) {
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                result.stdout(),
+                "\"result\":{\"new\":true}",
+            ) != null);
+        }
     }
 }
 

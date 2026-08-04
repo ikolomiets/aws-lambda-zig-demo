@@ -148,10 +148,16 @@ printf '%s\n' "$operation_json" | zig-out/bin/operation create
 ```
 
 The Operation hash is the BLAKE3-256 digest of a JSON envelope containing only
-`name` and `body`. The body is parsed and re-serialized before hashing, so
+`name` and `body`. The body is parsed once into an arena-owned
+`std.json.Value` and serialized directly into the hash stream, so
 insignificant whitespace and equivalent string escapes do not change the hash,
 while object member order remains significant. The `id`, `state`,
 `last_updated`, and `result` fields are not included.
+
+Each CLI command and Lambda POST owns its Operation strings, body, and result
+through one short-lived arena. Optional absence means a field is omitted from
+that Operation view; an explicit JSON `null` remains a distinct
+`std.json.Value`. Terminal results must be present and non-null.
 
 A create is safe to retry with the original UUID, name, and body. If that UUID
 already identifies an Operation with the same Operation hash, the retry
@@ -168,7 +174,8 @@ zig-out/bin/operation read \
 
 Updates may move to any state, including the current state. Pending states
 require empty standard input, while terminal states require one non-null JSON
-result of at most 4,096 serialized bytes:
+result of at most 4,096 input bytes whose compact serialization is also at most
+4,096 bytes:
 
 ```sh
 zig-out/bin/operation update \
@@ -194,7 +201,9 @@ use `attribute_not_exists(id)` and request the existing item on a failed
 condition so matching retries need no separate read. Updates first perform a
 strongly consistent read and then condition on the complete snapshot, so a
 concurrent change is reported instead of overwritten. Updates preserve `id`,
-`name`, and `hash`.
+`name`, and `hash`. DynamoDB keeps `result` as an `S` attribute containing the
+compact `std.json.Value` serialization. Reads reject malformed, oversized,
+duplicate-key, explicit-null, or noncanonical stored result strings.
 
 The Lambda Function URL requires the token in an HTTP authorization header:
 

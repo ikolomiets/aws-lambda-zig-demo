@@ -1,12 +1,12 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const JSONValue = std.json.Value;
 
 pub const UnixSeconds = i64;
 pub const body_size_max = 4096;
 pub const result_size_max = 4096;
 pub const name_size_max = 64;
-const hash_envelope_size_max = body_size_max + 1024;
 const uuid_string_size = 36;
 
 comptime {
@@ -43,7 +43,7 @@ pub fn stateToString(state: State) []const u8 {
     };
 }
 
-/// Reports whether the state requires a non-null serialized result.
+/// Reports whether the state requires a non-null result.
 pub fn stateIsTerminal(state: State) bool {
     return switch (state) {
         .succeeded, .failed => true,
@@ -54,11 +54,11 @@ pub fn stateIsTerminal(state: State) bool {
 pub const Operation = struct {
     id: u128,
     name: []const u8,
-    body: ?[]const u8 = null,
+    body: ?JSONValue = null,
     state: ?State = null,
     /// The caller must update this whenever state changes.
     last_updated: ?UnixSeconds = null,
-    result: ?[]const u8 = null,
+    result: ?JSONValue = null,
     hash: ?[32]u8 = null,
 };
 
@@ -69,41 +69,29 @@ const InputFields = struct {
     state: ?[]const u8 = null,
 };
 
-/// Parses the input view into arena-owned slices and releases all normalization storage.
+/// Parses the input view into values owned by the lifetime arena.
 pub fn parseInputJSON(
     arena: Allocator,
-    temporary_allocator: Allocator,
     input_json: []const u8,
     now: UnixSeconds,
 ) !Operation {
-    var scratch = std.heap.ArenaAllocator.init(temporary_allocator);
-    defer scratch.deinit();
-    const temporary = scratch.allocator();
-
-    const fields = try scanInputFields(temporary, input_json);
+    const fields = try scanInputFields(arena, input_json);
     const id_json = fields.id orelse return error.MissingField;
     const name_json = fields.name orelse return error.MissingField;
     const body_json = fields.body orelse return error.MissingField;
 
-    var id_parsed = try parseJSONString(temporary, id_json);
-    defer id_parsed.deinit();
-    const id = try uuidFromString(id_parsed.value);
-
-    var name_parsed = try parseJSONString(temporary, name_json);
-    defer name_parsed.deinit();
-    try validateName(name_parsed.value);
+    const id_string = try parseJSONString(arena, id_json);
+    const id = try uuidFromString(id_string);
+    const name = try parseJSONString(arena, name_json);
+    try validateName(name);
 
     const state = if (fields.state) |state_json|
-        try parseInputState(temporary, state_json)
+        try parseInputState(arena, state_json)
     else
         State.new;
     if (body_json.len > body_size_max) return error.BodyTooLarge;
-    const hash = try operationHash(temporary, name_parsed.value, body_json);
-
-    const name = try arena.dupe(u8, name_parsed.value);
-    errdefer arena.free(name);
-    const body = try arena.dupe(u8, body_json);
-    errdefer arena.free(body);
+    const body = try parseJSONValue(arena, body_json);
+    const hash = try operationHash(name, &body);
 
     return .{
         .id = id,
@@ -115,13 +103,29 @@ pub fn parseInputJSON(
     };
 }
 
-/// Writes the output view while embedding a terminal result as an already-validated JSON value.
+/// Parses a bounded, non-null terminal result into the lifetime arena.
+pub fn parseResultJSON(arena: Allocator, input_json: []const u8) !JSONValue {
+    if (input_json.len > result_size_max) return error.ResultTooLarge;
+    const result = try parseJSONValue(arena, input_json);
+    if (result == .null) return error.MissingResult;
+    try validateResultSize(&result);
+    return result;
+}
+
+/// Serializes a result compactly into the fixed persistence request buffer.
+pub fn writeResultJSON(buffer: *[result_size_max]u8, result: *const JSONValue) ![]const u8 {
+    var writer: std.Io.Writer = .fixed(buffer);
+    std.json.Stringify.value(result.*, .{}, &writer) catch return error.ResultTooLarge;
+    std.debug.assert(writer.buffered().len <= result_size_max);
+    return writer.buffered();
+}
+
+/// Writes the output view while serializing result Values directly.
 pub fn writeOutputJSON(
-    temporary_allocator: Allocator,
     writer: *std.Io.Writer,
     operation: *const Operation,
 ) !void {
-    const result_present = try validateView(temporary_allocator, operation);
+    const result_present = try validateView(operation);
     const state = operation.state.?;
     const last_updated = operation.last_updated.?;
     const hash = operation.hash.?;
@@ -144,9 +148,7 @@ pub fn writeOutputJSON(
     try json.write(last_updated);
     if (result_present) {
         try json.objectField("result");
-        try json.beginWriteRaw();
-        try writer.writeAll(operation.result.?);
-        json.endWriteRaw();
+        try json.write(operation.result.?);
     }
     try json.objectField("hash");
     try json.write(&hash_hex);
@@ -154,12 +156,9 @@ pub fn writeOutputJSON(
 }
 
 /// Checks the invariants required before mapping an operation to a persistent entity.
-pub fn validatePersistent(
-    temporary_allocator: Allocator,
-    operation: *const Operation,
-) !void {
+pub fn validatePersistent(operation: *const Operation) !void {
     if (operation.body != null) return error.UnexpectedBody;
-    _ = try validateView(temporary_allocator, operation);
+    _ = try validateView(operation);
 }
 
 /// Converts the canonical hyphenated UUID representation to its numeric representation.
@@ -203,8 +202,8 @@ pub fn uuidToString(id: u128, buffer: *[uuid_string_size]u8) []const u8 {
     return buffer;
 }
 
-fn scanInputFields(temporary: Allocator, input_json: []const u8) !InputFields {
-    var scanner = std.json.Scanner.initCompleteInput(temporary, input_json);
+fn scanInputFields(arena: Allocator, input_json: []const u8) !InputFields {
+    var scanner = std.json.Scanner.initCompleteInput(arena, input_json);
     defer scanner.deinit();
 
     const first = scanner.next() catch |err| return jsonError(err);
@@ -214,7 +213,7 @@ fn scanInputFields(temporary: Allocator, input_json: []const u8) !InputFields {
     var field_count: u8 = 0;
     while (true) {
         const token = scanner.nextAllocMax(
-            temporary,
+            arena,
             .alloc_always,
             input_json.len,
         ) catch |err| return jsonError(err);
@@ -288,52 +287,34 @@ fn scannerSkipValue(scanner: *std.json.Scanner) !void {
     scanner.skipValue() catch |err| return jsonError(err);
 }
 
-fn parseJSONString(temporary: Allocator, json: []const u8) !std.json.Parsed([]const u8) {
-    return std.json.parseFromSlice([]const u8, temporary, json, .{
+fn parseJSONString(arena: Allocator, json: []const u8) ![]const u8 {
+    return std.json.parseFromSliceLeaky([]const u8, arena, json, .{
         .allocate = .alloc_always,
         .max_value_len = json.len,
     }) catch |err| return jsonError(err);
 }
 
-fn parseInputState(temporary: Allocator, state_json: []const u8) !State {
-    var parsed = try parseJSONString(temporary, state_json);
-    defer parsed.deinit();
-    const state = try stateFromString(parsed.value);
+fn parseInputState(arena: Allocator, state_json: []const u8) !State {
+    const state_string = try parseJSONString(arena, state_json);
+    const state = try stateFromString(state_string);
     if (state != .new) return error.InvalidState;
     return state;
 }
 
-fn operationHash(
-    temporary: Allocator,
-    name: []const u8,
-    body_json: []const u8,
-) ![32]u8 {
-    var body = try parseJSONValue(temporary, body_json);
-    defer body.deinit();
-
-    var count_buffer: [256]u8 = undefined;
-    var counter: std.Io.Writer.Discarding = .init(&count_buffer);
-    hashEnvelopeWrite(&counter.writer, name, body.value) catch unreachable;
-    const envelope_size = std.math.cast(usize, counter.fullCount()) orelse {
-        return error.InvalidJSON;
-    };
-    if (envelope_size > hash_envelope_size_max) return error.InvalidJSON;
-
-    const envelope = try temporary.alloc(u8, envelope_size);
-    defer temporary.free(envelope);
-    var writer: std.Io.Writer = .fixed(envelope);
-    hashEnvelopeWrite(&writer, name, body.value) catch unreachable;
-    std.debug.assert(writer.buffered().len == envelope.len);
-
+fn operationHash(name: []const u8, body: *const JSONValue) ![32]u8 {
+    var hash_buffer: [64]u8 = undefined;
+    var hashing: std.Io.Writer.Hashing(std.crypto.hash.Blake3) = .init(&hash_buffer);
+    try hashEnvelopeWrite(&hashing.writer, name, body);
+    try hashing.writer.flush();
     var hash: [32]u8 = undefined;
-    std.crypto.hash.Blake3.hash(envelope, &hash, .{});
+    hashing.hasher.final(&hash);
     return hash;
 }
 
 fn hashEnvelopeWrite(
     writer: *std.Io.Writer,
     name: []const u8,
-    body: std.json.Value,
+    body: *const JSONValue,
 ) !void {
     var json: std.json.Stringify = .{
         .writer = writer,
@@ -343,38 +324,42 @@ fn hashEnvelopeWrite(
     try json.objectField("name");
     try json.write(name);
     try json.objectField("body");
-    try json.write(body);
+    try json.write(body.*);
     try json.endObject();
 }
 
-fn parseJSONValue(temporary: Allocator, json: []const u8) !std.json.Parsed(std.json.Value) {
-    return std.json.parseFromSlice(std.json.Value, temporary, json, .{
+fn parseJSONValue(arena: Allocator, json: []const u8) !JSONValue {
+    return std.json.parseFromSliceLeaky(JSONValue, arena, json, .{
+        .allocate = .alloc_always,
         .duplicate_field_behavior = .@"error",
         .max_value_len = json.len,
         .parse_numbers = true,
     }) catch |err| return jsonError(err);
 }
 
-fn validateView(temporary: Allocator, operation: *const Operation) !bool {
+fn validateView(operation: *const Operation) !bool {
     try validateName(operation.name);
     const state = operation.state orelse return error.MissingState;
     if (operation.last_updated == null) return error.MissingLastUpdated;
     if (operation.hash == null) return error.MissingHash;
-    const result_present = try serializedResultPresent(temporary, operation.result);
+    const result_present = operation.result != null;
     if (stateIsTerminal(state)) {
         if (!result_present) return error.MissingResult;
+        if (operation.result.? == .null) return error.MissingResult;
     } else {
-        if (result_present) return error.UnexpectedResult;
+        if (operation.result) |result| {
+            if (result != .null) return error.UnexpectedResult;
+        }
     }
+    if (operation.result) |*result| try validateResultSize(result);
     return result_present;
 }
 
-fn serializedResultPresent(temporary: Allocator, result_optional: ?[]const u8) !bool {
-    const result = result_optional orelse return false;
-    if (result.len > result_size_max) return error.ResultTooLarge;
-    var parsed = try parseJSONValue(temporary, result);
-    defer parsed.deinit();
-    return parsed.value != .null;
+fn validateResultSize(result: *const JSONValue) !void {
+    var count_buffer: [256]u8 = undefined;
+    var counter: std.Io.Writer.Discarding = .init(&count_buffer);
+    try std.json.Stringify.value(result.*, .{}, &counter.writer);
+    if (counter.fullCount() > result_size_max) return error.ResultTooLarge;
 }
 
 fn validateName(name: []const u8) !void {
@@ -436,10 +421,15 @@ fn testInput(
 fn testOutput(operation: *const Operation) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     errdefer output.deinit();
-    try writeOutputJSON(std.testing.allocator, &output.writer, operation);
+    try writeOutputJSON(&output.writer, operation);
     std.debug.assert(output.written().len > operation.name.len);
     std.debug.assert(output.written().len > 0);
     return output.toOwnedSlice();
+}
+
+fn expectValueJSON(expected: []const u8, value: *const JSONValue) !void {
+    var buffer: [result_size_max]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, try writeResultJSON(&buffer, value));
 }
 
 test "persistent state parsing formatting and terminal classification are exhaustive" {
@@ -485,7 +475,7 @@ test "UUID conversion is symmetric and output is lowercase" {
     );
 }
 
-test "input preserves serialized body and defaults state" {
+test "input parses an arena-owned body Value and defaults state" {
     const input = try testInput(
         std.testing.allocator,
         "echo",
@@ -498,12 +488,11 @@ test "input preserves serialized body and defaults state" {
 
     const operation = try parseInputJSON(
         arena.allocator(),
-        std.testing.allocator,
         input,
         test_now,
     );
     try std.testing.expectEqualStrings("echo", operation.name);
-    try std.testing.expectEqualStrings("{ \"message\" : \"hello\" }", operation.body.?);
+    try expectValueJSON("{\"message\":\"hello\"}", &operation.body.?);
     try std.testing.expectEqual(State.new, operation.state.?);
     try std.testing.expectEqual(test_now, operation.last_updated.?);
     try std.testing.expect(operation.result == null);
@@ -522,12 +511,11 @@ test "body accepts exactly 4096 serialized bytes" {
 
     const operation = try parseInputJSON(
         arena.allocator(),
-        std.testing.allocator,
         input,
         test_now,
     );
-    try std.testing.expectEqual(@as(usize, body_size_max), operation.body.?.len);
-    try std.testing.expectEqualSlices(u8, &body, operation.body.?);
+    try std.testing.expect(operation.body.? == .string);
+    try std.testing.expectEqual(@as(usize, body_size_max - 2), operation.body.?.string.len);
 }
 
 test "body rejects more than 4096 serialized bytes and invalid JSON" {
@@ -542,13 +530,12 @@ test "body rejects more than 4096 serialized bytes and invalid JSON" {
 
     try std.testing.expectError(
         error.BodyTooLarge,
-        parseInputJSON(arena.allocator(), std.testing.allocator, oversized, test_now),
+        parseInputJSON(arena.allocator(), oversized, test_now),
     );
     try std.testing.expectError(
         error.InvalidJSON,
         parseInputJSON(
             arena.allocator(),
-            std.testing.allocator,
             "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"name\":\"x\",\"body\":[}",
             test_now,
         ),
@@ -567,7 +554,6 @@ test "normalized hash matches the documented BLAKE3-256 digest" {
     defer arena.deinit();
     const operation = try parseInputJSON(
         arena.allocator(),
-        std.testing.allocator,
         input,
         test_now,
     );
@@ -600,18 +586,17 @@ test "hash normalizes whitespace and equivalent string escapes" {
 
     const first = try parseInputJSON(
         arena.allocator(),
-        std.testing.allocator,
         compact,
         test_now,
     );
     const second = try parseInputJSON(
         arena.allocator(),
-        std.testing.allocator,
         spaced,
         test_now,
     );
     try std.testing.expectEqualSlices(u8, &first.hash.?, &second.hash.?);
-    try std.testing.expect(!std.mem.eql(u8, first.body.?, second.body.?));
+    try expectValueJSON("{\"message\":\"hello\",\"items\":[1,2]}", &first.body.?);
+    try expectValueJSON("{\"message\":\"hello\",\"items\":[1,2]}", &second.body.?);
 }
 
 test "hash includes the operation name and preserves object key order" {
@@ -641,19 +626,16 @@ test "hash includes the operation name and preserves object key order" {
 
     const first = try parseInputJSON(
         arena.allocator(),
-        std.testing.allocator,
         first_input,
         test_now,
     );
     const second = try parseInputJSON(
         arena.allocator(),
-        std.testing.allocator,
         second_input,
         test_now,
     );
     const reordered = try parseInputJSON(
         arena.allocator(),
-        std.testing.allocator,
         reordered_input,
         test_now,
     );
@@ -671,14 +653,13 @@ test "input accepts only omitted state or explicit NEW" {
 
     const operation = try parseInputJSON(
         arena.allocator(),
-        std.testing.allocator,
         explicit,
         test_now,
     );
     try std.testing.expectEqual(State.new, operation.state.?);
     try std.testing.expectError(
         error.InvalidState,
-        parseInputJSON(arena.allocator(), std.testing.allocator, later, test_now),
+        parseInputJSON(arena.allocator(), later, test_now),
     );
 }
 
@@ -693,7 +674,6 @@ test "input rejects spoofed output fields duplicates and unknown fields" {
         error.ForbiddenField,
         parseInputJSON(
             arena.allocator(),
-            std.testing.allocator,
             prefix ++ ",\"hash\":\"spoofed\"}",
             test_now,
         ),
@@ -702,7 +682,6 @@ test "input rejects spoofed output fields duplicates and unknown fields" {
         error.ForbiddenField,
         parseInputJSON(
             arena.allocator(),
-            std.testing.allocator,
             prefix ++ ",\"result\":null}",
             test_now,
         ),
@@ -711,7 +690,6 @@ test "input rejects spoofed output fields duplicates and unknown fields" {
         error.ForbiddenField,
         parseInputJSON(
             arena.allocator(),
-            std.testing.allocator,
             prefix ++ ",\"last_updated\":0}",
             test_now,
         ),
@@ -720,7 +698,6 @@ test "input rejects spoofed output fields duplicates and unknown fields" {
         error.UnknownField,
         parseInputJSON(
             arena.allocator(),
-            std.testing.allocator,
             prefix ++ ",\"extra\":true}",
             test_now,
         ),
@@ -729,7 +706,6 @@ test "input rejects spoofed output fields duplicates and unknown fields" {
         error.DuplicateField,
         parseInputJSON(
             arena.allocator(),
-            std.testing.allocator,
             prefix ++ ",\"name\":\"again\"}",
             test_now,
         ),
@@ -743,20 +719,20 @@ test "input requires id name and body and validates name bounds" {
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"name\":\"echo\"}";
     try std.testing.expectError(
         error.MissingField,
-        parseInputJSON(arena.allocator(), std.testing.allocator, missing_body, test_now),
+        parseInputJSON(arena.allocator(), missing_body, test_now),
     );
     const empty = try testInput(std.testing.allocator, "", "null", null);
     defer std.testing.allocator.free(empty);
     try std.testing.expectError(
         error.InvalidName,
-        parseInputJSON(arena.allocator(), std.testing.allocator, empty, test_now),
+        parseInputJSON(arena.allocator(), empty, test_now),
     );
     const long_name = [_]u8{'a'} ** (name_size_max + 1);
     const long = try testInput(std.testing.allocator, &long_name, "null", null);
     defer std.testing.allocator.free(long);
     try std.testing.expectError(
         error.InvalidName,
-        parseInputJSON(arena.allocator(), std.testing.allocator, long, test_now),
+        parseInputJSON(arena.allocator(), long, test_now),
     );
 
     const maximum_name = [_]u8{'a'} ** name_size_max;
@@ -764,7 +740,6 @@ test "input requires id name and body and validates name bounds" {
     defer std.testing.allocator.free(maximum);
     const operation = try parseInputJSON(
         arena.allocator(),
-        std.testing.allocator,
         maximum,
         test_now,
     );
@@ -775,11 +750,11 @@ fn testParseAllocationFailures(allocator: Allocator) !void {
     const input =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"name\":\"echo\",\"body\":{\"message\":\"hello\"}}";
-    const operation = try parseInputJSON(allocator, allocator, input, test_now);
-    defer allocator.free(operation.name);
-    defer allocator.free(operation.body.?);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const operation = try parseInputJSON(arena.allocator(), input, test_now);
     std.debug.assert(operation.name.len > 0);
-    std.debug.assert(operation.body.?.len > 0);
+    std.debug.assert(operation.body.? == .object);
 }
 
 test "input parsing cleans up every allocation failure path" {
@@ -799,55 +774,119 @@ test "persistent validation enforces view and terminal result invariants" {
         .last_updated = test_now,
         .hash = hash,
     };
-    try validatePersistent(std.testing.allocator, &operation);
+    try validatePersistent(&operation);
     operation.state = .submitted;
     operation.last_updated = test_now + 1;
-    try validatePersistent(std.testing.allocator, &operation);
-    operation.result = "null";
-    try validatePersistent(std.testing.allocator, &operation);
-    operation.result = "true";
+    try validatePersistent(&operation);
+    operation.result = .null;
+    try validatePersistent(&operation);
+    operation.result = .{ .bool = true };
     try std.testing.expectError(
         error.UnexpectedResult,
-        validatePersistent(std.testing.allocator, &operation),
+        validatePersistent(&operation),
     );
     operation.state = .succeeded;
     operation.last_updated = test_now + 2;
-    try validatePersistent(std.testing.allocator, &operation);
-    operation.result = "null";
+    try validatePersistent(&operation);
+    operation.result = .null;
     try std.testing.expectError(
         error.MissingResult,
-        validatePersistent(std.testing.allocator, &operation),
-    );
-    operation.result = "{broken";
-    try std.testing.expectError(
-        error.InvalidJSON,
-        validatePersistent(std.testing.allocator, &operation),
+        validatePersistent(&operation),
     );
 }
 
-test "result accepts exactly 4096 serialized bytes" {
-    var result: [result_size_max]u8 = undefined;
-    result[0] = '"';
-    @memset(result[1 .. result.len - 1], 'a');
-    result[result.len - 1] = '"';
+test "result accepts exactly 4096 compact bytes" {
+    const maximum = "a" ** (result_size_max - 2);
     var operation = Operation{
         .id = try uuidFromString(test_uuid),
         .name = "echo",
         .state = .failed,
         .last_updated = test_now,
-        .result = &result,
+        .result = .{ .string = maximum },
         .hash = [_]u8{0} ** 32,
     };
-    try validatePersistent(std.testing.allocator, &operation);
+    try validatePersistent(&operation);
 
-    var oversized: [result_size_max + 1]u8 = undefined;
-    oversized[0] = '"';
-    @memset(oversized[1 .. oversized.len - 1], 'a');
-    oversized[oversized.len - 1] = '"';
-    operation.result = &oversized;
+    operation.result = .{ .string = "a" ** (result_size_max - 1) };
     try std.testing.expectError(
         error.ResultTooLarge,
-        validatePersistent(std.testing.allocator, &operation),
+        validatePersistent(&operation),
+    );
+}
+
+test "terminal result ingress accepts exactly 4096 bytes and rejects more" {
+    const maximum = "\"" ++ ("a" ** (result_size_max - 2)) ++ "\"";
+    const oversized = "\"" ++ ("a" ** (result_size_max - 1)) ++ "\"";
+    comptime std.debug.assert(maximum.len == result_size_max);
+    comptime std.debug.assert(oversized.len == result_size_max + 1);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const result = try parseResultJSON(arena.allocator(), maximum);
+    try std.testing.expect(result == .string);
+    try std.testing.expectEqual(@as(usize, result_size_max - 2), result.string.len);
+    try std.testing.expectError(
+        error.ResultTooLarge,
+        parseResultJSON(arena.allocator(), oversized),
+    );
+}
+
+test "terminal result parsing owns and normalizes every JSON Value variant" {
+    const inputs = [_][]const u8{
+        "true",
+        "42",
+        "\"hello\"",
+        "[true, 42]",
+        "{\"first\":1,\"second\":2}",
+    };
+    const expected = [_][]const u8{
+        "true",
+        "42",
+        "\"hello\"",
+        "[true,42]",
+        "{\"first\":1,\"second\":2}",
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (inputs, expected) |input, canonical| {
+        const result = try parseResultJSON(arena.allocator(), input);
+        try expectValueJSON(canonical, &result);
+    }
+    try std.testing.expectError(
+        error.MissingResult,
+        parseResultJSON(arena.allocator(), "null"),
+    );
+    try std.testing.expectError(
+        error.InvalidJSON,
+        parseResultJSON(arena.allocator(), "{\"key\":1,\"key\":2}"),
+    );
+    try std.testing.expectError(
+        error.InvalidJSON,
+        parseResultJSON(arena.allocator(), "{broken"),
+    );
+}
+
+test "body parses every JSON Value variant and rejects duplicate object keys" {
+    const bodies = [_][]const u8{ "null", "false", "42", "\"text\"", "[1]", "{\"a\":1}" };
+    const tags = [_]std.meta.Tag(JSONValue){ .null, .bool, .integer, .string, .array, .object };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (bodies, tags) |body, tag| {
+        const input = try testInput(std.testing.allocator, "variants", body, null);
+        defer std.testing.allocator.free(input);
+        const parsed = try parseInputJSON(arena.allocator(), input, test_now);
+        try std.testing.expectEqual(tag, std.meta.activeTag(parsed.body.?));
+    }
+    const duplicate = try testInput(
+        std.testing.allocator,
+        "variants",
+        "{\"a\":1,\"a\":2}",
+        null,
+    );
+    defer std.testing.allocator.free(duplicate);
+    try std.testing.expectError(
+        error.InvalidJSON,
+        parseInputJSON(arena.allocator(), duplicate, test_now),
     );
 }
 
@@ -855,43 +894,45 @@ test "persistent view rejects body and requires state timestamp and hash" {
     var operation = Operation{
         .id = try uuidFromString(test_uuid),
         .name = "echo",
-        .body = "null",
+        .body = .null,
         .state = .new,
         .last_updated = test_now,
         .hash = [_]u8{0} ** 32,
     };
     try std.testing.expectError(
         error.UnexpectedBody,
-        validatePersistent(std.testing.allocator, &operation),
+        validatePersistent(&operation),
     );
     operation.body = null;
     operation.state = null;
     try std.testing.expectError(
         error.MissingState,
-        validatePersistent(std.testing.allocator, &operation),
+        validatePersistent(&operation),
     );
     operation.state = .new;
     operation.last_updated = null;
     try std.testing.expectError(
         error.MissingLastUpdated,
-        validatePersistent(std.testing.allocator, &operation),
+        validatePersistent(&operation),
     );
     operation.last_updated = test_now;
     operation.hash = null;
     try std.testing.expectError(
         error.MissingHash,
-        validatePersistent(std.testing.allocator, &operation),
+        validatePersistent(&operation),
     );
 }
 
 test "output omits body and emits terminal result as raw JSON" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var operation = Operation{
         .id = try uuidFromString(test_uuid),
         .name = "echo",
-        .body = "{\"private\":true}",
+        .body = .{ .bool = true },
         .state = .succeeded,
         .last_updated = test_now,
-        .result = "{\"ok\":true}",
+        .result = try parseResultJSON(arena.allocator(), "{\"ok\":true}"),
         .hash = [_]u8{0xAB} ** 32,
     };
     const output = try testOutput(&operation);

@@ -106,7 +106,6 @@ const OperationCreator = struct {
     create_fn: *const fn (
         *anyopaque,
         Allocator,
-        Allocator,
         *const operation.Operation,
     ) anyerror!operation.Operation,
 
@@ -120,11 +119,10 @@ const OperationCreator = struct {
             fn create(
                 context: *anyopaque,
                 allocator: Allocator,
-                temporary: Allocator,
                 source: *const operation.Operation,
             ) anyerror!operation.Operation {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.create(allocator, temporary, source);
+                return self.create(allocator, source);
             }
         };
         return .{ .context = pointer, .create_fn = Adapter.create };
@@ -133,10 +131,9 @@ const OperationCreator = struct {
     fn create(
         creator: OperationCreator,
         allocator: Allocator,
-        temporary: Allocator,
         source: *const operation.Operation,
     ) !operation.Operation {
-        return creator.create_fn(creator.context, allocator, temporary, source);
+        return creator.create_fn(creator.context, allocator, source);
     }
 };
 
@@ -240,9 +237,11 @@ fn post_invocation_outcome(
     now: operation.UnixSeconds,
 ) InvocationOutcome {
     const input_json = request.body orelse return .bad_request;
+    var operation_arena = std.heap.ArenaAllocator.init(allocator);
+    defer operation_arena.deinit();
+    const arena = operation_arena.allocator();
     const parsed = operation.parseInputJSON(
-        allocator,
-        allocator,
+        arena,
         input_json,
         now,
     ) catch |err| {
@@ -251,10 +250,7 @@ fn post_invocation_outcome(
             else => .bad_request,
         };
     };
-    defer allocator.free(parsed.name);
-    defer allocator.free(parsed.body.?);
-
-    const created = creator.create(allocator, allocator, &parsed) catch |err| {
+    const created = creator.create(arena, &parsed) catch |err| {
         return switch (err) {
             error.OperationConflict => .conflict,
             else => .internal_server_error,
@@ -279,7 +275,7 @@ fn operation_output_body(
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    try operation.writeOutputJSON(allocator, &output.writer, persisted);
+    try operation.writeOutputJSON(&output.writer, persisted);
     std.debug.assert(output.written().len > 0);
     return output.toOwnedSlice();
 }
@@ -566,12 +562,10 @@ const FakePersistence = struct {
     fn create(
         fake: *FakePersistence,
         _: Allocator,
-        _: Allocator,
         source: *const operation.Operation,
     ) !operation.Operation {
         std.debug.assert(fake.create_count < 32);
         std.debug.assert(source.name.len <= fake.last_name_buffer.len);
-        std.debug.assert(source.body.?.len <= fake.last_body_buffer.len);
         fake.create_count += 1;
         fake.last_id = source.id;
         fake.last_state = source.state;
@@ -579,8 +573,8 @@ const FakePersistence = struct {
         fake.last_hash = source.hash;
         fake.last_name_len = @intCast(source.name.len);
         @memcpy(fake.last_name_buffer[0..source.name.len], source.name);
-        fake.last_body_len = @intCast(source.body.?.len);
-        @memcpy(fake.last_body_buffer[0..source.body.?.len], source.body.?);
+        const body = try operation.writeResultJSON(&fake.last_body_buffer, &source.body.?);
+        fake.last_body_len = @intCast(body.len);
 
         if (fake.create_error) |err| return err;
         if (fake.response) |response| return response;
@@ -957,6 +951,8 @@ test "authenticated POST returns a new operation without its body" {
 }
 
 test "matching POST retry returns the latest stored persistent view" {
+    var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer result_arena.deinit();
     var key_pair = testKeyPair(0x45);
     defer paseto.wipeSecretKey(&key_pair.secret_key);
     const token = try testToken(&key_pair, 1_700_000_000, 60);
@@ -977,7 +973,10 @@ test "matching POST retry returns the latest stored persistent view" {
         .name = "echo",
         .state = .succeeded,
         .last_updated = 1_700_000_123,
-        .result = "{\"message\":\"done\"}",
+        .result = try operation.parseResultJSON(
+            result_arena.allocator(),
+            "{ \"message\" : \"done\" }",
+        ),
         .hash = expected_hash,
     } };
     const input =

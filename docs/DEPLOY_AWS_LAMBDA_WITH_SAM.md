@@ -164,18 +164,24 @@ The DynamoDB item contract enforced by `src/operation_persistence.zig` is:
 | `state` | `S` | One of `NEW`, `SUBMITTED`, `RUNNING`, `SUCCEEDED`, or `FAILED`. |
 | `last_updated` | `N` | Unix epoch seconds. |
 | `hash` | `S` | 64-character lowercase BLAKE3-256 hexadecimal value. |
-| `result` | `S` | Terminal states only; exact serialized JSON; at most 4,096 UTF-8 bytes. |
+| `result` | `S` | Terminal states only; compact `std.json.Value` JSON; at most 4,096 UTF-8 bytes. |
 
 The Operation hash covers only a JSON envelope containing `name` and `body`.
-The body is parsed and re-serialized before hashing, so insignificant
-whitespace and equivalent string escapes do not change the hash, while object
-member order remains significant. The `id`, `state`, `last_updated`, and
-`result` fields are excluded.
+The body is parsed once into an arena-owned `std.json.Value` and serialized
+directly into the hash stream, so insignificant whitespace and equivalent
+string escapes do not change the hash, while object member order remains
+significant. The `id`, `state`, `last_updated`, and `result` fields are
+excluded. One lifetime arena owns each Operation's strings and nested body or
+result Values for a CLI command or Lambda POST.
 
 Never persist `body`. The 4,096-byte `result` bound is an application-enforced
 constraint because DynamoDB and CloudFormation cannot enforce a per-attribute
-size limit. The adapter validates immediately before every `PutItem` or
-`UpdateItem` and after decoding every read. Creates use
+size limit. Terminal result input and its compact serialization must both fit
+the bound. The adapter serializes result Values into fixed request buffers and
+validates immediately before every `PutItem` or `UpdateItem`. On reads, it
+parses the stored string once into the caller's arena and requires the string
+to equal the compact reserialization, rejecting malformed, duplicate-key,
+explicit-null, oversized, or noncanonical items. Creates use
 `attribute_not_exists(id)` and request `ALL_OLD` when that condition fails. A
 failed create condition succeeds as an idempotent retry only when the returned
 item has the submitted Operation hash, regardless of its current state;
@@ -502,7 +508,8 @@ zig-out/bin/operation read \
 ```
 
 Pending states require empty standard input. Terminal states require a
-non-null JSON result no larger than 4,096 serialized bytes:
+non-null JSON result no larger than 4,096 input bytes whose compact
+serialization is also no larger than 4,096 bytes:
 
 ```sh
 zig-out/bin/operation update \
