@@ -7,10 +7,12 @@ pub const UnixSeconds = i64;
 pub const body_size_max = 4096;
 pub const result_size_max = 4096;
 pub const name_size_max = 64;
+pub const ttl_seconds: UnixSeconds = 24 * 60 * 60;
 const uuid_string_size = 36;
 
 comptime {
     std.debug.assert(body_size_max == result_size_max);
+    std.debug.assert(ttl_seconds == 86_400);
     std.debug.assert(uuid_string_size == 36);
 }
 
@@ -56,8 +58,10 @@ pub const Operation = struct {
     name: []const u8,
     body: ?JSONValue = null,
     state: ?State = null,
-    /// The caller must update this whenever state changes.
+    /// Callers must update both timestamps together for every Operation update.
     last_updated: ?UnixSeconds = null,
+    /// DynamoDB may delete this Operation after this Unix timestamp.
+    expires_at: ?UnixSeconds = null,
     result: ?JSONValue = null,
     hash: ?[32]u8 = null,
 };
@@ -92,6 +96,7 @@ pub fn parseInputJSON(
     if (body_json.len > body_size_max) return error.BodyTooLarge;
     const body = try parseJSONValue(arena, body_json);
     const hash = try operationHash(name, &body);
+    const expires_at = try expires_at_from_last_updated(now);
 
     return .{
         .id = id,
@@ -99,8 +104,22 @@ pub fn parseInputJSON(
         .body = body,
         .state = state,
         .last_updated = now,
+        .expires_at = expires_at,
         .hash = hash,
     };
+}
+
+/// Computes the fixed DynamoDB expiration timestamp for an Operation update.
+pub fn expires_at_from_last_updated(last_updated: UnixSeconds) !UnixSeconds {
+    const expires_at = std.math.add(
+        UnixSeconds,
+        last_updated,
+        ttl_seconds,
+    ) catch return error.InvalidExpiresAt;
+    if (expires_at <= last_updated) return error.InvalidExpiresAt;
+    std.debug.assert(expires_at > last_updated);
+    std.debug.assert(expires_at - last_updated == ttl_seconds);
+    return expires_at;
 }
 
 /// Parses a bounded, non-null terminal result into the lifetime arena.
@@ -128,6 +147,7 @@ pub fn writeOutputJSON(
     const result_present = try validateView(operation);
     const state = operation.state.?;
     const last_updated = operation.last_updated.?;
+    const expires_at = operation.expires_at.?;
     const hash = operation.hash.?;
     var id_buffer: [uuid_string_size]u8 = undefined;
     const id = uuidToString(operation.id, &id_buffer);
@@ -146,6 +166,8 @@ pub fn writeOutputJSON(
     try json.write(stateToString(state));
     try json.objectField("last_updated");
     try json.write(last_updated);
+    try json.objectField("expires_at");
+    try json.write(expires_at);
     if (result_present) {
         try json.objectField("result");
         try json.write(operation.result.?);
@@ -257,6 +279,8 @@ fn setInputField(
         return error.ForbiddenField;
     } else if (std.mem.eql(u8, field_name, "last_updated")) {
         return error.ForbiddenField;
+    } else if (std.mem.eql(u8, field_name, "expires_at")) {
+        return error.ForbiddenField;
     } else {
         return error.UnknownField;
     }
@@ -340,7 +364,10 @@ fn parseJSONValue(arena: Allocator, json: []const u8) !JSONValue {
 fn validateView(operation: *const Operation) !bool {
     try validateName(operation.name);
     const state = operation.state orelse return error.MissingState;
-    if (operation.last_updated == null) return error.MissingLastUpdated;
+    const last_updated = operation.last_updated orelse return error.MissingLastUpdated;
+    const expires_at = operation.expires_at orelse return error.MissingExpiresAt;
+    const expected_expires_at = try expires_at_from_last_updated(last_updated);
+    if (expires_at != expected_expires_at) return error.InvalidExpiresAt;
     if (operation.hash == null) return error.MissingHash;
     const result_present = operation.result != null;
     if (stateIsTerminal(state)) {
@@ -495,6 +522,7 @@ test "input parses an arena-owned body Value and defaults state" {
     try expectValueJSON("{\"message\":\"hello\"}", &operation.body.?);
     try std.testing.expectEqual(State.new, operation.state.?);
     try std.testing.expectEqual(test_now, operation.last_updated.?);
+    try std.testing.expectEqual(test_now + ttl_seconds, operation.expires_at.?);
     try std.testing.expect(operation.result == null);
     try std.testing.expect(operation.hash != null);
 }
@@ -695,6 +723,14 @@ test "input rejects spoofed output fields duplicates and unknown fields" {
         ),
     );
     try std.testing.expectError(
+        error.ForbiddenField,
+        parseInputJSON(
+            arena.allocator(),
+            prefix ++ ",\"expires_at\":0}",
+            test_now,
+        ),
+    );
+    try std.testing.expectError(
         error.UnknownField,
         parseInputJSON(
             arena.allocator(),
@@ -765,6 +801,18 @@ test "input parsing cleans up every allocation failure path" {
     );
 }
 
+test "input rejects expiration timestamp overflow" {
+    const input = try testInput(std.testing.allocator, "echo", "null", null);
+    defer std.testing.allocator.free(input);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectError(
+        error.InvalidExpiresAt,
+        parseInputJSON(arena.allocator(), input, std.math.maxInt(UnixSeconds)),
+    );
+}
+
 test "persistent validation enforces view and terminal result invariants" {
     const hash = [_]u8{0xAB} ** 32;
     var operation = Operation{
@@ -772,11 +820,13 @@ test "persistent validation enforces view and terminal result invariants" {
         .name = "echo",
         .state = .new,
         .last_updated = test_now,
+        .expires_at = test_now + ttl_seconds,
         .hash = hash,
     };
     try validatePersistent(&operation);
     operation.state = .submitted;
     operation.last_updated = test_now + 1;
+    operation.expires_at = test_now + 1 + ttl_seconds;
     try validatePersistent(&operation);
     operation.result = .null;
     try validatePersistent(&operation);
@@ -787,6 +837,7 @@ test "persistent validation enforces view and terminal result invariants" {
     );
     operation.state = .succeeded;
     operation.last_updated = test_now + 2;
+    operation.expires_at = test_now + 2 + ttl_seconds;
     try validatePersistent(&operation);
     operation.result = .null;
     try std.testing.expectError(
@@ -802,6 +853,7 @@ test "result accepts exactly 4096 compact bytes" {
         .name = "echo",
         .state = .failed,
         .last_updated = test_now,
+        .expires_at = test_now + ttl_seconds,
         .result = .{ .string = maximum },
         .hash = [_]u8{0} ** 32,
     };
@@ -890,13 +942,14 @@ test "body parses every JSON Value variant and rejects duplicate object keys" {
     );
 }
 
-test "persistent view rejects body and requires state timestamp and hash" {
+test "persistent view rejects body and requires state timestamps and hash" {
     var operation = Operation{
         .id = try uuidFromString(test_uuid),
         .name = "echo",
         .body = .null,
         .state = .new,
         .last_updated = test_now,
+        .expires_at = test_now + ttl_seconds,
         .hash = [_]u8{0} ** 32,
     };
     try std.testing.expectError(
@@ -916,6 +969,17 @@ test "persistent view rejects body and requires state timestamp and hash" {
         validatePersistent(&operation),
     );
     operation.last_updated = test_now;
+    operation.expires_at = null;
+    try std.testing.expectError(
+        error.MissingExpiresAt,
+        validatePersistent(&operation),
+    );
+    operation.expires_at = test_now + ttl_seconds + 1;
+    try std.testing.expectError(
+        error.InvalidExpiresAt,
+        validatePersistent(&operation),
+    );
+    operation.expires_at = test_now + ttl_seconds;
     operation.hash = null;
     try std.testing.expectError(
         error.MissingHash,
@@ -932,6 +996,7 @@ test "output omits body and emits terminal result as raw JSON" {
         .body = .{ .bool = true },
         .state = .succeeded,
         .last_updated = test_now,
+        .expires_at = test_now + ttl_seconds,
         .result = try parseResultJSON(arena.allocator(), "{\"ok\":true}"),
         .hash = [_]u8{0xAB} ** 32,
     };
@@ -941,6 +1006,7 @@ test "output omits body and emits terminal result as raw JSON" {
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"echo\",\"state\":\"SUCCEEDED\"," ++
             "\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400," ++
             "\"result\":{\"ok\":true}," ++
             "\"hash\":\"abababababababababababababababab" ++
             "abababababababababababababababab\"}",
@@ -950,6 +1016,7 @@ test "output omits body and emits terminal result as raw JSON" {
 
     operation.state = .submitted;
     operation.last_updated = test_now + 1;
+    operation.expires_at = test_now + 1 + ttl_seconds;
     operation.result = null;
     const pending_output = try testOutput(&operation);
     defer std.testing.allocator.free(pending_output);
@@ -960,4 +1027,15 @@ test "output omits body and emits terminal result as raw JSON" {
 
     operation.last_updated = null;
     try std.testing.expectError(error.MissingLastUpdated, testOutput(&operation));
+}
+
+test "expiration calculation rejects timestamp overflow" {
+    try std.testing.expectEqual(
+        test_now + ttl_seconds,
+        try expires_at_from_last_updated(test_now),
+    );
+    try std.testing.expectError(
+        error.InvalidExpiresAt,
+        expires_at_from_last_updated(std.math.maxInt(UnixSeconds)),
+    );
 }

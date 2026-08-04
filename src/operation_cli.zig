@@ -414,6 +414,8 @@ fn classifyError(err: anyerror) Failure {
         error.ResultTooLarge,
         error.MissingState,
         error.MissingLastUpdated,
+        error.MissingExpiresAt,
+        error.InvalidExpiresAt,
         error.MissingHash,
         error.MissingResult,
         error.UnexpectedBody,
@@ -470,6 +472,7 @@ fn executeUpdate(
     var replacement = snapshot;
     replacement.state = options.state;
     replacement.last_updated = context.now;
+    replacement.expires_at = try operation.expires_at_from_last_updated(context.now);
     replacement.result = if (operation.stateIsTerminal(options.state))
         try operation.parseResultJSON(context.allocator, context.stdin)
     else
@@ -498,6 +501,7 @@ const FakePersistence = struct {
         .name = "echo",
         .state = .running,
         .last_updated = 1_700_000_000,
+        .expires_at = 1_700_086_400,
         .hash = test_hash,
     },
     create_error: ?anyerror = null,
@@ -521,7 +525,10 @@ const FakePersistence = struct {
         if (fake.create_error) |err| return err;
         var created = source.*;
         created.body = null;
-        if (fake.create_last_updated) |last_updated| created.last_updated = last_updated;
+        if (fake.create_last_updated) |last_updated| {
+            created.last_updated = last_updated;
+            created.expires_at = try operation.expires_at_from_last_updated(last_updated);
+        }
         return created;
     }
 
@@ -708,6 +715,7 @@ test "create parses stdin dispatches once and writes canonical JSON" {
     try std.testing.expectEqualStrings(
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"echo\",\"state\":\"NEW\",\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400," ++
             "\"hash\":\"ab9a059eb68c36bddaffb5bdd23aa717" ++
             "7c3a97dc34f9af54eb06f1c488ac3662\"}\n",
         result.stdout(),
@@ -734,6 +742,11 @@ test "matching create retry writes the authoritative stored timestamp" {
         u8,
         result.stdout(),
         "\"last_updated\":1700000000",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.stdout(),
+        "\"expires_at\":1700086400",
     ) != null);
     try std.testing.expectEqualStrings("", result.stderr());
 }
@@ -836,6 +849,11 @@ test "update accepts every target including jumps same state and terminal remova
         try std.testing.expectEqual(@as(u8, 1), fake.read_count);
         try std.testing.expectEqual(@as(u8, 1), fake.update_count);
         try std.testing.expectEqual(state, fake.last_state.?);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            result.stdout(),
+            "\"expires_at\":1700086401",
+        ) != null);
         try std.testing.expect(std.mem.indexOf(
             u8,
             result.stdout(),

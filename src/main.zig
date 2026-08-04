@@ -272,6 +272,7 @@ fn operation_output_body(
     std.debug.assert(persisted.body == null);
     std.debug.assert(persisted.state != null);
     std.debug.assert(persisted.last_updated != null);
+    std.debug.assert(persisted.expires_at != null);
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -553,6 +554,7 @@ const FakePersistence = struct {
     last_id: u128 = 0,
     last_state: ?operation.State = null,
     last_updated: ?operation.UnixSeconds = null,
+    last_expires_at: ?operation.UnixSeconds = null,
     last_hash: ?[32]u8 = null,
     last_name_buffer: [operation.name_size_max]u8 = undefined,
     last_name_len: u8 = 0,
@@ -570,6 +572,7 @@ const FakePersistence = struct {
         fake.last_id = source.id;
         fake.last_state = source.state;
         fake.last_updated = source.last_updated;
+        fake.last_expires_at = source.expires_at;
         fake.last_hash = source.hash;
         fake.last_name_len = @intCast(source.name.len);
         @memcpy(fake.last_name_buffer[0..source.name.len], source.name);
@@ -902,6 +905,7 @@ test "authenticated POST returns a new operation without its body" {
         "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
         "\\\"name\\\":\\\"echo\\\",\\\"state\\\":\\\"NEW\\\"," ++
         "\\\"last_updated\\\":1700000000," ++
+        "\\\"expires_at\\\":1700086400," ++
         "\\\"hash\\\":\\\"ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662\\\"}\"}";
 
     for (inputs) |input| {
@@ -936,6 +940,7 @@ test "authenticated POST returns a new operation without its body" {
         );
         try std.testing.expectEqual(operation.State.new, fake.last_state.?);
         try std.testing.expectEqual(@as(i64, 1_700_000_000), fake.last_updated.?);
+        try std.testing.expectEqual(@as(i64, 1_700_086_400), fake.last_expires_at.?);
         try std.testing.expectEqualStrings("echo", fake.lastName());
         try std.testing.expectEqualStrings(
             "{\"message\":\"hello\",\"count\":2}",
@@ -973,6 +978,7 @@ test "matching POST retry returns the latest stored persistent view" {
         .name = "echo",
         .state = .succeeded,
         .last_updated = 1_700_000_123,
+        .expires_at = 1_700_086_523,
         .result = try operation.parseResultJSON(
             result_arena.allocator(),
             "{ \"message\" : \"done\" }",
@@ -1007,6 +1013,7 @@ test "matching POST retry returns the latest stored persistent view" {
         "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
         "\\\"name\\\":\\\"echo\\\",\\\"state\\\":\\\"SUCCEEDED\\\"," ++
         "\\\"last_updated\\\":1700000123," ++
+        "\\\"expires_at\\\":1700086523," ++
         "\\\"result\\\":{\\\"message\\\":\\\"done\\\"}," ++
         "\\\"hash\\\":\\\"ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662\\\"}\"}";
     try std.testing.expectEqualStrings(expected, response);

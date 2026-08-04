@@ -151,9 +151,9 @@ first POST persistence request and returned to the caller as a sanitized HTTP
 
 The operations table uses on-demand `PAY_PER_REQUEST` billing and has one
 string partition key named `id`. It has no sort key, secondary indexes,
-streams, TTL, provisioned capacity, or explicit table name. Point-in-time
-recovery is explicitly disabled, and omitting `SSESpecification` selects
-DynamoDB's default AWS-owned encryption.
+streams, provisioned capacity, or explicit table name. Native DynamoDB TTL is
+enabled on `expires_at`. Point-in-time recovery is explicitly disabled, and
+omitting `SSESpecification` selects DynamoDB's default AWS-owned encryption.
 
 The DynamoDB item contract enforced by `src/operation_persistence.zig` is:
 
@@ -163,6 +163,7 @@ The DynamoDB item contract enforced by `src/operation_persistence.zig` is:
 | `name` | `S` | Always present. |
 | `state` | `S` | One of `NEW`, `SUBMITTED`, `RUNNING`, `SUCCEEDED`, or `FAILED`. |
 | `last_updated` | `N` | Unix epoch seconds. |
+| `expires_at` | `N` | Exactly 86,400 seconds after `last_updated`; DynamoDB TTL attribute. |
 | `hash` | `S` | 64-character lowercase BLAKE3-256 hexadecimal value. |
 | `result` | `S` | Terminal states only; compact `std.json.Value` JSON; at most 4,096 UTF-8 bytes. |
 
@@ -170,9 +171,9 @@ The Operation hash covers only a JSON envelope containing `name` and `body`.
 The body is parsed once into an arena-owned `std.json.Value` and serialized
 directly into the hash stream, so insignificant whitespace and equivalent
 string escapes do not change the hash, while object member order remains
-significant. The `id`, `state`, `last_updated`, and `result` fields are
-excluded. One lifetime arena owns each Operation's strings and nested body or
-result Values for a CLI command or Lambda POST.
+significant. The `id`, `state`, `last_updated`, `expires_at`, and `result`
+fields are excluded. One lifetime arena owns each Operation's strings and
+nested body or result Values for a CLI command or Lambda POST.
 
 Never persist `body`. The 4,096-byte `result` bound is an application-enforced
 constraint because DynamoDB and CloudFormation cannot enforce a per-attribute
@@ -186,9 +187,18 @@ explicit-null, oversized, or noncanonical items. Creates use
 failed create condition succeeds as an idempotent retry only when the returned
 item has the submitted Operation hash, regardless of its current state;
 otherwise it is an Operation conflict. Reads are strongly consistent. Updates
-condition on the previously read snapshot, preserve `id`, `name`, and `hash`,
-and return and validate `ALL_NEW`. Result-size validation remains in the
-application rather than a DynamoDB condition expression.
+condition on the previously read snapshot, including the old `expires_at`,
+preserve `id`, `name`, and `hash`, and return and validate `ALL_NEW`. New items
+and every successful update set `expires_at` to `last_updated + 86,400`.
+Result-size validation remains in the application rather than a DynamoDB
+condition expression.
+
+DynamoDB TTL deletion is asynchronous. An item becomes eligible for deletion
+at `expires_at` but may remain readable until DynamoDB removes it. Records that
+predate this contract have no TTL attribute and are rejected by the strict item
+decoder; remove, recreate, or separately backfill them before deploying this
+version. CloudFormation configures TTL, so the Lambda role does not need an
+additional DynamoDB control-plane permission.
 
 The Function URL settings are:
 
@@ -455,8 +465,8 @@ curl -L \
 ```
 
 For a new ID, the handler persists and returns the Operation output view with
-`NEW` state, the invocation timestamp, and its stable hash. It omits the input
-body:
+`NEW` state, the invocation timestamp, its 24-hour expiry, and its stable hash.
+It omits the input body:
 
 ```json
 {
@@ -464,13 +474,14 @@ body:
   "name": "echo",
   "state": "NEW",
   "last_updated": 1700000000,
+  "expires_at": 1700086400,
   "hash": "ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662"
 }
 ```
 
 Retrying the same ID, name, and body is idempotent and returns the latest
-stored state, timestamp, terminal result when present, and hash. Reusing the ID
-for different work returns the static `409 Conflict` response. DynamoDB,
+stored state, timestamps, terminal result when present, and hash. Reusing the
+ID for different work returns the static `409 Conflict` response. DynamoDB,
 malformed stored-item, and allocation failures return only the static
 `500 Internal Server Error` response.
 
@@ -496,9 +507,9 @@ printf '%s\n' "$operation_json" | zig-out/bin/operation create
 
 Retry create with the original UUID, name, and body. When the UUID already
 identifies an Operation with the same Operation hash, create returns the current
-stored Operation, including its state, `last_updated`, and terminal result when
-present. A different hash returns `operation: operation conflict` with exit code
-`1`.
+stored Operation, including its state, `last_updated`, `expires_at`, and terminal
+result when present. A different hash returns `operation: operation conflict`
+with exit code `1`.
 
 Read the persistent output view:
 
@@ -522,6 +533,9 @@ printf '%s\n' '{"message":"done"}' \
       --id 00112233-4455-6677-8899-aabbccddeeff \
       --state SUCCEEDED
 ```
+
+Each successful update refreshes both `last_updated` and `expires_at`, keeping
+the expiry exactly 24 hours after the update timestamp.
 
 Lifecycle ordering is intentionally not enforced: any valid state may replace
 any previous state, including a same-state update. Exit code `1` means the item

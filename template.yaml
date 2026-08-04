@@ -30,6 +30,9 @@ Resources:
           KeyType: HASH
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: false
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
 
   DemoFunction:
     Type: AWS::Serverless::Function

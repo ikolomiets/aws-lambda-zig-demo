@@ -152,7 +152,7 @@ The Operation hash is the BLAKE3-256 digest of a JSON envelope containing only
 `std.json.Value` and serialized directly into the hash stream, so
 insignificant whitespace and equivalent string escapes do not change the hash,
 while object member order remains significant. The `id`, `state`,
-`last_updated`, and `result` fields are not included.
+`last_updated`, `expires_at`, and `result` fields are not included.
 
 Each CLI command and Lambda POST owns its Operation strings, body, and result
 through one short-lived arena. Optional absence means a field is omitted from
@@ -162,8 +162,9 @@ that Operation view; an explicit JSON `null` remains a distinct
 A create is safe to retry with the original UUID, name, and body. If that UUID
 already identifies an Operation with the same Operation hash, the retry
 succeeds and returns the current stored Operation, including its state,
-`last_updated`, and terminal result when present. Reusing the UUID for different
-content returns `operation: operation conflict` with exit code `1`.
+`last_updated`, `expires_at`, and terminal result when present. Reusing the UUID
+for different content returns `operation: operation conflict` with exit code
+`1`.
 
 Read it with a strongly consistent DynamoDB read:
 
@@ -189,6 +190,10 @@ printf '%s\n' '{"message":"done"}' \
       --state SUCCEEDED
 ```
 
+A newly created item and every successful update set `expires_at` to exactly
+86,400 seconds after `last_updated`, extending the Operation's DynamoDB lifetime
+by 24 hours.
+
 Every successful command emits the canonical Operation output JSON. Exit code
 `1` identifies an expected missing or Operation-conflict outcome; exit code
 `2` identifies invalid invocation or input, missing configuration, an AWS
@@ -196,14 +201,21 @@ failure, or an internal failure. Create and update conflicts both emit
 `operation: operation conflict`.
 
 The persistent item contains exactly `id`, `name`, `state`, `last_updated`,
-`hash`, and an optional terminal `result`; it never contains `body`. Creates
-use `attribute_not_exists(id)` and request the existing item on a failed
-condition so matching retries need no separate read. Updates first perform a
-strongly consistent read and then condition on the complete snapshot, so a
-concurrent change is reported instead of overwritten. Updates preserve `id`,
-`name`, and `hash`. DynamoDB keeps `result` as an `S` attribute containing the
-compact `std.json.Value` serialization. Reads reject malformed, oversized,
-duplicate-key, explicit-null, or noncanonical stored result strings.
+`expires_at`, `hash`, and an optional terminal `result`; it never contains
+`body`. Creates use `attribute_not_exists(id)` and request the existing item on
+a failed condition so matching retries need no separate read. Updates first
+perform a strongly consistent read and then condition on the complete snapshot,
+including `expires_at`, so a concurrent change is reported instead of
+overwritten. Updates preserve `id`, `name`, and `hash`. DynamoDB keeps `result`
+as an `S` attribute containing the compact `std.json.Value` serialization.
+Reads reject malformed, oversized, duplicate-key, explicit-null, or
+noncanonical stored result strings.
+
+The SAM table enables native DynamoDB TTL on `expires_at`. Expiration is
+best-effort: an Operation becomes eligible for deletion after 24 hours but may
+remain readable until DynamoDB removes it asynchronously. The item contract is
+strict, so records created before `expires_at` was introduced must be removed,
+recreated, or backfilled separately before this version reads them.
 
 The Lambda Function URL requires the token in an HTTP authorization header:
 
@@ -314,8 +326,9 @@ curl -L \
   <FunctionUrl>
 ```
 
-For a new ID, the response has `NEW` state, the invocation timestamp, and the
-stable BLAKE3-256 operation hash. The input body is intentionally omitted:
+For a new ID, the response has `NEW` state, the invocation timestamp, its
+24-hour expiry, and the stable BLAKE3-256 operation hash. The input body is
+intentionally omitted:
 
 ```json
 {
@@ -323,12 +336,13 @@ stable BLAKE3-256 operation hash. The input body is intentionally omitted:
   "name": "echo",
   "state": "NEW",
   "last_updated": 1700000000,
+  "expires_at": 1700086400,
   "hash": "ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662"
 }
 ```
 
 The POST is persisted before the response is generated. Retrying the same ID,
-name, and body returns the latest stored state, timestamp, terminal result when
+name, and body returns the latest stored state, timestamps, terminal result when
 present, and hash. Reusing the ID for different work returns `409 Conflict`.
 
 The template intentionally creates a publicly reachable Function URL for demo
