@@ -221,7 +221,7 @@ DynamoDB, so those failures are returned as sanitized HTTP 500 responses.
 
 ## Deploy
 
-The preferred deployment path is AWS SAM:
+The supported deployment path is AWS SAM:
 
 ```sh
 sam validate --template-file template.yaml --region ca-central-1

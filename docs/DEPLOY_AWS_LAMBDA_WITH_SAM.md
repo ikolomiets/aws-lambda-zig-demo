@@ -41,6 +41,12 @@ Expected ARN shape:
 arn:aws:sts::<account-id>:assumed-role/AWSReservedSSO_.../<user>
 ```
 
+When using `deploy.sh`, this refresh is automatic when needed. Before building,
+the helper verifies the selected profile with STS. If a directly configured SSO
+profile has expired, it runs `aws sso login --profile <profile>` once and then
+verifies the profile again. Direct `sam` and `aws` commands in this guide still
+require an active session.
+
 ## 2. Build and package the Zig Lambda
 
 Build the stripped, single-threaded, ReleaseSafe Lambda executable for AWS
@@ -322,6 +328,13 @@ Lambda environment. Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run` to run the
 local checks, rebuild `lambda.zip`, and validate `template.yaml` without
 deploying to AWS.
+
+For non-dry-run deployments, the helper verifies the selected AWS profile before
+starting local work. When verification fails for a profile configured with
+`sso_session` or the legacy `sso_start_url`, it runs one interactive
+`aws sso login`, retries STS once, and stops if either step fails. Non-SSO
+profile failures stop without attempting SSO login. Dry runs make no AWS
+authentication calls.
 
 After a successful deployment, `deploy.sh` reads the
 `OperationsTableName` stack output, waits for the table to exist, and prints a

@@ -34,6 +34,10 @@ Options:
 Environment overrides:
   PROFILE, REGION, STACK_NAME, FUNCTION_NAME, LAMBDA_PRINCIPAL,
   PASETO_PRIVATE_KEY, PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT
+
+Authentication:
+  Non-dry-run deployments verify the selected profile before building. If an
+  SSO-backed profile is expired, the script runs aws sso login once and retries.
 EOF
 }
 
@@ -53,6 +57,44 @@ need_value() {
 
 need_command() {
     command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
+}
+
+profile_uses_sso() {
+    local profile="$1"
+
+    if aws configure get sso_session --profile "$profile" >/dev/null 2>&1; then
+        return 0
+    fi
+    aws configure get sso_start_url --profile "$profile" >/dev/null 2>&1
+}
+
+verify_aws_profile() {
+    local profile="$1"
+
+    printf '==> Verifying AWS profile %s\n' "$profile"
+    if aws sts get-caller-identity \
+        --profile "$profile" \
+        --query Arn \
+        --output text \
+        >/dev/null 2>&1
+    then
+        return 0
+    fi
+
+    profile_uses_sso "$profile" ||
+        fail "AWS profile check failed for non-SSO profile $profile"
+
+    printf '==> Refreshing AWS SSO session for profile %s\n' "$profile"
+    aws sso login --profile "$profile" ||
+        fail "AWS SSO login failed for profile $profile"
+
+    printf '==> Re-verifying AWS profile %s\n' "$profile"
+    aws sts get-caller-identity \
+        --profile "$profile" \
+        --query Arn \
+        --output text \
+        >/dev/null ||
+        fail "AWS profile check failed after SSO login for profile $profile"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -133,10 +175,7 @@ cd "$(dirname "$0")"
 
 if [ "$DRY_RUN" -eq 0 ]; then
     need_command aws
-
-    printf '==> Verifying AWS profile %s\n' "$PROFILE"
-    aws sts get-caller-identity --profile "$PROFILE" --query Arn --output text >/dev/null ||
-        fail "AWS profile check failed. Run: aws sso login --profile $PROFILE"
+    verify_aws_profile "$PROFILE"
 fi
 
 [ -n "$PASETO_PUBLIC_KEY" ] ||

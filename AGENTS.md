@@ -4,8 +4,8 @@
 
 This repository is a small Zig 0.16.0 AWS Lambda example. The root build files
 define the Lambda bootstrap executable, application code lives in `src/`, AWS
-deployment material lives in `template.yaml` and `docs/`, and the vendored
-`aws_lambda` dependency is under `zig-pkg/`.
+deployment material lives in `template.yaml`, `deploy.sh`, and `docs/`, and the
+vendored `aws_lambda` dependency is under `zig-pkg/`.
 
 Use these sources in order:
 
@@ -14,9 +14,8 @@ Use these sources in order:
 - `src/main.zig` is the Lambda entrypoint and request handler.
 - `template.yaml` defines the SAM-managed Lambda, Function URL, permissions,
   memory, timeout, runtime, and architecture.
-- `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md` documents the preferred deployment flow.
-- `docs/DEPLOY_AWS_LAMBDA_WITH_CLI.md` documents the equivalent manual AWS CLI
-  deployment flow.
+- `deploy.sh` implements the supported automated AWS SAM deployment flow.
+- `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md` documents the supported deployment flow.
 - `docs/TIGER_STYLE.md` is the mandatory coding style reference.
 
 ## Coding Style
@@ -50,8 +49,8 @@ Keep the project small. The current application has a single handler in
 `src/main.zig`; do not add modules, layers, or helper packages until there is
 real behavior that needs that structure.
 
-Before changing deployment behavior, read both the SAM template and the relevant
-deployment doc. Public Function URL settings are intentionally demo-oriented;
+Before changing deployment behavior, read the SAM template, deployment helper,
+and SAM deployment doc. Public Function URL settings are intentionally demo-oriented;
 do not widen IAM, CORS, runtime, timeout, memory, region, or profile assumptions
 without updating the matching documentation and calling out the operational
 effect.
@@ -71,8 +70,8 @@ Keep changes scoped and update only affected files:
   `build.zig.zon` as appropriate, then run formatting and build validation.
 - SAM resources, permissions, function settings, or outputs: update
   `template.yaml` and `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md`.
-- Manual AWS CLI deployment behavior: update
-  `docs/DEPLOY_AWS_LAMBDA_WITH_CLI.md`.
+- Deployment helper behavior: update `deploy.sh` and
+  `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md`.
 - Deployment artifact expectations: update the affected deployment docs.
 - Any Zig code change: verify it still follows `docs/TIGER_STYLE.md`.
 
