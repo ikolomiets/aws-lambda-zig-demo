@@ -3,10 +3,14 @@ const aws = @import("aws");
 const dynamodb = @import("dynamodb");
 const lambda = @import("aws-lambda");
 const operation = @import("operation");
+const operation_persistence = @import("operation_persistence");
 const paseto = @import("paseto");
+
+const Allocator = std.mem.Allocator;
 
 const authorization_header_count_max = 256;
 const bad_request_body = "Bad Request\n";
+const conflict_body = "Conflict\n";
 const content_type_json = "application/json";
 const content_type_text = "text/plain; charset=utf-8";
 const environment_count_max = 512;
@@ -18,11 +22,25 @@ const method_not_allowed_body = "Method Not Allowed\n";
 const redacted_value = "<redacted>";
 const unauthorized_body = "Unauthorized\n";
 
+var runtime_operation_creator: ?OperationCreator = null;
+
 pub fn main(init: std.process.Init) void {
+    var resources: RuntimeResources = undefined;
+    resources.init(init) catch |err| {
+        std.log.err("Lambda initialization failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer resources.deinit();
+
+    installRuntimeOperationCreator(OperationCreator.init(&resources.persistence));
+    defer uninstallRuntimeOperationCreator();
     lambda.handle(init, handler, .{});
 }
 
 fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
+    const creator = runtime_operation_creator orelse {
+        return error.PersistenceNotInitialized;
+    };
     const now = std.Io.Clock.real.now(ctx.io).toSeconds();
     return handleInvocation(
         ctx.arena,
@@ -30,25 +48,127 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
         ctx.config,
         ctx.request,
         @field(ctx, "_").kv,
+        creator,
         now,
     );
 }
 
+const RuntimeResources = struct {
+    config: aws.Config,
+    client: dynamodb.Client,
+    persistence: operation_persistence.Persistence,
+
+    fn init(resources: *RuntimeResources, process_init: std.process.Init) !void {
+        const table_name = configuredTableName(process_init.environ_map) catch {
+            return error.InvalidTableConfiguration;
+        };
+        resources.config = aws.Config.load(
+            process_init.gpa,
+            process_init.io,
+            process_init.environ_map,
+            .{},
+        ) catch return error.AWSConfigurationFailure;
+        errdefer resources.config.deinit();
+
+        resources.client = dynamodb.Client.init(process_init.gpa, &resources.config);
+        errdefer resources.client.deinit();
+        resources.persistence = operation_persistence.Persistence.init(
+            &resources.client,
+            table_name,
+        ) catch return error.PersistenceConfigurationFailure;
+
+        std.debug.assert(resources.client.config == &resources.config);
+        std.debug.assert(resources.persistence.client == &resources.client);
+    }
+
+    fn deinit(resources: *RuntimeResources) void {
+        resources.persistence.deinit();
+        resources.client.deinit();
+        resources.config.deinit();
+        resources.* = undefined;
+    }
+};
+
+fn configuredTableName(environment: *const std.process.Environ.Map) ![]const u8 {
+    const table_name = environment.get("OPERATIONS_TABLE_NAME") orelse {
+        return error.InvalidTableConfiguration;
+    };
+    operation_persistence.validateTableName(table_name) catch {
+        return error.InvalidTableConfiguration;
+    };
+    std.debug.assert(table_name.len >= 3);
+    std.debug.assert(table_name.len <= 255);
+    return table_name;
+}
+
+const OperationCreator = struct {
+    context: *anyopaque,
+    create_fn: *const fn (
+        *anyopaque,
+        Allocator,
+        Allocator,
+        *const operation.Operation,
+    ) anyerror!operation.Operation,
+
+    fn init(pointer: anytype) OperationCreator {
+        const Pointer = @TypeOf(pointer);
+        const pointer_info = @typeInfo(Pointer);
+        comptime std.debug.assert(pointer_info == .pointer);
+        comptime std.debug.assert(pointer_info.pointer.size == .one);
+
+        const Adapter = struct {
+            fn create(
+                context: *anyopaque,
+                allocator: Allocator,
+                temporary: Allocator,
+                source: *const operation.Operation,
+            ) anyerror!operation.Operation {
+                const self: Pointer = @ptrCast(@alignCast(context));
+                return self.create(allocator, temporary, source);
+            }
+        };
+        return .{ .context = pointer, .create_fn = Adapter.create };
+    }
+
+    fn create(
+        creator: OperationCreator,
+        allocator: Allocator,
+        temporary: Allocator,
+        source: *const operation.Operation,
+    ) !operation.Operation {
+        return creator.create_fn(creator.context, allocator, temporary, source);
+    }
+};
+
+fn installRuntimeOperationCreator(creator: OperationCreator) void {
+    std.debug.assert(runtime_operation_creator == null);
+    runtime_operation_creator = creator;
+    std.debug.assert(runtime_operation_creator != null);
+}
+
+fn uninstallRuntimeOperationCreator() void {
+    std.debug.assert(runtime_operation_creator != null);
+    runtime_operation_creator = null;
+    std.debug.assert(runtime_operation_creator == null);
+}
+
 fn handleInvocation(
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     event: []const u8,
     cfg: lambda.Context.ConfigMeta,
     req: lambda.Context.RequestMeta,
     env: *const std.process.Environ.Map,
+    creator: OperationCreator,
     now: i64,
 ) []const u8 {
-    const outcome = invocationOutcome(allocator, event, cfg, req, env, now);
+    const outcome = invocationOutcome(allocator, event, cfg, req, env, creator, now);
     return encodeOutcome(allocator, outcome) catch internal_server_error_response;
 }
 
 const InvocationOutcome = union(enum) {
     success: Success,
     bad_request,
+    conflict,
     method_not_allowed,
     unauthorized,
     internal_server_error,
@@ -60,11 +180,12 @@ const Success = struct {
 };
 
 fn invocationOutcome(
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     event: []const u8,
     cfg: lambda.Context.ConfigMeta,
     req: lambda.Context.RequestMeta,
     env: *const std.process.Environ.Map,
+    creator: OperationCreator,
     now: i64,
 ) InvocationOutcome {
     const request = lambda.url.parseRequest(allocator, event) catch {
@@ -91,7 +212,7 @@ fn invocationOutcome(
     };
     return switch (method) {
         .GET => get_invocation_outcome(allocator, claims.sub, cfg, req, env),
-        .POST => post_invocation_outcome(allocator, &request, now),
+        .POST => post_invocation_outcome(allocator, &request, creator, now),
         else => .method_not_allowed,
     };
 }
@@ -113,8 +234,9 @@ fn get_invocation_outcome(
 }
 
 fn post_invocation_outcome(
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     request: *const lambda.url.Request,
+    creator: OperationCreator,
     now: operation.UnixSeconds,
 ) InvocationOutcome {
     const input_json = request.body orelse return .bad_request;
@@ -132,7 +254,13 @@ fn post_invocation_outcome(
     defer allocator.free(parsed.name);
     defer allocator.free(parsed.body.?);
 
-    const body = post_handler_body(allocator, &parsed) catch {
+    const created = creator.create(allocator, allocator, &parsed) catch |err| {
+        return switch (err) {
+            error.OperationConflict => .conflict,
+            else => .internal_server_error,
+        };
+    };
+    const body = operation_output_body(allocator, &created) catch {
         return .internal_server_error;
     };
     return .{ .success = .{
@@ -141,16 +269,17 @@ fn post_invocation_outcome(
     } };
 }
 
-fn post_handler_body(
-    allocator: std.mem.Allocator,
-    parsed: *const operation.Operation,
+fn operation_output_body(
+    allocator: Allocator,
+    persisted: *const operation.Operation,
 ) ![]const u8 {
-    std.debug.assert(parsed.state == .new);
-    std.debug.assert(parsed.last_updated != null);
+    std.debug.assert(persisted.body == null);
+    std.debug.assert(persisted.state != null);
+    std.debug.assert(persisted.last_updated != null);
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    try operation.writeOutputJSON(allocator, &output.writer, parsed);
+    try operation.writeOutputJSON(allocator, &output.writer, persisted);
     std.debug.assert(output.written().len > 0);
     return output.toOwnedSlice();
 }
@@ -205,6 +334,11 @@ fn encodeOutcome(
             .content_type = content_type_text,
             .status_code = .bad_request,
             .body = .{ .textual = bad_request_body },
+        }),
+        .conflict => lambda.url.encodeResponse(allocator, .{
+            .content_type = content_type_text,
+            .status_code = .conflict,
+            .body = .{ .textual = conflict_body },
         }),
         .method_not_allowed => lambda.url.encodeResponse(allocator, .{
             .content_type = content_type_text,
@@ -416,11 +550,123 @@ fn writerCountToUsize(count: u64) !usize {
     return std.math.cast(usize, count) orelse return error.BodyTooLarge;
 }
 
+const FakePersistence = struct {
+    response: ?operation.Operation = null,
+    create_error: ?anyerror = null,
+    create_count: u8 = 0,
+    last_id: u128 = 0,
+    last_state: ?operation.State = null,
+    last_updated: ?operation.UnixSeconds = null,
+    last_hash: ?[32]u8 = null,
+    last_name_buffer: [operation.name_size_max]u8 = undefined,
+    last_name_len: u8 = 0,
+    last_body_buffer: [operation.body_size_max]u8 = undefined,
+    last_body_len: u16 = 0,
+
+    fn create(
+        fake: *FakePersistence,
+        _: Allocator,
+        _: Allocator,
+        source: *const operation.Operation,
+    ) !operation.Operation {
+        std.debug.assert(fake.create_count < 32);
+        std.debug.assert(source.name.len <= fake.last_name_buffer.len);
+        std.debug.assert(source.body.?.len <= fake.last_body_buffer.len);
+        fake.create_count += 1;
+        fake.last_id = source.id;
+        fake.last_state = source.state;
+        fake.last_updated = source.last_updated;
+        fake.last_hash = source.hash;
+        fake.last_name_len = @intCast(source.name.len);
+        @memcpy(fake.last_name_buffer[0..source.name.len], source.name);
+        fake.last_body_len = @intCast(source.body.?.len);
+        @memcpy(fake.last_body_buffer[0..source.body.?.len], source.body.?);
+
+        if (fake.create_error) |err| return err;
+        if (fake.response) |response| return response;
+        var created = source.*;
+        created.body = null;
+        std.debug.assert(created.body == null);
+        return created;
+    }
+
+    fn lastName(fake: *const FakePersistence) []const u8 {
+        return fake.last_name_buffer[0..fake.last_name_len];
+    }
+
+    fn lastBody(fake: *const FakePersistence) []const u8 {
+        return fake.last_body_buffer[0..fake.last_body_len];
+    }
+};
+
+fn handleInvocationForTest(
+    allocator: Allocator,
+    event: []const u8,
+    cfg: lambda.Context.ConfigMeta,
+    req: lambda.Context.RequestMeta,
+    env: *const std.process.Environ.Map,
+    fake: *FakePersistence,
+    now: i64,
+) []const u8 {
+    return handleInvocation(
+        allocator,
+        event,
+        cfg,
+        req,
+        env,
+        OperationCreator.init(fake),
+        now,
+    );
+}
+
 test "AWS SDK exposes runtime configuration and DynamoDB client types" {
     comptime {
         std.debug.assert(@TypeOf(aws.Config) == type);
         std.debug.assert(@TypeOf(dynamodb.Client) == type);
     }
+}
+
+test "operations table configuration is mandatory and syntactically valid" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+
+    try std.testing.expectError(
+        error.InvalidTableConfiguration,
+        configuredTableName(&environment),
+    );
+    const invalid_names = [_][]const u8{
+        "",
+        "ab",
+        "operations/table",
+        "operations table",
+        "a" ** 256,
+    };
+    for (invalid_names) |table_name| {
+        try environment.put("OPERATIONS_TABLE_NAME", table_name);
+        try std.testing.expectError(
+            error.InvalidTableConfiguration,
+            configuredTableName(&environment),
+        );
+    }
+}
+
+test "valid table configuration binds persistence to the shared client" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("OPERATIONS_TABLE_NAME", "operations-table.1");
+
+    var config: aws.Config = undefined;
+    var client = dynamodb.Client.init(std.testing.allocator, &config);
+    defer client.deinit();
+    var persistence = try operation_persistence.Persistence.init(
+        &client,
+        try configuredTableName(&environment),
+    );
+    defer persistence.deinit();
+
+    try std.testing.expect(persistence.client == &client);
+    try std.testing.expect(client.config == &config);
+    try std.testing.expectEqualStrings("operations-table.1", persistence.table_name);
 }
 
 test "config metadata body includes config fields" {
@@ -593,6 +839,7 @@ test "valid credentials include subject greeting and accept case insensitive aut
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try putTestPublicKey(&environment, key_pair.public_key);
+    var fake: FakePersistence = .{};
 
     const expected_body = try get_handler_body(
         std.testing.allocator,
@@ -623,12 +870,13 @@ test "valid credentials include subject greeting and accept case insensitive aut
                 token,
             );
             defer std.testing.allocator.free(event);
-            const response = handleInvocation(
+            const response = handleInvocationForTest(
                 std.testing.allocator,
                 event,
                 .{},
                 .{},
                 &environment,
+                &fake,
                 1000,
             );
             defer std.testing.allocator.free(response);
@@ -636,6 +884,7 @@ test "valid credentials include subject greeting and accept case insensitive aut
             try expectContains(response, "Hello, lambda-test-user!");
         }
     }
+    try std.testing.expectEqual(@as(u8, 0), fake.create_count);
 }
 
 test "authenticated POST returns a new operation without its body" {
@@ -662,6 +911,7 @@ test "authenticated POST returns a new operation without its body" {
         "\\\"hash\\\":\\\"ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662\\\"}\"}";
 
     for (inputs) |input| {
+        var fake: FakePersistence = .{};
         const event = try test_authorization_request_event(
             std.testing.allocator,
             .POST,
@@ -671,12 +921,13 @@ test "authenticated POST returns a new operation without its body" {
             input,
         );
         defer std.testing.allocator.free(event);
-        const response = handleInvocation(
+        const response = handleInvocationForTest(
             std.testing.allocator,
             event,
             .{},
             .{},
             &environment,
+            &fake,
             1_700_000_000,
         );
         defer std.testing.allocator.free(response);
@@ -684,7 +935,213 @@ test "authenticated POST returns a new operation without its body" {
         try std.testing.expectEqualStrings(expected, response);
         try expectNotContains(response, "message");
         try expectNotContains(response, "count");
+        try std.testing.expectEqual(@as(u8, 1), fake.create_count);
+        try std.testing.expectEqual(
+            operation.uuidFromString("00112233-4455-6677-8899-aabbccddeeff") catch unreachable,
+            fake.last_id,
+        );
+        try std.testing.expectEqual(operation.State.new, fake.last_state.?);
+        try std.testing.expectEqual(@as(i64, 1_700_000_000), fake.last_updated.?);
+        try std.testing.expectEqualStrings("echo", fake.lastName());
+        try std.testing.expectEqualStrings(
+            "{\"message\":\"hello\",\"count\":2}",
+            fake.lastBody(),
+        );
+        var expected_hash: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(
+            &expected_hash,
+            "ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662",
+        );
+        try std.testing.expectEqualSlices(u8, &expected_hash, &fake.last_hash.?);
     }
+}
+
+test "matching POST retry returns the latest stored persistent view" {
+    var key_pair = testKeyPair(0x45);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1_700_000_000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+
+    var expected_hash: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(
+        &expected_hash,
+        "ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662",
+    );
+    var fake = FakePersistence{ .response = .{
+        .id = operation.uuidFromString(
+            "00112233-4455-6677-8899-aabbccddeeff",
+        ) catch unreachable,
+        .name = "echo",
+        .state = .succeeded,
+        .last_updated = 1_700_000_123,
+        .result = "{\"message\":\"done\"}",
+        .hash = expected_hash,
+    } };
+    const input =
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+        "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
+    const event = try test_authorization_request_event(
+        std.testing.allocator,
+        .POST,
+        "Authorization",
+        "Bearer",
+        token,
+        input,
+    );
+    defer std.testing.allocator.free(event);
+    const response = handleInvocationForTest(
+        std.testing.allocator,
+        event,
+        .{},
+        .{},
+        &environment,
+        &fake,
+        1_700_000_000,
+    );
+    defer std.testing.allocator.free(response);
+
+    const expected =
+        "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
+        "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
+        "\\\"name\\\":\\\"echo\\\",\\\"state\\\":\\\"SUCCEEDED\\\"," ++
+        "\\\"last_updated\\\":1700000123," ++
+        "\\\"result\\\":{\\\"message\\\":\\\"done\\\"}," ++
+        "\\\"hash\\\":\\\"ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662\\\"}\"}";
+    try std.testing.expectEqualStrings(expected, response);
+    try std.testing.expectEqual(@as(u8, 1), fake.create_count);
+}
+
+test "POST conflict returns only the static conflict response" {
+    var key_pair = testKeyPair(0x46);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+    var fake = FakePersistence{ .create_error = error.OperationConflict };
+    const event = try test_authorization_request_event(
+        std.testing.allocator,
+        .POST,
+        "Authorization",
+        "Bearer",
+        token,
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"name\":\"conflict-marker\",\"body\":true}",
+    );
+    defer std.testing.allocator.free(event);
+    const response = handleInvocationForTest(
+        std.testing.allocator,
+        event,
+        .{},
+        .{},
+        &environment,
+        &fake,
+        1000,
+    );
+    defer std.testing.allocator.free(response);
+
+    try expectConflict(response);
+    try expectNotContains(response, "conflict-marker");
+    try std.testing.expectEqual(@as(u8, 1), fake.create_count);
+}
+
+test "POST persistence failures return only the static internal error" {
+    var key_pair = testKeyPair(0x47);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+    const event = try test_authorization_request_event(
+        std.testing.allocator,
+        .POST,
+        "Authorization",
+        "Bearer",
+        token,
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"name\":\"failure-marker\",\"body\":true}",
+    );
+    defer std.testing.allocator.free(event);
+
+    const failures = [_]anyerror{
+        error.AWSFailure,
+        error.InvalidItem,
+        error.ConnectionFailed,
+        error.OutOfMemory,
+    };
+    for (failures) |failure| {
+        var fake = FakePersistence{ .create_error = failure };
+        const response = handleInvocationForTest(
+            std.testing.allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            &fake,
+            1000,
+        );
+        defer std.testing.allocator.free(response);
+
+        try expectInternalServerError(response);
+        try expectNotContains(response, "failure-marker");
+        try std.testing.expectEqual(@as(u8, 1), fake.create_count);
+    }
+}
+
+test "warm invocations reuse one adapter without retaining request data" {
+    var key_pair = testKeyPair(0x48);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+    var fake: FakePersistence = .{};
+    const creator = OperationCreator.init(&fake);
+    const inputs = [_][]const u8{
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"name\":\"first-operation\",\"body\":{\"value\":1}}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeef0\"," ++
+            "\"name\":\"second-operation\",\"body\":{\"value\":2}}",
+    };
+
+    for (inputs, 0..) |input, index| {
+        const event = try test_authorization_request_event(
+            std.testing.allocator,
+            .POST,
+            "Authorization",
+            "Bearer",
+            token,
+            input,
+        );
+        defer std.testing.allocator.free(event);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const response = handleInvocation(
+            arena.allocator(),
+            event,
+            .{},
+            .{},
+            &environment,
+            creator,
+            1000 + @as(i64, @intCast(index)),
+        );
+        if (index == 0) {
+            try expectContains(response, "first-operation");
+            try expectNotContains(response, "second-operation");
+        } else {
+            try expectContains(response, "second-operation");
+            try expectNotContains(response, "first-operation");
+        }
+    }
+    try std.testing.expectEqual(@as(u8, 2), fake.create_count);
+    try std.testing.expectEqualStrings("second-operation", fake.lastName());
+    try std.testing.expectEqualStrings("{\"value\":2}", fake.lastBody());
 }
 
 test "authenticated POST rejects missing and invalid operation JSON" {
@@ -695,6 +1152,7 @@ test "authenticated POST rejects missing and invalid operation JSON" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try putTestPublicKey(&environment, key_pair.public_key);
+    var fake: FakePersistence = .{};
 
     const invalid_inputs = [_]?[]const u8{
         null,
@@ -713,12 +1171,13 @@ test "authenticated POST rejects missing and invalid operation JSON" {
             input,
         );
         defer std.testing.allocator.free(event);
-        const response = handleInvocation(
+        const response = handleInvocationForTest(
             std.testing.allocator,
             event,
             .{},
             .{},
             &environment,
+            &fake,
             1000,
         );
         defer std.testing.allocator.free(response);
@@ -727,6 +1186,7 @@ test "authenticated POST rejects missing and invalid operation JSON" {
         try expectNotContains(response, "invalid-json-marker");
         try expectNotContains(response, "SUBMITTED");
     }
+    try std.testing.expectEqual(@as(u8, 0), fake.create_count);
 }
 
 test "authentication precedes method routing" {
@@ -737,6 +1197,7 @@ test "authentication precedes method routing" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try putTestPublicKey(&environment, key_pair.public_key);
+    var fake: FakePersistence = .{};
 
     const unsupported_event = try test_authorization_request_event(
         std.testing.allocator,
@@ -747,12 +1208,13 @@ test "authentication precedes method routing" {
         null,
     );
     defer std.testing.allocator.free(unsupported_event);
-    const unsupported_response = handleInvocation(
+    const unsupported_response = handleInvocationForTest(
         std.testing.allocator,
         unsupported_event,
         .{},
         .{},
         &environment,
+        &fake,
         1000,
     );
     defer std.testing.allocator.free(unsupported_response);
@@ -764,12 +1226,13 @@ test "authentication precedes method routing" {
         .{token},
     );
     defer std.testing.allocator.free(missing_method_event);
-    const missing_method_response = handleInvocation(
+    const missing_method_response = handleInvocationForTest(
         std.testing.allocator,
         missing_method_event,
         .{},
         .{},
         &environment,
+        &fake,
         1000,
     );
     defer std.testing.allocator.free(missing_method_response);
@@ -780,30 +1243,34 @@ test "authentication precedes method routing" {
         "{\"requestContext\":{\"http\":{\"method\":\"PUT\"}}}",
     };
     for (unauthenticated_events) |event| {
-        const response = handleInvocation(
+        const response = handleInvocationForTest(
             std.testing.allocator,
             event,
             .{},
             .{},
             &environment,
+            &fake,
             1000,
         );
         defer std.testing.allocator.free(response);
         try expectUnauthorized(response);
     }
+    try std.testing.expectEqual(@as(u8, 0), fake.create_count);
 }
 
 test "missing and malformed credentials return a Bearer challenge" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
+    var fake: FakePersistence = .{};
     const missing_event =
         "{\"version\":\"2.0\",\"routeKey\":\"$default\",\"headers\":{}}";
-    const missing_response = handleInvocation(
+    const missing_response = handleInvocationForTest(
         std.testing.allocator,
         missing_event,
         .{},
         .{},
         &environment,
+        &fake,
         1000,
     );
     defer std.testing.allocator.free(missing_response);
@@ -825,12 +1292,13 @@ test "missing and malformed credentials return a Bearer challenge" {
             .{value},
         );
         defer std.testing.allocator.free(event);
-        const response = handleInvocation(
+        const response = handleInvocationForTest(
             std.testing.allocator,
             event,
             .{},
             .{},
             &environment,
+            &fake,
             1000,
         );
         defer std.testing.allocator.free(response);
@@ -840,16 +1308,18 @@ test "missing and malformed credentials return a Bearer challenge" {
     const duplicate_event =
         "{\"headers\":{\"Authorization\":\"Bearer one\"," ++
         "\"authorization\":\"Bearer two\"}}";
-    const duplicate_response = handleInvocation(
+    const duplicate_response = handleInvocationForTest(
         std.testing.allocator,
         duplicate_event,
         .{},
         .{},
         &environment,
+        &fake,
         1000,
     );
     defer std.testing.allocator.free(duplicate_response);
     try expectUnauthorized(duplicate_response);
+    try std.testing.expectEqual(@as(u8, 0), fake.create_count);
 }
 
 test "wrong and expired tokens return a sanitized unauthorized response" {
@@ -864,6 +1334,7 @@ test "wrong and expired tokens return a sanitized unauthorized response" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try putTestPublicKey(&environment, key_pair.public_key);
+    var fake: FakePersistence = .{};
 
     const tokens = [_][]const u8{ wrong_token, expired_token };
     for (tokens) |token| {
@@ -874,18 +1345,20 @@ test "wrong and expired tokens return a sanitized unauthorized response" {
             token,
         );
         defer std.testing.allocator.free(event);
-        const response = handleInvocation(
+        const response = handleInvocationForTest(
             std.testing.allocator,
             event,
             .{},
             .{},
             &environment,
+            &fake,
             1001,
         );
         defer std.testing.allocator.free(response);
         try expectUnauthorized(response);
         try expectNotContains(response, token);
     }
+    try std.testing.expectEqual(@as(u8, 0), fake.create_count);
 }
 
 test "missing and invalid public key configuration return sanitized errors" {
@@ -900,15 +1373,17 @@ test "missing and invalid public key configuration return sanitized errors" {
         token,
     );
     defer std.testing.allocator.free(event);
+    var fake: FakePersistence = .{};
 
     var missing_environment = std.process.Environ.Map.init(std.testing.allocator);
     defer missing_environment.deinit();
-    const missing_response = handleInvocation(
+    const missing_response = handleInvocationForTest(
         std.testing.allocator,
         event,
         .{},
         .{},
         &missing_environment,
+        &fake,
         1000,
     );
     defer std.testing.allocator.free(missing_response);
@@ -918,30 +1393,34 @@ test "missing and invalid public key configuration return sanitized errors" {
     var invalid_environment = std.process.Environ.Map.init(std.testing.allocator);
     defer invalid_environment.deinit();
     try invalid_environment.put("PASETO_PUBLIC_KEY", key_marker);
-    const invalid_response = handleInvocation(
+    const invalid_response = handleInvocationForTest(
         std.testing.allocator,
         event,
         .{},
         .{},
         &invalid_environment,
+        &fake,
         1000,
     );
     defer std.testing.allocator.free(invalid_response);
     try expectInternalServerError(invalid_response);
     try expectNotContains(invalid_response, key_marker);
     try expectNotContains(invalid_response, token);
+    try std.testing.expectEqual(@as(u8, 0), fake.create_count);
 }
 
 test "internal failures return only the static sanitized response" {
     const event_marker = "malformed-event-marker";
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    const malformed_response = handleInvocation(
+    var fake: FakePersistence = .{};
+    const malformed_response = handleInvocationForTest(
         std.testing.allocator,
         "{\"headers\":" ++ event_marker,
         .{},
         .{},
         &environment,
+        &fake,
         1000,
     );
     defer std.testing.allocator.free(malformed_response);
@@ -952,18 +1431,20 @@ test "internal failures return only the static sanitized response" {
         std.testing.allocator,
         .{ .fail_index = 0 },
     );
-    const allocation_response = handleInvocation(
+    const allocation_response = handleInvocationForTest(
         failing_allocator.allocator(),
         "{}",
         .{},
         .{},
         &environment,
+        &fake,
         1000,
     );
     try std.testing.expectEqualStrings(
         internal_server_error_response,
         allocation_response,
     );
+    try std.testing.expectEqual(@as(u8, 0), fake.create_count);
 }
 
 fn testAuthorizationEvent(
@@ -1072,6 +1553,14 @@ fn expectBadRequest(response: []const u8) !void {
     try std.testing.expectEqualStrings(
         "{\"statusCode\":400,\"headers\":{\"Content-Type\":\"" ++ content_type_text ++
             "\"},\"body\":\"Bad Request\\n\"}",
+        response,
+    );
+}
+
+fn expectConflict(response: []const u8) !void {
+    try std.testing.expectEqualStrings(
+        "{\"statusCode\":409,\"headers\":{\"Content-Type\":\"" ++ content_type_text ++
+            "\"},\"body\":\"Conflict\\n\"}",
         response,
     );
 }

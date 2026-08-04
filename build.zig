@@ -36,6 +36,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/operation.zig"),
     });
+    const lambda_operation_persistence = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/operation_persistence.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
+            .{ .name = "dynamodb", .module = lambda_dynamodb },
+            .{ .name = "operation", .module = lambda_operation },
+        },
+    });
 
     const lambda_mod = b.createModule(.{
         .target = lambda_target,
@@ -48,6 +58,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "aws-lambda", .module = lambda_runtime },
             .{ .name = "dynamodb", .module = lambda_dynamodb },
             .{ .name = "operation", .module = lambda_operation },
+            .{ .name = "operation_persistence", .module = lambda_operation_persistence },
             .{ .name = "paseto", .module = lambda_paseto },
         },
     });
@@ -136,6 +147,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "aws-lambda", .module = test_runtime },
             .{ .name = "dynamodb", .module = host_dynamodb },
             .{ .name = "operation", .module = host_operation },
+            .{ .name = "operation_persistence", .module = host_operation_persistence },
             .{ .name = "paseto", .module = host_paseto },
         },
     });

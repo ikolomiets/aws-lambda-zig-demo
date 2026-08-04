@@ -34,6 +34,10 @@ pub const Persistence = struct {
         return .{ .client = client, .table_name = table_name };
     }
 
+    pub fn deinit(self: *Self) void {
+        self.* = undefined;
+    }
+
     /// Creates an item or returns the matching existing item for an idempotent retry.
     pub fn create(
         self: *Self,
@@ -394,7 +398,7 @@ fn readError(err: anyerror, diagnostic: *dynamodb.ServiceError) anyerror {
     return error.AWSFailure;
 }
 
-fn validateTableName(table_name: []const u8) !void {
+pub fn validateTableName(table_name: []const u8) !void {
     if (table_name.len < 3) return error.InvalidTableName;
     if (table_name.len > 255) return error.InvalidTableName;
     for (table_name) |character| {

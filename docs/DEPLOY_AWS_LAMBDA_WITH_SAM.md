@@ -130,10 +130,18 @@ Environment:
 The inline policy grants the function only `GetItem`, `PutItem`, and
 `UpdateItem` access to this stack's operations table. The
 `OPERATIONS_TABLE_NAME` environment variable contains the
-CloudFormation-generated physical table name. The host-native `operation` CLI
-uses the active persistence adapter and the same table contract. The current
-Lambda handler still validates and returns POST input without calling
-DynamoDB.
+CloudFormation-generated physical table name. These resources are mandatory:
+the bootstrap validates the table name, loads AWS configuration, creates one
+DynamoDB client, and binds one persistence adapter before starting the Lambda
+invocation loop. Missing or invalid table configuration therefore prevents all
+invocation handling, including GET. The client, its HTTP connection pool, and
+the adapter are reused across warm invocations. The host-native `operation` CLI
+uses the same adapter and table contract.
+
+Startup validation does not call `DescribeTable` or make a DynamoDB health
+check. A missing table or insufficient IAM permission is discovered by the
+first POST persistence request and returned to the caller as a sanitized HTTP
+500 response.
 
 The operations table uses on-demand `PAY_PER_REQUEST` billing and has one
 string partition key named `id`. It has no sort key, secondary indexes,
@@ -404,6 +412,7 @@ RequestMeta
 
 Environment
 LAMBDA_PRINCIPAL=*
+OPERATIONS_TABLE_NAME=<CloudFormation-generated-table-name>
 PASETO_PUBLIC_KEY=<public-key-from-keygen>
 ...
 ```
@@ -426,8 +435,9 @@ curl -L \
   <FunctionUrl>
 ```
 
-The handler returns the Operation output view with `NEW` state, the invocation
-timestamp, and its stable hash. It omits the input body:
+For a new ID, the handler persists and returns the Operation output view with
+`NEW` state, the invocation timestamp, and its stable hash. It omits the input
+body:
 
 ```json
 {
@@ -438,6 +448,12 @@ timestamp, and its stable hash. It omits the input body:
   "hash": "ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662"
 }
 ```
+
+Retrying the same ID, name, and body is idempotent and returns the latest
+stored state, timestamp, terminal result when present, and hash. Reusing the ID
+for different work returns the static `409 Conflict` response. DynamoDB,
+malformed stored-item, and allocation failures return only the static
+`500 Internal Server Error` response.
 
 ## 9. Create, read, and update persisted Operations
 
@@ -520,6 +536,21 @@ Changing the piped Operation JSON cannot fix this diagnostic because command
 configuration is checked before input parsing. Failures encountered while
 calling DynamoDB after configuration loading instead report
 `operation: AWS request failed`.
+
+### Troubleshoot Lambda persistence initialization
+
+The SAM template supplies `OPERATIONS_TABLE_NAME` and the table-scoped IAM
+policy together. Removing the environment variable or replacing it with an
+empty, oversized, or syntactically invalid DynamoDB table name makes the
+bootstrap exit during Lambda INIT, before it requests an invocation. Check the
+deployed template and function configuration; no HTTP response can be produced
+for an INIT failure.
+
+A syntactically valid but nonexistent table, or missing `PutItem` permission,
+does not fail INIT because startup makes no DynamoDB request. The first valid,
+authenticated POST returns a sanitized HTTP 500 in those cases; inspect Lambda
+logs and the SAM-managed stack resources without recording live table names or
+account-specific identifiers in this repository.
 
 ## 10. Update the deployed Lambda code
 

@@ -8,13 +8,13 @@ host-native DynamoDB Operation utility named `operation`. The handler
 authenticates a PASETO v4.public bearer token before serving GET and POST
 requests through the `aws-lambda-zig` runtime package. GET returns a plain-text
 Lambda environment dump, while POST validates and hashes an Operation JSON
-document and returns its output view without the body.
+document, persists it idempotently in DynamoDB, and returns the current stored
+output view without the body.
 
 ## Requirements
 
 - Zig 0.16.0 or newer within the supported 0.16.x line.
-- AWS CLI v2 for manual AWS operations.
-- AWS SAM CLI for the SAM deployment flow.
+- AWS CLI v2 and AWS SAM CLI for the SAM deployment flow and stack queries.
 - An AWS profile with permission to create Lambda, IAM, and CloudFormation
   resources.
 
@@ -207,7 +207,17 @@ expired, or unverifiable credentials receive `401 Unauthorized` with
 `WWW-Authenticate: Bearer`. Missing or invalid public-key configuration and
 internal failures receive a sanitized `500 Internal Server Error`.
 Invalid POST operation documents receive `400 Bad Request`. Authenticated
-methods other than GET and POST receive `405 Method Not Allowed`.
+methods other than GET and POST receive `405 Method Not Allowed`. A POST that
+reuses an Operation ID with a different server-computed hash receives a
+sanitized `409 Conflict`; DynamoDB and malformed stored-item failures receive
+the static `500 Internal Server Error` response.
+
+`OPERATIONS_TABLE_NAME` is mandatory at Lambda initialization. The bootstrap
+validates the table name, loads the AWS SDK configuration, and creates one
+shared DynamoDB client before requesting an invocation. Missing or invalid
+table configuration prevents all request handling, including GET. Table
+existence and IAM authorization are checked only when POST first calls
+DynamoDB, so those failures are returned as sanitized HTTP 500 responses.
 
 ## Deploy
 
@@ -235,15 +245,17 @@ different value when the function should see a narrower principal string.
 configuration. It is public key material; keep the corresponding private key
 only in the signing environment.
 
+The SAM-managed DynamoDB table, `OPERATIONS_TABLE_NAME` environment variable,
+and table-scoped `GetItem`, `PutItem`, and `UpdateItem` IAM policy are mandatory
+parts of the runnable application. Deploy the complete stack from
+`template.yaml` with AWS SAM.
+
 See [docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md)
 for the full SAM workflow.
 
-There is also a manual AWS CLI deployment guide:
-[docs/DEPLOY_AWS_LAMBDA_WITH_CLI.md](docs/DEPLOY_AWS_LAMBDA_WITH_CLI.md).
-
 ## Test The Function URL
 
-After deployment, call the Function URL printed by SAM or the AWS CLI:
+After deployment, call the Function URL printed by SAM:
 
 ```sh
 curl -i -L <FunctionUrl>
@@ -293,8 +305,8 @@ curl -L \
   <FunctionUrl>
 ```
 
-The response has `NEW` state, the invocation timestamp, and the stable
-BLAKE3-256 operation hash. The input body is intentionally omitted:
+For a new ID, the response has `NEW` state, the invocation timestamp, and the
+stable BLAKE3-256 operation hash. The input body is intentionally omitted:
 
 ```json
 {
@@ -305,6 +317,10 @@ BLAKE3-256 operation hash. The input body is intentionally omitted:
   "hash": "ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662"
 }
 ```
+
+The POST is persisted before the response is generated. Retrying the same ID,
+name, and body returns the latest stored state, timestamp, terminal result when
+present, and hash. Reusing the ID for different work returns `409 Conflict`.
 
 The template intentionally creates a publicly reachable Function URL for demo
 HTTP GET and POST testing, while the handler enforces PASETO bearer
@@ -324,7 +340,7 @@ or CloudFront.
 - `build.zig`: Zig build graph for `bootstrap`, both host utilities, and tests.
 - `build.zig.zon`: package metadata and pinned dependencies.
 - `template.yaml`: SAM template for the Lambda, Function URL, and permissions.
-- `docs/`: deployment guides and the Zig style reference.
+- `docs/`: the SAM deployment guide, ADRs, and the Zig style reference.
 - `AGENTS.md`: repository guidance for coding agents.
 
 ## Development Notes
