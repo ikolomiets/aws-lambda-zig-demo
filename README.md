@@ -147,12 +147,17 @@ operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 printf '%s\n' "$operation_json" | zig-out/bin/operation create
 ```
 
-A create is safe to retry only with the original UUID, name, and body. If that
-UUID already identifies a `NEW` Operation with the same Operation hash, the
-retry succeeds and returns the existing Operation with its original
-`last_updated`. Reusing the UUID for different content, or retrying after the
-Operation has left `NEW`, returns `operation: operation conflict` with exit
-code `1`.
+The Operation hash is the BLAKE3-256 digest of a JSON envelope containing only
+`name` and `body`. The body is parsed and re-serialized before hashing, so
+insignificant whitespace and equivalent string escapes do not change the hash,
+while object member order remains significant. The `id`, `state`,
+`last_updated`, and `result` fields are not included.
+
+A create is safe to retry with the original UUID, name, and body. If that UUID
+already identifies an Operation with the same Operation hash, the retry
+succeeds and returns the current stored Operation, including its state,
+`last_updated`, and terminal result when present. Reusing the UUID for different
+content returns `operation: operation conflict` with exit code `1`.
 
 Read it with a strongly consistent DynamoDB read:
 
@@ -186,10 +191,10 @@ failure, or an internal failure. Create and update conflicts both emit
 The persistent item contains exactly `id`, `name`, `state`, `last_updated`,
 `hash`, and an optional terminal `result`; it never contains `body`. Creates
 use `attribute_not_exists(id)` and request the existing item on a failed
-condition so matching `NEW` retries need no separate read. Updates first
-perform a strongly consistent read and then condition on the complete
-snapshot, so a concurrent change is reported instead of overwritten. Updates
-preserve `id`, `name`, and `hash`.
+condition so matching retries need no separate read. Updates first perform a
+strongly consistent read and then condition on the complete snapshot, so a
+concurrent change is reported instead of overwritten. Updates preserve `id`,
+`name`, and `hash`.
 
 The Lambda Function URL requires the token in an HTTP authorization header:
 

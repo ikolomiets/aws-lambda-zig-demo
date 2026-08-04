@@ -34,7 +34,7 @@ pub const Persistence = struct {
         return .{ .client = client, .table_name = table_name };
     }
 
-    /// Creates an item or returns the matching existing NEW item for an idempotent retry.
+    /// Creates an item or returns the matching existing item for an idempotent retry.
     pub fn create(
         self: *Self,
         allocator: Allocator,
@@ -376,7 +376,6 @@ fn createError(
     if (!std.mem.eql(u8, &existing.hash.?, &submitted.hash.?)) {
         return error.OperationConflict;
     }
-    if (existing.state.? != .new) return error.OperationConflict;
     return ownedPersistentCopy(allocator, &existing);
 }
 
@@ -719,59 +718,49 @@ test "updates allow same state and reject immutable replacements" {
     );
 }
 
-test "matching NEW create retry returns the stored timestamp and owned fields" {
+test "matching create retry returns the stored Operation in every state" {
     const submitted = testOperation(.new, null);
-    var existing = submitted;
-    existing.last_updated.? -= 10;
-    var diagnostic_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    existing.name = try diagnostic_arena.allocator().dupe(u8, "echo");
-    var request: CreateRequest = undefined;
-    createRequestInit(&request, &existing);
-    var diagnostic = dynamodb.ServiceError{
-        .arena = diagnostic_arena,
-        .kind = .{ .conditional_check_failed_exception = .{
-            .item = request.items[0..request.item_count],
-        } },
-    };
-
-    const created = try createError(
-        std.testing.allocator,
-        std.testing.allocator,
-        error.ServiceError,
-        &diagnostic,
-        &submitted,
-    );
-    defer std.testing.allocator.free(created.name);
-    try std.testing.expectEqual(existing.last_updated, created.last_updated);
-    try std.testing.expectEqualStrings("echo", created.name);
-    try std.testing.expect(created.body == null);
-}
-
-test "create retry conflicts on every hash and non-NEW state mismatch" {
-    const submitted = testOperation(.new, null);
-    var different_hash = submitted;
-    different_hash.hash.?[0] ^= 1;
-    var request: CreateRequest = undefined;
-    createRequestInit(&request, &different_hash);
-    var diagnostic = dynamodb.ServiceError{
-        .kind = .{ .conditional_check_failed_exception = .{
-            .item = request.items[0..request.item_count],
-        } },
-    };
-    try std.testing.expectError(error.OperationConflict, createError(
-        std.testing.allocator,
-        std.testing.allocator,
-        error.ServiceError,
-        &diagnostic,
-        &submitted,
-    ));
-
-    const states = [_]operation.State{ .submitted, .running, .succeeded, .failed };
+    const states = [_]operation.State{ .new, .submitted, .running, .succeeded, .failed };
     for (states) |state| {
         var existing = testOperation(state, if (operation.stateIsTerminal(state)) "true" else null);
-        if (state == .failed) existing.hash.?[0] ^= 1;
+        existing.last_updated.? -= 10;
+        var diagnostic_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        existing.name = try diagnostic_arena.allocator().dupe(u8, "echo");
+        var request: CreateRequest = undefined;
         createRequestInit(&request, &existing);
-        diagnostic = .{ .kind = .{ .conditional_check_failed_exception = .{
+        var diagnostic = dynamodb.ServiceError{
+            .arena = diagnostic_arena,
+            .kind = .{ .conditional_check_failed_exception = .{
+                .item = request.items[0..request.item_count],
+            } },
+        };
+
+        const created = try createError(
+            std.testing.allocator,
+            std.testing.allocator,
+            error.ServiceError,
+            &diagnostic,
+            &submitted,
+        );
+        defer std.testing.allocator.free(created.name);
+        defer if (created.result) |result| std.testing.allocator.free(result);
+        try std.testing.expectEqual(existing.state, created.state);
+        try std.testing.expectEqual(existing.last_updated, created.last_updated);
+        try std.testing.expect(optionalStringEqual(existing.result, created.result));
+        try std.testing.expectEqualStrings("echo", created.name);
+        try std.testing.expect(created.body == null);
+    }
+}
+
+test "create retry conflicts on a hash mismatch in every state" {
+    const submitted = testOperation(.new, null);
+    const states = [_]operation.State{ .new, .submitted, .running, .succeeded, .failed };
+    for (states) |state| {
+        var existing = testOperation(state, if (operation.stateIsTerminal(state)) "true" else null);
+        existing.hash.?[0] ^= 1;
+        var request: CreateRequest = undefined;
+        createRequestInit(&request, &existing);
+        var diagnostic = dynamodb.ServiceError{ .kind = .{ .conditional_check_failed_exception = .{
             .item = request.items[0..request.item_count],
         } } };
         try std.testing.expectError(error.OperationConflict, createError(

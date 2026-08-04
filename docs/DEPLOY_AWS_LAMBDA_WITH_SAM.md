@@ -152,17 +152,23 @@ The DynamoDB item contract enforced by `src/operation_persistence.zig` is:
 | `hash` | `S` | 64-character lowercase BLAKE3-256 hexadecimal value. |
 | `result` | `S` | Terminal states only; exact serialized JSON; at most 4,096 UTF-8 bytes. |
 
+The Operation hash covers only a JSON envelope containing `name` and `body`.
+The body is parsed and re-serialized before hashing, so insignificant
+whitespace and equivalent string escapes do not change the hash, while object
+member order remains significant. The `id`, `state`, `last_updated`, and
+`result` fields are excluded.
+
 Never persist `body`. The 4,096-byte `result` bound is an application-enforced
 constraint because DynamoDB and CloudFormation cannot enforce a per-attribute
 size limit. The adapter validates immediately before every `PutItem` or
 `UpdateItem` and after decoding every read. Creates use
 `attribute_not_exists(id)` and request `ALL_OLD` when that condition fails. A
 failed create condition succeeds as an idempotent retry only when the returned
-item has the submitted Operation hash and remains in `NEW`; otherwise it is an
-Operation conflict. Reads are strongly consistent. Updates condition on the
-previously read snapshot, preserve `id`, `name`, and `hash`, and return and
-validate `ALL_NEW`. Result-size validation remains in the application rather
-than a DynamoDB condition expression.
+item has the submitted Operation hash, regardless of its current state;
+otherwise it is an Operation conflict. Reads are strongly consistent. Updates
+condition on the previously read snapshot, preserve `id`, `name`, and `hash`,
+and return and validate `ALL_NEW`. Result-size validation remains in the
+application rather than a DynamoDB condition expression.
 
 The Function URL settings are:
 
@@ -453,11 +459,11 @@ operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 printf '%s\n' "$operation_json" | zig-out/bin/operation create
 ```
 
-Retry create only with the original UUID, name, and body. When the UUID already
-identifies a `NEW` Operation with the same Operation hash, create returns that
-stored Operation, including its original `last_updated`. A different hash or
-any state other than `NEW` returns `operation: operation conflict` with exit
-code `1`.
+Retry create with the original UUID, name, and body. When the UUID already
+identifies an Operation with the same Operation hash, create returns the current
+stored Operation, including its state, `last_updated`, and terminal result when
+present. A different hash returns `operation: operation conflict` with exit code
+`1`.
 
 Read the persistent output view:
 
