@@ -16,32 +16,37 @@ Use these sources in order:
   memory, timeout, runtime, and architecture.
 - `deploy.sh` implements the supported automated AWS SAM deployment flow.
 - `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md` documents the supported deployment flow.
-- `docs/TIGER_STYLE.md` is the mandatory coding style reference.
+- [`docs/TIGER_STYLE_AGENT.md`](docs/TIGER_STYLE_AGENT.md) is the concise,
+  recommended operational style guide for Zig changes.
+- [`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md) is the authoritative extended
+  Tiger Style philosophy, rationale, and examples.
 
 ## Coding Style
 
-Follow `docs/TIGER_STYLE.md` for Zig code. Treat it as a hard project
-constraint, not background reading. Safety comes first, then performance, then
-developer experience.
+Before modifying Zig code, read and follow the recommendations in
+[`docs/TIGER_STYLE_AGENT.md`](docs/TIGER_STYLE_AGENT.md). Tiger Style is the
+preferred default, with safety first, then performance, then developer
+experience. It is not required when it conflicts with established codebase
+behavior, architecture, or conventions, or when compliance would require
+significant changes outside the task. Do not perform broad refactors or
+unrelated cleanup solely for style compliance.
 
-In practice:
+Keep the active use of assertions central to Zig changes. Assert programmer
+errors, invariants, preconditions, postconditions, results, and boundary
+assumptions; use Zig errors for expected operating failures. Assertions do not
+need to satisfy a numeric quota.
 
-- Keep control flow simple and explicit. Do not introduce recursion.
-- Keep scopes small and minimize live variables.
-- Prefer direct, concrete code over speculative abstraction.
-- Put fixed bounds on work where practical and make important bounds visible.
-- Use assertions for programmer errors, invariants, preconditions,
-  postconditions, and boundary assumptions.
-- Split compound assertions and complex boolean conditions into simpler checks.
-- Use Zig errors for expected operating failures.
-- Pass dependencies and effects explicitly; avoid hidden global state.
-- Keep allocation ownership clear. Do not allocate where a caller-provided
-  buffer, arena, or existing Lambda context resource is the right owner.
-- Keep `comptime` small and purposeful.
+Read the relevant section of [`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md) when:
 
-When deviating from a Tiger Style rule because the Lambda runtime or Zig
-standard library forces a tradeoff, document the reason in the code review or
-change summary and keep the exception as narrow as possible.
+- making architectural or performance-sensitive decisions;
+- introducing an abstraction;
+- changing memory-management or control-flow patterns;
+- resolving ambiguity in the concise guide; or
+- performing a dedicated design or code-quality review.
+
+When a material Tiger Style recommendation is not suitable, document the
+reason in the code review or change summary and keep the exception scoped to
+the affected change.
 
 ## Architecture and Change Scope
 
@@ -73,7 +78,9 @@ Keep changes scoped and update only affected files:
 - Deployment helper behavior: update `deploy.sh` and
   `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md`.
 - Deployment artifact expectations: update the affected deployment docs.
-- Any Zig code change: verify it still follows `docs/TIGER_STYLE.md`.
+- Any Zig code change: review it against
+  [`docs/TIGER_STYLE_AGENT.md`](docs/TIGER_STYLE_AGENT.md), subject to the
+  compatibility and change-scope exceptions above.
 
 Avoid unrelated prose rewrites, hidden behavior changes, broad refactors, and
 new dependencies unless the task explicitly needs them.
