@@ -12,10 +12,11 @@ string escapes compare equally, but object key order is retained and therefore a
 
 `Operation.body` and `Operation.result` are optional `std.json.Value` fields owned, together with
 their nested strings and collections, by the caller's lifetime arena. Input bodies and terminal
-results are parsed once with duplicate-key rejection and owned strings. Hashing and output serialize
-those Values directly. DynamoDB omits `body` and stores a terminal `result` as the compact Value
-serialization in an `S` attribute; reads accept only an exact compact reserialization no larger than
-4,096 bytes.
+results are parsed once with duplicate-key rejection and owned strings. Hashing and the Operation
+JSON writer serialize those Values directly. The writer preserves `body` whenever the in-memory view
+contains it. DynamoDB omits `body`, so persisted output views remain bodyless, and stores a terminal
+`result` as the compact Value serialization in an `S` attribute; reads accept only an exact compact
+reserialization no larger than 4,096 bytes.
 
 The reference envelope
 `{"tenant":"tenant-a","name":"echo","body":{"message":"hello","count":2}}` has lowercase

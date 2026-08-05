@@ -147,7 +147,7 @@ pub fn writeResultJSON(buffer: *[result_size_max]u8, result: *const JSONValue) !
     return writer.buffered();
 }
 
-/// Writes the output view while serializing result Values directly.
+/// Writes the Operation view while preserving body and result Values when present.
 pub fn writeOutputJSON(
     writer: *std.Io.Writer,
     operation: *const Operation,
@@ -172,6 +172,10 @@ pub fn writeOutputJSON(
     try json.write(operation.tenant);
     try json.objectField("name");
     try json.write(operation.name);
+    if (operation.body) |body| {
+        try json.objectField("body");
+        try json.write(body);
+    }
     try json.objectField("state");
     try json.write(stateToString(state));
     try json.objectField("last_updated");
@@ -1078,10 +1082,10 @@ test "persistent view rejects body and requires state timestamps and hash" {
     );
 }
 
-test "output omits body and emits terminal result as raw JSON" {
+test "output preserves scalar body and terminal result as raw JSON" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var operation = Operation{
+    const operation = Operation{
         .id = try uuidFromString(test_uuid),
         .tenant = test_tenant,
         .name = "echo",
@@ -1092,34 +1096,65 @@ test "output omits body and emits terminal result as raw JSON" {
         .result = try parseResultJSON(arena.allocator(), "{\"ok\":true}"),
         .hash = [_]u8{0xAB} ** 32,
     };
-    const output = try testOutput(&operation);
-    defer std.testing.allocator.free(output);
+    var output_buffer: [512]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&output_buffer);
+    try writeOutputJSON(&output, &operation);
     try std.testing.expectEqualStrings(
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
+            "\"body\":true," ++
             "\"state\":\"SUCCEEDED\"," ++
             "\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"result\":{\"ok\":true}," ++
             "\"hash\":\"abababababababababababababababab" ++
             "abababababababababababababababab\"}",
-        output,
+        output.buffered(),
     );
-    try std.testing.expect(std.mem.indexOf(u8, output, "body") == null);
 
-    operation.state = .submitted;
-    operation.last_updated = test_now + 1;
-    operation.expires_at = test_now + 1 + ttl_seconds;
-    operation.result = null;
-    const pending_output = try testOutput(&operation);
-    defer std.testing.allocator.free(pending_output);
-    try std.testing.expect(std.mem.indexOf(u8, pending_output, "SUBMITTED") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pending_output, "1700000001") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pending_output, "result") == null);
-    try std.testing.expect(std.mem.indexOf(u8, pending_output, "body") == null);
+    var invalid = operation;
+    invalid.last_updated = null;
+    try std.testing.expectError(error.MissingLastUpdated, writeOutputJSON(&output, &invalid));
+}
 
-    operation.last_updated = null;
-    try std.testing.expectError(error.MissingLastUpdated, testOutput(&operation));
+test "output distinguishes object explicit-null and absent bodies" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var operation = Operation{
+        .id = try uuidFromString(test_uuid),
+        .tenant = test_tenant,
+        .name = "echo",
+        .body = try parseJSONValue(arena.allocator(), "{\"message\":\"hello\"}"),
+        .state = .submitted,
+        .last_updated = test_now + 1,
+        .expires_at = test_now + 1 + ttl_seconds,
+        .hash = [_]u8{0xAB} ** 32,
+    };
+    const object_output = try testOutput(&operation);
+    defer std.testing.allocator.free(object_output);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        object_output,
+        "\"body\":{\"message\":\"hello\"},\"state\"",
+    ) != null);
+
+    operation.body = .null;
+    const null_output = try testOutput(&operation);
+    defer std.testing.allocator.free(null_output);
+    try std.testing.expect(std.mem.indexOf(u8, null_output, "\"body\":null,\"state\"") != null);
+
+    operation.body = null;
+    const absent_output = try testOutput(&operation);
+    defer std.testing.allocator.free(absent_output);
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000001," ++
+            "\"expires_at\":1700086401," ++
+            "\"hash\":\"abababababababababababababababab" ++
+            "abababababababababababababababab\"}",
+        absent_output,
+    );
 }
 
 test "expiration calculation rejects timestamp overflow" {
