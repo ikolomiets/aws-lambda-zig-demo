@@ -36,8 +36,10 @@ Environment overrides:
   PASETO_PRIVATE_KEY, PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT
 
 Authentication:
-  Non-dry-run deployments verify the selected profile before building. If an
-  SSO-backed profile is expired, the script runs aws sso login once and retries.
+  Non-dry-run deployments resolve and verify the selected profile credentials
+  before building. Valid cached credentials are reused. If resolution or
+  verification fails for an SSO-backed profile, the script runs aws sso login
+  once and retries.
 EOF
 }
 
@@ -68,33 +70,70 @@ profile_uses_sso() {
     aws configure get sso_start_url --profile "$profile" >/dev/null 2>&1
 }
 
-verify_aws_profile() {
-    local profile="$1"
+clear_aws_credentials() {
+    unset AWS_ACCESS_KEY_ID
+    unset AWS_SECRET_ACCESS_KEY
+    unset AWS_SESSION_TOKEN
+    unset AWS_SECURITY_TOKEN
+    unset AWS_CREDENTIAL_EXPIRATION
+}
 
-    printf '==> Verifying AWS profile %s\n' "$profile"
-    if aws sts get-caller-identity \
-        --profile "$profile" \
+load_aws_credentials() {
+    local profile="$1"
+    local credential_exports
+
+    clear_aws_credentials
+    credential_exports="$(
+        aws configure export-credentials \
+            --profile "$profile" \
+            --format env
+    )" || return 1
+
+    [ -n "$credential_exports" ] || return 1
+    eval "$credential_exports"
+    unset credential_exports
+
+    [ -n "${AWS_ACCESS_KEY_ID:-}" ] || return 1
+    [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] || return 1
+}
+
+verify_aws_credentials() {
+    aws sts get-caller-identity \
         --query Arn \
         --output text \
         >/dev/null 2>&1
+}
+
+prepare_aws_credentials() {
+    local profile="$1"
+
+    unset AWS_PROFILE
+    unset AWS_DEFAULT_PROFILE
+
+    printf '==> Resolving AWS credentials for profile %s\n' "$profile"
+    if load_aws_credentials "$profile"
     then
-        return 0
+        printf '==> Verifying resolved AWS credentials\n'
+        if verify_aws_credentials; then
+            return 0
+        fi
     fi
 
+    clear_aws_credentials
     profile_uses_sso "$profile" ||
-        fail "AWS profile check failed for non-SSO profile $profile"
+        fail "AWS credential resolution failed for non-SSO profile $profile"
 
     printf '==> Refreshing AWS SSO session for profile %s\n' "$profile"
     aws sso login --profile "$profile" ||
         fail "AWS SSO login failed for profile $profile"
 
-    printf '==> Re-verifying AWS profile %s\n' "$profile"
-    aws sts get-caller-identity \
-        --profile "$profile" \
-        --query Arn \
-        --output text \
-        >/dev/null ||
-        fail "AWS profile check failed after SSO login for profile $profile"
+    printf '==> Re-resolving AWS credentials for profile %s\n' "$profile"
+    load_aws_credentials "$profile" ||
+        fail "AWS credential resolution failed after SSO login for profile $profile"
+
+    printf '==> Verifying resolved AWS credentials\n'
+    verify_aws_credentials ||
+        fail "AWS credential verification failed after SSO login for profile $profile"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -175,7 +214,7 @@ cd "$(dirname "$0")"
 
 if [ "$DRY_RUN" -eq 0 ]; then
     need_command aws
-    verify_aws_profile "$PROFILE"
+    prepare_aws_credentials "$PROFILE"
 fi
 
 [ -n "$PASETO_PUBLIC_KEY" ] ||
@@ -258,7 +297,6 @@ printf '==> Deploying stack %s to %s\n' "$STACK_NAME" "$REGION"
 sam deploy \
     --template-file template.yaml \
     --stack-name "$STACK_NAME" \
-    --profile "$PROFILE" \
     --region "$REGION" \
     --capabilities CAPABILITY_IAM \
     --resolve-s3 \
@@ -275,14 +313,12 @@ aws cloudformation describe-stacks \
     --stack-name "$STACK_NAME" \
     --query 'Stacks[0].StackStatus' \
     --output text \
-    --profile "$PROFILE" \
     --region "$REGION"
 
 OPERATIONS_TABLE_NAME="$(aws cloudformation describe-stacks \
     --stack-name "$STACK_NAME" \
     --query "Stacks[0].Outputs[?OutputKey=='OperationsTableName'].OutputValue | [0]" \
     --output text \
-    --profile "$PROFILE" \
     --region "$REGION")"
 
 case "$OPERATIONS_TABLE_NAME" in
@@ -294,7 +330,6 @@ esac
 printf '==> Waiting for DynamoDB table %s\n' "$OPERATIONS_TABLE_NAME"
 aws dynamodb wait table-exists \
     --table-name "$OPERATIONS_TABLE_NAME" \
-    --profile "$PROFILE" \
     --region "$REGION"
 
 printf '==> DynamoDB table summary\n'
@@ -302,14 +337,12 @@ aws dynamodb describe-table \
     --table-name "$OPERATIONS_TABLE_NAME" \
     --query '{TableName:Table.TableName,TableStatus:Table.TableStatus,BillingMode:Table.BillingModeSummary.BillingMode,AttributeDefinitions:Table.AttributeDefinitions,KeySchema:Table.KeySchema,LocalSecondaryIndexesPresent:length(not_null(Table.LocalSecondaryIndexes, `[]`)) > `0`,GlobalSecondaryIndexesPresent:length(not_null(Table.GlobalSecondaryIndexes, `[]`)) > `0`}' \
     --output json \
-    --profile "$PROFILE" \
     --region "$REGION"
 
 TABLE_VALIDATION="$(aws dynamodb describe-table \
     --table-name "$OPERATIONS_TABLE_NAME" \
     --query 'Table.[TableName,TableStatus,BillingModeSummary.BillingMode,length(AttributeDefinitions),AttributeDefinitions[0].AttributeName,AttributeDefinitions[0].AttributeType,length(KeySchema),KeySchema[0].AttributeName,KeySchema[0].KeyType,length(not_null(LocalSecondaryIndexes, `[]`)),length(not_null(GlobalSecondaryIndexes, `[]`))]' \
     --output text \
-    --profile "$PROFILE" \
     --region "$REGION")"
 
 read -r \
@@ -352,7 +385,6 @@ FUNCTION_URL="$(aws cloudformation describe-stacks \
     --stack-name "$STACK_NAME" \
     --query "Stacks[0].Outputs[?OutputKey=='FunctionUrl'].OutputValue | [0]" \
     --output text \
-    --profile "$PROFILE" \
     --region "$REGION")"
 
 printf 'FunctionUrl: %s\n' "$FUNCTION_URL"

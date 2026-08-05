@@ -42,10 +42,11 @@ arn:aws:sts::<account-id>:assumed-role/AWSReservedSSO_.../<user>
 ```
 
 When using `deploy.sh`, this refresh is automatic when needed. Before building,
-the helper verifies the selected profile with STS. If a directly configured SSO
-profile has expired, it runs `aws sso login --profile <profile>` once and then
-verifies the profile again. Direct `sam` and `aws` commands in this guide still
-require an active session.
+the helper resolves the selected profile to temporary environment credentials
+and verifies them with STS. Valid cached credentials are reused without opening
+a browser. If resolution or verification fails for a directly configured SSO
+profile, the helper runs `aws sso login --profile <profile>` once and retries.
+Direct `sam` and `aws` commands in this guide still require an active session.
 
 ## 2. Build and package the Zig Lambda
 
@@ -361,12 +362,16 @@ Lambda environment. Use
 local checks, rebuild `lambda.zip`, and validate `template.yaml` without
 deploying to AWS.
 
-For non-dry-run deployments, the helper verifies the selected AWS profile before
-starting local work. When verification fails for a profile configured with
-`sso_session` or the legacy `sso_start_url`, it runs one interactive
-`aws sso login`, retries STS once, and stops if either step fails. Non-SSO
-profile failures stop without attempting SSO login. Dry runs make no AWS
-authentication calls.
+For non-dry-run deployments, the helper resolves and verifies the selected AWS
+profile before starting local work. It exports the resolved credentials only to
+the script process and its children, so SAM and the post-deploy AWS commands use
+the same credential snapshot instead of resolving the SSO profile again. When
+resolution or STS verification fails for a profile configured with `sso_session`
+or the legacy `sso_start_url`, it runs one interactive `aws sso login`, resolves
+the credentials again, and stops if login, resolution, or verification fails.
+Non-SSO profile failures stop without attempting SSO login. Dry runs make no AWS
+authentication calls, and the helper does not print or write resolved
+credentials.
 
 After a successful deployment, `deploy.sh` reads the
 `OperationsTableName` stack output, waits for the table to exist, and prints a
