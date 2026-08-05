@@ -5,8 +5,15 @@ This context receives named operations and tracks their execution through comple
 ## Language
 
 **Operation**:
-A uniquely identified unit of work with a name, body, lifecycle state, result, and stable hash.
+A globally identified unit of work with a tenant, name, body, lifecycle state, result, and stable
+hash.
 _Avoid_: Job, task
+
+**Operation Tenant**:
+Required server-owned UTF-8 metadata identifying who requested an operation. Lambda derives it only
+from the verified PASETO `sub` claim; the host CLI accepts it only as create-command metadata. It is
+part of idempotency identity, but does not scope the DynamoDB partition key or authorize reads.
+_Avoid_: Customer ID, partition key
 
 **Operation Body**:
 The caller-supplied JSON value that contains an operation's input.
@@ -25,5 +32,5 @@ A succeeded or failed state after which an operation has a result.
 _Avoid_: Completed state
 
 **Operation Hash**:
-A stable fingerprint of an operation's name and body used to identify the requested work.
+A stable fingerprint of an operation's tenant, name, and body used to identify the requested work.
 _Avoid_: Body hash, checksum

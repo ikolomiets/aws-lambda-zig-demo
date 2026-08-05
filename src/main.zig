@@ -22,6 +22,10 @@ const method_not_allowed_body = "Method Not Allowed\n";
 const redacted_value = "<redacted>";
 const unauthorized_body = "Unauthorized\n";
 
+comptime {
+    std.debug.assert(paseto.subject_size_max == operation.tenant_size_max);
+}
+
 var runtime_operation_creator: ?OperationCreator = null;
 
 pub fn main(init: std.process.Init) void {
@@ -209,7 +213,7 @@ fn invocationOutcome(
     };
     return switch (method) {
         .GET => get_invocation_outcome(allocator, claims.sub, cfg, req, env),
-        .POST => post_invocation_outcome(allocator, &request, creator, now),
+        .POST => post_invocation_outcome(allocator, claims.sub, &request, creator, now),
         else => .method_not_allowed,
     };
 }
@@ -232,6 +236,7 @@ fn get_invocation_outcome(
 
 fn post_invocation_outcome(
     allocator: Allocator,
+    tenant: []const u8,
     request: *const lambda.url.Request,
     creator: OperationCreator,
     now: operation.UnixSeconds,
@@ -243,7 +248,10 @@ fn post_invocation_outcome(
     const parsed = operation.parseInputJSON(
         arena,
         input_json,
-        now,
+        .{
+            .tenant = tenant,
+            .now = now,
+        },
     ) catch |err| {
         return switch (err) {
             error.OutOfMemory => .internal_server_error,
@@ -556,6 +564,8 @@ const FakePersistence = struct {
     last_updated: ?operation.UnixSeconds = null,
     last_expires_at: ?operation.UnixSeconds = null,
     last_hash: ?[32]u8 = null,
+    last_tenant_buffer: [operation.tenant_size_max]u8 = undefined,
+    last_tenant_len: u8 = 0,
     last_name_buffer: [operation.name_size_max]u8 = undefined,
     last_name_len: u8 = 0,
     last_body_buffer: [operation.body_size_max]u8 = undefined,
@@ -567,6 +577,7 @@ const FakePersistence = struct {
         source: *const operation.Operation,
     ) !operation.Operation {
         std.debug.assert(fake.create_count < 32);
+        std.debug.assert(source.tenant.len <= fake.last_tenant_buffer.len);
         std.debug.assert(source.name.len <= fake.last_name_buffer.len);
         fake.create_count += 1;
         fake.last_id = source.id;
@@ -574,6 +585,8 @@ const FakePersistence = struct {
         fake.last_updated = source.last_updated;
         fake.last_expires_at = source.expires_at;
         fake.last_hash = source.hash;
+        fake.last_tenant_len = @intCast(source.tenant.len);
+        @memcpy(fake.last_tenant_buffer[0..source.tenant.len], source.tenant);
         fake.last_name_len = @intCast(source.name.len);
         @memcpy(fake.last_name_buffer[0..source.name.len], source.name);
         const body = try operation.writeResultJSON(&fake.last_body_buffer, &source.body.?);
@@ -589,6 +602,10 @@ const FakePersistence = struct {
 
     fn lastName(fake: *const FakePersistence) []const u8 {
         return fake.last_name_buffer[0..fake.last_name_len];
+    }
+
+    fn lastTenant(fake: *const FakePersistence) []const u8 {
+        return fake.last_tenant_buffer[0..fake.last_tenant_len];
     }
 
     fn lastBody(fake: *const FakePersistence) []const u8 {
@@ -903,10 +920,11 @@ test "authenticated POST returns a new operation without its body" {
     const expected =
         "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
         "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
-        "\\\"name\\\":\\\"echo\\\",\\\"state\\\":\\\"NEW\\\"," ++
+        "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
+        "\\\"state\\\":\\\"NEW\\\"," ++
         "\\\"last_updated\\\":1700000000," ++
         "\\\"expires_at\\\":1700086400," ++
-        "\\\"hash\\\":\\\"ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662\\\"}\"}";
+        "\\\"hash\\\":\\\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\\\"}\"}";
 
     for (inputs) |input| {
         var fake: FakePersistence = .{};
@@ -941,6 +959,7 @@ test "authenticated POST returns a new operation without its body" {
         try std.testing.expectEqual(operation.State.new, fake.last_state.?);
         try std.testing.expectEqual(@as(i64, 1_700_000_000), fake.last_updated.?);
         try std.testing.expectEqual(@as(i64, 1_700_086_400), fake.last_expires_at.?);
+        try std.testing.expectEqualStrings("lambda-test-user", fake.lastTenant());
         try std.testing.expectEqualStrings("echo", fake.lastName());
         try std.testing.expectEqualStrings(
             "{\"message\":\"hello\",\"count\":2}",
@@ -949,10 +968,56 @@ test "authenticated POST returns a new operation without its body" {
         var expected_hash: [32]u8 = undefined;
         _ = try std.fmt.hexToBytes(
             &expected_hash,
-            "ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662",
+            "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
         );
         try std.testing.expectEqualSlices(u8, &expected_hash, &fake.last_hash.?);
     }
+}
+
+test "POST derives tenant and hash from distinct bounded verified subjects" {
+    var key_pair = testKeyPair(0x49);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+    const subjects = [_][]const u8{
+        "a" ** paseto.subject_size_max,
+        "tenant-b",
+    };
+    const input =
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+        "\"name\":\"echo\",\"body\":null}";
+    var hashes: [subjects.len][32]u8 = undefined;
+
+    for (subjects, 0..) |subject, index| {
+        const token = try testTokenForSubject(&key_pair, subject, 1000, 60);
+        defer std.testing.allocator.free(token);
+        const event = try test_authorization_request_event(
+            std.testing.allocator,
+            .POST,
+            "Authorization",
+            "Bearer",
+            token,
+            input,
+        );
+        defer std.testing.allocator.free(event);
+        var fake: FakePersistence = .{};
+        const response = handleInvocationForTest(
+            std.testing.allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            &fake,
+            1000,
+        );
+        defer std.testing.allocator.free(response);
+
+        try expectContains(response, subject);
+        try std.testing.expectEqualStrings(subject, fake.lastTenant());
+        hashes[index] = fake.last_hash.?;
+    }
+    try std.testing.expect(!std.mem.eql(u8, &hashes[0], &hashes[1]));
 }
 
 test "matching POST retry returns the latest stored persistent view" {
@@ -969,12 +1034,13 @@ test "matching POST retry returns the latest stored persistent view" {
     var expected_hash: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(
         &expected_hash,
-        "ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662",
+        "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
     );
     var fake = FakePersistence{ .response = .{
         .id = operation.uuidFromString(
             "00112233-4455-6677-8899-aabbccddeeff",
         ) catch unreachable,
+        .tenant = "lambda-test-user",
         .name = "echo",
         .state = .succeeded,
         .last_updated = 1_700_000_123,
@@ -1011,11 +1077,12 @@ test "matching POST retry returns the latest stored persistent view" {
     const expected =
         "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
         "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
-        "\\\"name\\\":\\\"echo\\\",\\\"state\\\":\\\"SUCCEEDED\\\"," ++
+        "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
+        "\\\"state\\\":\\\"SUCCEEDED\\\"," ++
         "\\\"last_updated\\\":1700000123," ++
         "\\\"expires_at\\\":1700086523," ++
         "\\\"result\\\":{\\\"message\\\":\\\"done\\\"}," ++
-        "\\\"hash\\\":\\\"ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662\\\"}\"}";
+        "\\\"hash\\\":\\\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\\\"}\"}";
     try std.testing.expectEqualStrings(expected, response);
     try std.testing.expectEqual(@as(u8, 1), fake.create_count);
 }
@@ -1164,6 +1231,8 @@ test "authenticated POST rejects missing and invalid operation JSON" {
         null,
         "{invalid-json-marker",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"name\":\"echo\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"spoofed\",\"name\":\"echo\",\"body\":null}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"echo\",\"body\":null,\"state\":\"SUBMITTED\"}",
     };
@@ -1522,6 +1591,15 @@ fn testToken(
     now: i64,
     ttl_seconds: i64,
 ) ![]u8 {
+    return testTokenForSubject(key_pair, "lambda-test-user", now, ttl_seconds);
+}
+
+fn testTokenForSubject(
+    key_pair: *const paseto.Ed25519.KeyPair,
+    subject: []const u8,
+    now: i64,
+    ttl_seconds: i64,
+) ![]u8 {
     std.debug.assert(ttl_seconds > 0);
     var random = std.Random.DefaultPrng.init(0x4c414d4244415554);
     return paseto.issue(
@@ -1529,7 +1607,7 @@ fn testToken(
         random.random(),
         &key_pair.secret_key,
         .{
-            .subject = "lambda-test-user",
+            .subject = subject,
             .now = now,
             .ttl_seconds = ttl_seconds,
         },

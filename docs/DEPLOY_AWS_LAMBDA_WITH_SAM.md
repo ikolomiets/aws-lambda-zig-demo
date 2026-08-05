@@ -160,6 +160,7 @@ The DynamoDB item contract enforced by `src/operation_persistence.zig` is:
 | Attribute | DynamoDB type | Contract |
 | --- | --- | --- |
 | `id` | `S` | Always present; partition key; canonical lowercase hyphenated Operation UUID. |
+| `tenant` | `S` | Always present; server-owned valid UTF-8; 1 to 64 bytes. |
 | `name` | `S` | Always present. |
 | `state` | `S` | One of `NEW`, `SUBMITTED`, `RUNNING`, `SUCCEEDED`, or `FAILED`. |
 | `last_updated` | `N` | Unix epoch seconds. |
@@ -167,13 +168,22 @@ The DynamoDB item contract enforced by `src/operation_persistence.zig` is:
 | `hash` | `S` | 64-character lowercase BLAKE3-256 hexadecimal value. |
 | `result` | `S` | Terminal states only; compact `std.json.Value` JSON; at most 4,096 UTF-8 bytes. |
 
-The Operation hash covers only a JSON envelope containing `name` and `body`.
+The Operation hash covers only the fixed-order JSON envelope containing
+`tenant`, `name`, and `body`.
 The body is parsed once into an arena-owned `std.json.Value` and serialized
 directly into the hash stream, so insignificant whitespace and equivalent
 string escapes do not change the hash, while object member order remains
 significant. The `id`, `state`, `last_updated`, `expires_at`, and `result`
-fields are excluded. One lifetime arena owns each Operation's strings and
-nested body or result Values for a CLI command or Lambda POST.
+fields are excluded. Lambda derives tenant exclusively from the verified
+PASETO `sub` claim. The host CLI accepts it only through
+`operation create --tenant`; caller-supplied Operation JSON cannot set it. One
+lifetime arena owns each Operation's tenant, strings, and nested body or result
+Values for a CLI command or Lambda POST.
+
+The reference envelope
+`{"tenant":"tenant-a","name":"echo","body":{"message":"hello","count":2}}`
+has lowercase BLAKE3-256 digest
+`d271e3bd560113d2b82e42dfc46be33fb90b43d7f4b12114f3da4888eae445d4`.
 
 Never persist `body`. The 4,096-byte `result` bound is an application-enforced
 constraint because DynamoDB and CloudFormation cannot enforce a per-attribute
@@ -185,20 +195,26 @@ to equal the compact reserialization, rejecting malformed, duplicate-key,
 explicit-null, oversized, or noncanonical items. Creates use
 `attribute_not_exists(id)` and request `ALL_OLD` when that condition fails. A
 failed create condition succeeds as an idempotent retry only when the returned
-item has the submitted Operation hash, regardless of its current state;
+item has the submitted tenant and Operation hash, regardless of its current state;
 otherwise it is an Operation conflict. Reads are strongly consistent. Updates
 condition on the previously read snapshot, including the old `expires_at`,
-preserve `id`, `name`, and `hash`, and return and validate `ALL_NEW`. New items
-and every successful update set `expires_at` to `last_updated + 86,400`.
+preserve `id`, `tenant`, `name`, and `hash`, and return and validate `ALL_NEW`.
+New items and every successful update set `expires_at` to
+`last_updated + 86,400`.
 Result-size validation remains in the application rather than a DynamoDB
 condition expression.
 
+Tenant is metadata and part of idempotency identity. UUIDs and the `id`
+partition key remain globally scoped, so reusing a UUID under another tenant
+changes the hash and returns an Operation conflict. This contract does not add
+tenant-scoped keys, secondary indexes, or new read authorization behavior.
+
 DynamoDB TTL deletion is asynchronous. An item becomes eligible for deletion
-at `expires_at` but may remain readable until DynamoDB removes it. Records that
-predate this contract have no TTL attribute and are rejected by the strict item
-decoder; remove, recreate, or separately backfill them before deploying this
-version. CloudFormation configures TTL, so the Lambda role does not need an
-additional DynamoDB control-plane permission.
+at `expires_at` but may remain readable until DynamoDB removes it. Legacy rows
+without tenant are rejected by the strict item decoder and must be deleted and
+recreated before deploying this version; there is no fallback decoder or
+application migration path. CloudFormation configures TTL, so the Lambda role
+does not need an additional DynamoDB control-plane permission.
 
 The Function URL settings are:
 
@@ -465,25 +481,27 @@ curl -L \
 ```
 
 For a new ID, the handler persists and returns the Operation output view with
-`NEW` state, the invocation timestamp, its 24-hour expiry, and its stable hash.
-It omits the input body:
+`NEW` state, the invocation timestamp, its 24-hour expiry, the verified subject
+as tenant, and its stable hash. It omits the input body:
 
 ```json
 {
   "id": "00112233-4455-6677-8899-aabbccddeeff",
+  "tenant": "example-user",
   "name": "echo",
   "state": "NEW",
   "last_updated": 1700000000,
   "expires_at": 1700086400,
-  "hash": "ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662"
+  "hash": "f4142429f9f7373c34b7b5eeab555ed5b4534a746193c40bfca65bb73f9a3014"
 }
 ```
 
-Retrying the same ID, name, and body is idempotent and returns the latest
-stored state, timestamps, terminal result when present, and hash. Reusing the
-ID for different work returns the static `409 Conflict` response. DynamoDB,
-malformed stored-item, and allocation failures return only the static
-`500 Internal Server Error` response.
+Retrying the same ID, tenant, name, and body is idempotent and returns the
+latest stored state, timestamps, terminal result when present, and hash.
+Reusing the ID for different work or from a different verified subject returns
+the static `409 Conflict` response. DynamoDB, malformed stored-item, and
+allocation failures return only the static `500 Internal Server Error`
+response.
 
 ## 9. Create, read, and update persisted Operations
 
@@ -497,19 +515,22 @@ export AWS_PROFILE=dev
 export AWS_REGION=ca-central-1
 ```
 
-Create an Operation from its input JSON view:
+Create an Operation from its unchanged input JSON view while supplying required
+tenant metadata separately. A tenant must be valid UTF-8 between 1 and 64
+bytes:
 
 ```sh
 operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"echo","body":{"message":"hello","count":2}}'
-printf '%s\n' "$operation_json" | zig-out/bin/operation create
+printf '%s\n' "$operation_json" \
+  | zig-out/bin/operation create --tenant 'tenant-a'
 ```
 
-Retry create with the original UUID, name, and body. When the UUID already
+Retry create with the original UUID, tenant, name, and body. When the UUID already
 identifies an Operation with the same Operation hash, create returns the current
 stored Operation, including its state, `last_updated`, `expires_at`, and terminal
-result when present. A different hash returns `operation: operation conflict`
-with exit code `1`.
+result when present. A different hash, including one derived under another
+tenant, returns `operation: operation conflict` with exit code `1`.
 
 Read the persistent output view:
 

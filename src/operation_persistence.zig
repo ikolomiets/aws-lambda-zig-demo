@@ -10,8 +10,8 @@ const AttributeName = aws.map.StringMapEntry;
 
 const id_size = 36;
 const hash_size = 64;
-const attribute_count_min = 6;
-const attribute_count_max = 7;
+const attribute_count_min = 7;
+const attribute_count_max = 8;
 const create_condition = "attribute_not_exists(id)";
 
 comptime {
@@ -135,8 +135,8 @@ const UpdateRequest = struct {
     old_result_buffer: [operation.result_size_max]u8,
     new_result_buffer: [operation.result_size_max]u8,
     key: [1]Attribute,
-    names: [4]AttributeName,
-    values: [11]Attribute,
+    names: [5]AttributeName,
+    values: [12]Attribute,
     value_count: u8,
     condition_expression: []const u8,
     update_expression: []const u8,
@@ -149,11 +149,12 @@ fn createRequestInit(request: *CreateRequest, source: *const operation.Operation
     request.hash_buffer = std.fmt.bytesToHex(source.hash.?, .lower);
     request.items = undefined;
     request.items[0] = stringAttribute("id", operation.uuidToString(source.id, &request.id_buffer));
-    request.items[1] = stringAttribute("name", source.name);
-    request.items[2] = stringAttribute("state", operation.stateToString(state));
-    request.items[3] = numberAttribute("last_updated", timestamp);
-    request.items[4] = numberAttribute("expires_at", expires_at);
-    request.items[5] = stringAttribute("hash", &request.hash_buffer);
+    request.items[1] = stringAttribute("tenant", source.tenant);
+    request.items[2] = stringAttribute("name", source.name);
+    request.items[3] = stringAttribute("state", operation.stateToString(state));
+    request.items[4] = numberAttribute("last_updated", timestamp);
+    request.items[5] = numberAttribute("expires_at", expires_at);
+    request.items[6] = stringAttribute("hash", &request.hash_buffer);
     request.item_count = attribute_count_min;
     if (operation.stateIsTerminal(state)) {
         const result = try operation.writeResultJSON(&request.result_buffer, &source.result.?);
@@ -194,10 +195,12 @@ fn updateRequestInit(
         .{ .key = "#name", .value = "name" },
         .{ .key = "#result", .value = "result" },
         .{ .key = "#state", .value = "state" },
+        .{ .key = "#tenant", .value = "tenant" },
     };
     request.values = undefined;
     request.value_count = 0;
     updateValue(request, ":id", .{ .s = id });
+    updateValue(request, ":old_tenant", .{ .s = snapshot.tenant });
     updateValue(request, ":old_name", .{ .s = snapshot.name });
     updateValue(request, ":old_state", .{ .s = operation.stateToString(snapshot.state.?) });
     updateValue(request, ":old_time", .{ .n = old_time });
@@ -228,7 +231,7 @@ fn updateRequestResult(
     } else {
         request.update_expression = update_without_result;
     }
-    std.debug.assert(request.value_count >= 9);
+    std.debug.assert(request.value_count >= 10);
     std.debug.assert(request.value_count <= request.values.len);
 }
 
@@ -240,11 +243,13 @@ fn updateValue(request: *UpdateRequest, key: []const u8, value: AttributeValue) 
 }
 
 const condition_without_result =
-    "id = :id AND #name = :old_name AND #state = :old_state AND " ++
+    "id = :id AND #tenant = :old_tenant AND #name = :old_name AND " ++
+    "#state = :old_state AND " ++
     "last_updated = :old_time AND expires_at = :old_expires_at AND " ++
     "#hash = :old_hash AND attribute_not_exists(#result)";
 const condition_with_result =
-    "id = :id AND #name = :old_name AND #state = :old_state AND " ++
+    "id = :id AND #tenant = :old_tenant AND #name = :old_name AND " ++
+    "#state = :old_state AND " ++
     "last_updated = :old_time AND expires_at = :old_expires_at AND " ++
     "#hash = :old_hash AND #result = :old_result";
 const update_without_result =
@@ -267,6 +272,7 @@ fn decodeItem(arena: Allocator, item: []const Attribute) !operation.Operation {
 
 const DecodedFields = struct {
     id: ?[]const u8 = null,
+    tenant: ?[]const u8 = null,
     name: ?[]const u8 = null,
     state: ?[]const u8 = null,
     last_updated: ?[]const u8 = null,
@@ -278,6 +284,9 @@ const DecodedFields = struct {
         if (std.mem.eql(u8, attribute.key, "id")) {
             if (fields.id != null) return error.InvalidItem;
             fields.id = try stringValue(attribute.value);
+        } else if (std.mem.eql(u8, attribute.key, "tenant")) {
+            if (fields.tenant != null) return error.InvalidItem;
+            fields.tenant = try stringValue(attribute.value);
         } else if (std.mem.eql(u8, attribute.key, "name")) {
             if (fields.name != null) return error.InvalidItem;
             fields.name = try stringValue(attribute.value);
@@ -318,8 +327,11 @@ const DecodedFields = struct {
             break :result null;
         };
         const name_text = fields.name orelse return error.InvalidItem;
+        const tenant_text = fields.tenant orelse return error.InvalidItem;
+        operation.validateTenant(tenant_text) catch return error.InvalidItem;
         return .{
             .id = id,
+            .tenant = try arena.dupe(u8, tenant_text),
             .name = try arena.dupe(u8, name_text),
             .state = state,
             .last_updated = try timestampFromString(fields.last_updated orelse {
@@ -373,6 +385,7 @@ fn validateUpdate(
     try validateStored(snapshot);
     try validateStored(replacement);
     if (snapshot.id != replacement.id) return error.ImmutableField;
+    if (!std.mem.eql(u8, snapshot.tenant, replacement.tenant)) return error.ImmutableField;
     if (!std.mem.eql(u8, snapshot.name, replacement.name)) return error.ImmutableField;
     if (!std.mem.eql(u8, &snapshot.hash.?, &replacement.hash.?)) return error.ImmutableField;
     std.debug.assert(snapshot.body == null);
@@ -384,6 +397,7 @@ fn validateUpdateResult(
     replacement: *const operation.Operation,
 ) !void {
     if (updated.id != replacement.id) return error.InvalidItem;
+    if (!std.mem.eql(u8, updated.tenant, replacement.tenant)) return error.InvalidItem;
     if (!std.mem.eql(u8, updated.name, replacement.name)) return error.InvalidItem;
     if (!std.mem.eql(u8, &updated.hash.?, &replacement.hash.?)) return error.InvalidItem;
     if (updated.state != replacement.state) return error.InvalidItem;
@@ -406,6 +420,9 @@ fn createError(
     };
     const item = failure.item orelse return error.InvalidItem;
     const existing = try decodeItem(arena, item);
+    if (!std.mem.eql(u8, existing.tenant, submitted.tenant)) {
+        return error.OperationConflict;
+    }
     if (!std.mem.eql(u8, &existing.hash.?, &submitted.hash.?)) {
         return error.OperationConflict;
     }
@@ -518,6 +535,7 @@ const test_hash = [_]u8{0xAB} ** 32;
 fn testOperation(state: operation.State, result: ?std.json.Value) operation.Operation {
     return .{
         .id = operation.uuidFromString(test_id) catch unreachable,
+        .tenant = "tenant-a",
         .name = "echo",
         .state = state,
         .last_updated = 1_700_000_000,
@@ -560,6 +578,8 @@ test "items round trip every state without persisting body" {
         const decoded = try decodeItem(arena.allocator(), item);
 
         try std.testing.expectEqual(state, decoded.state.?);
+        try std.testing.expectEqualStrings("tenant-a", decoded.tenant);
+        try std.testing.expect(decoded.tenant.ptr != source.tenant.ptr);
         try std.testing.expect(findAttribute(item, "body") == null);
         try std.testing.expectEqual(operation.stateIsTerminal(state), decoded.result != null);
         try std.testing.expectEqual(@as(usize, request.item_count), item.len);
@@ -570,10 +590,25 @@ test "create request uses the exact item contract and returns a failed condition
     const source = testOperation(.new, null);
     var request: CreateRequest = undefined;
     try createRequestInit(&request, &source);
-    try std.testing.expectEqual(@as(u8, 6), request.item_count);
+    try std.testing.expectEqual(@as(u8, 7), request.item_count);
     try std.testing.expectEqualStrings("00112233-4455-6677-8899-aabbccddeeff", try stringValue(
         findAttribute(request.items[0..request.item_count], "id").?,
     ));
+    try std.testing.expectEqualStrings("tenant-a", try stringValue(
+        findAttribute(request.items[0..request.item_count], "tenant").?,
+    ));
+    const expected_keys = [_][]const u8{
+        "id",
+        "tenant",
+        "name",
+        "state",
+        "last_updated",
+        "expires_at",
+        "hash",
+    };
+    for (request.items[0..request.item_count], expected_keys) |attribute, key| {
+        try std.testing.expectEqualStrings(key, attribute.key);
+    }
     try std.testing.expectEqualStrings("1700000000", try numberValue(
         findAttribute(request.items[0..request.item_count], "last_updated").?,
     ));
@@ -600,6 +635,7 @@ test "persistent copy omits the private body without copying arena-owned Values"
 
     try std.testing.expect(created.body == null);
     try std.testing.expectEqual(source.id, created.id);
+    try std.testing.expectEqualStrings(source.tenant, created.tenant);
     try std.testing.expectEqual(source.state, created.state);
     try std.testing.expectEqual(source.last_updated, created.last_updated);
     try std.testing.expectEqual(source.expires_at, created.expires_at);
@@ -618,65 +654,92 @@ test "read request is strongly consistent and keyed by canonical UUID" {
     try std.testing.expectEqualStrings(test_id, try stringValue(input.key[0].value));
 }
 
-test "decoder rejects missing duplicate unknown wrong and malformed attributes" {
+test "decoder rejects legacy and malformed tenant attributes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source = testOperation(.new, null);
     var request: CreateRequest = undefined;
     try createRequestInit(&request, &source);
     const valid = request.items[0..request.item_count];
-
-    try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), valid[0..5]));
-    var duplicate = request.items;
-    duplicate[6] = duplicate[0];
-    try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &duplicate));
-    var unknown = request.items;
-    unknown[6] = stringAttribute("body", "null");
-    try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &unknown));
-    var wrong_type = request.items;
-    wrong_type[1].value = .{ .n = "1" };
+    const legacy_without_tenant = [_]Attribute{
+        valid[0],
+        valid[2],
+        valid[3],
+        valid[4],
+        valid[5],
+        valid[6],
+    };
     try std.testing.expectError(
         error.InvalidItem,
-        decodeItem(arena.allocator(), wrong_type[0..6]),
+        decodeItem(arena.allocator(), &legacy_without_tenant),
     );
+    const invalid_values = [_]AttributeValue{
+        .{ .n = "1" },
+        .{ .s = "" },
+        .{ .s = "a" ** (operation.tenant_size_max + 1) },
+        .{ .s = &.{0xFF} },
+    };
+    for (invalid_values) |invalid| {
+        var malformed = request.items;
+        malformed[1].value = invalid;
+        try std.testing.expectError(
+            error.InvalidItem,
+            decodeItem(arena.allocator(), malformed[0..7]),
+        );
+    }
+}
+
+test "decoder rejects duplicate unknown wrong and malformed attributes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source = testOperation(.new, null);
+    var request: CreateRequest = undefined;
+    try createRequestInit(&request, &source);
+
+    var duplicate = request.items;
+    duplicate[7] = duplicate[0];
+    try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &duplicate));
+    var unknown = request.items;
+    unknown[7] = stringAttribute("body", "null");
+    try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &unknown));
     var malformed = request.items;
     malformed[0].value = .{ .s = "00112233-4455-6677-8899-AABBCCDDEEFF" };
     try std.testing.expectError(
         error.InvalidItem,
-        decodeItem(arena.allocator(), malformed[0..6]),
+        decodeItem(arena.allocator(), malformed[0..7]),
     );
     malformed = request.items;
-    malformed[2].value = .{ .s = "DONE" };
+    malformed[3].value = .{ .s = "DONE" };
     try std.testing.expectError(
         error.InvalidItem,
-        decodeItem(arena.allocator(), malformed[0..6]),
+        decodeItem(arena.allocator(), malformed[0..7]),
     );
     malformed = request.items;
-    malformed[3].value = .{ .n = "01700000000" };
+    malformed[4].value = .{ .n = "01700000000" };
     try std.testing.expectError(
         error.InvalidItem,
-        decodeItem(arena.allocator(), malformed[0..6]),
+        decodeItem(arena.allocator(), malformed[0..7]),
     );
     malformed = request.items;
-    malformed[4].value = .{ .s = "1700086400" };
+    malformed[5].value = .{ .s = "1700086400" };
     try std.testing.expectError(
         error.InvalidItem,
-        decodeItem(arena.allocator(), malformed[0..6]),
+        decodeItem(arena.allocator(), malformed[0..7]),
     );
     malformed = request.items;
-    malformed[4].value = .{ .n = "1700086401" };
+    malformed[5].value = .{ .n = "1700086401" };
     try std.testing.expectError(
         error.InvalidItem,
-        decodeItem(arena.allocator(), malformed[0..6]),
+        decodeItem(arena.allocator(), malformed[0..7]),
     );
     malformed = request.items;
-    malformed[5].value = .{ .s = "AB" ** 32 };
+    malformed[6].value = .{ .s = "AB" ** 32 };
     try std.testing.expectError(
         error.InvalidItem,
-        decodeItem(arena.allocator(), malformed[0..6]),
+        decodeItem(arena.allocator(), malformed[0..7]),
     );
     malformed = request.items;
-    malformed[6] = stringAttribute("result", "null");
+    malformed[7] = stringAttribute("result", "null");
     try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &malformed));
 }
 
@@ -693,35 +756,36 @@ test "decoder enforces terminal result presence type canonical JSON and size" {
 
     const legacy = [_]Attribute{
         request.items[0],
-        request.items[1],
         request.items[2],
         request.items[3],
+        request.items[4],
         request.items[5],
         request.items[6],
+        request.items[7],
     };
     try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &legacy));
     try std.testing.expectError(
         error.InvalidItem,
-        decodeItem(arena.allocator(), request.items[0..6]),
+        decodeItem(arena.allocator(), request.items[0..7]),
     );
     var malformed = request.items;
-    malformed[6].value = .{ .n = "1" };
+    malformed[7].value = .{ .n = "1" };
     try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &malformed));
     malformed = request.items;
-    malformed[6].value = .{ .s = "null" };
+    malformed[7].value = .{ .s = "null" };
     try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &malformed));
     malformed = request.items;
-    malformed[6].value = .{ .s = "{broken" };
+    malformed[7].value = .{ .s = "{broken" };
     try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &malformed));
     malformed = request.items;
-    malformed[6].value = .{ .s = "{\"ok\": true}" };
+    malformed[7].value = .{ .s = "{\"ok\": true}" };
     try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &malformed));
     malformed = request.items;
-    malformed[6].value = .{ .s = "{\"key\":1,\"key\":2}" };
+    malformed[7].value = .{ .s = "{\"key\":1,\"key\":2}" };
     try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &malformed));
     const oversized = "\"" ++ ("a" ** (operation.result_size_max - 1)) ++ "\"";
     malformed = request.items;
-    malformed[6].value = .{ .s = oversized };
+    malformed[7].value = .{ .s = oversized };
     try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &malformed));
 }
 
@@ -776,6 +840,14 @@ test "updates snapshot every stored field and return all new attributes" {
 
     try std.testing.expectEqualStrings(condition_without_result, request.condition_expression);
     try std.testing.expectEqualStrings(update_with_result, request.update_expression);
+    try std.testing.expectEqualStrings("tenant-a", try stringValue(
+        findUpdateValue(&request, ":old_tenant").?,
+    ));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        request.condition_expression,
+        "#tenant = :old_tenant",
+    ) != null);
     try std.testing.expectEqualStrings("RUNNING", try stringValue(
         findUpdateValue(&request, ":old_state").?,
     ));
@@ -843,6 +915,12 @@ test "updates allow same state and reject immutable replacements" {
         validateUpdate(&snapshot, &replacement),
     );
     replacement = snapshot;
+    replacement.tenant = "tenant-b";
+    try std.testing.expectError(
+        error.ImmutableField,
+        validateUpdate(&snapshot, &replacement),
+    );
+    replacement = snapshot;
     replacement.name = "different";
     try std.testing.expectError(
         error.ImmutableField,
@@ -862,6 +940,12 @@ test "update result requires the replacement expiration" {
     try validateUpdateResult(&updated, &replacement);
 
     updated.expires_at.? += 1;
+    try std.testing.expectError(
+        error.InvalidItem,
+        validateUpdateResult(&updated, &replacement),
+    );
+    updated = replacement;
+    updated.tenant = "tenant-b";
     try std.testing.expectError(
         error.InvalidItem,
         validateUpdateResult(&updated, &replacement),
@@ -929,6 +1013,26 @@ test "create retry conflicts on a hash mismatch in every state" {
             &submitted,
         ));
     }
+}
+
+test "create retry conflicts when a global UUID belongs to another tenant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const submitted = testOperation(.new, null);
+    var existing = submitted;
+    existing.tenant = "tenant-b";
+    var request: CreateRequest = undefined;
+    try createRequestInit(&request, &existing);
+    var diagnostic = dynamodb.ServiceError{ .kind = .{ .conditional_check_failed_exception = .{
+        .item = request.items[0..request.item_count],
+    } } };
+
+    try std.testing.expectError(error.OperationConflict, createError(
+        arena.allocator(),
+        error.ServiceError,
+        &diagnostic,
+        &submitted,
+    ));
 }
 
 test "create failure requires a valid returned item and preserves AWS failures" {

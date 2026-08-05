@@ -8,7 +8,8 @@ host-native DynamoDB Operation utility named `operation`. The handler
 authenticates a PASETO v4.public bearer token before serving GET and POST
 requests through the `aws-lambda-zig` runtime package. GET returns a plain-text
 Lambda environment dump, while POST validates and hashes an Operation JSON
-document, persists it idempotently in DynamoDB, and returns the current stored
+document, derives required tenant metadata from the verified token subject,
+persists the Operation idempotently in DynamoDB, and returns the current stored
 output view without the body.
 
 ## Requirements
@@ -139,32 +140,45 @@ Identity Center. Credential or service failures encountered after
 configuration loading are reported separately as `operation: AWS request
 failed`.
 
-Create an Operation by sending the existing input JSON view on standard input:
+Create an Operation by supplying required tenant metadata separately and
+sending the unchanged input JSON view on standard input. A tenant must be valid
+UTF-8 between 1 and 64 bytes:
 
 ```sh
 operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"echo","body":{"message":"hello","count":2}}'
-printf '%s\n' "$operation_json" | zig-out/bin/operation create
+printf '%s\n' "$operation_json" \
+  | zig-out/bin/operation create --tenant 'tenant-a'
 ```
 
 The Operation hash is the BLAKE3-256 digest of a JSON envelope containing only
-`name` and `body`. The body is parsed once into an arena-owned
+`tenant`, `name`, and `body`, in that fixed order. The body is parsed once into an arena-owned
 `std.json.Value` and serialized directly into the hash stream, so
 insignificant whitespace and equivalent string escapes do not change the hash,
 while object member order remains significant. The `id`, `state`,
 `last_updated`, `expires_at`, and `result` fields are not included.
+For reference,
+`{"tenant":"tenant-a","name":"echo","body":{"message":"hello","count":2}}`
+hashes to
+`d271e3bd560113d2b82e42dfc46be33fb90b43d7f4b12114f3da4888eae445d4`.
 
-Each CLI command and Lambda POST owns its Operation strings, body, and result
+Tenant is server-owned Operation metadata rather than an input JSON field. The
+CLI accepts it only through `--tenant`, and Lambda derives it exclusively from
+the verified PASETO `sub` claim. Supplying `tenant` inside the JSON document is
+rejected to prevent spoofing.
+
+Each CLI command and Lambda POST owns its Operation tenant, strings, body, and result
 through one short-lived arena. Optional absence means a field is omitted from
 that Operation view; an explicit JSON `null` remains a distinct
 `std.json.Value`. Terminal results must be present and non-null.
 
-A create is safe to retry with the original UUID, name, and body. If that UUID
+A create is safe to retry with the original UUID, tenant, name, and body. If that UUID
 already identifies an Operation with the same Operation hash, the retry
 succeeds and returns the current stored Operation, including its state,
 `last_updated`, `expires_at`, and terminal result when present. Reusing the UUID
 for different content returns `operation: operation conflict` with exit code
-`1`.
+`1`. UUIDs are globally scoped, so reusing an ID under another tenant also
+changes the hash and returns a conflict.
 
 Read it with a strongly consistent DynamoDB read:
 
@@ -200,13 +214,14 @@ Every successful command emits the canonical Operation output JSON. Exit code
 failure, or an internal failure. Create and update conflicts both emit
 `operation: operation conflict`.
 
-The persistent item contains exactly `id`, `name`, `state`, `last_updated`,
-`expires_at`, `hash`, and an optional terminal `result`; it never contains
-`body`. Creates use `attribute_not_exists(id)` and request the existing item on
+The persistent item contains exactly `id`, `tenant`, `name`, `state`,
+`last_updated`, `expires_at`, `hash`, and an optional terminal `result`; it never
+contains `body`. Tenant is a required DynamoDB `S` attribute. Creates use
+`attribute_not_exists(id)` and request the existing item on
 a failed condition so matching retries need no separate read. Updates first
 perform a strongly consistent read and then condition on the complete snapshot,
 including `expires_at`, so a concurrent change is reported instead of
-overwritten. Updates preserve `id`, `name`, and `hash`. DynamoDB keeps `result`
+overwritten. Updates preserve `id`, `tenant`, `name`, and `hash`. DynamoDB keeps `result`
 as an `S` attribute containing the compact `std.json.Value` serialization.
 Reads reject malformed, oversized, duplicate-key, explicit-null, or
 noncanonical stored result strings.
@@ -214,8 +229,9 @@ noncanonical stored result strings.
 The SAM table enables native DynamoDB TTL on `expires_at`. Expiration is
 best-effort: an Operation becomes eligible for deletion after 24 hours but may
 remain readable until DynamoDB removes it asynchronously. The item contract is
-strict, so records created before `expires_at` was introduced must be removed,
-recreated, or backfilled separately before this version reads them.
+strict: legacy records without `tenant` are rejected and must be deleted and
+recreated before this version reads them. There is no fallback decoder or
+migration path in the application.
 
 The Lambda Function URL requires the token in an HTTP authorization header:
 
@@ -232,6 +248,10 @@ methods other than GET and POST receive `405 Method Not Allowed`. A POST that
 reuses an Operation ID with a different server-computed hash receives a
 sanitized `409 Conflict`; DynamoDB and malformed stored-item failures receive
 the static `500 Internal Server Error` response.
+
+Tenant is metadata and part of idempotency identity only. The DynamoDB `id`
+partition key remains globally scoped, and this change does not add
+tenant-scoped keys or new read authorization behavior.
 
 `OPERATIONS_TABLE_NAME` is mandatory at Lambda initialization. The bootstrap
 validates the table name, loads the AWS SDK configuration, and creates one
@@ -327,23 +347,25 @@ curl -L \
 ```
 
 For a new ID, the response has `NEW` state, the invocation timestamp, its
-24-hour expiry, and the stable BLAKE3-256 operation hash. The input body is
-intentionally omitted:
+24-hour expiry, verified subject as tenant, and the stable BLAKE3-256 operation
+hash. The input body is intentionally omitted:
 
 ```json
 {
   "id": "00112233-4455-6677-8899-aabbccddeeff",
+  "tenant": "example-user",
   "name": "echo",
   "state": "NEW",
   "last_updated": 1700000000,
   "expires_at": 1700086400,
-  "hash": "ab9a059eb68c36bddaffb5bdd23aa7177c3a97dc34f9af54eb06f1c488ac3662"
+  "hash": "f4142429f9f7373c34b7b5eeab555ed5b4534a746193c40bfca65bb73f9a3014"
 }
 ```
 
 The POST is persisted before the response is generated. Retrying the same ID,
-name, and body returns the latest stored state, timestamps, terminal result when
-present, and hash. Reusing the ID for different work returns `409 Conflict`.
+tenant, name, and body returns the latest stored state, timestamps, terminal
+result when present, and hash. Reusing the ID for different work or from a
+different verified subject returns `409 Conflict`.
 
 The template intentionally creates a publicly reachable Function URL for demo
 HTTP GET and POST testing, while the handler enforces PASETO bearer

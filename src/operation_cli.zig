@@ -18,9 +18,13 @@ comptime {
 
 const Command = union(enum) {
     help,
-    create,
+    create: CreateOptions,
     read: u128,
     update: UpdateOptions,
+};
+
+const CreateOptions = struct {
+    tenant: []const u8,
 };
 
 const UpdateOptions = struct {
@@ -40,7 +44,7 @@ const CliError = error{InvalidInvocation};
 
 const usage =
     \\Usage:
-    \\  operation create
+    \\  operation create --tenant <tenant>
     \\  operation read --id <uuid>
     \\  operation update --id <uuid> --state <state>
     \\
@@ -232,11 +236,13 @@ fn parseCommand(arguments: []const []const u8) CliError!Command {
 }
 
 fn parseCreate(arguments: []const []const u8) CliError!Command {
-    if (arguments.len == 0) return .create;
     if (arguments.len == 1) {
         if (isHelp(arguments[0])) return .help;
     }
-    return error.InvalidInvocation;
+    if (arguments.len != 2) return error.InvalidInvocation;
+    if (!std.mem.eql(u8, arguments[0], "--tenant")) return error.InvalidInvocation;
+    operation.validateTenant(arguments[1]) catch return error.InvalidInvocation;
+    return .{ .create = .{ .tenant = arguments[1] } };
 }
 
 fn parseRead(arguments: []const []const u8) CliError!Command {
@@ -408,6 +414,7 @@ fn classifyError(err: anyerror) Failure {
         error.ForbiddenField,
         error.UnknownField,
         error.InvalidUUID,
+        error.InvalidTenant,
         error.InvalidName,
         error.InvalidState,
         error.BodyTooLarge,
@@ -439,17 +446,24 @@ fn executeCommand(
     const backend = backend_optional orelse return error.InternalFailure;
     switch (command) {
         .help => unreachable,
-        .create => try executeCreate(context, backend),
+        .create => |options| try executeCreate(context, backend, options),
         .read => |id| try executeRead(context, backend, id),
         .update => |options| try executeUpdate(context, backend, options),
     }
 }
 
-fn executeCreate(context: Context, backend: PersistenceInterface) !void {
+fn executeCreate(
+    context: Context,
+    backend: PersistenceInterface,
+    options: CreateOptions,
+) !void {
     const parsed = try operation.parseInputJSON(
         context.allocator,
         context.stdin,
-        context.now,
+        .{
+            .tenant = options.tenant,
+            .now = context.now,
+        },
     );
     const created = try backend.create(context.allocator, &parsed);
     try operation.validatePersistent(&created);
@@ -498,6 +512,7 @@ const test_hash = [_]u8{0xAB} ** 32;
 const FakePersistence = struct {
     stored: operation.Operation = .{
         .id = operation.uuidFromString(test_id) catch unreachable,
+        .tenant = "tenant-a",
         .name = "echo",
         .state = .running,
         .last_updated = 1_700_000_000,
@@ -513,6 +528,8 @@ const FakePersistence = struct {
     last_id: u128 = 0,
     last_state: ?operation.State = null,
     create_last_updated: ?operation.UnixSeconds = null,
+    create_tenant_buffer: [operation.tenant_size_max]u8 = undefined,
+    create_tenant_len: u8 = 0,
 
     fn create(
         fake: *FakePersistence,
@@ -522,6 +539,8 @@ const FakePersistence = struct {
         fake.create_count += 1;
         fake.last_id = source.id;
         fake.last_state = source.state;
+        fake.create_tenant_len = @intCast(source.tenant.len);
+        @memcpy(fake.create_tenant_buffer[0..source.tenant.len], source.tenant);
         if (fake.create_error) |err| return err;
         var created = source.*;
         created.body = null;
@@ -530,6 +549,10 @@ const FakePersistence = struct {
             created.expires_at = try operation.expires_at_from_last_updated(last_updated);
         }
         return created;
+    }
+
+    fn createTenant(fake: *const FakePersistence) []const u8 {
+        return fake.create_tenant_buffer[0..fake.create_tenant_len];
     }
 
     fn read(
@@ -665,6 +688,35 @@ test "help works without AWS configuration and invocation is bounded" {
     try std.testing.expectEqual(@as(u8, 2), excessive.exit_code);
 }
 
+test "create requires one valid bounded tenant flag" {
+    const valid = [_][]const u8{
+        "a",
+        "a" ** operation.tenant_size_max,
+        "é" ** (operation.tenant_size_max / 2),
+    };
+    for (valid) |tenant| {
+        const command = try parseCommand(&.{ "operation", "create", "--tenant", tenant });
+        try std.testing.expectEqualStrings(tenant, command.create.tenant);
+    }
+
+    const invalid = [_][]const u8{
+        "",
+        "a" ** (operation.tenant_size_max + 1),
+        ("é" ** (operation.tenant_size_max / 2)) ++ "a",
+        &.{0xFF},
+    };
+    try std.testing.expectError(
+        error.InvalidInvocation,
+        parseCommand(&.{ "operation", "create" }),
+    );
+    for (invalid) |tenant| {
+        try std.testing.expectError(
+            error.InvalidInvocation,
+            parseCommand(&.{ "operation", "create", "--tenant", tenant }),
+        );
+    }
+}
+
 test "configuration is required before persistence dispatch" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
@@ -703,7 +755,7 @@ test "create parses stdin dispatches once and writes canonical JSON" {
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
     const result = runForTest(
-        &.{ "operation", "create" },
+        &.{ "operation", "create", "--tenant", "tenant-a" },
         input,
         &environment,
         1_700_000_000,
@@ -712,12 +764,14 @@ test "create parses stdin dispatches once and writes canonical JSON" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
     try std.testing.expectEqual(@as(u8, 1), fake.create_count);
     try std.testing.expectEqual(operation.State.new, fake.last_state.?);
+    try std.testing.expectEqualStrings("tenant-a", fake.createTenant());
     try std.testing.expectEqualStrings(
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"name\":\"echo\",\"state\":\"NEW\",\"last_updated\":1700000000," ++
+            "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
+            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
-            "\"hash\":\"ab9a059eb68c36bddaffb5bdd23aa717" ++
-            "7c3a97dc34f9af54eb06f1c488ac3662\"}\n",
+            "\"hash\":\"d271e3bd560113d2b82e42dfc46be33" ++
+            "fb90b43d7f4b12114f3da4888eae445d4\"}\n",
         result.stdout(),
     );
     try std.testing.expectEqualStrings("", result.stderr());
@@ -731,7 +785,7 @@ test "matching create retry writes the authoritative stored timestamp" {
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
     const result = runForTest(
-        &.{ "operation", "create" },
+        &.{ "operation", "create", "--tenant", "tenant-a" },
         input,
         &environment,
         1_700_000_010,
@@ -756,17 +810,40 @@ test "create bounds stdin and reports conflict and invalid input outcomes" {
     defer environment.deinit();
     var fake: FakePersistence = .{};
     const oversized = "a" ** (stdin_size_max + 1);
-    const large = runForTest(&.{ "operation", "create" }, oversized, &environment, 0, &fake);
+    const large = runForTest(
+        &.{ "operation", "create", "--tenant", "tenant-a" },
+        oversized,
+        &environment,
+        0,
+        &fake,
+    );
     try std.testing.expectEqual(@as(u8, 2), large.exit_code);
     try std.testing.expectEqual(@as(u8, 0), fake.create_count);
 
-    const invalid = runForTest(&.{ "operation", "create" }, "null", &environment, 0, &fake);
+    const invalid = runForTest(
+        &.{ "operation", "create", "--tenant", "tenant-a" },
+        "null",
+        &environment,
+        0,
+        &fake,
+    );
     try std.testing.expectEqual(@as(u8, 2), invalid.exit_code);
     try std.testing.expectEqualStrings("operation: invalid operation input\n", invalid.stderr());
 
+    const spoofed = runForTest(
+        &.{ "operation", "create", "--tenant", "tenant-a" },
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"spoofed\",\"name\":\"echo\",\"body\":null}",
+        &environment,
+        0,
+        &fake,
+    );
+    try std.testing.expectEqual(@as(u8, 2), spoofed.exit_code);
+    try std.testing.expectEqual(@as(u8, 0), fake.create_count);
+
     fake.create_error = error.OperationConflict;
     const conflict = runForTest(
-        &.{ "operation", "create" },
+        &.{ "operation", "create", "--tenant", "tenant-a" },
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"echo\",\"body\":null}",
         &environment,
@@ -791,6 +868,11 @@ test "read validates UUID and writes a canonical strongly modeled item" {
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
     try std.testing.expectEqual(@as(u8, 1), fake.read_count);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout(), test_id) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.stdout(),
+        "\"tenant\":\"tenant-a\"",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout(), "\"state\":\"RUNNING\"") != null);
 
     const invalid = runForTest(
@@ -849,6 +931,11 @@ test "update accepts every target including jumps same state and terminal remova
         try std.testing.expectEqual(@as(u8, 1), fake.read_count);
         try std.testing.expectEqual(@as(u8, 1), fake.update_count);
         try std.testing.expectEqual(state, fake.last_state.?);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            result.stdout(),
+            "\"tenant\":\"tenant-a\"",
+        ) != null);
         try std.testing.expect(std.mem.indexOf(
             u8,
             result.stdout(),
