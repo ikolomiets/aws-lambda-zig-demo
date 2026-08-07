@@ -4,8 +4,8 @@ This guide documents how to deploy the Zig Lambda package in this repository
 using AWS SAM and `template.yaml`.
 
 SAM deploys the Lambda function as a CloudFormation-managed stack. It creates
-the Lambda function, execution role, DynamoDB operations table, public Function
-URL, and Function URL permissions.
+the Lambda function, execution role, DynamoDB operations table, SQS operations
+queue, public Function URL, and Function URL permissions.
 
 ## Assumptions
 
@@ -102,6 +102,7 @@ Both commands should report that `template.yaml` is valid.
 `template.yaml` defines these resources:
 
 - `OperationsTable`: `AWS::DynamoDB::Table`
+- `OperationsQueue`: `AWS::SQS::Queue`
 - `DemoFunction`: `AWS::Serverless::Function`
 - `DemoFunctionUrl`: `AWS::Lambda::Url`
 - `FunctionUrlInvokeFunctionUrlPermission`: allows `lambda:InvokeFunctionUrl`
@@ -127,9 +128,14 @@ Policies:
           - dynamodb:PutItem
           - dynamodb:UpdateItem
         Resource: !GetAtt OperationsTable.Arn
+      - Effect: Allow
+        Action:
+          - sqs:SendMessage
+        Resource: !GetAtt OperationsQueue.Arn
 Environment:
   Variables:
     LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
+    OPERATIONS_QUEUE_URL: !Ref OperationsQueue
     OPERATIONS_TABLE_NAME: !Ref OperationsTable
     PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 ```
@@ -149,6 +155,20 @@ Startup validation does not call `DescribeTable` or make a DynamoDB health
 check. A missing table or insufficient IAM permission is discovered by the
 first POST persistence request and returned to the caller as a sanitized HTTP
 500 response.
+
+The second inline-policy statement grants the function only `SendMessage`
+access to this stack's operations queue. `OPERATIONS_QUEUE_URL` contains its
+CloudFormation-generated URL. The queue and AWS SDK SQS module prepare the
+function to become a producer, but the current handler does not create an SQS
+client, route Operations by name, or send messages. It has no receive, delete,
+purge, or queue-management permissions, and the template defines no consumer
+or Lambda event source mapping.
+
+`OperationsQueue` is a standard queue with a CloudFormation-generated name.
+The template does not configure FIFO behavior, a dead-letter queue, or custom
+queue attributes. `DeletionPolicy: Delete` and `UpdateReplacePolicy: Delete`
+mean deleting the stack or replacing the queue permanently deletes queued
+messages.
 
 The operations table uses on-demand `PAY_PER_REQUEST` billing and has one
 string partition key named `id`. It has no sort key, secondary indexes,
@@ -377,21 +397,24 @@ After a successful deployment, `deploy.sh` reads the
 `OperationsTableName` stack output, waits for the table to exist, and prints a
 concise table summary. It fails unless the table is active, uses on-demand
 billing, has only the `id` string partition key, and has no local or global
-secondary indexes. The existing stack-status and Function URL checks then
-continue as usual.
+secondary indexes. It then reads the `OperationsQueueUrl` output and calls
+`GetQueueAttributes` to print a concise SQS summary. This probe verifies that
+the deployed queue can be queried but does not enforce SQS attribute values.
+The existing Function URL checks then continue as usual.
 
 Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run --use-local-libs`
 to build with local dependency checkouts. The `aws_lambda` checkout defaults
 to `../aws-lambda-zig`; override it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
 
-## 7. Read the Function URL output
+## 7. Read the stack outputs
 
 After deployment, SAM prints stack outputs. Look for:
 
 ```text
 FunctionUrl
 OperationsTableName
+OperationsQueueUrl
 ```
 
 You can also query it later with CloudFormation:
@@ -412,6 +435,19 @@ export OPERATIONS_TABLE_NAME="$(
   aws cloudformation describe-stacks \
     --stack-name aws-lambda-zig-demo \
     --query "Stacks[0].Outputs[?OutputKey=='OperationsTableName'].OutputValue" \
+    --output text \
+    --profile dev \
+    --region ca-central-1
+)"
+```
+
+Discover and export the operations queue URL for future producer tooling:
+
+```sh
+export OPERATIONS_QUEUE_URL="$(
+  aws cloudformation describe-stacks \
+    --stack-name aws-lambda-zig-demo \
+    --query "Stacks[0].Outputs[?OutputKey=='OperationsQueueUrl'].OutputValue" \
     --output text \
     --profile dev \
     --region ca-central-1
@@ -462,6 +498,7 @@ RequestMeta
 
 Environment
 LAMBDA_PRINCIPAL=*
+OPERATIONS_QUEUE_URL=<CloudFormation-generated-queue-url>
 OPERATIONS_TABLE_NAME=<CloudFormation-generated-table-name>
 PASETO_PUBLIC_KEY=<public-key-from-keygen>
 ...
@@ -631,8 +668,8 @@ SAM uploads the new `lambda.zip` and updates the CloudFormation-managed Lambda f
 
 ## 11. Delete the SAM stack
 
-To remove the SAM-managed function, role, operations table, Function URL, and
-permissions:
+To remove the SAM-managed function, role, operations table, operations queue,
+Function URL, and permissions:
 
 ```sh
 sam delete \
@@ -645,6 +682,8 @@ This deletes only resources owned by the SAM stack. The operations table has
 `DeletionPolicy: Delete` and `UpdateReplacePolicy: Delete`, so deleting the
 stack or replacing the table permanently deletes its data. Point-in-time
 recovery is disabled; this demo configuration provides no recovery capability.
+The operations queue uses the same deletion policies, so deleting or replacing
+it permanently deletes any queued messages.
 
 ## Security note
 

@@ -381,6 +381,31 @@ read -r \
 [ "$GLOBAL_INDEX_COUNT" = 0 ] ||
     fail "DynamoDB table has $GLOBAL_INDEX_COUNT global secondary indexes; expected 0"
 
+OPERATIONS_QUEUE_URL="$(aws cloudformation describe-stacks \
+    --stack-name "$STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='OperationsQueueUrl'].OutputValue | [0]" \
+    --output text \
+    --region "$REGION")"
+
+case "$OPERATIONS_QUEUE_URL" in
+    "" | None)
+        fail "stack output OperationsQueueUrl is missing or empty"
+        ;;
+esac
+
+printf '==> SQS queue summary\n'
+aws sqs get-queue-attributes \
+    --queue-url "$OPERATIONS_QUEUE_URL" \
+    --attribute-names \
+    QueueArn \
+    SqsManagedSseEnabled \
+    VisibilityTimeout \
+    MessageRetentionPeriod \
+    ReceiveMessageWaitTimeSeconds \
+    --query Attributes \
+    --output json \
+    --region "$REGION"
+
 FUNCTION_URL="$(aws cloudformation describe-stacks \
     --stack-name "$STACK_NAME" \
     --query "Stacks[0].Outputs[?OutputKey=='FunctionUrl'].OutputValue | [0]" \

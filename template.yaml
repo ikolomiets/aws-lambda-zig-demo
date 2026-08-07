@@ -34,6 +34,11 @@ Resources:
         AttributeName: expires_at
         Enabled: true
 
+  OperationsQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
   DemoFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -56,9 +61,14 @@ Resources:
                 - dynamodb:PutItem
                 - dynamodb:UpdateItem
               Resource: !GetAtt OperationsTable.Arn
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt OperationsQueue.Arn
       Environment:
         Variables:
           LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
+          OPERATIONS_QUEUE_URL: !Ref OperationsQueue
           OPERATIONS_TABLE_NAME: !Ref OperationsTable
           PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 
@@ -99,6 +109,9 @@ Outputs:
   OperationsTableName:
     Description: CloudFormation-generated DynamoDB operations table name.
     Value: !Ref OperationsTable
+  OperationsQueueUrl:
+    Description: CloudFormation-generated SQS operations queue URL.
+    Value: !Ref OperationsQueue
   FunctionName:
     Description: Deployed Lambda function name.
     Value: !Ref DemoFunction

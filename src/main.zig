@@ -5,6 +5,7 @@ const lambda = @import("aws-lambda");
 const operation = @import("operation");
 const operation_persistence = @import("operation_persistence");
 const paseto = @import("paseto");
+const sqs = @import("sqs");
 
 const Allocator = std.mem.Allocator;
 
@@ -633,10 +634,11 @@ fn handleInvocationForTest(
     );
 }
 
-test "AWS SDK exposes runtime configuration and DynamoDB client types" {
+test "AWS SDK exposes runtime configuration, DynamoDB, and SQS client types" {
     comptime {
         std.debug.assert(@TypeOf(aws.Config) == type);
         std.debug.assert(@TypeOf(dynamodb.Client) == type);
+        std.debug.assert(@TypeOf(sqs.Client) == type);
     }
 }
 
