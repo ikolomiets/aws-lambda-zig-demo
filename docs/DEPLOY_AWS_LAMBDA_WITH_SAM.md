@@ -57,6 +57,10 @@ Lambda ARM64.
 zig build --release -Darch=arm
 ```
 
+The build also installs the host-native `paseto`, `dynamodb`, and `sqs`
+utilities under `zig-out/bin/`. The `sqs` executable is built for the current
+host, not packaged into `lambda.zip`.
+
 Verify that the built artifact is a Linux ARM64 executable.
 
 ```sh
@@ -158,11 +162,12 @@ first POST persistence request and returned to the caller as a sanitized HTTP
 
 The second inline-policy statement grants the function only `SendMessage`
 access to this stack's operations queue. `OPERATIONS_QUEUE_URL` contains its
-CloudFormation-generated URL. The queue and AWS SDK SQS module prepare the
-function to become a producer, but the current handler does not create an SQS
+CloudFormation-generated URL. The current handler does not create an SQS
 client, route Operations by name, or send messages. It has no receive, delete,
 purge, or queue-management permissions, and the template defines no consumer
-or Lambda event source mapping.
+or Lambda event source mapping. The separate host-native `sqs` utility can
+operate on this queue using the local caller's AWS identity; it does not expand
+the Lambda execution role.
 
 `OperationsQueue` is a standard queue with a CloudFormation-generated name.
 The template does not configure FIFO behavior, a dead-letter queue, or custom
@@ -441,7 +446,7 @@ export OPERATIONS_TABLE_NAME="$(
 )"
 ```
 
-Discover and export the operations queue URL for future producer tooling:
+Discover and export the operations queue URL for the host SQS utility:
 
 ```sh
 export OPERATIONS_QUEUE_URL="$(
@@ -649,7 +654,84 @@ authenticated POST returns a sanitized HTTP 500 in those cases; inspect Lambda
 logs and the SAM-managed stack resources without recording live table names or
 account-specific identifiers in this repository.
 
-## 10. Update the deployed Lambda code
+## 10. Send, receive, and check queued Operations
+
+Builds install the host-native utility at `zig-out/bin/sqs`. It requires the
+queue URL from section 7 and follows standard AWS configuration for
+credentials, region, profile, and endpoint:
+
+```sh
+export AWS_PROFILE=dev
+export AWS_REGION=ca-central-1
+```
+
+The repository also includes `sqs.sh`, which defaults to profile `dev`, region
+`ca-central-1`, and stack `aws-lambda-zig-demo`. It exports the selected
+profile's temporary credentials, queries the `OperationsQueueUrl` stack
+output, and runs the host utility. Override the defaults with `PROFILE`,
+`REGION`, or `STACK_NAME`.
+
+Send an Operation while supplying required tenant metadata separately:
+
+```sh
+operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
+'"name":"echo","body":{"message":"hello","count":2}}'
+printf '%s\n' "$operation_json" | ./sqs.sh send --tenant 'tenant-a'
+```
+
+`send` validates the input with `src/operation.zig`, derives `last_updated`
+from the current time, and replaces an omitted or explicit `NEW` state with
+`SUBMITTED`. It validates and serializes the resulting full Operation exactly
+once. The SQS message contains the compact canonical JSON with `id`, `tenant`,
+`name`, `body`, `state`, `last_updated`, `expires_at`, and `hash`, with no
+trailing newline. After `SendMessage` succeeds, stdout receives those exact
+bytes followed by a newline. State remains excluded from the Operation hash.
+The command does not read or update DynamoDB.
+
+Request every queue attribute and print one JSON object. Unknown future keys
+are retained:
+
+```sh
+./sqs.sh check
+```
+
+Immediately receive at most one message:
+
+```sh
+./sqs.sh receive
+```
+
+This receive is destructive: it writes the body byte-for-byte to stdout with
+no added newline, flushes stdout, and only then calls `DeleteMessage` with the
+receipt handle. Bodies need not be JSON or canonical Operations. An empty
+queue exits with code `1`. A response missing the body or receipt handle is
+rejected without deletion. A delete failure occurs after output and can allow
+the message to reappear after its visibility timeout. All invocation,
+validation, configuration, AWS, invalid-response, output, and internal
+failures exit with code `2` and sanitized diagnostics.
+
+The caller needs these queue-scoped permissions for the commands it uses:
+
+- `sqs:SendMessage` for `send`
+- `sqs:ReceiveMessage` and `sqs:DeleteMessage` for `receive`
+- `sqs:GetQueueAttributes` for `check`
+
+The wrapper also needs `cloudformation:DescribeStacks`. These local caller
+permissions are independent of the Lambda role, which remains send-only for
+SQS. Top-level and subcommand help work without queue or AWS configuration.
+
+If `sqs: missing or invalid configuration` is emitted, confirm queue discovery
+succeeded without printing the account-specific URL:
+
+```sh
+test -n "${OPERATIONS_QUEUE_URL:-}" && printf 'queue configured\n'
+```
+
+The URL must be non-empty and at most 2,048 bytes. Configuration is checked
+before the Operation input is parsed. Service or credential failures after
+configuration loading instead report `sqs: AWS request failed`.
+
+## 11. Update the deployed Lambda code
 
 After changing Zig source code, rebuild and repackage:
 
@@ -666,7 +748,7 @@ sam deploy --profile dev --region ca-central-1
 
 SAM uploads the new `lambda.zip` and updates the CloudFormation-managed Lambda function.
 
-## 11. Delete the SAM stack
+## 12. Delete the SAM stack
 
 To remove the SAM-managed function, role, operations table, operations queue,
 Function URL, and permissions:

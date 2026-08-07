@@ -138,6 +138,23 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(dynamodb_cli_exe);
 
+    const sqs_cli_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/sqs_cli.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "sqs", .module = host_sqs },
+        },
+    });
+    const sqs_cli_exe = b.addExecutable(.{
+        .name = "sqs",
+        .root_module = sqs_cli_mod,
+    });
+
+    b.installArtifact(sqs_cli_exe);
+
     const test_runtime = b.dependency("aws_lambda", .{
         .target = b.graph.host,
     }).module("lambda");
@@ -201,6 +218,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_dynamodb_cli_tests = b.addRunArtifact(dynamodb_cli_tests);
 
+    const sqs_cli_tests = b.addTest(.{
+        .root_module = sqs_cli_mod,
+    });
+    const run_sqs_cli_tests = b.addRunArtifact(sqs_cli_tests);
+
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_lambda_tests.step);
     test_step.dependOn(&run_operation_tests.step);
@@ -208,4 +230,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_paseto_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_dynamodb_cli_tests.step);
+    test_step.dependOn(&run_sqs_cli_tests.step);
 }

@@ -4,7 +4,8 @@ A minimal AWS Lambda Function URL demo written in Zig.
 
 The project builds a custom `provided.al2023` Lambda runtime executable named
 `bootstrap`, a host-native PASETO v4.public utility named `paseto`, and a
-host-native DynamoDB Operation utility named `dynamodb`. The handler
+host-native DynamoDB Operation utility named `dynamodb`, and a host-native SQS
+Operation utility named `sqs`. The handler
 authenticates a PASETO v4.public bearer token before serving GET and POST
 requests through the `aws-lambda-zig` runtime package. GET returns a plain-text
 Lambda environment dump, while POST validates and hashes an Operation JSON
@@ -35,11 +36,12 @@ Build the stripped, single-threaded, ReleaseSafe Linux ARM64 Lambda executable:
 zig build --release -Darch=arm
 ```
 
-This also installs the host-native `zig-out/bin/paseto` and
-`zig-out/bin/dynamodb` developer utilities. The Lambda `bootstrap` and PASETO
-utility both use the shared PASETO implementation in `src/paseto.zig`; the
-Operation utility uses the shared model in `src/operation.zig` and the
-DynamoDB adapter in `src/operation_persistence.zig`.
+This also installs the host-native `zig-out/bin/paseto`,
+`zig-out/bin/dynamodb`, and `zig-out/bin/sqs` developer utilities. The Lambda
+`bootstrap` and PASETO utility both use the shared PASETO implementation in
+`src/paseto.zig`; the Operation utilities use the shared model in
+`src/operation.zig`, and `dynamodb` also uses the adapter in
+`src/operation_persistence.zig`.
 
 Verify that the output is a statically linked ARM64 Linux executable:
 
@@ -233,6 +235,71 @@ strict: legacy records without `tenant` are rejected and must be deleted and
 recreated before this version reads them. There is no fallback decoder or
 migration path in the application.
 
+## SQS CLI
+
+The `sqs` utility sends canonical Operations, destructively receives one
+immediately available message, and checks the SAM stack's operations queue. It
+requires a non-empty `OPERATIONS_QUEUE_URL` no longer than 2,048 bytes and uses
+the standard AWS configuration chain. Top-level and subcommand help do not
+require AWS configuration:
+
+```sh
+zig-out/bin/sqs --help
+zig-out/bin/sqs send --help
+zig-out/bin/sqs receive --help
+zig-out/bin/sqs check --help
+```
+
+The `sqs.sh` wrapper uses `PROFILE`, `REGION`, and `STACK_NAME`, defaulting to
+`dev`, `ca-central-1`, and `aws-lambda-zig-demo`. It exports temporary profile
+credentials, resolves the `OperationsQueueUrl` stack output, and runs the host
+utility. Send a validated Operation input like this:
+
+```sh
+operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
+'"name":"echo","body":{"message":"hello","count":2}}'
+printf '%s\n' "$operation_json" | ./sqs.sh send --tenant 'tenant-a'
+```
+
+`send` parses and validates the input through the shared Operation model using
+the current Unix time. It then replaces an omitted or explicit `NEW` state
+with `SUBMITTED`, validates the complete output view, and serializes it once.
+The exact compact JSON bytes sent to SQS contain `id`, `tenant`, `name`,
+`body`, `state`, `last_updated`, `expires_at`, and `hash`. After `SendMessage`
+succeeds, the same bytes are printed followed by a newline; the SQS message
+does not include that newline. State is excluded from the existing Operation
+hash, along with `id`, timestamps, expiration, and result. This command does
+not read or update DynamoDB.
+
+Inspect all queue attributes, including attributes added by future AWS API
+versions:
+
+```sh
+./sqs.sh check
+```
+
+Receive one immediately available message:
+
+```sh
+./sqs.sh receive
+```
+
+`receive` is destructive. It writes the message body byte-for-byte with no
+added newline, flushes standard output, and then deletes the message using its
+receipt handle. It accepts arbitrary noncanonical and non-JSON bodies. An
+empty queue exits with code `1`. A missing body or receipt handle is treated
+as an invalid AWS response and is not deleted. If deletion fails after output,
+the command exits with code `2` and the message may become visible again.
+Invocation, validation, configuration, AWS, invalid-response, output, and
+internal failures also use exit code `2` with sanitized diagnostics.
+
+The AWS identity running the direct utility needs `sqs:SendMessage` for
+`send`, `sqs:ReceiveMessage` and `sqs:DeleteMessage` for `receive`, and
+`sqs:GetQueueAttributes` for `check`. The wrapper additionally calls
+`cloudformation:DescribeStacks`. These are caller permissions: the Lambda
+execution role remains separate and is intentionally limited to
+`sqs:SendMessage` for this queue.
+
 The Lambda Function URL requires the token in an HTTP authorization header:
 
 ```text
@@ -380,9 +447,11 @@ or CloudFront.
 - `src/operation.zig`: Operation JSON model, validation, and hash contract.
 - `src/operation_persistence.zig`: DynamoDB Operation mapping and conditional writes.
 - `src/dynamodb_cli.zig`: host DynamoDB Operation persistence CLI and its tests.
+- `src/sqs_cli.zig`: host SQS Operation CLI and its tests.
 - `src/paseto.zig`: shared PASETO v4.public issuance and verification.
 - `src/paseto_cli.zig`: host PASETO v4.public CLI and its tests.
-- `build.zig`: Zig build graph for `bootstrap`, both host utilities, and tests.
+- `sqs.sh`: stack-aware credential and queue wrapper for the SQS CLI.
+- `build.zig`: Zig build graph for `bootstrap`, the host utilities, and tests.
 - `build.zig.zon`: package metadata and pinned dependencies.
 - `template.yaml`: SAM template for the Lambda, Function URL, and permissions.
 - `docs/`: the SAM deployment guide, ADRs, and the Zig style reference.
@@ -394,7 +463,7 @@ Run formatting checks before committing Zig changes:
 
 ```sh
 zig fmt --check build.zig src/main.zig src/operation.zig src/operation_persistence.zig \
-  src/dynamodb_cli.zig src/paseto.zig src/paseto_cli.zig
+  src/dynamodb_cli.zig src/sqs_cli.zig src/paseto.zig src/paseto_cli.zig
 ```
 
 Run the handler, persistence, and host utility tests with:
