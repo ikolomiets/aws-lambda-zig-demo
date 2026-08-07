@@ -4,7 +4,7 @@ A minimal AWS Lambda Function URL demo written in Zig.
 
 The project builds a custom `provided.al2023` Lambda runtime executable named
 `bootstrap`, a host-native PASETO v4.public utility named `paseto`, and a
-host-native DynamoDB Operation utility named `operation`. The handler
+host-native DynamoDB Operation utility named `dynamodb`. The handler
 authenticates a PASETO v4.public bearer token before serving GET and POST
 requests through the `aws-lambda-zig` runtime package. GET returns a plain-text
 Lambda environment dump, while POST validates and hashes an Operation JSON
@@ -36,7 +36,7 @@ zig build --release -Darch=arm
 ```
 
 This also installs the host-native `zig-out/bin/paseto` and
-`zig-out/bin/operation` developer utilities. The Lambda `bootstrap` and PASETO
+`zig-out/bin/dynamodb` developer utilities. The Lambda `bootstrap` and PASETO
 utility both use the shared PASETO implementation in `src/paseto.zig`; the
 Operation utility uses the shared model in `src/operation.zig` and the
 DynamoDB adapter in `src/operation_persistence.zig`.
@@ -100,9 +100,9 @@ if one is present, but that safeguard is not a secret-management system and
 does not cover differently named variables. Verification needs only
 `PASETO_PUBLIC_KEY`; it never falls back to the private key.
 
-## Operation CLI
+## DynamoDB CLI
 
-The `operation` utility creates, reads, and updates Operations in the SAM
+The `dynamodb` utility creates, reads, and updates Operations in the SAM
 stack's DynamoDB table. It requires `OPERATIONS_TABLE_NAME` and uses the
 standard AWS configuration chain, including `AWS_PROFILE`, `AWS_REGION`, AWS
 credential variables, shared AWS configuration files, and configured endpoint
@@ -123,7 +123,7 @@ export OPERATIONS_TABLE_NAME="$(
 )"
 ```
 
-If the CLI reports `operation: missing or invalid configuration`, it has not
+If the CLI reports `dynamodb: missing or invalid configuration`, it has not
 processed the Operation JSON yet. Confirm that table discovery returned a
 non-empty value without printing the account-specific table name:
 
@@ -137,7 +137,7 @@ chain cannot resolve settings such as the region or selected profile. Re-run
 the discovery command above, check `AWS_PROFILE` and `AWS_REGION`, and use
 `aws sso login --profile "$AWS_PROFILE"` first when the profile uses IAM
 Identity Center. Credential or service failures encountered after
-configuration loading are reported separately as `operation: AWS request
+configuration loading are reported separately as `dynamodb: AWS request
 failed`.
 
 Create an Operation by supplying required tenant metadata separately and
@@ -148,7 +148,7 @@ UTF-8 between 1 and 64 bytes:
 operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"echo","body":{"message":"hello","count":2}}'
 printf '%s\n' "$operation_json" \
-  | zig-out/bin/operation create --tenant 'tenant-a'
+  | zig-out/bin/dynamodb create --tenant 'tenant-a'
 ```
 
 The Operation hash is the BLAKE3-256 digest of a JSON envelope containing only
@@ -176,14 +176,14 @@ A create is safe to retry with the original UUID, tenant, name, and body. If tha
 already identifies an Operation with the same Operation hash, the retry
 succeeds and returns the current stored Operation, including its state,
 `last_updated`, `expires_at`, and terminal result when present. Reusing the UUID
-for different content returns `operation: operation conflict` with exit code
+for different content returns `dynamodb: operation conflict` with exit code
 `1`. UUIDs are globally scoped, so reusing an ID under another tenant also
 changes the hash and returns a conflict.
 
 Read it with a strongly consistent DynamoDB read:
 
 ```sh
-zig-out/bin/operation read \
+zig-out/bin/dynamodb read \
   --id 00112233-4455-6677-8899-aabbccddeeff
 ```
 
@@ -193,13 +193,13 @@ result of at most 4,096 input bytes whose compact serialization is also at most
 4,096 bytes:
 
 ```sh
-zig-out/bin/operation update \
+zig-out/bin/dynamodb update \
   --id 00112233-4455-6677-8899-aabbccddeeff \
   --state RUNNING \
   </dev/null
 
 printf '%s\n' '{"message":"done"}' \
-  | zig-out/bin/operation update \
+  | zig-out/bin/dynamodb update \
       --id 00112233-4455-6677-8899-aabbccddeeff \
       --state SUCCEEDED
 ```
@@ -212,7 +212,7 @@ Every successful command emits the canonical Operation output JSON. Exit code
 `1` identifies an expected missing or Operation-conflict outcome; exit code
 `2` identifies invalid invocation or input, missing configuration, an AWS
 failure, or an internal failure. Create and update conflicts both emit
-`operation: operation conflict`.
+`dynamodb: operation conflict`.
 
 The persistent item contains exactly `id`, `tenant`, `name`, `state`,
 `last_updated`, `expires_at`, `hash`, and an optional terminal `result`; it never
@@ -379,7 +379,7 @@ or CloudFront.
 - `src/main.zig`: Lambda entrypoint and request handler.
 - `src/operation.zig`: Operation JSON model, validation, and hash contract.
 - `src/operation_persistence.zig`: DynamoDB Operation mapping and conditional writes.
-- `src/operation_cli.zig`: host Operation persistence CLI and its tests.
+- `src/dynamodb_cli.zig`: host DynamoDB Operation persistence CLI and its tests.
 - `src/paseto.zig`: shared PASETO v4.public issuance and verification.
 - `src/paseto_cli.zig`: host PASETO v4.public CLI and its tests.
 - `build.zig`: Zig build graph for `bootstrap`, both host utilities, and tests.
@@ -394,7 +394,7 @@ Run formatting checks before committing Zig changes:
 
 ```sh
 zig fmt --check build.zig src/main.zig src/operation.zig src/operation_persistence.zig \
-  src/operation_cli.zig src/paseto.zig src/paseto_cli.zig
+  src/dynamodb_cli.zig src/paseto.zig src/paseto_cli.zig
 ```
 
 Run the handler, persistence, and host utility tests with:

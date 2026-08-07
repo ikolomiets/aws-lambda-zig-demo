@@ -120,10 +120,10 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(cli_exe);
 
-    const operation_cli_mod = b.createModule(.{
+    const dynamodb_cli_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = optimize,
-        .root_source_file = b.path("src/operation_cli.zig"),
+        .root_source_file = b.path("src/dynamodb_cli.zig"),
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
             .{ .name = "dynamodb", .module = host_dynamodb },
@@ -131,12 +131,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation_persistence", .module = host_operation_persistence },
         },
     });
-    const operation_cli_exe = b.addExecutable(.{
-        .name = "operation",
-        .root_module = operation_cli_mod,
+    const dynamodb_cli_exe = b.addExecutable(.{
+        .name = "dynamodb",
+        .root_module = dynamodb_cli_mod,
     });
 
-    b.installArtifact(operation_cli_exe);
+    b.installArtifact(dynamodb_cli_exe);
 
     const test_runtime = b.dependency("aws_lambda", .{
         .target = b.graph.host,
@@ -196,10 +196,10 @@ pub fn build(b: *std.Build) void {
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
-    const operation_cli_tests = b.addTest(.{
-        .root_module = operation_cli_mod,
+    const dynamodb_cli_tests = b.addTest(.{
+        .root_module = dynamodb_cli_mod,
     });
-    const run_operation_cli_tests = b.addRunArtifact(operation_cli_tests);
+    const run_dynamodb_cli_tests = b.addRunArtifact(dynamodb_cli_tests);
 
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_lambda_tests.step);
@@ -207,5 +207,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_operation_persistence_tests.step);
     test_step.dependOn(&run_paseto_tests.step);
     test_step.dependOn(&run_cli_tests.step);
-    test_step.dependOn(&run_operation_cli_tests.step);
+    test_step.dependOn(&run_dynamodb_cli_tests.step);
 }

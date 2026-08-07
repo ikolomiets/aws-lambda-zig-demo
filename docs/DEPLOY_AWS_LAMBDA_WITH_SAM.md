@@ -148,7 +148,7 @@ the bootstrap validates the table name, loads AWS configuration, creates one
 DynamoDB client, and binds one persistence adapter before starting the Lambda
 invocation loop. Missing or invalid table configuration therefore prevents all
 invocation handling, including GET. The client, its HTTP connection pool, and
-the adapter are reused across warm invocations. The host-native `operation` CLI
+the adapter are reused across warm invocations. The host-native `dynamodb` CLI
 uses the same adapter and table contract.
 
 Startup validation does not call `DescribeTable` or make a DynamoDB health
@@ -197,7 +197,7 @@ string escapes do not change the hash, while object member order remains
 significant. The `id`, `state`, `last_updated`, `expires_at`, and `result`
 fields are excluded. Lambda derives tenant exclusively from the verified
 PASETO `sub` claim. The host CLI accepts it only through
-`operation create --tenant`; caller-supplied Operation JSON cannot set it. One
+`dynamodb create --tenant`; caller-supplied Operation JSON cannot set it. One
 lifetime arena owns each Operation's tenant, strings, and nested body or result
 Values for a CLI command or Lambda POST.
 
@@ -547,7 +547,7 @@ response.
 
 ## 9. Create, read, and update persisted Operations
 
-Builds install the host-native utility at `zig-out/bin/operation`. It requires
+Builds install the host-native utility at `zig-out/bin/dynamodb`. It requires
 the table environment variable above and follows standard AWS configuration
 for credentials, region, profile, and endpoint. These examples select the same
 profile and region used for deployment:
@@ -565,19 +565,19 @@ bytes:
 operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"echo","body":{"message":"hello","count":2}}'
 printf '%s\n' "$operation_json" \
-  | zig-out/bin/operation create --tenant 'tenant-a'
+  | zig-out/bin/dynamodb create --tenant 'tenant-a'
 ```
 
 Retry create with the original UUID, tenant, name, and body. When the UUID already
 identifies an Operation with the same Operation hash, create returns the current
 stored Operation, including its state, `last_updated`, `expires_at`, and terminal
 result when present. A different hash, including one derived under another
-tenant, returns `operation: operation conflict` with exit code `1`.
+tenant, returns `dynamodb: operation conflict` with exit code `1`.
 
 Read the persistent output view:
 
 ```sh
-zig-out/bin/operation read \
+zig-out/bin/dynamodb read \
   --id 00112233-4455-6677-8899-aabbccddeeff
 ```
 
@@ -586,13 +586,13 @@ non-null JSON result no larger than 4,096 input bytes whose compact
 serialization is also no larger than 4,096 bytes:
 
 ```sh
-zig-out/bin/operation update \
+zig-out/bin/dynamodb update \
   --id 00112233-4455-6677-8899-aabbccddeeff \
   --state RUNNING \
   </dev/null
 
 printf '%s\n' '{"message":"done"}' \
-  | zig-out/bin/operation update \
+  | zig-out/bin/dynamodb update \
       --id 00112233-4455-6677-8899-aabbccddeeff \
       --state SUCCEEDED
 ```
@@ -603,16 +603,16 @@ the expiry exactly 24 hours after the update timestamp.
 Lifecycle ordering is intentionally not enforced: any valid state may replace
 any previous state, including a same-state update. Exit code `1` means the item
 was missing or a create/update conflict occurred. Both conflict paths emit
-`operation: operation conflict`. Exit code `2` means invocation, validation,
+`dynamodb: operation conflict`. Exit code `2` means invocation, validation,
 configuration, AWS, or internal failure.
 
 The caller running the host CLI needs `dynamodb:GetItem`, `dynamodb:PutItem`,
 and `dynamodb:UpdateItem` permissions for the table. The Lambda execution
 role's inline policy does not grant permissions to the local AWS identity.
 
-### Troubleshoot Operation CLI configuration
+### Troubleshoot DynamoDB CLI configuration
 
-`operation: missing or invalid configuration` is emitted before Operation JSON
+`dynamodb: missing or invalid configuration` is emitted before Operation JSON
 is parsed when `OPERATIONS_TABLE_NAME` is missing or invalid, or when the AWS
 configuration chain cannot resolve settings such as the region or profile.
 Confirm table discovery succeeded without printing the account-specific name:
@@ -632,7 +632,7 @@ aws sso login --profile "$AWS_PROFILE"
 Changing the piped Operation JSON cannot fix this diagnostic because command
 configuration is checked before input parsing. Failures encountered while
 calling DynamoDB after configuration loading instead report
-`operation: AWS request failed`.
+`dynamodb: AWS request failed`.
 
 ### Troubleshoot Lambda persistence initialization
 

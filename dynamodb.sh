@@ -13,7 +13,7 @@ fail() {
 command -v aws >/dev/null 2>&1 || fail "missing required command: aws"
 
 cd "$(dirname "$0")"
-[ -x zig-out/bin/operation ] || fail "missing executable: run zig build first"
+[ -x zig-out/bin/dynamodb ] || fail "missing executable: run zig build first"
 
 credential_exports="$(
     aws configure export-credentials \
@@ -44,4 +44,4 @@ operations_table_name="$(
 export OPERATIONS_TABLE_NAME="$operations_table_name"
 unset operations_table_name
 
-exec ./zig-out/bin/operation "$@"
+exec ./zig-out/bin/dynamodb "$@"

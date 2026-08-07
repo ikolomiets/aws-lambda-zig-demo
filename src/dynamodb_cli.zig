@@ -44,9 +44,9 @@ const CliError = error{InvalidInvocation};
 
 const usage =
     \\Usage:
-    \\  operation create --tenant <tenant>
-    \\  operation read --id <uuid>
-    \\  operation update --id <uuid> --state <state>
+    \\  dynamodb create --tenant <tenant>
+    \\  dynamodb read --id <uuid>
+    \\  dynamodb update --id <uuid> --state <state>
     \\
     \\States:
     \\  NEW | SUBMITTED | RUNNING | SUCCEEDED | FAILED
@@ -134,13 +134,13 @@ fn finish(
 
 fn writeDiagnostic(stderr: *std.Io.Writer, failure: Failure) void {
     const message = switch (failure) {
-        .invocation => "operation: invalid invocation; use --help\n",
-        .validation => "operation: invalid operation input\n",
-        .configuration => "operation: missing or invalid configuration\n",
-        .missing => "operation: operation not found\n",
-        .conflict => "operation: operation conflict\n",
-        .aws => "operation: AWS request failed\n",
-        .internal => "operation: operation failed\n",
+        .invocation => "dynamodb: invalid invocation; use --help\n",
+        .validation => "dynamodb: invalid operation input\n",
+        .configuration => "dynamodb: missing or invalid configuration\n",
+        .missing => "dynamodb: operation not found\n",
+        .conflict => "dynamodb: operation conflict\n",
+        .aws => "dynamodb: AWS request failed\n",
+        .internal => "dynamodb: operation failed\n",
     };
     stderr.writeAll(message) catch {};
 }
@@ -661,12 +661,12 @@ test "help works without AWS configuration and invocation is bounded" {
     defer environment.deinit();
     var fake: FakePersistence = .{};
     const help_arguments = [_][]const []const u8{
-        &.{ "operation", "--help" },
-        &.{ "operation", "-h" },
-        &.{ "operation", "help" },
-        &.{ "operation", "create", "--help" },
-        &.{ "operation", "read", "--help" },
-        &.{ "operation", "update", "--help" },
+        &.{ "dynamodb", "--help" },
+        &.{ "dynamodb", "-h" },
+        &.{ "dynamodb", "help" },
+        &.{ "dynamodb", "create", "--help" },
+        &.{ "dynamodb", "read", "--help" },
+        &.{ "dynamodb", "update", "--help" },
     };
     for (help_arguments) |arguments| {
         const result = runForTest(arguments, "", &environment, 0, &fake);
@@ -675,11 +675,11 @@ test "help works without AWS configuration and invocation is bounded" {
         try std.testing.expectEqualStrings("", result.stderr());
     }
 
-    const invalid = runForTest(&.{"operation"}, "", &environment, 0, &fake);
+    const invalid = runForTest(&.{"dynamodb"}, "", &environment, 0, &fake);
     try std.testing.expectEqual(@as(u8, 2), invalid.exit_code);
     try std.testing.expectEqualStrings("", invalid.stdout());
     const excessive = runForTest(
-        &.{ "operation", "read", "--id", test_id, "a", "b", "c", "d", "e" },
+        &.{ "dynamodb", "read", "--id", test_id, "a", "b", "c", "d", "e" },
         "",
         &environment,
         0,
@@ -695,7 +695,7 @@ test "create requires one valid bounded tenant flag" {
         "é" ** (operation.tenant_size_max / 2),
     };
     for (valid) |tenant| {
-        const command = try parseCommand(&.{ "operation", "create", "--tenant", tenant });
+        const command = try parseCommand(&.{ "dynamodb", "create", "--tenant", tenant });
         try std.testing.expectEqualStrings(tenant, command.create.tenant);
     }
 
@@ -707,12 +707,12 @@ test "create requires one valid bounded tenant flag" {
     };
     try std.testing.expectError(
         error.InvalidInvocation,
-        parseCommand(&.{ "operation", "create" }),
+        parseCommand(&.{ "dynamodb", "create" }),
     );
     for (invalid) |tenant| {
         try std.testing.expectError(
             error.InvalidInvocation,
-            parseCommand(&.{ "operation", "create", "--tenant", tenant }),
+            parseCommand(&.{ "dynamodb", "create", "--tenant", tenant }),
         );
     }
 }
@@ -722,7 +722,7 @@ test "configuration is required before persistence dispatch" {
     defer environment.deinit();
     var fake: FakePersistence = .{};
     const missing = runForTest(
-        &.{ "operation", "read", "--id", test_id },
+        &.{ "dynamodb", "read", "--id", test_id },
         "",
         &environment,
         0,
@@ -730,14 +730,14 @@ test "configuration is required before persistence dispatch" {
     );
     try std.testing.expectEqual(@as(u8, 2), missing.exit_code);
     try std.testing.expectEqualStrings(
-        "operation: missing or invalid configuration\n",
+        "dynamodb: missing or invalid configuration\n",
         missing.stderr(),
     );
     try std.testing.expectEqual(@as(u8, 0), fake.read_count);
 
     try environment.put("OPERATIONS_TABLE_NAME", "");
     const empty = runForTest(
-        &.{ "operation", "read", "--id", test_id },
+        &.{ "dynamodb", "read", "--id", test_id },
         "",
         &environment,
         0,
@@ -755,7 +755,7 @@ test "create parses stdin dispatches once and writes canonical JSON" {
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
     const result = runForTest(
-        &.{ "operation", "create", "--tenant", "tenant-a" },
+        &.{ "dynamodb", "create", "--tenant", "tenant-a" },
         input,
         &environment,
         1_700_000_000,
@@ -785,7 +785,7 @@ test "matching create retry writes the authoritative stored timestamp" {
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
     const result = runForTest(
-        &.{ "operation", "create", "--tenant", "tenant-a" },
+        &.{ "dynamodb", "create", "--tenant", "tenant-a" },
         input,
         &environment,
         1_700_000_010,
@@ -811,7 +811,7 @@ test "create bounds stdin and reports conflict and invalid input outcomes" {
     var fake: FakePersistence = .{};
     const oversized = "a" ** (stdin_size_max + 1);
     const large = runForTest(
-        &.{ "operation", "create", "--tenant", "tenant-a" },
+        &.{ "dynamodb", "create", "--tenant", "tenant-a" },
         oversized,
         &environment,
         0,
@@ -821,17 +821,17 @@ test "create bounds stdin and reports conflict and invalid input outcomes" {
     try std.testing.expectEqual(@as(u8, 0), fake.create_count);
 
     const invalid = runForTest(
-        &.{ "operation", "create", "--tenant", "tenant-a" },
+        &.{ "dynamodb", "create", "--tenant", "tenant-a" },
         "null",
         &environment,
         0,
         &fake,
     );
     try std.testing.expectEqual(@as(u8, 2), invalid.exit_code);
-    try std.testing.expectEqualStrings("operation: invalid operation input\n", invalid.stderr());
+    try std.testing.expectEqualStrings("dynamodb: invalid operation input\n", invalid.stderr());
 
     const spoofed = runForTest(
-        &.{ "operation", "create", "--tenant", "tenant-a" },
+        &.{ "dynamodb", "create", "--tenant", "tenant-a" },
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"spoofed\",\"name\":\"echo\",\"body\":null}",
         &environment,
@@ -843,7 +843,7 @@ test "create bounds stdin and reports conflict and invalid input outcomes" {
 
     fake.create_error = error.OperationConflict;
     const conflict = runForTest(
-        &.{ "operation", "create", "--tenant", "tenant-a" },
+        &.{ "dynamodb", "create", "--tenant", "tenant-a" },
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"echo\",\"body\":null}",
         &environment,
@@ -851,7 +851,7 @@ test "create bounds stdin and reports conflict and invalid input outcomes" {
         &fake,
     );
     try std.testing.expectEqual(@as(u8, 1), conflict.exit_code);
-    try std.testing.expectEqualStrings("operation: operation conflict\n", conflict.stderr());
+    try std.testing.expectEqualStrings("dynamodb: operation conflict\n", conflict.stderr());
 }
 
 test "read validates UUID and writes a canonical strongly modeled item" {
@@ -859,7 +859,7 @@ test "read validates UUID and writes a canonical strongly modeled item" {
     defer environment.deinit();
     var fake: FakePersistence = .{};
     const result = runForTest(
-        &.{ "operation", "read", "--id", "00112233-4455-6677-8899-AABBCCDDEEFF" },
+        &.{ "dynamodb", "read", "--id", "00112233-4455-6677-8899-AABBCCDDEEFF" },
         "ignored",
         &environment,
         0,
@@ -876,7 +876,7 @@ test "read validates UUID and writes a canonical strongly modeled item" {
     try std.testing.expect(std.mem.indexOf(u8, result.stdout(), "\"state\":\"RUNNING\"") != null);
 
     const invalid = runForTest(
-        &.{ "operation", "read", "--id", "not-a-uuid" },
+        &.{ "dynamodb", "read", "--id", "not-a-uuid" },
         "",
         &environment,
         0,
@@ -890,25 +890,25 @@ test "read reports missing and AWS failures with stable exit codes" {
     defer environment.deinit();
     var fake: FakePersistence = .{ .read_error = error.OperationNotFound };
     const missing = runForTest(
-        &.{ "operation", "read", "--id", test_id },
+        &.{ "dynamodb", "read", "--id", test_id },
         "",
         &environment,
         0,
         &fake,
     );
     try std.testing.expectEqual(@as(u8, 1), missing.exit_code);
-    try std.testing.expectEqualStrings("operation: operation not found\n", missing.stderr());
+    try std.testing.expectEqualStrings("dynamodb: operation not found\n", missing.stderr());
 
     fake.read_error = error.AWSFailure;
     const failed = runForTest(
-        &.{ "operation", "read", "--id", test_id },
+        &.{ "dynamodb", "read", "--id", test_id },
         "",
         &environment,
         0,
         &fake,
     );
     try std.testing.expectEqual(@as(u8, 2), failed.exit_code);
-    try std.testing.expectEqualStrings("operation: AWS request failed\n", failed.stderr());
+    try std.testing.expectEqualStrings("dynamodb: AWS request failed\n", failed.stderr());
 }
 
 test "update accepts every target including jumps same state and terminal removal" {
@@ -921,7 +921,7 @@ test "update accepts every target including jumps same state and terminal remova
         fake.stored.result = .{ .bool = true };
         const input = if (operation.stateIsTerminal(state)) "{ \"new\" : true }" else "";
         const result = runForTest(
-            &.{ "operation", "update", "--state", operation.stateToString(state), "--id", test_id },
+            &.{ "dynamodb", "update", "--state", operation.stateToString(state), "--id", test_id },
             input,
             &environment,
             1_700_000_001,
@@ -966,7 +966,7 @@ test "update rejects nonempty pending input and null invalid or oversized termin
     defer environment.deinit();
     var fake: FakePersistence = .{};
     const pending = runForTest(
-        &.{ "operation", "update", "--id", test_id, "--state", "RUNNING" },
+        &.{ "dynamodb", "update", "--id", test_id, "--state", "RUNNING" },
         " ",
         &environment,
         0,
@@ -978,7 +978,7 @@ test "update rejects nonempty pending input and null invalid or oversized termin
     const invalid_results = [_][]const u8{ "", "null", "{broken" };
     for (invalid_results) |input| {
         const result = runForTest(
-            &.{ "operation", "update", "--id", test_id, "--state", "SUCCEEDED" },
+            &.{ "dynamodb", "update", "--id", test_id, "--state", "SUCCEEDED" },
             input,
             &environment,
             0,
@@ -988,7 +988,7 @@ test "update rejects nonempty pending input and null invalid or oversized termin
     }
     const oversized = "\"" ++ ("a" ** (operation.result_size_max - 1)) ++ "\"";
     const large = runForTest(
-        &.{ "operation", "update", "--id", test_id, "--state", "FAILED" },
+        &.{ "dynamodb", "update", "--id", test_id, "--state", "FAILED" },
         oversized,
         &environment,
         0,
@@ -1005,7 +1005,7 @@ test "update accepts a terminal result at the exact serialized size bound" {
     const maximum = "\"" ++ ("a" ** (operation.result_size_max - 2)) ++ "\"";
     comptime std.debug.assert(maximum.len == operation.result_size_max);
     const result = runForTest(
-        &.{ "operation", "update", "--id", test_id, "--state", "FAILED" },
+        &.{ "dynamodb", "update", "--id", test_id, "--state", "FAILED" },
         maximum,
         &environment,
         1_700_000_001,
@@ -1024,7 +1024,7 @@ test "update conflict is generic and diagnostics do not echo input or configurat
     var fake: FakePersistence = .{ .update_error = error.OperationConflict };
     const result_marker = "result-private-marker";
     const result = runForTest(
-        &.{ "operation", "update", "--id", test_id, "--state", "FAILED" },
+        &.{ "dynamodb", "update", "--id", test_id, "--state", "FAILED" },
         "\"result-private-marker\"",
         &environment,
         0,
@@ -1032,7 +1032,7 @@ test "update conflict is generic and diagnostics do not echo input or configurat
     );
     try std.testing.expectEqual(@as(u8, 1), result.exit_code);
     try std.testing.expectEqualStrings(
-        "operation: operation conflict\n",
+        "dynamodb: operation conflict\n",
         result.stderr(),
     );
     try std.testing.expect(std.mem.indexOf(u8, result.stderr(), table_marker) == null);
