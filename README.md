@@ -10,8 +10,8 @@ authenticates a PASETO v4.public bearer token before serving GET and POST
 requests through the `aws-lambda-zig` runtime package. GET returns a plain-text
 Lambda environment dump, while POST validates and hashes an Operation JSON
 document, derives required tenant metadata from the verified token subject,
-persists the Operation idempotently in DynamoDB, and returns the current stored
-output view without the body.
+persists the Operation idempotently in DynamoDB, submits new work to SQS, and
+returns the current stored output view without the body.
 
 ## Requirements
 
@@ -314,18 +314,21 @@ Invalid POST operation documents receive `400 Bad Request`. Authenticated
 methods other than GET and POST receive `405 Method Not Allowed`. A POST that
 reuses an Operation ID with a different server-computed hash receives a
 sanitized `409 Conflict`; DynamoDB and malformed stored-item failures receive
-the static `500 Internal Server Error` response.
+the static `500 Internal Server Error` response. An SQS submission failure
+receives a static `503 Service Unavailable` response.
 
 Tenant is metadata and part of idempotency identity only. The DynamoDB `id`
 partition key remains globally scoped, and this change does not add
 tenant-scoped keys or new read authorization behavior.
 
-`OPERATIONS_TABLE_NAME` is mandatory at Lambda initialization. The bootstrap
-validates the table name, loads the AWS SDK configuration, and creates one
-shared DynamoDB client before requesting an invocation. Missing or invalid
-table configuration prevents all request handling, including GET. Table
-existence and IAM authorization are checked only when POST first calls
-DynamoDB, so those failures are returned as sanitized HTTP 500 responses.
+`OPERATIONS_TABLE_NAME` and `OPERATIONS_QUEUE_URL` are mandatory at Lambda
+initialization. The bootstrap validates the table name and the non-empty,
+at-most-2,048-byte queue URL, loads the AWS SDK configuration, and creates
+shared DynamoDB and SQS clients before requesting an invocation. Missing or
+invalid configuration prevents all request handling, including GET. Resource
+existence and IAM authorization are checked only when POST first calls the
+services, so DynamoDB failures return a sanitized HTTP 500 and SQS send
+failures return a sanitized HTTP 503.
 
 ## Deploy
 
@@ -353,10 +356,10 @@ different value when the function should see a narrower principal string.
 configuration. It is public key material; keep the corresponding private key
 only in the signing environment.
 
-The SAM-managed DynamoDB table, `OPERATIONS_TABLE_NAME` environment variable,
-and table-scoped `GetItem`, `PutItem`, and `UpdateItem` IAM policy are mandatory
-parts of the runnable application. Deploy the complete stack from
-`template.yaml` with AWS SAM.
+The SAM-managed DynamoDB table and SQS queue, their environment variables, the
+table-scoped `GetItem`, `PutItem`, and `UpdateItem` policy, and the queue-scoped
+`SendMessage` policy are mandatory parts of the runnable application. Deploy
+the complete stack from `template.yaml` with AWS SAM.
 
 See [docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md)
 for the full SAM workflow.
@@ -413,7 +416,7 @@ curl -L \
   <FunctionUrl>
 ```
 
-For a new ID, the response has `NEW` state, the invocation timestamp, its
+For a new ID, the response has `SUBMITTED` state, the invocation timestamp, its
 24-hour expiry, verified subject as tenant, and the stable BLAKE3-256 operation
 hash. The input body is intentionally omitted:
 
@@ -422,17 +425,32 @@ hash. The input body is intentionally omitted:
   "id": "00112233-4455-6677-8899-aabbccddeeff",
   "tenant": "example-user",
   "name": "echo",
-  "state": "NEW",
+  "state": "SUBMITTED",
   "last_updated": 1700000000,
   "expires_at": 1700086400,
   "hash": "f4142429f9f7373c34b7b5eeab555ed5b4534a746193c40bfca65bb73f9a3014"
 }
 ```
 
-The POST is persisted before the response is generated. Retrying the same ID,
-tenant, name, and body returns the latest stored state, timestamps, terminal
-result when present, and hash. Reusing the ID for different work or from a
-different verified subject returns `409 Conflict`.
+For `NEW`, the handler combines the persisted identity with the parsed input
+body, refreshes both timestamps from the invocation time, and sends the exact
+compact full `SUBMITTED` Operation JSON to SQS without a trailing newline. It
+then conditionally updates the bodyless DynamoDB item to the same state and
+returns that item. A matching retry whose item is still `NEW` attempts this
+submission again. Matching `SUBMITTED`, `RUNNING`, `SUCCEEDED`, or `FAILED`
+items are returned immediately without another SQS send.
+
+If `SendMessage` fails, DynamoDB remains `NEW` and the handler returns the
+static `503 Service Unavailable` response so the caller can retry. If the
+conditional DynamoDB update fails after a successful send, the handler returns
+the static `500 Internal Server Error`; the message may already be available.
+A concurrent update conflict is reconciled with a strongly consistent read
+when the same Operation has advanced beyond `NEW`.
+
+Delivery is at least once. The standard queue, acknowledgement loss, and
+concurrent `NEW` retries can produce duplicate messages, so consumers must
+handle the Operation ID and hash idempotently. Reusing the ID for different
+work or from a different verified subject still returns `409 Conflict`.
 
 The template intentionally creates a publicly reachable Function URL for demo
 HTTP GET and POST testing, while the handler enforces PASETO bearer

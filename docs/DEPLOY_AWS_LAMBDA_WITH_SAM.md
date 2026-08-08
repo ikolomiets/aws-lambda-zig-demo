@@ -147,27 +147,29 @@ Environment:
 The inline policy grants the function only `GetItem`, `PutItem`, and
 `UpdateItem` access to this stack's operations table. The
 `OPERATIONS_TABLE_NAME` environment variable contains the
-CloudFormation-generated physical table name. These resources are mandatory:
-the bootstrap validates the table name, loads AWS configuration, creates one
-DynamoDB client, and binds one persistence adapter before starting the Lambda
-invocation loop. Missing or invalid table configuration therefore prevents all
-invocation handling, including GET. The client, its HTTP connection pool, and
-the adapter are reused across warm invocations. The host-native `dynamodb` CLI
-uses the same adapter and table contract.
+CloudFormation-generated physical table name. `OPERATIONS_QUEUE_URL` contains
+the stack queue's generated URL. Both are mandatory: before starting the Lambda
+invocation loop, the bootstrap validates the table name and the non-empty,
+at-most-2,048-byte queue URL, loads AWS configuration, creates DynamoDB and SQS
+clients, and binds one intake adapter. Missing or invalid configuration
+therefore prevents all invocation handling, including GET. The clients, their
+HTTP connection pools, and the adapter are reused across warm invocations. The
+host-native `dynamodb` CLI uses the same persistence adapter and table
+contract.
 
-Startup validation does not call `DescribeTable` or make a DynamoDB health
-check. A missing table or insufficient IAM permission is discovered by the
-first POST persistence request and returned to the caller as a sanitized HTTP
-500 response.
+Startup validation makes no DynamoDB or SQS request. A missing table or
+insufficient DynamoDB permission is discovered by a POST persistence request
+and returned as a sanitized HTTP 500. A missing queue, insufficient
+`SendMessage` permission, or another SQS send failure is returned as a
+sanitized HTTP 503.
 
 The second inline-policy statement grants the function only `SendMessage`
-access to this stack's operations queue. `OPERATIONS_QUEUE_URL` contains its
-CloudFormation-generated URL. The current handler does not create an SQS
-client, route Operations by name, or send messages. It has no receive, delete,
-purge, or queue-management permissions, and the template defines no consumer
-or Lambda event source mapping. The separate host-native `sqs` utility can
-operate on this queue using the local caller's AWS identity; it does not expand
-the Lambda execution role.
+access to this stack's operations queue. The handler sends full compact
+`SUBMITTED` Operation JSON, but has no receive, delete, purge, or
+queue-management permissions. The template defines no consumer or Lambda event
+source mapping. The separate host-native `sqs` utility can operate on this
+queue using the local caller's AWS identity; it does not expand the Lambda
+execution role.
 
 `OperationsQueue` is a standard queue with a CloudFormation-generated name.
 The template does not configure FIFO behavior, a dead-letter queue, or custom
@@ -527,28 +529,42 @@ curl -L \
   <FunctionUrl>
 ```
 
-For a new ID, the handler persists and returns the Operation output view with
-`NEW` state, the invocation timestamp, its 24-hour expiry, the verified subject
-as tenant, and its stable hash. It omits the input body:
+For a new ID, the handler persists `NEW`, submits the full Operation to SQS,
+conditionally stores `SUBMITTED`, and returns the bodyless Operation output
+view. It uses the invocation timestamp for `last_updated` and the 24-hour
+expiry, the verified subject as tenant, and the stable hash:
 
 ```json
 {
   "id": "00112233-4455-6677-8899-aabbccddeeff",
   "tenant": "example-user",
   "name": "echo",
-  "state": "NEW",
+  "state": "SUBMITTED",
   "last_updated": 1700000000,
   "expires_at": 1700086400,
   "hash": "f4142429f9f7373c34b7b5eeab555ed5b4534a746193c40bfca65bb73f9a3014"
 }
 ```
 
-Retrying the same ID, tenant, name, and body is idempotent and returns the
-latest stored state, timestamps, terminal result when present, and hash.
-Reusing the ID for different work or from a different verified subject returns
-the static `409 Conflict` response. DynamoDB, malformed stored-item, and
-allocation failures return only the static `500 Internal Server Error`
-response.
+The SQS message is the exact compact full Operation JSON with `id`, `tenant`,
+`name`, `body`, `state`, `last_updated`, `expires_at`, and `hash`, and no
+trailing newline. The DynamoDB item and successful HTTP response omit `body`.
+A matching retry that still reads `NEW` attempts submission again. Matching
+`SUBMITTED`, `RUNNING`, `SUCCEEDED`, or `FAILED` retries return the stored
+Operation without another send.
+
+An SQS failure leaves DynamoDB unchanged as `NEW` and returns only the static
+`503 Service Unavailable` response. A DynamoDB failure after a successful send
+returns the static `500 Internal Server Error` response; the message may
+already exist. If a conditional update loses a race, the handler performs a
+strongly consistent read and returns a matching Operation that has advanced
+beyond `NEW`. Other DynamoDB, malformed stored-item, and allocation failures
+remain sanitized HTTP 500 responses. Reusing the ID for different work or from
+a different verified subject returns the static `409 Conflict` response.
+
+Delivery is at least once. The standard queue, acknowledgement loss, and
+concurrent `NEW` retries can create duplicate messages. Consumers must use the
+Operation ID and hash idempotently.
 
 ## 9. Create, read, and update persisted Operations
 
@@ -639,20 +655,22 @@ configuration is checked before input parsing. Failures encountered while
 calling DynamoDB after configuration loading instead report
 `dynamodb: AWS request failed`.
 
-### Troubleshoot Lambda persistence initialization
+### Troubleshoot Lambda intake initialization
 
-The SAM template supplies `OPERATIONS_TABLE_NAME` and the table-scoped IAM
-policy together. Removing the environment variable or replacing it with an
-empty, oversized, or syntactically invalid DynamoDB table name makes the
-bootstrap exit during Lambda INIT, before it requests an invocation. Check the
-deployed template and function configuration; no HTTP response can be produced
-for an INIT failure.
+The SAM template supplies `OPERATIONS_TABLE_NAME`, `OPERATIONS_QUEUE_URL`, and
+their scoped IAM policies together. Removing either variable, configuring an
+empty or oversized queue URL, or configuring an invalid DynamoDB table name
+makes the bootstrap exit during Lambda INIT, before it requests an invocation.
+Check the deployed template and function configuration; no HTTP response can
+be produced for an INIT failure.
 
 A syntactically valid but nonexistent table, or missing `PutItem` permission,
 does not fail INIT because startup makes no DynamoDB request. The first valid,
 authenticated POST returns a sanitized HTTP 500 in those cases; inspect Lambda
 logs and the SAM-managed stack resources without recording live table names or
-account-specific identifiers in this repository.
+account-specific identifiers in this repository. Likewise, a syntactically
+valid but nonexistent queue or missing `SendMessage` permission is discovered
+only when POST attempts submission and returns a sanitized HTTP 503.
 
 ## 10. Send, receive, and check queued Operations
 

@@ -20,14 +20,19 @@ const internal_server_error_response =
     "{\"statusCode\":500,\"headers\":{\"Content-Type\":\"" ++ content_type_text ++
     "\"},\"body\":\"Internal Server Error\\n\"}";
 const method_not_allowed_body = "Method Not Allowed\n";
+const operation_message_size_max = 8 * 1024;
+const queue_url_size_max = 2048;
 const redacted_value = "<redacted>";
+const service_unavailable_body = "Service Unavailable\n";
 const unauthorized_body = "Unauthorized\n";
 
 comptime {
+    std.debug.assert(operation_message_size_max > operation.body_size_max);
     std.debug.assert(paseto.subject_size_max == operation.tenant_size_max);
+    std.debug.assert(queue_url_size_max < operation_message_size_max);
 }
 
-var runtime_operation_creator: ?OperationCreator = null;
+var runtime_intake_adapter: ?IntakeAdapter = null;
 
 pub fn main(init: std.process.Init) void {
     var resources: RuntimeResources = undefined;
@@ -37,13 +42,13 @@ pub fn main(init: std.process.Init) void {
     };
     defer resources.deinit();
 
-    installRuntimeOperationCreator(OperationCreator.init(&resources.persistence));
-    defer uninstallRuntimeOperationCreator();
+    installRuntimeIntakeAdapter(IntakeAdapter.init(&resources));
+    defer uninstallRuntimeIntakeAdapter();
     lambda.handle(init, handler, .{});
 }
 
 fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
-    const creator = runtime_operation_creator orelse {
+    const intake = runtime_intake_adapter orelse {
         return error.PersistenceNotInitialized;
     };
     const now = std.Io.Clock.real.now(ctx.io).toSeconds();
@@ -53,19 +58,24 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
         ctx.config,
         ctx.request,
         @field(ctx, "_").kv,
-        creator,
+        intake,
         now,
     );
 }
 
 const RuntimeResources = struct {
     config: aws.Config,
-    client: dynamodb.Client,
+    dynamodb_client: dynamodb.Client,
+    sqs_client: sqs.Client,
     persistence: operation_persistence.Persistence,
+    queue_url: []const u8,
 
     fn init(resources: *RuntimeResources, process_init: std.process.Init) !void {
         const table_name = configuredTableName(process_init.environ_map) catch {
             return error.InvalidTableConfiguration;
+        };
+        const queue_url = configuredQueueURL(process_init.environ_map) catch {
+            return error.InvalidQueueConfiguration;
         };
         resources.config = aws.Config.load(
             process_init.gpa,
@@ -75,22 +85,68 @@ const RuntimeResources = struct {
         ) catch return error.AWSConfigurationFailure;
         errdefer resources.config.deinit();
 
-        resources.client = dynamodb.Client.init(process_init.gpa, &resources.config);
-        errdefer resources.client.deinit();
+        resources.dynamodb_client = dynamodb.Client.init(process_init.gpa, &resources.config);
+        errdefer resources.dynamodb_client.deinit();
+        resources.sqs_client = sqs.Client.init(process_init.gpa, &resources.config);
+        errdefer resources.sqs_client.deinit();
         resources.persistence = operation_persistence.Persistence.init(
-            &resources.client,
+            &resources.dynamodb_client,
             table_name,
         ) catch return error.PersistenceConfigurationFailure;
+        resources.queue_url = queue_url;
 
-        std.debug.assert(resources.client.config == &resources.config);
-        std.debug.assert(resources.persistence.client == &resources.client);
+        std.debug.assert(resources.dynamodb_client.config == &resources.config);
+        std.debug.assert(resources.sqs_client.config == &resources.config);
+        std.debug.assert(resources.persistence.client == &resources.dynamodb_client);
+        std.debug.assert(resources.queue_url.len > 0);
     }
 
     fn deinit(resources: *RuntimeResources) void {
         resources.persistence.deinit();
-        resources.client.deinit();
+        resources.sqs_client.deinit();
+        resources.dynamodb_client.deinit();
         resources.config.deinit();
         resources.* = undefined;
+    }
+
+    fn create(
+        resources: *RuntimeResources,
+        arena: Allocator,
+        source: *const operation.Operation,
+    ) !operation.Operation {
+        return resources.persistence.create(arena, source);
+    }
+
+    fn read(
+        resources: *RuntimeResources,
+        arena: Allocator,
+        id: u128,
+    ) !operation.Operation {
+        return resources.persistence.read(arena, id);
+    }
+
+    fn update(
+        resources: *RuntimeResources,
+        arena: Allocator,
+        snapshot: *const operation.Operation,
+        replacement: *const operation.Operation,
+    ) !operation.Operation {
+        return resources.persistence.update(arena, snapshot, replacement);
+    }
+
+    fn send(
+        resources: *RuntimeResources,
+        arena: Allocator,
+        message: []const u8,
+    ) !void {
+        std.debug.assert(message.len > 0);
+        _ = resources.sqs_client.sendMessage(arena, .{
+            .message_body = message,
+            .queue_url = resources.queue_url,
+        }, .{}) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return error.QueueUnavailable;
+        };
     }
 };
 
@@ -106,15 +162,42 @@ fn configuredTableName(environment: *const std.process.Environ.Map) ![]const u8 
     return table_name;
 }
 
-const OperationCreator = struct {
+fn configuredQueueURL(environment: *const std.process.Environ.Map) ![]const u8 {
+    const queue_url = environment.get("OPERATIONS_QUEUE_URL") orelse {
+        return error.InvalidQueueConfiguration;
+    };
+    if (queue_url.len == 0) return error.InvalidQueueConfiguration;
+    if (queue_url.len > queue_url_size_max) return error.InvalidQueueConfiguration;
+    std.debug.assert(queue_url.len > 0);
+    std.debug.assert(queue_url.len <= queue_url_size_max);
+    return queue_url;
+}
+
+const IntakeAdapter = struct {
     context: *anyopaque,
     create_fn: *const fn (
         *anyopaque,
         Allocator,
         *const operation.Operation,
     ) anyerror!operation.Operation,
+    read_fn: *const fn (
+        *anyopaque,
+        Allocator,
+        u128,
+    ) anyerror!operation.Operation,
+    update_fn: *const fn (
+        *anyopaque,
+        Allocator,
+        *const operation.Operation,
+        *const operation.Operation,
+    ) anyerror!operation.Operation,
+    send_fn: *const fn (
+        *anyopaque,
+        Allocator,
+        []const u8,
+    ) anyerror!void,
 
-    fn init(pointer: anytype) OperationCreator {
+    fn init(pointer: anytype) IntakeAdapter {
         const Pointer = @TypeOf(pointer);
         const pointer_info = @typeInfo(Pointer);
         comptime std.debug.assert(pointer_info == .pointer);
@@ -129,29 +212,93 @@ const OperationCreator = struct {
                 const self: Pointer = @ptrCast(@alignCast(context));
                 return self.create(allocator, source);
             }
+
+            fn read(
+                context: *anyopaque,
+                allocator: Allocator,
+                id: u128,
+            ) anyerror!operation.Operation {
+                const self: Pointer = @ptrCast(@alignCast(context));
+                return self.read(allocator, id);
+            }
+
+            fn update(
+                context: *anyopaque,
+                allocator: Allocator,
+                snapshot: *const operation.Operation,
+                replacement: *const operation.Operation,
+            ) anyerror!operation.Operation {
+                const self: Pointer = @ptrCast(@alignCast(context));
+                return self.update(allocator, snapshot, replacement);
+            }
+
+            fn send(
+                context: *anyopaque,
+                allocator: Allocator,
+                message: []const u8,
+            ) anyerror!void {
+                const self: Pointer = @ptrCast(@alignCast(context));
+                return self.send(allocator, message);
+            }
         };
-        return .{ .context = pointer, .create_fn = Adapter.create };
+        return .{
+            .context = pointer,
+            .create_fn = Adapter.create,
+            .read_fn = Adapter.read,
+            .update_fn = Adapter.update,
+            .send_fn = Adapter.send,
+        };
     }
 
     fn create(
-        creator: OperationCreator,
+        intake: IntakeAdapter,
         allocator: Allocator,
         source: *const operation.Operation,
     ) !operation.Operation {
-        return creator.create_fn(creator.context, allocator, source);
+        return intake.create_fn(intake.context, allocator, source);
+    }
+
+    fn read(
+        intake: IntakeAdapter,
+        allocator: Allocator,
+        id: u128,
+    ) !operation.Operation {
+        return intake.read_fn(intake.context, allocator, id);
+    }
+
+    fn update(
+        intake: IntakeAdapter,
+        allocator: Allocator,
+        snapshot: *const operation.Operation,
+        replacement: *const operation.Operation,
+    ) !operation.Operation {
+        return intake.update_fn(
+            intake.context,
+            allocator,
+            snapshot,
+            replacement,
+        );
+    }
+
+    fn send(
+        intake: IntakeAdapter,
+        allocator: Allocator,
+        message: []const u8,
+    ) !void {
+        return intake.send_fn(intake.context, allocator, message);
     }
 };
 
-fn installRuntimeOperationCreator(creator: OperationCreator) void {
-    std.debug.assert(runtime_operation_creator == null);
-    runtime_operation_creator = creator;
-    std.debug.assert(runtime_operation_creator != null);
+fn installRuntimeIntakeAdapter(intake: IntakeAdapter) void {
+    std.debug.assert(runtime_intake_adapter == null);
+    runtime_intake_adapter = intake;
+    std.debug.assert(runtime_intake_adapter != null);
 }
 
-fn uninstallRuntimeOperationCreator() void {
-    std.debug.assert(runtime_operation_creator != null);
-    runtime_operation_creator = null;
-    std.debug.assert(runtime_operation_creator == null);
+fn uninstallRuntimeIntakeAdapter() void {
+    std.debug.assert(runtime_intake_adapter != null);
+    runtime_intake_adapter = null;
+    std.debug.assert(runtime_intake_adapter == null);
 }
 
 fn handleInvocation(
@@ -160,10 +307,10 @@ fn handleInvocation(
     cfg: lambda.Context.ConfigMeta,
     req: lambda.Context.RequestMeta,
     env: *const std.process.Environ.Map,
-    creator: OperationCreator,
+    intake: IntakeAdapter,
     now: i64,
 ) []const u8 {
-    const outcome = invocationOutcome(allocator, event, cfg, req, env, creator, now);
+    const outcome = invocationOutcome(allocator, event, cfg, req, env, intake, now);
     return encodeOutcome(allocator, outcome) catch internal_server_error_response;
 }
 
@@ -172,6 +319,7 @@ const InvocationOutcome = union(enum) {
     bad_request,
     conflict,
     method_not_allowed,
+    service_unavailable,
     unauthorized,
     internal_server_error,
 };
@@ -187,7 +335,7 @@ fn invocationOutcome(
     cfg: lambda.Context.ConfigMeta,
     req: lambda.Context.RequestMeta,
     env: *const std.process.Environ.Map,
-    creator: OperationCreator,
+    intake: IntakeAdapter,
     now: i64,
 ) InvocationOutcome {
     const request = lambda.url.parseRequest(allocator, event) catch {
@@ -214,7 +362,7 @@ fn invocationOutcome(
     };
     return switch (method) {
         .GET => get_invocation_outcome(allocator, claims.sub, cfg, req, env),
-        .POST => post_invocation_outcome(allocator, claims.sub, &request, creator, now),
+        .POST => post_invocation_outcome(allocator, claims.sub, &request, intake, now),
         else => .method_not_allowed,
     };
 }
@@ -239,7 +387,7 @@ fn post_invocation_outcome(
     allocator: Allocator,
     tenant: []const u8,
     request: *const lambda.url.Request,
-    creator: OperationCreator,
+    intake: IntakeAdapter,
     now: operation.UnixSeconds,
 ) InvocationOutcome {
     const input_json = request.body orelse return .bad_request;
@@ -259,13 +407,87 @@ fn post_invocation_outcome(
             else => .bad_request,
         };
     };
-    const created = creator.create(arena, &parsed) catch |err| {
+    const created = intake.create(arena, &parsed) catch |err| {
         return switch (err) {
             error.OperationConflict => .conflict,
             else => .internal_server_error,
         };
     };
-    const body = operation_output_body(allocator, &created) catch {
+    if (created.state.? != .new) return operation_success_outcome(allocator, &created);
+
+    var submitted = created;
+    submitted.body = parsed.body;
+    submitted.state = .submitted;
+    submitted.last_updated = now;
+    submitted.expires_at = operation.expires_at_from_last_updated(now) catch {
+        return .internal_server_error;
+    };
+    submitted.result = null;
+    const message = operation_message_body(arena, &submitted) catch {
+        return .internal_server_error;
+    };
+    intake.send(arena, message) catch |err| {
+        if (err == error.OutOfMemory) return .internal_server_error;
+        return .service_unavailable;
+    };
+
+    var replacement = submitted;
+    replacement.body = null;
+    const updated = intake.update(arena, &created, &replacement) catch |err| {
+        if (err != error.OperationConflict) return .internal_server_error;
+        return reconcile_update_conflict(allocator, arena, intake, &created);
+    };
+    return operation_success_outcome(allocator, &updated);
+}
+
+fn reconcile_update_conflict(
+    allocator: Allocator,
+    arena: Allocator,
+    intake: IntakeAdapter,
+    submitted_snapshot: *const operation.Operation,
+) InvocationOutcome {
+    const current = intake.read(arena, submitted_snapshot.id) catch {
+        return .internal_server_error;
+    };
+    if (!operation_identity_matches(&current, submitted_snapshot)) return .conflict;
+    if (current.state.? == .new) return .conflict;
+    return operation_success_outcome(allocator, &current);
+}
+
+fn operation_identity_matches(
+    left: *const operation.Operation,
+    right: *const operation.Operation,
+) bool {
+    if (left.id != right.id) return false;
+    if (!std.mem.eql(u8, left.tenant, right.tenant)) return false;
+    if (!std.mem.eql(u8, left.name, right.name)) return false;
+    if (!std.mem.eql(u8, &left.hash.?, &right.hash.?)) return false;
+    return true;
+}
+
+fn operation_message_body(
+    allocator: Allocator,
+    submitted: *const operation.Operation,
+) ![]const u8 {
+    std.debug.assert(submitted.body != null);
+    std.debug.assert(submitted.state == .submitted);
+
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try operation.writeOutputJSON(&output.writer, submitted);
+    if (output.written().len > operation_message_size_max) {
+        return error.OperationMessageTooLarge;
+    }
+    std.debug.assert(output.written().len > 0);
+    std.debug.assert(output.written().len <= operation_message_size_max);
+    return output.toOwnedSlice();
+}
+
+fn operation_success_outcome(
+    allocator: Allocator,
+    persisted: *const operation.Operation,
+) InvocationOutcome {
+    const body = operation_output_body(allocator, persisted) catch {
         return .internal_server_error;
     };
     return .{ .success = .{
@@ -353,6 +575,11 @@ fn encodeOutcome(
                 .{ .key = "Allow", .value = "GET, POST" },
             },
             .body = .{ .textual = method_not_allowed_body },
+        }),
+        .service_unavailable => lambda.url.encodeResponse(allocator, .{
+            .content_type = content_type_text,
+            .status_code = .service_unavailable,
+            .body = .{ .textual = service_unavailable_body },
         }),
         .unauthorized => lambda.url.encodeResponse(allocator, .{
             .content_type = content_type_text,
@@ -558,8 +785,16 @@ fn writerCountToUsize(count: u64) !usize {
 
 const FakePersistence = struct {
     response: ?operation.Operation = null,
+    read_response: ?operation.Operation = null,
+    update_response: ?operation.Operation = null,
     create_error: ?anyerror = null,
+    read_error: ?anyerror = null,
+    update_error: ?anyerror = null,
+    send_error: ?anyerror = null,
     create_count: u8 = 0,
+    read_count: u8 = 0,
+    update_count: u8 = 0,
+    send_count: u8 = 0,
     last_id: u128 = 0,
     last_state: ?operation.State = null,
     last_updated: ?operation.UnixSeconds = null,
@@ -571,6 +806,14 @@ const FakePersistence = struct {
     last_name_len: u8 = 0,
     last_body_buffer: [operation.body_size_max]u8 = undefined,
     last_body_len: u16 = 0,
+    last_message_buffer: [operation_message_size_max]u8 = undefined,
+    last_message_len: u16 = 0,
+    last_read_id: u128 = 0,
+    last_snapshot_state: ?operation.State = null,
+    last_update_state: ?operation.State = null,
+    last_update_time: ?operation.UnixSeconds = null,
+    last_update_expires_at: ?operation.UnixSeconds = null,
+    last_update_body_present: bool = false,
 
     fn create(
         fake: *FakePersistence,
@@ -601,6 +844,49 @@ const FakePersistence = struct {
         return created;
     }
 
+    fn read(
+        fake: *FakePersistence,
+        _: Allocator,
+        id: u128,
+    ) !operation.Operation {
+        std.debug.assert(fake.read_count < 32);
+        fake.read_count += 1;
+        fake.last_read_id = id;
+        if (fake.read_error) |err| return err;
+        return fake.read_response orelse error.OperationNotFound;
+    }
+
+    fn update(
+        fake: *FakePersistence,
+        _: Allocator,
+        snapshot: *const operation.Operation,
+        replacement: *const operation.Operation,
+    ) !operation.Operation {
+        std.debug.assert(fake.update_count < 32);
+        fake.update_count += 1;
+        fake.last_snapshot_state = snapshot.state;
+        fake.last_update_state = replacement.state;
+        fake.last_update_time = replacement.last_updated;
+        fake.last_update_expires_at = replacement.expires_at;
+        fake.last_update_body_present = replacement.body != null;
+        if (fake.update_error) |err| return err;
+        if (fake.update_response) |response| return response;
+        return replacement.*;
+    }
+
+    fn send(
+        fake: *FakePersistence,
+        _: Allocator,
+        message: []const u8,
+    ) !void {
+        std.debug.assert(fake.send_count < 32);
+        std.debug.assert(message.len <= fake.last_message_buffer.len);
+        fake.send_count += 1;
+        fake.last_message_len = @intCast(message.len);
+        @memcpy(fake.last_message_buffer[0..message.len], message);
+        if (fake.send_error) |err| return err;
+    }
+
     fn lastName(fake: *const FakePersistence) []const u8 {
         return fake.last_name_buffer[0..fake.last_name_len];
     }
@@ -611,6 +897,10 @@ const FakePersistence = struct {
 
     fn lastBody(fake: *const FakePersistence) []const u8 {
         return fake.last_body_buffer[0..fake.last_body_len];
+    }
+
+    fn lastMessage(fake: *const FakePersistence) []const u8 {
+        return fake.last_message_buffer[0..fake.last_message_len];
     }
 };
 
@@ -629,7 +919,7 @@ fn handleInvocationForTest(
         cfg,
         req,
         env,
-        OperationCreator.init(fake),
+        IntakeAdapter.init(fake),
         now,
     );
 }
@@ -664,6 +954,33 @@ test "operations table configuration is mandatory and syntactically valid" {
             configuredTableName(&environment),
         );
     }
+}
+
+test "operations queue configuration is mandatory and bounded" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+
+    try std.testing.expectError(
+        error.InvalidQueueConfiguration,
+        configuredQueueURL(&environment),
+    );
+    const invalid_urls = [_][]const u8{
+        "",
+        "a" ** 2049,
+    };
+    for (invalid_urls) |queue_url| {
+        try environment.put("OPERATIONS_QUEUE_URL", queue_url);
+        try std.testing.expectError(
+            error.InvalidQueueConfiguration,
+            configuredQueueURL(&environment),
+        );
+    }
+
+    try environment.put("OPERATIONS_QUEUE_URL", "https://sqs.example.invalid/operations");
+    try std.testing.expectEqualStrings(
+        "https://sqs.example.invalid/operations",
+        try configuredQueueURL(&environment),
+    );
 }
 
 test "valid table configuration binds persistence to the shared client" {
@@ -903,7 +1220,7 @@ test "valid credentials include subject greeting and accept case insensitive aut
     try std.testing.expectEqual(@as(u8, 0), fake.create_count);
 }
 
-test "authenticated POST returns a new operation without its body" {
+test "authenticated POST submits a new operation and returns it without its body" {
     var key_pair = testKeyPair(0x42);
     defer paseto.wipeSecretKey(&key_pair.secret_key);
     const token = try testToken(&key_pair, 1_700_000_000, 60);
@@ -923,10 +1240,17 @@ test "authenticated POST returns a new operation without its body" {
         "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
         "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
         "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
-        "\\\"state\\\":\\\"NEW\\\"," ++
+        "\\\"state\\\":\\\"SUBMITTED\\\"," ++
         "\\\"last_updated\\\":1700000000," ++
         "\\\"expires_at\\\":1700086400," ++
         "\\\"hash\\\":\\\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\\\"}\"}";
+    const expected_message =
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+        "\"tenant\":\"lambda-test-user\",\"name\":\"echo\"," ++
+        "\"body\":{\"message\":\"hello\",\"count\":2}," ++
+        "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+        "\"expires_at\":1700086400," ++
+        "\"hash\":\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\"}";
 
     for (inputs) |input| {
         var fake: FakePersistence = .{};
@@ -967,12 +1291,101 @@ test "authenticated POST returns a new operation without its body" {
             "{\"message\":\"hello\",\"count\":2}",
             fake.lastBody(),
         );
+        try std.testing.expectEqualStrings(expected_message, fake.lastMessage());
+        try std.testing.expectEqual(@as(u8, 1), fake.send_count);
+        try std.testing.expectEqual(@as(u8, 1), fake.update_count);
+        try std.testing.expectEqual(operation.State.new, fake.last_snapshot_state.?);
+        try std.testing.expectEqual(operation.State.submitted, fake.last_update_state.?);
+        try std.testing.expectEqual(@as(i64, 1_700_000_000), fake.last_update_time.?);
+        try std.testing.expectEqual(@as(i64, 1_700_086_400), fake.last_update_expires_at.?);
+        try std.testing.expect(!fake.last_update_body_present);
         var expected_hash: [32]u8 = undefined;
         _ = try std.fmt.hexToBytes(
             &expected_hash,
             "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
         );
         try std.testing.expectEqualSlices(u8, &expected_hash, &fake.last_hash.?);
+    }
+}
+
+test "POST queues every JSON body variant as exact full Operation JSON" {
+    var key_pair = testKeyPair(0x51);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1_700_000_000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+
+    const bodies = [_][]const u8{ "null", "false", "42", "\"text\"", "[1]", "{\"a\":1}" };
+    const messages = [_][]const u8{
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":null," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400," ++
+            "\"hash\":\"fd177e1082fafe25e8ae2bc301281fc4f4a5a0776ab241d35cf9ed91a46db3b3\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":false," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400," ++
+            "\"hash\":\"6e18221b306b6bfd8753e910d58beb8cf007da71923dc7b52011f107fbc51d1c\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":42," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400," ++
+            "\"hash\":\"d5ccd414185af1692c3678f3cde5756d3bb12a7cbfd0f39f797610b3fa7bd235\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":\"text\"," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400," ++
+            "\"hash\":\"576bfabb751a1c5df078d4d24cd5bd66c00cec5b765e898b7eb3743693a0c2bb\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":[1]," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400," ++
+            "\"hash\":\"9a2a3875c2b05917ae674a0d5b6f1bfc71d6dec7b3cb71059f9c21f60709cbc9\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":{\"a\":1}," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400," ++
+            "\"hash\":\"72773a3103040a8266d9052ef82f5119ea53608cc1aac4ae8844721705e292dd\"}",
+    };
+
+    for (bodies, messages) |body, expected_message| {
+        const input = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+                "\"name\":\"variants\",\"body\":{s}}}",
+            .{body},
+        );
+        defer std.testing.allocator.free(input);
+        const event = try test_authorization_request_event(
+            std.testing.allocator,
+            .POST,
+            "Authorization",
+            "Bearer",
+            token,
+            input,
+        );
+        defer std.testing.allocator.free(event);
+        var fake: FakePersistence = .{};
+        const response = handleInvocationForTest(
+            std.testing.allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            &fake,
+            1_700_000_000,
+        );
+        defer std.testing.allocator.free(response);
+
+        try std.testing.expectEqualStrings(expected_message, fake.lastMessage());
+        try expectContains(response, "\\\"state\\\":\\\"SUBMITTED\\\"");
+        try expectNotContains(response, "\\\"body\\\":");
+        try std.testing.expectEqual(@as(u8, 1), fake.send_count);
+        try std.testing.expectEqual(@as(u8, 1), fake.update_count);
+        try std.testing.expect(!fake.last_update_body_present);
     }
 }
 
@@ -1020,6 +1433,65 @@ test "POST derives tenant and hash from distinct bounded verified subjects" {
         hashes[index] = fake.last_hash.?;
     }
     try std.testing.expect(!std.mem.eql(u8, &hashes[0], &hashes[1]));
+}
+
+test "matching NEW POST retries submission with the invocation timestamp" {
+    var key_pair = testKeyPair(0x52);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1_700_000_500, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+    const input =
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+        "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
+    const event = try test_authorization_request_event(
+        std.testing.allocator,
+        .POST,
+        "Authorization",
+        "Bearer",
+        token,
+        input,
+    );
+    defer std.testing.allocator.free(event);
+    var expected_hash: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(
+        &expected_hash,
+        "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
+    );
+    var fake = FakePersistence{ .response = .{
+        .id = operation.uuidFromString(
+            "00112233-4455-6677-8899-aabbccddeeff",
+        ) catch unreachable,
+        .tenant = "lambda-test-user",
+        .name = "echo",
+        .state = .new,
+        .last_updated = 1_699_999_000,
+        .expires_at = 1_700_085_400,
+        .hash = expected_hash,
+    } };
+
+    const response = handleInvocationForTest(
+        std.testing.allocator,
+        event,
+        .{},
+        .{},
+        &environment,
+        &fake,
+        1_700_000_500,
+    );
+    defer std.testing.allocator.free(response);
+
+    try expectContains(response, "\\\"state\\\":\\\"SUBMITTED\\\"");
+    try expectContains(response, "\\\"last_updated\\\":1700000500");
+    try expectContains(response, "\\\"expires_at\\\":1700086900");
+    try expectContains(fake.lastMessage(), "\"body\":{\"message\":\"hello\",\"count\":2}");
+    try expectContains(fake.lastMessage(), "\"last_updated\":1700000500");
+    try std.testing.expectEqual(operation.State.new, fake.last_snapshot_state.?);
+    try std.testing.expectEqual(operation.State.submitted, fake.last_update_state.?);
+    try std.testing.expectEqual(@as(u8, 1), fake.send_count);
+    try std.testing.expectEqual(@as(u8, 1), fake.update_count);
 }
 
 test "matching POST retry returns the latest stored persistent view" {
@@ -1087,6 +1559,77 @@ test "matching POST retry returns the latest stored persistent view" {
         "\\\"hash\\\":\\\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\\\"}\"}";
     try std.testing.expectEqualStrings(expected, response);
     try std.testing.expectEqual(@as(u8, 1), fake.create_count);
+}
+
+test "matching POST in every later state returns without another submission" {
+    var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer result_arena.deinit();
+    var key_pair = testKeyPair(0x53);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1_700_000_000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+    const input =
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+        "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
+    const event = try test_authorization_request_event(
+        std.testing.allocator,
+        .POST,
+        "Authorization",
+        "Bearer",
+        token,
+        input,
+    );
+    defer std.testing.allocator.free(event);
+    var expected_hash: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(
+        &expected_hash,
+        "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
+    );
+    const states = [_]operation.State{ .submitted, .running, .succeeded, .failed };
+
+    for (states) |state| {
+        const result = if (operation.stateIsTerminal(state))
+            try operation.parseResultJSON(result_arena.allocator(), "{\"done\":true}")
+        else
+            null;
+        var fake = FakePersistence{ .response = .{
+            .id = operation.uuidFromString(
+                "00112233-4455-6677-8899-aabbccddeeff",
+            ) catch unreachable,
+            .tenant = "lambda-test-user",
+            .name = "echo",
+            .state = state,
+            .last_updated = 1_700_000_123,
+            .expires_at = 1_700_086_523,
+            .result = result,
+            .hash = expected_hash,
+        } };
+        const response = handleInvocationForTest(
+            std.testing.allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            &fake,
+            1_700_000_000,
+        );
+        defer std.testing.allocator.free(response);
+        const state_marker = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "\\\"state\\\":\\\"{s}\\\"",
+            .{operation.stateToString(state)},
+        );
+        defer std.testing.allocator.free(state_marker);
+
+        try expectContains(response, state_marker);
+        try std.testing.expectEqual(@as(u8, 1), fake.create_count);
+        try std.testing.expectEqual(@as(u8, 0), fake.send_count);
+        try std.testing.expectEqual(@as(u8, 0), fake.update_count);
+        try std.testing.expectEqual(@as(u8, 0), fake.read_count);
+    }
 }
 
 test "POST conflict returns only the static conflict response" {
@@ -1168,6 +1711,232 @@ test "POST persistence failures return only the static internal error" {
     }
 }
 
+test "SQS failure leaves NEW unchanged and a matching POST can retry submission" {
+    var key_pair = testKeyPair(0x50);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+    const event = try test_authorization_request_event(
+        std.testing.allocator,
+        .POST,
+        "Authorization",
+        "Bearer",
+        token,
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"name\":\"queue-failure-marker\",\"body\":true}",
+    );
+    defer std.testing.allocator.free(event);
+    var fake = FakePersistence{ .send_error = error.AWSFailure };
+
+    const failed = handleInvocationForTest(
+        std.testing.allocator,
+        event,
+        .{},
+        .{},
+        &environment,
+        &fake,
+        1000,
+    );
+    defer std.testing.allocator.free(failed);
+    try expectServiceUnavailable(failed);
+    try expectNotContains(failed, "queue-failure-marker");
+    try expectNotContains(failed, "AWSFailure");
+    try std.testing.expectEqual(@as(u8, 1), fake.send_count);
+    try std.testing.expectEqual(@as(u8, 0), fake.update_count);
+
+    fake.send_error = null;
+    const retried = handleInvocationForTest(
+        std.testing.allocator,
+        event,
+        .{},
+        .{},
+        &environment,
+        &fake,
+        1001,
+    );
+    defer std.testing.allocator.free(retried);
+    try expectContains(retried, "SUBMITTED");
+    try std.testing.expectEqual(@as(u8, 2), fake.create_count);
+    try std.testing.expectEqual(@as(u8, 2), fake.send_count);
+    try std.testing.expectEqual(@as(u8, 1), fake.update_count);
+}
+
+test "DynamoDB update failure after send returns only the static internal error" {
+    var key_pair = testKeyPair(0x54);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+    const event = try test_authorization_request_event(
+        std.testing.allocator,
+        .POST,
+        "Authorization",
+        "Bearer",
+        token,
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"name\":\"update-failure-marker\",\"body\":{\"secret\":\"marker\"}}",
+    );
+    defer std.testing.allocator.free(event);
+    var fake = FakePersistence{ .update_error = error.AWSFailure };
+
+    const response = handleInvocationForTest(
+        std.testing.allocator,
+        event,
+        .{},
+        .{},
+        &environment,
+        &fake,
+        1000,
+    );
+    defer std.testing.allocator.free(response);
+
+    try expectInternalServerError(response);
+    try expectNotContains(response, "update-failure-marker");
+    try expectNotContains(response, "AWSFailure");
+    try std.testing.expectEqual(@as(u8, 1), fake.send_count);
+    try std.testing.expectEqual(@as(u8, 1), fake.update_count);
+    try std.testing.expectEqual(@as(u8, 0), fake.read_count);
+    try expectContains(fake.lastMessage(), "\"state\":\"SUBMITTED\"");
+}
+
+test "concurrent submitted update conflict reconciles with a consistent read" {
+    var key_pair = testKeyPair(0x55);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+    const event = try test_authorization_request_event(
+        std.testing.allocator,
+        .POST,
+        "Authorization",
+        "Bearer",
+        token,
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}",
+    );
+    defer std.testing.allocator.free(event);
+    var expected_hash: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(
+        &expected_hash,
+        "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
+    );
+    var fake = FakePersistence{
+        .update_error = error.OperationConflict,
+        .read_response = .{
+            .id = operation.uuidFromString(
+                "00112233-4455-6677-8899-aabbccddeeff",
+            ) catch unreachable,
+            .tenant = "lambda-test-user",
+            .name = "echo",
+            .state = .submitted,
+            .last_updated = 1001,
+            .expires_at = 87_401,
+            .hash = expected_hash,
+        },
+    };
+
+    const response = handleInvocationForTest(
+        std.testing.allocator,
+        event,
+        .{},
+        .{},
+        &environment,
+        &fake,
+        1000,
+    );
+    defer std.testing.allocator.free(response);
+
+    try expectContains(response, "\\\"state\\\":\\\"SUBMITTED\\\"");
+    try expectContains(response, "\\\"last_updated\\\":1001");
+    try expectContains(response, "\\\"expires_at\\\":87401");
+    try std.testing.expectEqual(@as(u8, 1), fake.send_count);
+    try std.testing.expectEqual(@as(u8, 1), fake.update_count);
+    try std.testing.expectEqual(@as(u8, 1), fake.read_count);
+    try std.testing.expectEqual(fake.last_id, fake.last_read_id);
+}
+
+test "unreconciled conditional update conflicts remain sanitized" {
+    var key_pair = testKeyPair(0x56);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    const token = try testToken(&key_pair, 1000, 60);
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putTestPublicKey(&environment, key_pair.public_key);
+    const event = try test_authorization_request_event(
+        std.testing.allocator,
+        .POST,
+        "Authorization",
+        "Bearer",
+        token,
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"name\":\"reconcile-marker\",\"body\":true}",
+    );
+    defer std.testing.allocator.free(event);
+    var fake = FakePersistence{
+        .update_error = error.OperationConflict,
+        .read_response = .{
+            .id = operation.uuidFromString(
+                "00112233-4455-6677-8899-aabbccddeeff",
+            ) catch unreachable,
+            .tenant = "lambda-test-user",
+            .name = "reconcile-marker",
+            .state = .new,
+            .last_updated = 1001,
+            .expires_at = 87_401,
+            .hash = [_]u8{0xAB} ** 32,
+        },
+    };
+
+    const conflict = handleInvocationForTest(
+        std.testing.allocator,
+        event,
+        .{},
+        .{},
+        &environment,
+        &fake,
+        1000,
+    );
+    defer std.testing.allocator.free(conflict);
+    try expectConflict(conflict);
+    try expectNotContains(conflict, "reconcile-marker");
+
+    fake.read_response.?.hash = fake.last_hash;
+    const still_new = handleInvocationForTest(
+        std.testing.allocator,
+        event,
+        .{},
+        .{},
+        &environment,
+        &fake,
+        1000,
+    );
+    defer std.testing.allocator.free(still_new);
+    try expectConflict(still_new);
+    try expectNotContains(still_new, "reconcile-marker");
+
+    fake.read_error = error.AWSFailure;
+    const failed_read = handleInvocationForTest(
+        std.testing.allocator,
+        event,
+        .{},
+        .{},
+        &environment,
+        &fake,
+        1000,
+    );
+    defer std.testing.allocator.free(failed_read);
+    try expectInternalServerError(failed_read);
+    try expectNotContains(failed_read, "AWSFailure");
+}
+
 test "warm invocations reuse one adapter without retaining request data" {
     var key_pair = testKeyPair(0x48);
     defer paseto.wipeSecretKey(&key_pair.secret_key);
@@ -1177,7 +1946,7 @@ test "warm invocations reuse one adapter without retaining request data" {
     defer environment.deinit();
     try putTestPublicKey(&environment, key_pair.public_key);
     var fake: FakePersistence = .{};
-    const creator = OperationCreator.init(&fake);
+    const intake = IntakeAdapter.init(&fake);
     const inputs = [_][]const u8{
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"first-operation\",\"body\":{\"value\":1}}",
@@ -1203,7 +1972,7 @@ test "warm invocations reuse one adapter without retaining request data" {
             .{},
             .{},
             &environment,
-            creator,
+            intake,
             1000 + @as(i64, @intCast(index)),
         );
         if (index == 0) {
@@ -1661,6 +2430,14 @@ fn expectMethodNotAllowed(response: []const u8) !void {
 
 fn expectInternalServerError(response: []const u8) !void {
     try std.testing.expectEqualStrings(internal_server_error_response, response);
+}
+
+fn expectServiceUnavailable(response: []const u8) !void {
+    try std.testing.expectEqualStrings(
+        "{\"statusCode\":503,\"headers\":{\"Content-Type\":\"" ++ content_type_text ++
+            "\"},\"body\":\"Service Unavailable\\n\"}",
+        response,
+    );
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {
