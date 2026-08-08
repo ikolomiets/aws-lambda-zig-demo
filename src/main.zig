@@ -1,6 +1,5 @@
 const std = @import("std");
 const aws = @import("aws");
-const dynamodb = @import("dynamodb");
 const lambda = @import("aws-lambda");
 const operation = @import("operation");
 const operation_persistence = @import("operation_persistence");
@@ -65,15 +64,11 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
 
 const RuntimeResources = struct {
     config: aws.Config,
-    dynamodb_client: dynamodb.Client,
     sqs_client: sqs.Client,
     persistence: operation_persistence.Persistence,
     queue_url: []const u8,
 
     fn init(resources: *RuntimeResources, process_init: std.process.Init) !void {
-        const table_name = configuredTableName(process_init.environ_map) catch {
-            return error.InvalidTableConfiguration;
-        };
         const queue_url = configuredQueueURL(process_init.environ_map) catch {
             return error.InvalidQueueConfiguration;
         };
@@ -85,26 +80,23 @@ const RuntimeResources = struct {
         ) catch return error.AWSConfigurationFailure;
         errdefer resources.config.deinit();
 
-        resources.dynamodb_client = dynamodb.Client.init(process_init.gpa, &resources.config);
-        errdefer resources.dynamodb_client.deinit();
         resources.sqs_client = sqs.Client.init(process_init.gpa, &resources.config);
         errdefer resources.sqs_client.deinit();
-        resources.persistence = operation_persistence.Persistence.init(
-            &resources.dynamodb_client,
-            table_name,
+        operation_persistence.Persistence.init(
+            &resources.persistence,
+            process_init.gpa,
+            &resources.config,
+            process_init.environ_map,
         ) catch return error.PersistenceConfigurationFailure;
         resources.queue_url = queue_url;
 
-        std.debug.assert(resources.dynamodb_client.config == &resources.config);
         std.debug.assert(resources.sqs_client.config == &resources.config);
-        std.debug.assert(resources.persistence.client == &resources.dynamodb_client);
         std.debug.assert(resources.queue_url.len > 0);
     }
 
     fn deinit(resources: *RuntimeResources) void {
         resources.persistence.deinit();
         resources.sqs_client.deinit();
-        resources.dynamodb_client.deinit();
         resources.config.deinit();
         resources.* = undefined;
     }
@@ -149,18 +141,6 @@ const RuntimeResources = struct {
         };
     }
 };
-
-fn configuredTableName(environment: *const std.process.Environ.Map) ![]const u8 {
-    const table_name = environment.get("OPERATIONS_TABLE_NAME") orelse {
-        return error.InvalidTableConfiguration;
-    };
-    operation_persistence.validateTableName(table_name) catch {
-        return error.InvalidTableConfiguration;
-    };
-    std.debug.assert(table_name.len >= 3);
-    std.debug.assert(table_name.len <= 255);
-    return table_name;
-}
 
 fn configuredQueueURL(environment: *const std.process.Environ.Map) ![]const u8 {
     const queue_url = environment.get("OPERATIONS_QUEUE_URL") orelse {
@@ -924,35 +904,10 @@ fn handleInvocationForTest(
     );
 }
 
-test "AWS SDK exposes runtime configuration, DynamoDB, and SQS client types" {
+test "AWS SDK exposes runtime configuration and SQS client types" {
     comptime {
         std.debug.assert(@TypeOf(aws.Config) == type);
-        std.debug.assert(@TypeOf(dynamodb.Client) == type);
         std.debug.assert(@TypeOf(sqs.Client) == type);
-    }
-}
-
-test "operations table configuration is mandatory and syntactically valid" {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-
-    try std.testing.expectError(
-        error.InvalidTableConfiguration,
-        configuredTableName(&environment),
-    );
-    const invalid_names = [_][]const u8{
-        "",
-        "ab",
-        "operations/table",
-        "operations table",
-        "a" ** 256,
-    };
-    for (invalid_names) |table_name| {
-        try environment.put("OPERATIONS_TABLE_NAME", table_name);
-        try std.testing.expectError(
-            error.InvalidTableConfiguration,
-            configuredTableName(&environment),
-        );
     }
 }
 
@@ -981,25 +936,6 @@ test "operations queue configuration is mandatory and bounded" {
         "https://sqs.example.invalid/operations",
         try configuredQueueURL(&environment),
     );
-}
-
-test "valid table configuration binds persistence to the shared client" {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-    try environment.put("OPERATIONS_TABLE_NAME", "operations-table.1");
-
-    var config: aws.Config = undefined;
-    var client = dynamodb.Client.init(std.testing.allocator, &config);
-    defer client.deinit();
-    var persistence = try operation_persistence.Persistence.init(
-        &client,
-        try configuredTableName(&environment),
-    );
-    defer persistence.deinit();
-
-    try std.testing.expect(persistence.client == &client);
-    try std.testing.expect(client.config == &config);
-    try std.testing.expectEqualStrings("operations-table.1", persistence.table_name);
 }
 
 test "config metadata body includes config fields" {
@@ -1764,7 +1700,7 @@ test "SQS failure leaves NEW unchanged and a matching POST can retry submission"
     try std.testing.expectEqual(@as(u8, 1), fake.update_count);
 }
 
-test "DynamoDB update failure after send returns only the static internal error" {
+test "persistence update failure after send returns only the static internal error" {
     var key_pair = testKeyPair(0x54);
     defer paseto.wipeSecretKey(&key_pair.secret_key);
     const token = try testToken(&key_pair, 1000, 60);

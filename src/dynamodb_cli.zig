@@ -1,6 +1,5 @@
 const std = @import("std");
 const aws = @import("aws");
-const dynamodb = @import("dynamodb");
 const operation = @import("operation");
 const operation_persistence = @import("operation_persistence");
 
@@ -8,7 +7,6 @@ const Allocator = std.mem.Allocator;
 
 const argument_count_max = 8;
 const stdin_size_max = 8 * 1024;
-const table_name_size_max = 255;
 
 comptime {
     std.debug.assert(stdin_size_max > operation.body_size_max);
@@ -85,19 +83,20 @@ pub fn main(init: std.process.Init) u8 {
         const code = runCommand(command, context, null);
         return finish(context.stdout, context.stderr, code, null);
     }
-    const table_name = configuredTableName(init.environ_map) catch {
-        return finish(context.stdout, context.stderr, 2, .configuration);
-    };
-
     var config = aws.Config.load(init.gpa, init.io, init.environ_map, .{}) catch {
         return finish(context.stdout, context.stderr, 2, .configuration);
     };
     defer config.deinit();
-    var client = dynamodb.Client.init(init.gpa, &config);
-    defer client.deinit();
-    var persistence = operation_persistence.Persistence.init(&client, table_name) catch {
+    var persistence: operation_persistence.Persistence = undefined;
+    operation_persistence.Persistence.init(
+        &persistence,
+        init.gpa,
+        &config,
+        init.environ_map,
+    ) catch {
         return finish(context.stdout, context.stderr, 2, .configuration);
     };
+    defer persistence.deinit();
     const backend = PersistenceInterface.init(&persistence);
     const code = runCommand(command, context, backend);
     return finish(context.stdout, context.stderr, code, null);
@@ -207,17 +206,6 @@ fn unixSeconds(io: std.Io) operation.UnixSeconds {
     std.debug.assert(result >= std.math.minInt(operation.UnixSeconds));
     std.debug.assert(result <= std.math.maxInt(operation.UnixSeconds));
     return result;
-}
-
-fn configuredTableName(environment: *const std.process.Environ.Map) ![]const u8 {
-    const table_name = environment.get("OPERATIONS_TABLE_NAME") orelse {
-        return error.InvalidConfiguration;
-    };
-    if (table_name.len == 0) return error.InvalidConfiguration;
-    if (table_name.len > table_name_size_max) return error.InvalidConfiguration;
-    std.debug.assert(table_name.len > 0);
-    std.debug.assert(table_name.len <= table_name_size_max);
-    return table_name;
 }
 
 fn parseCommand(arguments: []const []const u8) CliError!Command {
@@ -598,7 +586,6 @@ const TestResult = struct {
 fn runForTest(
     arguments: []const []const u8,
     stdin: []const u8,
-    environment: *const std.process.Environ.Map,
     now: operation.UnixSeconds,
     fake: *FakePersistence,
 ) TestResult {
@@ -617,12 +604,6 @@ fn runForTest(
         writeDiagnostic(&stderr, .validation);
         return testResultFinish(&result, &stdout, &stderr, 2);
     };
-    if (command != .help) {
-        _ = configuredTableName(environment) catch {
-            writeDiagnostic(&stderr, .configuration);
-            return testResultFinish(&result, &stdout, &stderr, 2);
-        };
-    }
     const backend = if (command == .help) null else PersistenceInterface.init(fake);
     const code = runCommand(command, .{
         .allocator = std.testing.allocator,
@@ -648,17 +629,7 @@ fn testResultFinish(
     return result.*;
 }
 
-fn testEnvironment() !std.process.Environ.Map {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    errdefer environment.deinit();
-    try environment.put("OPERATIONS_TABLE_NAME", "operations");
-    std.debug.assert(environment.get("OPERATIONS_TABLE_NAME") != null);
-    return environment;
-}
-
 test "help works without AWS configuration and invocation is bounded" {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
     var fake: FakePersistence = .{};
     const help_arguments = [_][]const []const u8{
         &.{ "dynamodb", "--help" },
@@ -669,19 +640,18 @@ test "help works without AWS configuration and invocation is bounded" {
         &.{ "dynamodb", "update", "--help" },
     };
     for (help_arguments) |arguments| {
-        const result = runForTest(arguments, "", &environment, 0, &fake);
+        const result = runForTest(arguments, "", 0, &fake);
         try std.testing.expectEqual(@as(u8, 0), result.exit_code);
         try std.testing.expect(std.mem.startsWith(u8, result.stdout(), "Usage:\n"));
         try std.testing.expectEqualStrings("", result.stderr());
     }
 
-    const invalid = runForTest(&.{"dynamodb"}, "", &environment, 0, &fake);
+    const invalid = runForTest(&.{"dynamodb"}, "", 0, &fake);
     try std.testing.expectEqual(@as(u8, 2), invalid.exit_code);
     try std.testing.expectEqualStrings("", invalid.stdout());
     const excessive = runForTest(
         &.{ "dynamodb", "read", "--id", test_id, "a", "b", "c", "d", "e" },
         "",
-        &environment,
         0,
         &fake,
     );
@@ -717,39 +687,7 @@ test "create requires one valid bounded tenant flag" {
     }
 }
 
-test "configuration is required before persistence dispatch" {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-    var fake: FakePersistence = .{};
-    const missing = runForTest(
-        &.{ "dynamodb", "read", "--id", test_id },
-        "",
-        &environment,
-        0,
-        &fake,
-    );
-    try std.testing.expectEqual(@as(u8, 2), missing.exit_code);
-    try std.testing.expectEqualStrings(
-        "dynamodb: missing or invalid configuration\n",
-        missing.stderr(),
-    );
-    try std.testing.expectEqual(@as(u8, 0), fake.read_count);
-
-    try environment.put("OPERATIONS_TABLE_NAME", "");
-    const empty = runForTest(
-        &.{ "dynamodb", "read", "--id", test_id },
-        "",
-        &environment,
-        0,
-        &fake,
-    );
-    try std.testing.expectEqual(@as(u8, 2), empty.exit_code);
-    try std.testing.expectEqual(@as(u8, 0), fake.read_count);
-}
-
 test "create parses stdin dispatches once and writes canonical JSON" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
     var fake: FakePersistence = .{};
     const input =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
@@ -757,7 +695,6 @@ test "create parses stdin dispatches once and writes canonical JSON" {
     const result = runForTest(
         &.{ "dynamodb", "create", "--tenant", "tenant-a" },
         input,
-        &environment,
         1_700_000_000,
         &fake,
     );
@@ -778,8 +715,6 @@ test "create parses stdin dispatches once and writes canonical JSON" {
 }
 
 test "matching create retry writes the authoritative stored timestamp" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
     var fake: FakePersistence = .{ .create_last_updated = 1_700_000_000 };
     const input =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
@@ -787,7 +722,6 @@ test "matching create retry writes the authoritative stored timestamp" {
     const result = runForTest(
         &.{ "dynamodb", "create", "--tenant", "tenant-a" },
         input,
-        &environment,
         1_700_000_010,
         &fake,
     );
@@ -806,14 +740,11 @@ test "matching create retry writes the authoritative stored timestamp" {
 }
 
 test "create bounds stdin and reports conflict and invalid input outcomes" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
     var fake: FakePersistence = .{};
     const oversized = "a" ** (stdin_size_max + 1);
     const large = runForTest(
         &.{ "dynamodb", "create", "--tenant", "tenant-a" },
         oversized,
-        &environment,
         0,
         &fake,
     );
@@ -823,7 +754,6 @@ test "create bounds stdin and reports conflict and invalid input outcomes" {
     const invalid = runForTest(
         &.{ "dynamodb", "create", "--tenant", "tenant-a" },
         "null",
-        &environment,
         0,
         &fake,
     );
@@ -834,7 +764,6 @@ test "create bounds stdin and reports conflict and invalid input outcomes" {
         &.{ "dynamodb", "create", "--tenant", "tenant-a" },
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"spoofed\",\"name\":\"echo\",\"body\":null}",
-        &environment,
         0,
         &fake,
     );
@@ -846,7 +775,6 @@ test "create bounds stdin and reports conflict and invalid input outcomes" {
         &.{ "dynamodb", "create", "--tenant", "tenant-a" },
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"echo\",\"body\":null}",
-        &environment,
         1,
         &fake,
     );
@@ -855,13 +783,10 @@ test "create bounds stdin and reports conflict and invalid input outcomes" {
 }
 
 test "read validates UUID and writes a canonical strongly modeled item" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
     var fake: FakePersistence = .{};
     const result = runForTest(
         &.{ "dynamodb", "read", "--id", "00112233-4455-6677-8899-AABBCCDDEEFF" },
         "ignored",
-        &environment,
         0,
         &fake,
     );
@@ -878,7 +803,6 @@ test "read validates UUID and writes a canonical strongly modeled item" {
     const invalid = runForTest(
         &.{ "dynamodb", "read", "--id", "not-a-uuid" },
         "",
-        &environment,
         0,
         &fake,
     );
@@ -886,13 +810,10 @@ test "read validates UUID and writes a canonical strongly modeled item" {
 }
 
 test "read reports missing and AWS failures with stable exit codes" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
     var fake: FakePersistence = .{ .read_error = error.OperationNotFound };
     const missing = runForTest(
         &.{ "dynamodb", "read", "--id", test_id },
         "",
-        &environment,
         0,
         &fake,
     );
@@ -903,7 +824,6 @@ test "read reports missing and AWS failures with stable exit codes" {
     const failed = runForTest(
         &.{ "dynamodb", "read", "--id", test_id },
         "",
-        &environment,
         0,
         &fake,
     );
@@ -912,8 +832,6 @@ test "read reports missing and AWS failures with stable exit codes" {
 }
 
 test "update accepts every target including jumps same state and terminal removal" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
     const targets = [_]operation.State{ .new, .submitted, .running, .succeeded, .failed };
     for (targets) |state| {
         var fake: FakePersistence = .{};
@@ -923,7 +841,6 @@ test "update accepts every target including jumps same state and terminal remova
         const result = runForTest(
             &.{ "dynamodb", "update", "--state", operation.stateToString(state), "--id", test_id },
             input,
-            &environment,
             1_700_000_001,
             &fake,
         );
@@ -962,13 +879,10 @@ test "update accepts every target including jumps same state and terminal remova
 }
 
 test "update rejects nonempty pending input and null invalid or oversized terminal results" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
     var fake: FakePersistence = .{};
     const pending = runForTest(
         &.{ "dynamodb", "update", "--id", test_id, "--state", "RUNNING" },
         " ",
-        &environment,
         0,
         &fake,
     );
@@ -980,7 +894,6 @@ test "update rejects nonempty pending input and null invalid or oversized termin
         const result = runForTest(
             &.{ "dynamodb", "update", "--id", test_id, "--state", "SUCCEEDED" },
             input,
-            &environment,
             0,
             &fake,
         );
@@ -990,7 +903,6 @@ test "update rejects nonempty pending input and null invalid or oversized termin
     const large = runForTest(
         &.{ "dynamodb", "update", "--id", test_id, "--state", "FAILED" },
         oversized,
-        &environment,
         0,
         &fake,
     );
@@ -999,15 +911,12 @@ test "update rejects nonempty pending input and null invalid or oversized termin
 }
 
 test "update accepts a terminal result at the exact serialized size bound" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
     var fake: FakePersistence = .{};
     const maximum = "\"" ++ ("a" ** (operation.result_size_max - 2)) ++ "\"";
     comptime std.debug.assert(maximum.len == operation.result_size_max);
     const result = runForTest(
         &.{ "dynamodb", "update", "--id", test_id, "--state", "FAILED" },
         maximum,
-        &environment,
         1_700_000_001,
         &fake,
     );
@@ -1016,17 +925,12 @@ test "update accepts a terminal result at the exact serialized size bound" {
     try std.testing.expect(result.stdout().len > operation.result_size_max);
 }
 
-test "update conflict is generic and diagnostics do not echo input or configuration" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
-    const table_marker = "operations-private-marker";
-    try environment.put("OPERATIONS_TABLE_NAME", table_marker);
+test "update conflict is generic and diagnostics do not echo input" {
     var fake: FakePersistence = .{ .update_error = error.OperationConflict };
     const result_marker = "result-private-marker";
     const result = runForTest(
         &.{ "dynamodb", "update", "--id", test_id, "--state", "FAILED" },
         "\"result-private-marker\"",
-        &environment,
         0,
         &fake,
     );
@@ -1035,6 +939,5 @@ test "update conflict is generic and diagnostics do not echo input or configurat
         "dynamodb: operation conflict\n",
         result.stderr(),
     );
-    try std.testing.expect(std.mem.indexOf(u8, result.stderr(), table_marker) == null);
     try std.testing.expect(std.mem.indexOf(u8, result.stderr(), result_marker) == null);
 }

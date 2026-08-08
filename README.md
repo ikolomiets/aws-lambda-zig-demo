@@ -329,13 +329,14 @@ partition key remains globally scoped, and this change does not add
 tenant-scoped keys or new read authorization behavior.
 
 `OPERATIONS_TABLE_NAME` and `OPERATIONS_QUEUE_URL` are mandatory at Lambda
-initialization. The bootstrap validates the table name and the non-empty,
-at-most-2,048-byte queue URL, loads the AWS SDK configuration, and creates
-shared DynamoDB and SQS clients before requesting an invocation. Missing or
-invalid configuration prevents all request handling, including GET. Resource
-existence and IAM authorization are checked only when POST first calls the
-services, so DynamoDB failures return a sanitized HTTP 500 and SQS send
-failures return a sanitized HTTP 503.
+initialization. The bootstrap validates the non-empty, at-most-2,048-byte queue
+URL, loads the shared AWS SDK configuration, initializes Operation persistence
+with the validated table name, and creates the SQS client before requesting an
+invocation. Persistence privately owns its DynamoDB client; it and SQS share
+the AWS configuration and HTTP pool. Missing or invalid configuration prevents
+all request handling, including GET. Resource existence and IAM authorization
+are checked only when POST first calls the services, so DynamoDB failures
+return a sanitized HTTP 500 and SQS send failures return a sanitized HTTP 503.
 
 ## Deploy
 

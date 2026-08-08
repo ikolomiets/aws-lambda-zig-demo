@@ -149,12 +149,14 @@ The inline policy grants the function only `GetItem`, `PutItem`, and
 `OPERATIONS_TABLE_NAME` environment variable contains the
 CloudFormation-generated physical table name. `OPERATIONS_QUEUE_URL` contains
 the stack queue's generated URL. Both are mandatory: before starting the Lambda
-invocation loop, the bootstrap validates the table name and the non-empty,
-at-most-2,048-byte queue URL, loads AWS configuration, creates DynamoDB and SQS
-clients, and binds one intake adapter. Missing or invalid configuration
-therefore prevents all invocation handling, including GET. The clients, their
-HTTP connection pools, and the adapter are reused across warm invocations. The
-host-native `dynamodb` CLI uses the same persistence adapter and table
+invocation loop, the bootstrap validates the non-empty, at-most-2,048-byte
+queue URL, loads the shared AWS configuration, initializes Operation
+persistence with the validated table name, creates the SQS client, and binds
+one intake adapter. Persistence privately owns its DynamoDB client; it and SQS
+share the AWS configuration and HTTP pool. The persistence value, SQS client,
+configuration, pool, and adapter are reused across warm invocations. Missing or
+invalid configuration therefore prevents all invocation handling, including
+GET. The host-native `dynamodb` CLI uses the same persistence adapter and table
 contract.
 
 Startup validation makes no DynamoDB or SQS request. A missing table or

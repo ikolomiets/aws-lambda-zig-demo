@@ -57,7 +57,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "aws", .module = lambda_aws },
             .{ .name = "aws-lambda", .module = lambda_runtime },
-            .{ .name = "dynamodb", .module = lambda_dynamodb },
             .{ .name = "operation", .module = lambda_operation },
             .{ .name = "operation_persistence", .module = lambda_operation_persistence },
             .{ .name = "paseto", .module = lambda_paseto },
@@ -126,7 +125,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/dynamodb_cli.zig"),
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
-            .{ .name = "dynamodb", .module = host_dynamodb },
             .{ .name = "operation", .module = host_operation },
             .{ .name = "operation_persistence", .module = host_operation_persistence },
         },
@@ -165,7 +163,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
             .{ .name = "aws-lambda", .module = test_runtime },
-            .{ .name = "dynamodb", .module = host_dynamodb },
             .{ .name = "operation", .module = host_operation },
             .{ .name = "operation_persistence", .module = host_operation_persistence },
             .{ .name = "paseto", .module = host_paseto },

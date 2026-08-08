@@ -22,19 +22,31 @@ comptime {
 
 /// Stores and retrieves Operations using the repository's fixed DynamoDB item contract.
 pub const Persistence = struct {
-    client: *dynamodb.Client,
+    client: dynamodb.Client,
     table_name: []const u8,
 
     const Self = @This();
 
-    pub fn init(client: *dynamodb.Client, table_name: []const u8) !Self {
-        try validateTableName(table_name);
+    pub fn init(
+        target: *Self,
+        allocator: Allocator,
+        aws_config: *aws.Config,
+        environment: *const std.process.Environ.Map,
+    ) !void {
+        const table_name = configuredTableName(environment) catch {
+            return error.InvalidConfiguration;
+        };
+        target.* = .{
+            .client = dynamodb.Client.init(allocator, aws_config),
+            .table_name = table_name,
+        };
         std.debug.assert(table_name.len >= 3);
         std.debug.assert(table_name.len <= 255);
-        return .{ .client = client, .table_name = table_name };
+        std.debug.assert(target.client.config == aws_config);
     }
 
     pub fn deinit(self: *Self) void {
+        self.client.deinit();
         self.* = undefined;
     }
 
@@ -444,7 +456,17 @@ fn readError(err: anyerror, diagnostic: *dynamodb.ServiceError) anyerror {
     return error.AWSFailure;
 }
 
-pub fn validateTableName(table_name: []const u8) !void {
+fn configuredTableName(environment: *const std.process.Environ.Map) ![]const u8 {
+    const table_name = environment.get("OPERATIONS_TABLE_NAME") orelse {
+        return error.InvalidConfiguration;
+    };
+    validateTableName(table_name) catch return error.InvalidConfiguration;
+    std.debug.assert(table_name.len >= 3);
+    std.debug.assert(table_name.len <= 255);
+    return table_name;
+}
+
+fn validateTableName(table_name: []const u8) !void {
     if (table_name.len < 3) return error.InvalidTableName;
     if (table_name.len > 255) return error.InvalidTableName;
     for (table_name) |character| {
@@ -1099,10 +1121,72 @@ test "conditional update failures map to concurrent outcomes" {
     );
 }
 
-test "table name validation bounds configuration" {
-    try validateTableName("operations-table.1");
-    try std.testing.expectError(error.InvalidTableName, validateTableName(""));
-    try std.testing.expectError(error.InvalidTableName, validateTableName("ab"));
-    try std.testing.expectError(error.InvalidTableName, validateTableName("operations/table"));
-    try std.testing.expectError(error.InvalidTableName, validateTableName("a" ** 256));
+test "initialization requires table configuration" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var config: aws.Config = undefined;
+    var persistence: Persistence = undefined;
+
+    try std.testing.expectError(
+        error.InvalidConfiguration,
+        Persistence.init(
+            &persistence,
+            std.testing.allocator,
+            &config,
+            &environment,
+        ),
+    );
+}
+
+test "initialization rejects malformed and oversized table configuration" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var config: aws.Config = undefined;
+    var persistence: Persistence = undefined;
+    const invalid_names = [_][]const u8{
+        "",
+        "ab",
+        "operations/table",
+        "operations table",
+        "a" ** 256,
+    };
+
+    for (invalid_names) |table_name| {
+        try environment.put("OPERATIONS_TABLE_NAME", table_name);
+        try std.testing.expectError(
+            error.InvalidConfiguration,
+            Persistence.init(
+                &persistence,
+                std.testing.allocator,
+                &config,
+                &environment,
+            ),
+        );
+    }
+}
+
+test "initialization retains valid table configuration and shared AWS configuration" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    var config: aws.Config = undefined;
+    const valid_names = [_][]const u8{
+        "abc",
+        "operations-table.1",
+        "a" ** 255,
+    };
+
+    for (valid_names) |table_name| {
+        try environment.put("OPERATIONS_TABLE_NAME", table_name);
+        var persistence: Persistence = undefined;
+        try Persistence.init(
+            &persistence,
+            std.testing.allocator,
+            &config,
+            &environment,
+        );
+        defer persistence.deinit();
+
+        try std.testing.expect(persistence.client.config == &config);
+        try std.testing.expectEqualStrings(table_name, persistence.table_name);
+    }
 }
