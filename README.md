@@ -237,8 +237,8 @@ migration path in the application.
 
 ## SQS CLI
 
-The `sqs` utility sends canonical Operations, destructively receives one
-immediately available message, and checks the SAM stack's operations queue. It
+The `sqs` utility sends canonical Operations, destructively consumes queued
+messages, and checks the SAM stack's operations queue. It
 requires a non-empty `OPERATIONS_QUEUE_URL` no longer than 2,048 bytes and uses
 the standard AWS configuration chain. Top-level and subcommand help do not
 require AWS configuration:
@@ -278,20 +278,27 @@ versions:
 ./sqs.sh check
 ```
 
-Receive one immediately available message:
+Consume messages until interrupted:
 
 ```sh
 ./sqs.sh receive
 ```
 
-`receive` is destructive. It writes the message body byte-for-byte with no
-added newline, flushes standard output, and then deletes the message using its
-receipt handle. It accepts arbitrary noncanonical and non-JSON bodies. An
-empty queue exits with code `1`. A missing body or receipt handle is treated
-as an invalid AWS response and is not deleted. If deletion fails after output,
-the command exits with code `2` and the message may become visible again.
-Invocation, validation, configuration, AWS, invalid-response, output, and
-internal failures also use exit code `2` with sanitized diagnostics.
+`receive` is a destructive long-running consumer. It requests one message at a
+time with 20-second SQS long polling and silently polls again after an empty
+response. For each message, it writes the body byte-for-byte, appends exactly
+one newline, flushes standard output, and then deletes the message using its
+receipt handle. Bodies may be noncanonical, non-JSON, or contain newlines.
+
+The consumer runs until SIGINT. It keeps the default signal action, so Ctrl-C
+terminates promptly and the shell reports status `130`. The `sqs.sh` wrapper's
+final `exec` passes the signal directly to the utility. Interruption can occur
+after output is flushed but before deletion completes; an already-printed
+message may therefore become visible and be printed again. A missing body or
+receipt handle is an invalid AWS response and is not deleted. AWS, malformed
+response, output, deletion, and internal failures stop the loop with exit code
+`2` and a sanitized diagnostic. Invocation, validation, and configuration
+failures also exit with code `2`.
 
 The AWS identity running the direct utility needs `sqs:SendMessage` for
 `send`, `sqs:ReceiveMessage` and `sqs:DeleteMessage` for `receive`, and

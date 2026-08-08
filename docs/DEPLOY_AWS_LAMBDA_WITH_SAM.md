@@ -713,20 +713,28 @@ are retained:
 ./sqs.sh check
 ```
 
-Immediately receive at most one message:
+Consume queued messages until interrupted:
 
 ```sh
 ./sqs.sh receive
 ```
 
-This receive is destructive: it writes the body byte-for-byte to stdout with
-no added newline, flushes stdout, and only then calls `DeleteMessage` with the
-receipt handle. Bodies need not be JSON or canonical Operations. An empty
-queue exits with code `1`. A response missing the body or receipt handle is
-rejected without deletion. A delete failure occurs after output and can allow
-the message to reappear after its visibility timeout. All invocation,
-validation, configuration, AWS, invalid-response, output, and internal
-failures exit with code `2` and sanitized diagnostics.
+This is a destructive long-running consumer. It requests one message at a time
+with `WaitTimeSeconds` set to `20` and silently polls again when SQS returns no
+messages. For each message, it writes the body byte-for-byte, appends exactly
+one newline, flushes stdout, and only then calls `DeleteMessage` with the
+receipt handle. Bodies need not be JSON or canonical Operations and may contain
+embedded newlines.
+
+The consumer keeps the default SIGINT action. Ctrl-C terminates it promptly and
+the shell reports status `130`; the `sqs.sh` wrapper preserves this behavior by
+replacing itself with the utility via `exec`. Interruption can occur after a
+message is flushed but before deletion completes, so an already-printed message
+may become visible and be printed again. A response missing the body or receipt
+handle is rejected without deletion. AWS, malformed-response, output, deletion,
+and internal failures stop the loop with exit code `2` and sanitized
+diagnostics. Invocation, validation, and configuration failures also exit with
+code `2`.
 
 The caller needs these queue-scoped permissions for the commands it uses:
 
