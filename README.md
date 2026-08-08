@@ -40,8 +40,8 @@ This also installs the host-native `zig-out/bin/paseto`,
 `zig-out/bin/dynamodb`, and `zig-out/bin/sqs` developer utilities. The Lambda
 `bootstrap` and PASETO utility both use the shared PASETO implementation in
 `src/paseto.zig`; the Operation utilities use the shared model in
-`src/operation.zig`, and `dynamodb` also uses the adapter in
-`src/operation_persistence.zig`.
+`src/operation.zig`. The Lambda and host utilities reach AWS through
+`src/operation_persistence.zig` and `src/operation_queue.zig`.
 
 Verify that the output is a statically linked ARM64 Linux executable:
 
@@ -330,13 +330,14 @@ tenant-scoped keys or new read authorization behavior.
 
 `OPERATIONS_TABLE_NAME` and `OPERATIONS_QUEUE_URL` are mandatory at Lambda
 initialization. The bootstrap validates the non-empty, at-most-2,048-byte queue
-URL, loads the shared AWS SDK configuration, initializes Operation persistence
-with the validated table name, and creates the SQS client before requesting an
-invocation. Persistence privately owns its DynamoDB client; it and SQS share
-the AWS configuration and HTTP pool. Missing or invalid configuration prevents
-all request handling, including GET. Resource existence and IAM authorization
-are checked only when POST first calls the services, so DynamoDB failures
-return a sanitized HTTP 500 and SQS send failures return a sanitized HTTP 503.
+URL and table name while initializing the Operation persistence and queue
+modules around one shared AWS SDK configuration. Each module privately owns its
+respective DynamoDB or SQS client, and both clients share that configuration
+and its HTTP pool. The module values, configuration, and pool are reused across
+warm invocations. Missing or invalid configuration prevents all request
+handling, including GET. Resource existence and IAM authorization are checked
+only when POST first calls the services, so DynamoDB failures return a
+sanitized HTTP 500 and SQS send failures return a sanitized HTTP 503.
 
 ## Deploy
 
@@ -472,6 +473,7 @@ or CloudFront.
 - `src/main.zig`: Lambda entrypoint and request handler.
 - `src/operation.zig`: Operation JSON model, validation, and hash contract.
 - `src/operation_persistence.zig`: DynamoDB Operation mapping and conditional writes.
+- `src/operation_queue.zig`: SQS Operation queue configuration and message contract.
 - `src/dynamodb_cli.zig`: host DynamoDB Operation persistence CLI and its tests.
 - `src/sqs_cli.zig`: host SQS Operation CLI and its tests.
 - `src/paseto.zig`: shared PASETO v4.public issuance and verification.
@@ -489,7 +491,8 @@ Run formatting checks before committing Zig changes:
 
 ```sh
 zig fmt --check build.zig src/main.zig src/operation.zig src/operation_persistence.zig \
-  src/dynamodb_cli.zig src/sqs_cli.zig src/paseto.zig src/paseto_cli.zig
+  src/operation_queue.zig src/dynamodb_cli.zig src/sqs_cli.zig src/paseto.zig \
+  src/paseto_cli.zig
 ```
 
 Run the handler, persistence, and host utility tests with:

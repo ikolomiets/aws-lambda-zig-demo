@@ -1,26 +1,18 @@
 const std = @import("std");
 const aws = @import("aws");
 const operation = @import("operation");
-const sqs = @import("sqs");
+const operation_queue = @import("operation_queue");
 
 const Allocator = std.mem.Allocator;
 
 const argument_count_max = 4;
 const stdin_size_max = 8 * 1024;
-const queue_url_size_max = 2048;
-const message_size_max = 1024 * 1024;
-const receipt_handle_size_max = 64 * 1024;
-const attribute_count_max = 64;
-const attribute_name_size_max = 256;
-const attribute_value_size_max = 256 * 1024;
 const io_buffer_size = 4096;
 const receive_loop_is_intentionally_unbounded = true;
 
 comptime {
     std.debug.assert(stdin_size_max > operation.body_size_max);
     std.debug.assert(argument_count_max < stdin_size_max);
-    std.debug.assert(queue_url_size_max < message_size_max);
-    std.debug.assert(attribute_count_max > 1);
     std.debug.assert(receive_loop_is_intentionally_unbounded);
 }
 
@@ -34,22 +26,6 @@ const Command = union(enum) {
 const SendOptions = struct {
     tenant: []const u8,
 };
-
-const ReceiveOptions = struct {
-    message_count_max: i32,
-    wait_time_seconds: i32,
-};
-
-const receive_options = ReceiveOptions{
-    .message_count_max = 1,
-    .wait_time_seconds = 20,
-};
-
-comptime {
-    std.debug.assert(receive_options.message_count_max == 1);
-    std.debug.assert(receive_options.wait_time_seconds > 0);
-    std.debug.assert(receive_options.wait_time_seconds <= 20);
-}
 
 const Context = struct {
     allocator: Allocator,
@@ -103,22 +79,21 @@ pub fn main(init: std.process.Init) u8 {
         .stderr = &stderr_file.interface,
     };
     if (command == .help) {
-        const code = runCommand(command, context, null, null);
+        const code = runCommand(command, context, null);
         return finish(context.stdout, context.stderr, code, null);
     }
-    const queue_url = configuredQueueURL(init.environ_map) catch {
-        return finish(context.stdout, context.stderr, 2, .configuration);
-    };
 
     var config = aws.Config.load(init.gpa, init.io, init.environ_map, .{}) catch {
         return finish(context.stdout, context.stderr, 2, .configuration);
     };
     defer config.deinit();
-    var client = sqs.Client.init(init.gpa, &config);
-    defer client.deinit();
-    var sdk_queue = SDKQueue{ .client = &client };
-    const backend = SQSInterface.init(&sdk_queue);
-    const code = runCommand(command, context, queue_url, backend);
+    var queue: operation_queue.Queue = undefined;
+    operation_queue.Queue.init(&queue, init.gpa, &config, init.environ_map) catch {
+        return finish(context.stdout, context.stderr, 2, .configuration);
+    };
+    defer queue.deinit();
+    const backend = QueueInterface.init(&queue);
+    const code = runCommand(command, context, backend);
     return finish(context.stdout, context.stderr, code, null);
 }
 
@@ -224,17 +199,6 @@ fn unixSeconds(io: std.Io) operation.UnixSeconds {
     return result;
 }
 
-fn configuredQueueURL(environment: *const std.process.Environ.Map) ![]const u8 {
-    const queue_url = environment.get("OPERATIONS_QUEUE_URL") orelse {
-        return error.InvalidConfiguration;
-    };
-    if (queue_url.len == 0) return error.InvalidConfiguration;
-    if (queue_url.len > queue_url_size_max) return error.InvalidConfiguration;
-    std.debug.assert(queue_url.len > 0);
-    std.debug.assert(queue_url.len <= queue_url_size_max);
-    return queue_url;
-}
-
 fn parseCommand(arguments: []const []const u8) CliError!Command {
     if (arguments.len < 2) return error.InvalidInvocation;
     if (arguments.len > argument_count_max) return error.InvalidInvocation;
@@ -275,210 +239,125 @@ fn isHelp(argument: []const u8) bool {
     return std.mem.eql(u8, argument, "help");
 }
 
-const SQSInterface = struct {
+const QueueInterface = struct {
     context: *anyopaque,
     vtable: *const VTable,
 
     const VTable = struct {
-        send_message: *const fn (
+        send: *const fn (
             *anyopaque,
             Allocator,
-            []const u8,
             []const u8,
         ) anyerror!void,
-        receive_message: *const fn (
+        receive: *const fn (
             *anyopaque,
             Allocator,
-            []const u8,
-            ReceiveOptions,
-        ) anyerror![]const sqs.types.Message,
-        delete_message: *const fn (
+        ) anyerror!?operation_queue.Message,
+        delete: *const fn (
             *anyopaque,
             Allocator,
-            []const u8,
             []const u8,
         ) anyerror!void,
         get_attributes: *const fn (
             *anyopaque,
             Allocator,
-            []const u8,
-        ) anyerror![]const aws.map.StringMapEntry,
+        ) anyerror![]const operation_queue.Attribute,
     };
 
-    fn init(pointer: anytype) SQSInterface {
+    fn init(pointer: anytype) QueueInterface {
         const Pointer = @TypeOf(pointer);
         const pointer_info = @typeInfo(Pointer);
         comptime std.debug.assert(pointer_info == .pointer);
         comptime std.debug.assert(pointer_info.pointer.size == .one);
 
         const Adapter = struct {
-            fn sendMessage(
+            fn send(
                 context: *anyopaque,
                 allocator: Allocator,
-                queue_url: []const u8,
                 body: []const u8,
             ) anyerror!void {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.sendMessage(allocator, queue_url, body);
+                return self.send(allocator, body);
             }
 
-            fn receiveMessage(
+            fn receive(
                 context: *anyopaque,
                 allocator: Allocator,
-                queue_url: []const u8,
-                options: ReceiveOptions,
-            ) anyerror![]const sqs.types.Message {
+            ) anyerror!?operation_queue.Message {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.receiveMessage(allocator, queue_url, options);
+                return self.receive(allocator);
             }
 
-            fn deleteMessage(
+            fn delete(
                 context: *anyopaque,
                 allocator: Allocator,
-                queue_url: []const u8,
                 receipt_handle: []const u8,
             ) anyerror!void {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.deleteMessage(allocator, queue_url, receipt_handle);
+                return self.delete(allocator, receipt_handle);
             }
 
-            fn getAttributes(
+            fn get_attributes(
                 context: *anyopaque,
                 allocator: Allocator,
-                queue_url: []const u8,
-            ) anyerror![]const aws.map.StringMapEntry {
+            ) anyerror![]const operation_queue.Attribute {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.getAttributes(allocator, queue_url);
+                return self.get_attributes(allocator);
             }
         };
         return .{
             .context = pointer,
             .vtable = &.{
-                .send_message = Adapter.sendMessage,
-                .receive_message = Adapter.receiveMessage,
-                .delete_message = Adapter.deleteMessage,
-                .get_attributes = Adapter.getAttributes,
+                .send = Adapter.send,
+                .receive = Adapter.receive,
+                .delete = Adapter.delete,
+                .get_attributes = Adapter.get_attributes,
             },
         };
     }
 
-    fn sendMessage(
-        self: SQSInterface,
+    fn send(
+        self: QueueInterface,
         allocator: Allocator,
-        queue_url: []const u8,
         body: []const u8,
     ) !void {
-        return self.vtable.send_message(self.context, allocator, queue_url, body);
+        return self.vtable.send(self.context, allocator, body);
     }
 
-    fn receiveMessage(
-        self: SQSInterface,
+    fn receive(
+        self: QueueInterface,
         allocator: Allocator,
-        queue_url: []const u8,
-        options: ReceiveOptions,
-    ) ![]const sqs.types.Message {
-        return self.vtable.receive_message(self.context, allocator, queue_url, options);
+    ) !?operation_queue.Message {
+        return self.vtable.receive(self.context, allocator);
     }
 
-    fn deleteMessage(
-        self: SQSInterface,
+    fn delete(
+        self: QueueInterface,
         allocator: Allocator,
-        queue_url: []const u8,
         receipt_handle: []const u8,
     ) !void {
-        return self.vtable.delete_message(
-            self.context,
-            allocator,
-            queue_url,
-            receipt_handle,
-        );
+        return self.vtable.delete(self.context, allocator, receipt_handle);
     }
 
-    fn getAttributes(
-        self: SQSInterface,
+    fn get_attributes(
+        self: QueueInterface,
         allocator: Allocator,
-        queue_url: []const u8,
-    ) ![]const aws.map.StringMapEntry {
-        return self.vtable.get_attributes(self.context, allocator, queue_url);
+    ) ![]const operation_queue.Attribute {
+        return self.vtable.get_attributes(self.context, allocator);
     }
 };
-
-const SDKQueue = struct {
-    client: *sqs.Client,
-
-    fn sendMessage(
-        self: *SDKQueue,
-        allocator: Allocator,
-        queue_url: []const u8,
-        body: []const u8,
-    ) !void {
-        _ = self.client.sendMessage(allocator, .{
-            .message_body = body,
-            .queue_url = queue_url,
-        }, .{}) catch |err| return mapAWSError(err);
-    }
-
-    fn receiveMessage(
-        self: *SDKQueue,
-        allocator: Allocator,
-        queue_url: []const u8,
-        options: ReceiveOptions,
-    ) ![]const sqs.types.Message {
-        const output = self.client.receiveMessage(allocator, .{
-            .max_number_of_messages = options.message_count_max,
-            .queue_url = queue_url,
-            .wait_time_seconds = options.wait_time_seconds,
-        }, .{}) catch |err| return mapAWSError(err);
-        return output.messages orelse &.{};
-    }
-
-    fn deleteMessage(
-        self: *SDKQueue,
-        allocator: Allocator,
-        queue_url: []const u8,
-        receipt_handle: []const u8,
-    ) !void {
-        _ = self.client.deleteMessage(allocator, .{
-            .queue_url = queue_url,
-            .receipt_handle = receipt_handle,
-        }, .{}) catch |err| return mapAWSError(err);
-    }
-
-    fn getAttributes(
-        self: *SDKQueue,
-        allocator: Allocator,
-        queue_url: []const u8,
-    ) ![]const aws.map.StringMapEntry {
-        const all = [_]sqs.types.QueueAttributeName{.all};
-        const output = self.client.getQueueAttributes(allocator, .{
-            .attribute_names = &all,
-            .queue_url = queue_url,
-        }, .{}) catch |err| return mapAWSError(err);
-        return output.attributes orelse &.{};
-    }
-};
-
-fn mapAWSError(err: anyerror) error{ OutOfMemory, AWSFailure } {
-    if (err == error.OutOfMemory) return error.OutOfMemory;
-    return error.AWSFailure;
-}
 
 fn runCommand(
     command: Command,
     context: Context,
-    queue_url: ?[]const u8,
-    backend: ?SQSInterface,
+    backend: ?QueueInterface,
 ) u8 {
     if (command == .receive) {
-        const receive_queue_url = queue_url orelse {
-            writeDiagnostic(context.stderr, .internal);
-            return Failure.internal.code();
-        };
         const receive_backend = backend orelse {
             writeDiagnostic(context.stderr, .internal);
             return Failure.internal.code();
         };
-        return executeReceiveLoop(context, receive_backend, receive_queue_url) catch |err| {
+        return executeReceiveLoop(context, receive_backend) catch |err| {
             const failure = classifyError(err);
             writeDiagnostic(context.stderr, failure);
             return failure.code();
@@ -494,7 +373,7 @@ fn runCommand(
         .stdout = context.stdout,
         .stderr = context.stderr,
     };
-    executeCommand(command, command_context, queue_url, backend) catch |err| {
+    executeCommand(command, command_context, backend) catch |err| {
         const failure = classifyError(err);
         writeDiagnostic(context.stderr, failure);
         return failure.code();
@@ -527,7 +406,8 @@ fn classifyError(err: anyerror) Failure {
         error.UnexpectedBody,
         error.UnexpectedResult,
         error.InputTooLarge,
-        error.MessageTooLarge,
+        error.InvalidMessage,
+        error.InvalidReceiptHandle,
         => .validation,
         else => .internal,
     };
@@ -536,27 +416,24 @@ fn classifyError(err: anyerror) Failure {
 fn executeCommand(
     command: Command,
     context: Context,
-    queue_url_optional: ?[]const u8,
-    backend_optional: ?SQSInterface,
+    backend_optional: ?QueueInterface,
 ) !void {
     if (command == .help) {
         try context.stdout.writeAll(usage);
         return;
     }
-    const queue_url = queue_url_optional orelse return error.InternalFailure;
     const backend = backend_optional orelse return error.InternalFailure;
     switch (command) {
         .help => unreachable,
-        .send => |options| try executeSend(context, backend, queue_url, options),
+        .send => |options| try executeSend(context, backend, options),
         .receive => unreachable,
-        .check => try executeCheck(context, backend, queue_url),
+        .check => try executeCheck(context, backend),
     }
 }
 
 fn executeSend(
     context: Context,
-    backend: SQSInterface,
-    queue_url: []const u8,
+    backend: QueueInterface,
     options: SendOptions,
 ) !void {
     var parsed = try operation.parseInputJSON(context.allocator, context.stdin, .{
@@ -569,20 +446,17 @@ fn executeSend(
     defer serialized.deinit();
     try operation.writeOutputJSON(&serialized.writer, &parsed);
     const message = serialized.written();
-    if (message.len == 0) return error.MessageTooLarge;
-    if (message.len > message_size_max) return error.MessageTooLarge;
     std.debug.assert(parsed.state == .submitted);
     std.debug.assert(message.len > 0);
 
-    try backend.sendMessage(context.allocator, queue_url, message);
+    try backend.send(context.allocator, message);
     try context.stdout.writeAll(message);
     try context.stdout.writeByte('\n');
 }
 
 fn executeReceiveLoop(
     context: Context,
-    backend: SQSInterface,
-    queue_url: []const u8,
+    backend: QueueInterface,
 ) !noreturn {
     std.debug.assert(receive_loop_is_intentionally_unbounded);
     while (receive_loop_is_intentionally_unbounded) {
@@ -595,50 +469,36 @@ fn executeReceiveLoop(
             .stdout = context.stdout,
             .stderr = context.stderr,
         };
-        try executeReceivePoll(poll_context, backend, queue_url);
+        try executeReceivePoll(poll_context, backend);
     }
 }
 
 fn executeReceivePoll(
     context: Context,
-    backend: SQSInterface,
-    queue_url: []const u8,
+    backend: QueueInterface,
 ) !void {
-    const messages = try backend.receiveMessage(context.allocator, queue_url, receive_options);
-    try processReceiveResponse(context, backend, queue_url, messages);
+    const message = try backend.receive(context.allocator);
+    try processReceiveResponse(context, backend, message);
 }
 
 fn processReceiveResponse(
     context: Context,
-    backend: SQSInterface,
-    queue_url: []const u8,
-    messages: []const sqs.types.Message,
+    backend: QueueInterface,
+    message_optional: ?operation_queue.Message,
 ) !void {
-    if (messages.len == 0) return;
-    if (messages.len != 1) return error.InvalidServiceResponse;
-    const body = messages[0].body orelse return error.InvalidServiceResponse;
-    const receipt_handle = messages[0].receipt_handle orelse {
-        return error.InvalidServiceResponse;
-    };
-    if (body.len > message_size_max) return error.InvalidServiceResponse;
-    if (receipt_handle.len > receipt_handle_size_max) return error.InvalidServiceResponse;
-    std.debug.assert(messages.len == 1);
-    std.debug.assert(body.len <= message_size_max);
-    std.debug.assert(receipt_handle.len <= receipt_handle_size_max);
+    const message = message_optional orelse return;
 
-    try context.stdout.writeAll(body);
+    try context.stdout.writeAll(message.body);
     try context.stdout.writeByte('\n');
     try context.stdout.flush();
-    try backend.deleteMessage(context.allocator, queue_url, receipt_handle);
+    try backend.delete(context.allocator, message.receipt_handle);
 }
 
 fn executeCheck(
     context: Context,
-    backend: SQSInterface,
-    queue_url: []const u8,
+    backend: QueueInterface,
 ) !void {
-    const attributes = try backend.getAttributes(context.allocator, queue_url);
-    try validateAttributes(attributes);
+    const attributes = try backend.get_attributes(context.allocator);
     var json: std.json.Stringify = .{
         .writer = context.stdout,
         .options = .{},
@@ -652,29 +512,14 @@ fn executeCheck(
     try context.stdout.writeByte('\n');
 }
 
-fn validateAttributes(attributes: []const aws.map.StringMapEntry) !void {
-    if (attributes.len > attribute_count_max) return error.InvalidServiceResponse;
-    for (attributes) |attribute| {
-        if (attribute.key.len == 0) return error.InvalidServiceResponse;
-        if (attribute.key.len > attribute_name_size_max) return error.InvalidServiceResponse;
-        if (attribute.value.len > attribute_value_size_max) {
-            return error.InvalidServiceResponse;
-        }
-        if (!std.unicode.utf8ValidateSlice(attribute.key)) return error.InvalidServiceResponse;
-        if (!std.unicode.utf8ValidateSlice(attribute.value)) return error.InvalidServiceResponse;
-    }
-    std.debug.assert(attributes.len <= attribute_count_max);
-}
-
-const test_queue_url = "https://sqs.example.invalid/operations";
 const test_input =
     "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
     "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
 
-const FakeSQS = struct {
-    messages: []const sqs.types.Message = &.{},
-    receive_batches: []const []const sqs.types.Message = &.{},
-    attributes: []const aws.map.StringMapEntry = &.{},
+const FakeQueue = struct {
+    message: ?operation_queue.Message = null,
+    receive_batches: []const ?operation_queue.Message = &.{},
+    attributes: []const operation_queue.Attribute = &.{},
     send_error: ?anyerror = null,
     receive_error: ?anyerror = null,
     receive_error_after: ?u8 = null,
@@ -686,8 +531,6 @@ const FakeSQS = struct {
     allocation_released_before_poll: bool = true,
     send_count: u8 = 0,
     receive_count: u8 = 0,
-    receive_message_count_max: i32 = 0,
-    receive_wait_time_seconds: i32 = 0,
     delete_count: u8 = 0,
     check_count: u8 = 0,
     sent_buffer: [stdin_size_max * 2]u8 = undefined,
@@ -695,30 +538,23 @@ const FakeSQS = struct {
     receipt_buffer: [1024]u8 = undefined,
     receipt_size: usize = 0,
 
-    fn sendMessage(
-        fake: *FakeSQS,
+    fn send(
+        fake: *FakeQueue,
         _: Allocator,
-        queue_url: []const u8,
         body: []const u8,
     ) !void {
         fake.send_count += 1;
-        if (!std.mem.eql(u8, queue_url, test_queue_url)) return error.WrongQueue;
         if (fake.send_error) |err| return err;
         if (body.len > fake.sent_buffer.len) return error.TestBodyTooLarge;
         @memcpy(fake.sent_buffer[0..body.len], body);
         fake.sent_size = body.len;
     }
 
-    fn receiveMessage(
-        fake: *FakeSQS,
+    fn receive(
+        fake: *FakeQueue,
         allocator: Allocator,
-        queue_url: []const u8,
-        options: ReceiveOptions,
-    ) ![]const sqs.types.Message {
+    ) !?operation_queue.Message {
         fake.receive_count += 1;
-        fake.receive_message_count_max = options.message_count_max;
-        fake.receive_wait_time_seconds = options.wait_time_seconds;
-        if (!std.mem.eql(u8, queue_url, test_queue_url)) return error.WrongQueue;
         if (fake.allocation_bytes_in_use) |bytes_in_use| {
             if (bytes_in_use.* != 0) fake.allocation_released_before_poll = false;
         }
@@ -732,17 +568,15 @@ const FakeSQS = struct {
         if (fake.receive_count <= fake.receive_batches.len) {
             return fake.receive_batches[fake.receive_count - 1];
         }
-        return fake.messages;
+        return fake.message;
     }
 
-    fn deleteMessage(
-        fake: *FakeSQS,
+    fn delete(
+        fake: *FakeQueue,
         _: Allocator,
-        queue_url: []const u8,
         receipt_handle: []const u8,
     ) !void {
         fake.delete_count += 1;
-        if (!std.mem.eql(u8, queue_url, test_queue_url)) return error.WrongQueue;
         if (fake.flushed_before_delete) |flushed| {
             if (!flushed.*) return error.DeleteBeforeFlush;
         }
@@ -752,22 +586,20 @@ const FakeSQS = struct {
         fake.receipt_size = receipt_handle.len;
     }
 
-    fn getAttributes(
-        fake: *FakeSQS,
+    fn get_attributes(
+        fake: *FakeQueue,
         _: Allocator,
-        queue_url: []const u8,
-    ) ![]const aws.map.StringMapEntry {
+    ) ![]const operation_queue.Attribute {
         fake.check_count += 1;
-        if (!std.mem.eql(u8, queue_url, test_queue_url)) return error.WrongQueue;
         if (fake.check_error) |err| return err;
         return fake.attributes;
     }
 
-    fn sent(fake: *const FakeSQS) []const u8 {
+    fn sent(fake: *const FakeQueue) []const u8 {
         return fake.sent_buffer[0..fake.sent_size];
     }
 
-    fn receipt(fake: *const FakeSQS) []const u8 {
+    fn receipt(fake: *const FakeQueue) []const u8 {
         return fake.receipt_buffer[0..fake.receipt_size];
     }
 };
@@ -791,9 +623,8 @@ const TestResult = struct {
 fn runForTest(
     arguments: []const []const u8,
     stdin: []const u8,
-    environment: *const std.process.Environ.Map,
     now: operation.UnixSeconds,
-    fake: *FakeSQS,
+    fake: *FakeQueue,
 ) TestResult {
     var result: TestResult = undefined;
     var stdout: std.Io.Writer = .fixed(&result.stdout_buffer);
@@ -810,18 +641,14 @@ fn runForTest(
         writeDiagnostic(&stderr, .validation);
         return testResultFinish(&result, &stdout, &stderr, 2);
     };
-    const queue_url = if (command == .help) null else configuredQueueURL(environment) catch {
-        writeDiagnostic(&stderr, .configuration);
-        return testResultFinish(&result, &stdout, &stderr, 2);
-    };
-    const backend = if (command == .help) null else SQSInterface.init(fake);
+    const backend = if (command == .help) null else QueueInterface.init(fake);
     const code = runCommand(command, .{
         .allocator = std.testing.allocator,
         .now = now,
         .stdin = input,
         .stdout = &stdout,
         .stderr = &stderr,
-    }, queue_url, backend);
+    }, backend);
     return testResultFinish(&result, &stdout, &stderr, code);
 }
 
@@ -839,18 +666,8 @@ fn testResultFinish(
     return result.*;
 }
 
-fn testEnvironment() !std.process.Environ.Map {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    errdefer environment.deinit();
-    try environment.put("OPERATIONS_QUEUE_URL", test_queue_url);
-    std.debug.assert(environment.get("OPERATIONS_QUEUE_URL") != null);
-    return environment;
-}
-
 test "help works without AWS configuration and command parsing is bounded" {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-    var fake: FakeSQS = .{};
+    var fake: FakeQueue = .{};
     const help_arguments = [_][]const []const u8{
         &.{ "sqs", "--help" },
         &.{ "sqs", "-h" },
@@ -860,7 +677,7 @@ test "help works without AWS configuration and command parsing is bounded" {
         &.{ "sqs", "check", "--help" },
     };
     for (help_arguments) |arguments| {
-        const result = runForTest(arguments, "", &environment, 0, &fake);
+        const result = runForTest(arguments, "", 0, &fake);
         try std.testing.expectEqual(@as(u8, 0), result.exit_code);
         try std.testing.expect(std.mem.startsWith(u8, result.stdout(), "Usage:\n"));
         try std.testing.expect(std.mem.indexOf(u8, result.stdout(), "until interrupted") != null);
@@ -875,7 +692,7 @@ test "help works without AWS configuration and command parsing is bounded" {
         &.{ "sqs", "send", "--tenant", "tenant", "extra" },
     };
     for (invalid_arguments) |arguments| {
-        const result = runForTest(arguments, "", &environment, 0, &fake);
+        const result = runForTest(arguments, "", 0, &fake);
         try std.testing.expectEqual(@as(u8, 2), result.exit_code);
         try std.testing.expectEqualStrings(
             "sqs: invalid invocation; use --help\n",
@@ -907,14 +724,11 @@ test "send requires one valid bounded tenant and bounded Operation input" {
         );
     }
 
-    var environment = try testEnvironment();
-    defer environment.deinit();
-    var fake: FakeSQS = .{};
+    var fake: FakeQueue = .{};
     const oversized = "a" ** (stdin_size_max + 1);
     const result = runForTest(
         &.{ "sqs", "send", "--tenant", "tenant-a" },
         oversized,
-        &environment,
         0,
         &fake,
     );
@@ -922,31 +736,7 @@ test "send requires one valid bounded tenant and bounded Operation input" {
     try std.testing.expectEqual(@as(u8, 0), fake.send_count);
 }
 
-test "configuration is required and the queue URL is bounded" {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-    var fake: FakeSQS = .{};
-    const arguments = &.{ "sqs", "receive" };
-    const missing = runForTest(arguments, "", &environment, 0, &fake);
-    try std.testing.expectEqual(@as(u8, 2), missing.exit_code);
-    try std.testing.expectEqualStrings(
-        "sqs: missing or invalid configuration\n",
-        missing.stderr(),
-    );
-    try std.testing.expectEqual(@as(u8, 0), fake.receive_count);
-
-    try environment.put("OPERATIONS_QUEUE_URL", "");
-    const empty = runForTest(arguments, "", &environment, 0, &fake);
-    try std.testing.expectEqual(@as(u8, 2), empty.exit_code);
-    try environment.put("OPERATIONS_QUEUE_URL", "a" ** (queue_url_size_max + 1));
-    const large = runForTest(arguments, "", &environment, 0, &fake);
-    try std.testing.expectEqual(@as(u8, 2), large.exit_code);
-    try std.testing.expectEqual(@as(u8, 0), fake.receive_count);
-}
-
 test "send queues and prints the same canonical SUBMITTED Operation" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
     const expected =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
@@ -964,11 +754,10 @@ test "send queues and prints the same canonical SUBMITTED Operation" {
     var expected_message: ?[]u8 = null;
     defer if (expected_message) |message| std.testing.allocator.free(message);
     for (inputs) |input| {
-        var fake: FakeSQS = .{};
+        var fake: FakeQueue = .{};
         const result = runForTest(
             &.{ "sqs", "send", "--tenant", "tenant-a" },
             input,
-            &environment,
             1_700_000_000,
             &fake,
         );
@@ -987,13 +776,10 @@ test "send queues and prints the same canonical SUBMITTED Operation" {
 }
 
 test "send validates through Operation and reports AWS failures without output" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
-    var fake: FakeSQS = .{};
+    var fake: FakeQueue = .{};
     const invalid = runForTest(
         &.{ "sqs", "send", "--tenant", "tenant-a" },
         "null",
-        &environment,
         0,
         &fake,
     );
@@ -1005,7 +791,6 @@ test "send validates through Operation and reports AWS failures without output" 
     const failed = runForTest(
         &.{ "sqs", "send", "--tenant", "tenant-a" },
         test_input,
-        &environment,
         1_700_000_000,
         &fake,
     );
@@ -1015,28 +800,24 @@ test "send validates through Operation and reports AWS failures without output" 
 }
 
 test "receive continues through empty polls and prints and deletes messages in order" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
-    const first = [_]sqs.types.Message{.{
+    const first: operation_queue.Message = .{
         .body = "first",
         .receipt_handle = "receipt-1",
-    }};
-    const second = [_]sqs.types.Message{.{
+    };
+    const second: operation_queue.Message = .{
         .body = "second\nline",
         .receipt_handle = "receipt-2",
-    }};
-    const batches = [_][]const sqs.types.Message{ &.{}, &first, &.{}, &second };
-    var fake: FakeSQS = .{
+    };
+    const batches = [_]?operation_queue.Message{ null, first, null, second };
+    var fake: FakeQueue = .{
         .receive_batches = &batches,
         .receive_error_after = batches.len + 1,
     };
-    const result = runForTest(&.{ "sqs", "receive" }, "", &environment, 0, &fake);
+    const result = runForTest(&.{ "sqs", "receive" }, "", 0, &fake);
     try std.testing.expectEqual(@as(u8, 2), result.exit_code);
     try std.testing.expectEqualStrings("first\nsecond\nline\n", result.stdout());
     try std.testing.expectEqualStrings("sqs: operation failed\n", result.stderr());
     try std.testing.expectEqual(@as(u8, batches.len + 1), fake.receive_count);
-    try std.testing.expectEqual(@as(i32, 1), fake.receive_message_count_max);
-    try std.testing.expectEqual(@as(i32, 20), fake.receive_wait_time_seconds);
     try std.testing.expectEqual(@as(u8, 2), fake.delete_count);
     try std.testing.expectEqualStrings("receipt-2", fake.receipt());
 }
@@ -1049,7 +830,7 @@ test "receive releases every poll arena before polling again" {
     var debug_allocator: DebugAllocator = .{};
     defer std.debug.assert(debug_allocator.deinit() == .ok);
 
-    var fake: FakeSQS = .{
+    var fake: FakeQueue = .{
         .receive_error_after = 4,
         .allocation_bytes_in_use = &debug_allocator.total_requested_bytes,
         .allocation_size = 1024,
@@ -1064,7 +845,7 @@ test "receive releases every poll arena before polling again" {
         .stdin = "",
         .stdout = &stdout,
         .stderr = &stderr,
-    }, test_queue_url, SQSInterface.init(&fake));
+    }, QueueInterface.init(&fake));
 
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqual(@as(u8, 4), fake.receive_count);
@@ -1073,24 +854,26 @@ test "receive releases every poll arena before polling again" {
 }
 
 test "receive writes arbitrary bytes and deletes with the receipt handle" {
-    const body = "not JSON\nwith bytes: \\x00 is text";
-    const messages = [_]sqs.types.Message{.{
-        .body = body,
+    const body = [_]u8{ 'n', 'o', 't', ' ', 'J', 'S', 'O', 'N', '\n', 0x00, 0xFF };
+    const message: operation_queue.Message = .{
+        .body = &body,
         .receipt_handle = "receipt-1",
-    }};
+    };
     var stdout_buffer: [1024]u8 = undefined;
     var stderr_buffer: [1024]u8 = undefined;
     var stdout: std.Io.Writer = .fixed(&stdout_buffer);
     var stderr: std.Io.Writer = .fixed(&stderr_buffer);
-    var fake: FakeSQS = .{ .messages = &messages };
+    var fake: FakeQueue = .{ .message = message };
     try processReceiveResponse(.{
         .allocator = std.testing.allocator,
         .now = 0,
         .stdin = "",
         .stdout = &stdout,
         .stderr = &stderr,
-    }, SQSInterface.init(&fake), test_queue_url, &messages);
-    try std.testing.expectEqualStrings(body ++ "\n", stdout.buffered());
+    }, QueueInterface.init(&fake), message);
+    try std.testing.expectEqualSlices(u8, &body, stdout.buffered()[0..body.len]);
+    try std.testing.expectEqual(@as(u8, '\n'), stdout.buffered()[body.len]);
+    try std.testing.expectEqual(body.len + 1, stdout.buffered().len);
     try std.testing.expectEqualStrings("", stderr.buffered());
     try std.testing.expectEqual(@as(u8, 1), fake.delete_count);
     try std.testing.expectEqualStrings("receipt-1", fake.receipt());
@@ -1130,17 +913,17 @@ const TrackingWriter = struct {
 };
 
 test "receive flushes output before delete and does not delete after output failure" {
-    const messages = [_]sqs.types.Message{.{
+    const message: operation_queue.Message = .{
         .body = "raw-body",
         .receipt_handle = "receipt-2",
-    }};
+    };
     var stderr_buffer: [1024]u8 = undefined;
     var stderr: std.Io.Writer = .fixed(&stderr_buffer);
 
     var success_writer: TrackingWriter = undefined;
     success_writer.init(false);
-    var success_fake: FakeSQS = .{
-        .messages = &messages,
+    var success_fake: FakeQueue = .{
+        .message = message,
         .flushed_before_delete = &success_writer.flushed,
     };
     try processReceiveResponse(.{
@@ -1149,21 +932,21 @@ test "receive flushes output before delete and does not delete after output fail
         .stdin = "",
         .stdout = &success_writer.writer,
         .stderr = &stderr,
-    }, SQSInterface.init(&success_fake), test_queue_url, &messages);
+    }, QueueInterface.init(&success_fake), message);
     try std.testing.expect(success_writer.flushed);
     try std.testing.expectEqualStrings("raw-body\n", success_writer.output());
     try std.testing.expectEqual(@as(u8, 1), success_fake.delete_count);
 
     var failure_writer: TrackingWriter = undefined;
     failure_writer.init(true);
-    var failure_fake: FakeSQS = .{ .messages = &messages };
+    var failure_fake: FakeQueue = .{ .message = message };
     const failure_code = runCommand(.receive, .{
         .allocator = std.testing.allocator,
         .now = 0,
         .stdin = "",
         .stdout = &failure_writer.writer,
         .stderr = &stderr,
-    }, test_queue_url, SQSInterface.init(&failure_fake));
+    }, QueueInterface.init(&failure_fake));
     try std.testing.expectEqual(@as(u8, 2), failure_code);
     try std.testing.expect(!failure_writer.flushed);
     try std.testing.expectEqual(@as(u8, 0), failure_fake.delete_count);
@@ -1171,30 +954,17 @@ test "receive flushes output before delete and does not delete after output fail
     try std.testing.expectEqualStrings("sqs: operation failed\n", stderr.buffered());
 }
 
-test "receive rejects invalid responses and reports receive and delete failures" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
-    const invalid_messages = [_][]const sqs.types.Message{
-        &.{.{ .receipt_handle = "receipt" }},
-        &.{.{ .body = "body" }},
-        &.{ .{ .body = "one", .receipt_handle = "1" }, .{
-            .body = "two",
-            .receipt_handle = "2",
-        } },
-    };
-    for (invalid_messages) |messages| {
-        var fake: FakeSQS = .{ .messages = messages };
-        const result = runForTest(&.{ "sqs", "receive" }, "", &environment, 0, &fake);
-        try std.testing.expectEqual(@as(u8, 2), result.exit_code);
-        try std.testing.expectEqualStrings("sqs: invalid AWS response\n", result.stderr());
-        try std.testing.expectEqual(@as(u8, 0), fake.delete_count);
-    }
+test "receive reports invalid service, AWS, and delete failures" {
+    var response_fake: FakeQueue = .{ .receive_error = error.InvalidServiceResponse };
+    const response_failed = runForTest(&.{ "sqs", "receive" }, "", 0, &response_fake);
+    try std.testing.expectEqual(@as(u8, 2), response_failed.exit_code);
+    try std.testing.expectEqualStrings("sqs: invalid AWS response\n", response_failed.stderr());
+    try std.testing.expectEqual(@as(u8, 0), response_fake.delete_count);
 
-    var receive_fake: FakeSQS = .{ .receive_error = error.AWSFailure };
+    var receive_fake: FakeQueue = .{ .receive_error = error.AWSFailure };
     const receive_failed = runForTest(
         &.{ "sqs", "receive" },
         "",
-        &environment,
         0,
         &receive_fake,
     );
@@ -1202,18 +972,17 @@ test "receive rejects invalid responses and reports receive and delete failures"
     try std.testing.expectEqualStrings("sqs: AWS request failed\n", receive_failed.stderr());
     try std.testing.expectEqual(@as(u8, 1), receive_fake.receive_count);
 
-    const message = [_]sqs.types.Message{.{
+    const message: operation_queue.Message = .{
         .body = "already-output",
         .receipt_handle = "receipt",
-    }};
-    var delete_fake: FakeSQS = .{
-        .messages = &message,
+    };
+    var delete_fake: FakeQueue = .{
+        .message = message,
         .delete_error = error.AWSFailure,
     };
     const delete_failed = runForTest(
         &.{ "sqs", "receive" },
         "",
-        &environment,
         0,
         &delete_fake,
     );
@@ -1225,14 +994,12 @@ test "receive rejects invalid responses and reports receive and delete failures"
 }
 
 test "check writes every known and unknown attribute as escaped JSON" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
-    const attributes = [_]aws.map.StringMapEntry{
+    const attributes = [_]operation_queue.Attribute{
         .{ .key = "ApproximateNumberOfMessages", .value = "3" },
         .{ .key = "Future\"Attribute", .value = "line\nvalue\\suffix" },
     };
-    var fake: FakeSQS = .{ .attributes = &attributes };
-    const result = runForTest(&.{ "sqs", "check" }, "", &environment, 0, &fake);
+    var fake: FakeQueue = .{ .attributes = &attributes };
+    const result = runForTest(&.{ "sqs", "check" }, "", 0, &fake);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
     try std.testing.expectEqualStrings(
         "{\"ApproximateNumberOfMessages\":\"3\"," ++
@@ -1243,60 +1010,25 @@ test "check writes every known and unknown attribute as escaped JSON" {
     try std.testing.expectEqual(@as(u8, 1), fake.check_count);
 
     fake.attributes = &.{};
-    const empty = runForTest(&.{ "sqs", "check" }, "", &environment, 0, &fake);
+    const empty = runForTest(&.{ "sqs", "check" }, "", 0, &fake);
     try std.testing.expectEqualStrings("{}\n", empty.stdout());
 }
 
-test "check bounds and validates all returned attribute strings" {
-    const entry: aws.map.StringMapEntry = .{ .key = "key", .value = "value" };
-    const too_many = [_]aws.map.StringMapEntry{entry} ** (attribute_count_max + 1);
-    try std.testing.expectError(
-        error.InvalidServiceResponse,
-        validateAttributes(&too_many),
-    );
-    try std.testing.expectError(
-        error.InvalidServiceResponse,
-        validateAttributes(&.{.{ .key = "", .value = "value" }}),
-    );
-    try std.testing.expectError(
-        error.InvalidServiceResponse,
-        validateAttributes(&.{.{
-            .key = "k" ** (attribute_name_size_max + 1),
-            .value = "value",
-        }}),
-    );
-    try std.testing.expectError(
-        error.InvalidServiceResponse,
-        validateAttributes(&.{.{
-            .key = "key",
-            .value = "v" ** (attribute_value_size_max + 1),
-        }}),
-    );
-    try std.testing.expectError(
-        error.InvalidServiceResponse,
-        validateAttributes(&.{.{ .key = &.{0xFF}, .value = "value" }}),
-    );
-    try std.testing.expectError(
-        error.InvalidServiceResponse,
-        validateAttributes(&.{.{ .key = "key", .value = &.{0xFF} }}),
-    );
-}
-
-test "AWS and internal diagnostics do not echo queue or message data" {
-    var environment = try testEnvironment();
-    defer environment.deinit();
+test "AWS and internal diagnostics do not echo message data" {
     const body_marker = "private-message-marker";
-    const messages = [_]sqs.types.Message{.{
+    const message: operation_queue.Message = .{
         .body = body_marker,
         .receipt_handle = "private-receipt-marker",
-    }};
-    var fake: FakeSQS = .{
-        .messages = &messages,
+    };
+    var fake: FakeQueue = .{
+        .message = message,
         .delete_error = error.UnexpectedPrivateFailure,
     };
-    const result = runForTest(&.{ "sqs", "receive" }, "", &environment, 0, &fake);
+    const result = runForTest(&.{ "sqs", "receive" }, "", 0, &fake);
     try std.testing.expectEqual(@as(u8, 2), result.exit_code);
     try std.testing.expectEqualStrings("sqs: operation failed\n", result.stderr());
-    try std.testing.expect(std.mem.indexOf(u8, result.stderr(), test_queue_url) == null);
     try std.testing.expect(std.mem.indexOf(u8, result.stderr(), body_marker) == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, result.stderr(), message.receipt_handle) == null,
+    );
 }

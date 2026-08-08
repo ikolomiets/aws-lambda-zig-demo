@@ -3,8 +3,8 @@ const aws = @import("aws");
 const lambda = @import("aws-lambda");
 const operation = @import("operation");
 const operation_persistence = @import("operation_persistence");
+const operation_queue = @import("operation_queue");
 const paseto = @import("paseto");
-const sqs = @import("sqs");
 
 const Allocator = std.mem.Allocator;
 
@@ -20,7 +20,6 @@ const internal_server_error_response =
     "\"},\"body\":\"Internal Server Error\\n\"}";
 const method_not_allowed_body = "Method Not Allowed\n";
 const operation_message_size_max = 8 * 1024;
-const queue_url_size_max = 2048;
 const redacted_value = "<redacted>";
 const service_unavailable_body = "Service Unavailable\n";
 const unauthorized_body = "Unauthorized\n";
@@ -28,7 +27,6 @@ const unauthorized_body = "Unauthorized\n";
 comptime {
     std.debug.assert(operation_message_size_max > operation.body_size_max);
     std.debug.assert(paseto.subject_size_max == operation.tenant_size_max);
-    std.debug.assert(queue_url_size_max < operation_message_size_max);
 }
 
 var runtime_intake_adapter: ?IntakeAdapter = null;
@@ -64,14 +62,10 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
 
 const RuntimeResources = struct {
     config: aws.Config,
-    sqs_client: sqs.Client,
     persistence: operation_persistence.Persistence,
-    queue_url: []const u8,
+    queue: operation_queue.Queue,
 
     fn init(resources: *RuntimeResources, process_init: std.process.Init) !void {
-        const queue_url = configuredQueueURL(process_init.environ_map) catch {
-            return error.InvalidQueueConfiguration;
-        };
         resources.config = aws.Config.load(
             process_init.gpa,
             process_init.io,
@@ -80,23 +74,24 @@ const RuntimeResources = struct {
         ) catch return error.AWSConfigurationFailure;
         errdefer resources.config.deinit();
 
-        resources.sqs_client = sqs.Client.init(process_init.gpa, &resources.config);
-        errdefer resources.sqs_client.deinit();
+        operation_queue.Queue.init(
+            &resources.queue,
+            process_init.gpa,
+            &resources.config,
+            process_init.environ_map,
+        ) catch return error.InvalidQueueConfiguration;
+        errdefer resources.queue.deinit();
         operation_persistence.Persistence.init(
             &resources.persistence,
             process_init.gpa,
             &resources.config,
             process_init.environ_map,
         ) catch return error.PersistenceConfigurationFailure;
-        resources.queue_url = queue_url;
-
-        std.debug.assert(resources.sqs_client.config == &resources.config);
-        std.debug.assert(resources.queue_url.len > 0);
     }
 
     fn deinit(resources: *RuntimeResources) void {
         resources.persistence.deinit();
-        resources.sqs_client.deinit();
+        resources.queue.deinit();
         resources.config.deinit();
         resources.* = undefined;
     }
@@ -132,26 +127,9 @@ const RuntimeResources = struct {
         message: []const u8,
     ) !void {
         std.debug.assert(message.len > 0);
-        _ = resources.sqs_client.sendMessage(arena, .{
-            .message_body = message,
-            .queue_url = resources.queue_url,
-        }, .{}) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            return error.QueueUnavailable;
-        };
+        return resources.queue.send(arena, message);
     }
 };
-
-fn configuredQueueURL(environment: *const std.process.Environ.Map) ![]const u8 {
-    const queue_url = environment.get("OPERATIONS_QUEUE_URL") orelse {
-        return error.InvalidQueueConfiguration;
-    };
-    if (queue_url.len == 0) return error.InvalidQueueConfiguration;
-    if (queue_url.len > queue_url_size_max) return error.InvalidQueueConfiguration;
-    std.debug.assert(queue_url.len > 0);
-    std.debug.assert(queue_url.len <= queue_url_size_max);
-    return queue_url;
-}
 
 const IntakeAdapter = struct {
     context: *anyopaque,
@@ -904,38 +882,10 @@ fn handleInvocationForTest(
     );
 }
 
-test "AWS SDK exposes runtime configuration and SQS client types" {
+test "AWS SDK exposes the runtime configuration type" {
     comptime {
         std.debug.assert(@TypeOf(aws.Config) == type);
-        std.debug.assert(@TypeOf(sqs.Client) == type);
     }
-}
-
-test "operations queue configuration is mandatory and bounded" {
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-
-    try std.testing.expectError(
-        error.InvalidQueueConfiguration,
-        configuredQueueURL(&environment),
-    );
-    const invalid_urls = [_][]const u8{
-        "",
-        "a" ** 2049,
-    };
-    for (invalid_urls) |queue_url| {
-        try environment.put("OPERATIONS_QUEUE_URL", queue_url);
-        try std.testing.expectError(
-            error.InvalidQueueConfiguration,
-            configuredQueueURL(&environment),
-        );
-    }
-
-    try environment.put("OPERATIONS_QUEUE_URL", "https://sqs.example.invalid/operations");
-    try std.testing.expectEqualStrings(
-        "https://sqs.example.invalid/operations",
-        try configuredQueueURL(&environment),
-    );
 }
 
 test "config metadata body includes config fields" {

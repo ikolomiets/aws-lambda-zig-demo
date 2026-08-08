@@ -47,6 +47,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation", .module = lambda_operation },
         },
     });
+    const lambda_operation_queue = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/operation_queue.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
+            .{ .name = "sqs", .module = lambda_sqs },
+        },
+    });
 
     const lambda_mod = b.createModule(.{
         .target = lambda_target,
@@ -59,8 +68,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "aws-lambda", .module = lambda_runtime },
             .{ .name = "operation", .module = lambda_operation },
             .{ .name = "operation_persistence", .module = lambda_operation_persistence },
+            .{ .name = "operation_queue", .module = lambda_operation_queue },
             .{ .name = "paseto", .module = lambda_paseto },
-            .{ .name = "sqs", .module = lambda_sqs },
         },
     });
 
@@ -91,6 +100,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "aws", .module = host_aws },
             .{ .name = "dynamodb", .module = host_dynamodb },
             .{ .name = "operation", .module = host_operation },
+        },
+    });
+    const host_operation_queue = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/operation_queue.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "sqs", .module = host_sqs },
         },
     });
     const host_paseto_implementation = b.dependency("zig_paseto", .{
@@ -143,7 +161,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
             .{ .name = "operation", .module = host_operation },
-            .{ .name = "sqs", .module = host_sqs },
+            .{ .name = "operation_queue", .module = host_operation_queue },
         },
     });
     const sqs_cli_exe = b.addExecutable(.{
@@ -165,8 +183,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "aws-lambda", .module = test_runtime },
             .{ .name = "operation", .module = host_operation },
             .{ .name = "operation_persistence", .module = host_operation_persistence },
+            .{ .name = "operation_queue", .module = host_operation_queue },
             .{ .name = "paseto", .module = host_paseto },
-            .{ .name = "sqs", .module = host_sqs },
         },
     });
     const lambda_tests = b.addTest(.{
@@ -183,6 +201,11 @@ pub fn build(b: *std.Build) void {
         .root_module = host_operation_persistence,
     });
     const run_operation_persistence_tests = b.addRunArtifact(operation_persistence_tests);
+
+    const operation_queue_tests = b.addTest(.{
+        .root_module = host_operation_queue,
+    });
+    const run_operation_queue_tests = b.addRunArtifact(operation_queue_tests);
 
     const paseto_test_mod = b.createModule(.{
         .target = b.graph.host,
@@ -224,6 +247,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lambda_tests.step);
     test_step.dependOn(&run_operation_tests.step);
     test_step.dependOn(&run_operation_persistence_tests.step);
+    test_step.dependOn(&run_operation_queue_tests.step);
     test_step.dependOn(&run_paseto_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_dynamodb_cli_tests.step);
