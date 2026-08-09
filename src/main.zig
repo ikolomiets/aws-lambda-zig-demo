@@ -741,7 +741,7 @@ fn writerCountToUsize(count: u64) !usize {
     return std.math.cast(usize, count) orelse return error.BodyTooLarge;
 }
 
-const FakePersistence = struct {
+const FakeIntake = struct {
     response: ?operation.Operation = null,
     read_response: ?operation.Operation = null,
     update_response: ?operation.Operation = null,
@@ -774,7 +774,7 @@ const FakePersistence = struct {
     last_update_body_present: bool = false,
 
     fn create(
-        fake: *FakePersistence,
+        fake: *FakeIntake,
         _: Allocator,
         source: *const operation.Operation,
     ) !operation.Operation {
@@ -803,7 +803,7 @@ const FakePersistence = struct {
     }
 
     fn read(
-        fake: *FakePersistence,
+        fake: *FakeIntake,
         _: Allocator,
         id: u128,
     ) !operation.Operation {
@@ -815,7 +815,7 @@ const FakePersistence = struct {
     }
 
     fn update(
-        fake: *FakePersistence,
+        fake: *FakeIntake,
         _: Allocator,
         snapshot: *const operation.Operation,
         replacement: *const operation.Operation,
@@ -833,7 +833,7 @@ const FakePersistence = struct {
     }
 
     fn send(
-        fake: *FakePersistence,
+        fake: *FakeIntake,
         _: Allocator,
         message: []const u8,
     ) !void {
@@ -845,19 +845,19 @@ const FakePersistence = struct {
         if (fake.send_error) |err| return err;
     }
 
-    fn lastName(fake: *const FakePersistence) []const u8 {
+    fn lastName(fake: *const FakeIntake) []const u8 {
         return fake.last_name_buffer[0..fake.last_name_len];
     }
 
-    fn lastTenant(fake: *const FakePersistence) []const u8 {
+    fn lastTenant(fake: *const FakeIntake) []const u8 {
         return fake.last_tenant_buffer[0..fake.last_tenant_len];
     }
 
-    fn lastBody(fake: *const FakePersistence) []const u8 {
+    fn lastBody(fake: *const FakeIntake) []const u8 {
         return fake.last_body_buffer[0..fake.last_body_len];
     }
 
-    fn lastMessage(fake: *const FakePersistence) []const u8 {
+    fn lastMessage(fake: *const FakeIntake) []const u8 {
         return fake.last_message_buffer[0..fake.last_message_len];
     }
 };
@@ -868,7 +868,7 @@ fn handleInvocationForTest(
     cfg: lambda.Context.ConfigMeta,
     req: lambda.Context.RequestMeta,
     env: *const std.process.Environ.Map,
-    fake: *FakePersistence,
+    fake: *FakeIntake,
     now: i64,
 ) []const u8 {
     return handleInvocation(
@@ -1058,7 +1058,7 @@ test "valid credentials include subject greeting and accept case insensitive aut
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try putTestPublicKey(&environment, key_pair.public_key);
-    var fake: FakePersistence = .{};
+    var fake: FakeIntake = .{};
 
     const expected_body = try get_handler_body(
         std.testing.allocator,
@@ -1139,7 +1139,7 @@ test "authenticated POST submits a new operation and returns it without its body
         "\"hash\":\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\"}";
 
     for (inputs) |input| {
-        var fake: FakePersistence = .{};
+        var fake: FakeIntake = .{};
         const event = try test_authorization_request_event(
             std.testing.allocator,
             .POST,
@@ -1254,7 +1254,7 @@ test "POST queues every JSON body variant as exact full Operation JSON" {
             input,
         );
         defer std.testing.allocator.free(event);
-        var fake: FakePersistence = .{};
+        var fake: FakeIntake = .{};
         const response = handleInvocationForTest(
             std.testing.allocator,
             event,
@@ -1302,7 +1302,7 @@ test "POST derives tenant and hash from distinct bounded verified subjects" {
             input,
         );
         defer std.testing.allocator.free(event);
-        var fake: FakePersistence = .{};
+        var fake: FakeIntake = .{};
         const response = handleInvocationForTest(
             std.testing.allocator,
             event,
@@ -1346,7 +1346,7 @@ test "matching NEW POST retries submission with the invocation timestamp" {
         &expected_hash,
         "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
     );
-    var fake = FakePersistence{ .response = .{
+    var fake = FakeIntake{ .response = .{
         .id = operation.uuidFromString(
             "00112233-4455-6677-8899-aabbccddeeff",
         ) catch unreachable,
@@ -1396,7 +1396,7 @@ test "matching POST retry returns the latest stored persistent view" {
         &expected_hash,
         "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
     );
-    var fake = FakePersistence{ .response = .{
+    var fake = FakeIntake{ .response = .{
         .id = operation.uuidFromString(
             "00112233-4455-6677-8899-aabbccddeeff",
         ) catch unreachable,
@@ -1481,7 +1481,7 @@ test "matching POST in every later state returns without another submission" {
             try operation.parseResultJSON(result_arena.allocator(), "{\"done\":true}")
         else
             null;
-        var fake = FakePersistence{ .response = .{
+        var fake = FakeIntake{ .response = .{
             .id = operation.uuidFromString(
                 "00112233-4455-6677-8899-aabbccddeeff",
             ) catch unreachable,
@@ -1526,7 +1526,7 @@ test "POST conflict returns only the static conflict response" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try putTestPublicKey(&environment, key_pair.public_key);
-    var fake = FakePersistence{ .create_error = error.OperationConflict };
+    var fake = FakeIntake{ .create_error = error.OperationConflict };
     const event = try test_authorization_request_event(
         std.testing.allocator,
         .POST,
@@ -1579,7 +1579,7 @@ test "POST persistence failures return only the static internal error" {
         error.OutOfMemory,
     };
     for (failures) |failure| {
-        var fake = FakePersistence{ .create_error = failure };
+        var fake = FakeIntake{ .create_error = failure };
         const response = handleInvocationForTest(
             std.testing.allocator,
             event,
@@ -1615,7 +1615,7 @@ test "SQS failure leaves NEW unchanged and a matching POST can retry submission"
             "\"name\":\"queue-failure-marker\",\"body\":true}",
     );
     defer std.testing.allocator.free(event);
-    var fake = FakePersistence{ .send_error = error.AWSFailure };
+    var fake = FakeIntake{ .send_error = error.AWSFailure };
 
     const failed = handleInvocationForTest(
         std.testing.allocator,
@@ -1668,7 +1668,7 @@ test "persistence update failure after send returns only the static internal err
             "\"name\":\"update-failure-marker\",\"body\":{\"secret\":\"marker\"}}",
     );
     defer std.testing.allocator.free(event);
-    var fake = FakePersistence{ .update_error = error.AWSFailure };
+    var fake = FakeIntake{ .update_error = error.AWSFailure };
 
     const response = handleInvocationForTest(
         std.testing.allocator,
@@ -1713,7 +1713,7 @@ test "concurrent submitted update conflict reconciles with a consistent read" {
         &expected_hash,
         "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
     );
-    var fake = FakePersistence{
+    var fake = FakeIntake{
         .update_error = error.OperationConflict,
         .read_response = .{
             .id = operation.uuidFromString(
@@ -1766,7 +1766,7 @@ test "unreconciled conditional update conflicts remain sanitized" {
             "\"name\":\"reconcile-marker\",\"body\":true}",
     );
     defer std.testing.allocator.free(event);
-    var fake = FakePersistence{
+    var fake = FakeIntake{
         .update_error = error.OperationConflict,
         .read_response = .{
             .id = operation.uuidFromString(
@@ -1831,7 +1831,7 @@ test "warm invocations reuse one adapter without retaining request data" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try putTestPublicKey(&environment, key_pair.public_key);
-    var fake: FakePersistence = .{};
+    var fake: FakeIntake = .{};
     const intake = IntakeAdapter.init(&fake);
     const inputs = [_][]const u8{
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
@@ -1882,7 +1882,7 @@ test "authenticated POST rejects missing and invalid operation JSON" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try putTestPublicKey(&environment, key_pair.public_key);
-    var fake: FakePersistence = .{};
+    var fake: FakeIntake = .{};
 
     const invalid_inputs = [_]?[]const u8{
         null,
@@ -1929,7 +1929,7 @@ test "authentication precedes method routing" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try putTestPublicKey(&environment, key_pair.public_key);
-    var fake: FakePersistence = .{};
+    var fake: FakeIntake = .{};
 
     const unsupported_event = try test_authorization_request_event(
         std.testing.allocator,
@@ -1993,7 +1993,7 @@ test "authentication precedes method routing" {
 test "missing and malformed credentials return a Bearer challenge" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    var fake: FakePersistence = .{};
+    var fake: FakeIntake = .{};
     const missing_event =
         "{\"version\":\"2.0\",\"routeKey\":\"$default\",\"headers\":{}}";
     const missing_response = handleInvocationForTest(
@@ -2066,7 +2066,7 @@ test "wrong and expired tokens return a sanitized unauthorized response" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try putTestPublicKey(&environment, key_pair.public_key);
-    var fake: FakePersistence = .{};
+    var fake: FakeIntake = .{};
 
     const tokens = [_][]const u8{ wrong_token, expired_token };
     for (tokens) |token| {
@@ -2105,7 +2105,7 @@ test "missing and invalid public key configuration return sanitized errors" {
         token,
     );
     defer std.testing.allocator.free(event);
-    var fake: FakePersistence = .{};
+    var fake: FakeIntake = .{};
 
     var missing_environment = std.process.Environ.Map.init(std.testing.allocator);
     defer missing_environment.deinit();
@@ -2145,7 +2145,7 @@ test "internal failures return only the static sanitized response" {
     const event_marker = "malformed-event-marker";
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    var fake: FakePersistence = .{};
+    var fake: FakeIntake = .{};
     const malformed_response = handleInvocationForTest(
         std.testing.allocator,
         "{\"headers\":" ++ event_marker,

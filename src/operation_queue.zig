@@ -12,6 +12,7 @@ const attribute_name_size_max = 256;
 const attribute_value_size_max = 256 * 1024;
 const receive_message_count_max: i32 = 1;
 const receive_wait_time_seconds: i32 = 20;
+const attribute_names_all = [_]sqs.types.QueueAttributeName{.all};
 
 comptime {
     std.debug.assert(queue_url_size_max < message_size_max);
@@ -20,6 +21,7 @@ comptime {
     std.debug.assert(receive_message_count_max == 1);
     std.debug.assert(receive_wait_time_seconds > 0);
     std.debug.assert(receive_wait_time_seconds <= 20);
+    std.debug.assert(attribute_names_all.len == 1);
 }
 
 pub const Message = struct {
@@ -63,76 +65,80 @@ pub const Queue = struct {
     }
 
     pub fn send(self: *Self, arena: Allocator, body: []const u8) !void {
-        return send_with_client(&self.client, arena, self.queue_url, body);
+        const request = try send_request(self.queue_url, body);
+        _ = self.client.sendMessage(arena, request, .{}) catch |err| {
+            return map_aws_error(err);
+        };
     }
 
     /// Returns at most one message after polling for up to 20 seconds.
     pub fn receive(self: *Self, arena: Allocator) !?Message {
-        return receive_with_client(&self.client, arena, self.queue_url);
+        const request = receive_request(self.queue_url);
+        const output = self.client.receiveMessage(arena, request, .{}) catch |err| {
+            return map_aws_error(err);
+        };
+        return decode_receive_output(output);
     }
 
     pub fn delete(self: *Self, arena: Allocator, receipt_handle: []const u8) !void {
-        return delete_with_client(&self.client, arena, self.queue_url, receipt_handle);
+        const request = try delete_request(self.queue_url, receipt_handle);
+        _ = self.client.deleteMessage(arena, request, .{}) catch |err| {
+            return map_aws_error(err);
+        };
     }
 
     /// Returns every queue attribute, including attributes added by future SDK versions.
     pub fn get_attributes(self: *Self, arena: Allocator) ![]const Attribute {
-        return get_attributes_with_client(&self.client, arena, self.queue_url);
+        const request = get_attributes_request(self.queue_url);
+        const output = self.client.getQueueAttributes(arena, request, .{}) catch |err| {
+            return map_aws_error(err);
+        };
+        return decode_attributes_output(arena, output);
     }
 };
 
-fn send_with_client(
-    client: anytype,
-    arena: Allocator,
-    queue_url: []const u8,
-    body: []const u8,
-) !void {
+fn send_request(queue_url: []const u8, body: []const u8) !sqs.SendMessageInput {
     try validate_message_body(body);
-    _ = client.sendMessage(arena, .{
+    return .{
         .message_body = body,
         .queue_url = queue_url,
-    }, .{}) catch |err| return map_aws_error(err);
+    };
 }
 
-fn receive_with_client(
-    client: anytype,
-    arena: Allocator,
-    queue_url: []const u8,
-) !?Message {
-    const output = client.receiveMessage(arena, .{
+fn receive_request(queue_url: []const u8) sqs.ReceiveMessageInput {
+    return .{
         .max_number_of_messages = receive_message_count_max,
         .queue_url = queue_url,
         .wait_time_seconds = receive_wait_time_seconds,
-    }, .{}) catch |err| return map_aws_error(err);
+    };
+}
+
+fn decode_receive_output(output: sqs.ReceiveMessageOutput) !?Message {
     const messages = output.messages orelse return null;
     if (messages.len == 0) return null;
     if (messages.len != 1) return error.InvalidServiceResponse;
     return @as(?Message, try decode_message(messages[0]));
 }
 
-fn delete_with_client(
-    client: anytype,
-    arena: Allocator,
-    queue_url: []const u8,
-    receipt_handle: []const u8,
-) !void {
+fn delete_request(queue_url: []const u8, receipt_handle: []const u8) !sqs.DeleteMessageInput {
     try validate_receipt_handle(receipt_handle);
-    _ = client.deleteMessage(arena, .{
+    return .{
         .queue_url = queue_url,
         .receipt_handle = receipt_handle,
-    }, .{}) catch |err| return map_aws_error(err);
+    };
 }
 
-fn get_attributes_with_client(
-    client: anytype,
-    arena: Allocator,
-    queue_url: []const u8,
-) ![]const Attribute {
-    const all = [_]sqs.types.QueueAttributeName{.all};
-    const output = client.getQueueAttributes(arena, .{
-        .attribute_names = &all,
+fn get_attributes_request(queue_url: []const u8) sqs.GetQueueAttributesInput {
+    return .{
+        .attribute_names = &attribute_names_all,
         .queue_url = queue_url,
-    }, .{}) catch |err| return map_aws_error(err);
+    };
+}
+
+fn decode_attributes_output(
+    arena: Allocator,
+    output: sqs.GetQueueAttributesOutput,
+) ![]const Attribute {
     const sdk_attributes = output.attributes orelse return &.{};
     try validate_attributes(sdk_attributes);
     if (sdk_attributes.len == 0) return &.{};
@@ -201,78 +207,6 @@ fn map_aws_error(err: anyerror) error{ OutOfMemory, AWSFailure } {
 
 const test_queue_url = "https://sqs.example.invalid/operations";
 
-const FakeSQSClient = struct {
-    messages: ?[]const sqs.types.Message = null,
-    attributes: ?[]const aws.map.StringMapEntry = null,
-    request_error: ?anyerror = null,
-    send_count: u8 = 0,
-    receive_count: u8 = 0,
-    delete_count: u8 = 0,
-    attributes_count: u8 = 0,
-    sent_body: []const u8 = "",
-    sent_queue_url: []const u8 = "",
-    receive_queue_url: []const u8 = "",
-    receive_message_count_max: ?i32 = null,
-    receive_wait_time_seconds: ?i32 = null,
-    delete_queue_url: []const u8 = "",
-    deleted_receipt_handle: []const u8 = "",
-    attributes_queue_url: []const u8 = "",
-    requested_all_attributes: bool = false,
-
-    fn sendMessage(
-        fake: *FakeSQSClient,
-        _: Allocator,
-        input: sqs.SendMessageInput,
-        _: sqs.CallOptions,
-    ) !void {
-        fake.send_count += 1;
-        fake.sent_body = input.message_body;
-        fake.sent_queue_url = input.queue_url;
-        if (fake.request_error) |err| return err;
-    }
-
-    fn receiveMessage(
-        fake: *FakeSQSClient,
-        _: Allocator,
-        input: sqs.ReceiveMessageInput,
-        _: sqs.CallOptions,
-    ) !sqs.ReceiveMessageOutput {
-        fake.receive_count += 1;
-        fake.receive_queue_url = input.queue_url;
-        fake.receive_message_count_max = input.max_number_of_messages;
-        fake.receive_wait_time_seconds = input.wait_time_seconds;
-        if (fake.request_error) |err| return err;
-        return .{ .messages = fake.messages };
-    }
-
-    fn deleteMessage(
-        fake: *FakeSQSClient,
-        _: Allocator,
-        input: sqs.DeleteMessageInput,
-        _: sqs.CallOptions,
-    ) !void {
-        fake.delete_count += 1;
-        fake.delete_queue_url = input.queue_url;
-        fake.deleted_receipt_handle = input.receipt_handle;
-        if (fake.request_error) |err| return err;
-    }
-
-    fn getQueueAttributes(
-        fake: *FakeSQSClient,
-        _: Allocator,
-        input: sqs.GetQueueAttributesInput,
-        _: sqs.CallOptions,
-    ) !sqs.GetQueueAttributesOutput {
-        fake.attributes_count += 1;
-        fake.attributes_queue_url = input.queue_url;
-        if (input.attribute_names) |names| {
-            fake.requested_all_attributes = names.len == 1 and names[0] == .all;
-        }
-        if (fake.request_error) |err| return err;
-        return .{ .attributes = fake.attributes };
-    }
-};
-
 test "initialization requires a nonempty bounded queue URL" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
@@ -310,101 +244,56 @@ test "initialization retains valid queue configuration and shared AWS configurat
 }
 
 test "requests use the configured URL and fixed queue contracts" {
-    const sdk_messages = [_]sqs.types.Message{.{
-        .body = "body",
-        .receipt_handle = "receipt",
-    }};
-    const sdk_attributes = [_]aws.map.StringMapEntry{
-        .{ .key = "ApproximateNumberOfMessages", .value = "1" },
-    };
-    var fake: FakeSQSClient = .{
-        .messages = &sdk_messages,
-        .attributes = &sdk_attributes,
-    };
+    const send = try send_request(test_queue_url, "submitted-operation");
+    const receive = receive_request(test_queue_url);
+    const delete = try delete_request(test_queue_url, "receipt");
+    const attributes = get_attributes_request(test_queue_url);
 
-    try send_with_client(&fake, std.testing.allocator, test_queue_url, "submitted-operation");
-    const message = (try receive_with_client(
-        &fake,
-        std.testing.allocator,
-        test_queue_url,
-    )).?;
-    try delete_with_client(&fake, std.testing.allocator, test_queue_url, message.receipt_handle);
-    const attributes = try get_attributes_with_client(
-        &fake,
-        std.testing.allocator,
-        test_queue_url,
-    );
-    defer std.testing.allocator.free(attributes);
-
-    try std.testing.expectEqual(@as(u8, 1), fake.send_count);
-    try std.testing.expectEqualStrings(test_queue_url, fake.sent_queue_url);
-    try std.testing.expectEqualStrings("submitted-operation", fake.sent_body);
-    try std.testing.expectEqual(@as(u8, 1), fake.receive_count);
-    try std.testing.expectEqualStrings(test_queue_url, fake.receive_queue_url);
-    try std.testing.expectEqual(receive_message_count_max, fake.receive_message_count_max.?);
-    try std.testing.expectEqual(receive_wait_time_seconds, fake.receive_wait_time_seconds.?);
-    try std.testing.expectEqualStrings("body", message.body);
-    try std.testing.expectEqual(@as(u8, 1), fake.delete_count);
-    try std.testing.expectEqualStrings(test_queue_url, fake.delete_queue_url);
-    try std.testing.expectEqualStrings("receipt", fake.deleted_receipt_handle);
-    try std.testing.expectEqual(@as(u8, 1), fake.attributes_count);
-    try std.testing.expectEqualStrings(test_queue_url, fake.attributes_queue_url);
-    try std.testing.expect(fake.requested_all_attributes);
-    try std.testing.expectEqualStrings("ApproximateNumberOfMessages", attributes[0].key);
-    try std.testing.expectEqualStrings("1", attributes[0].value);
+    try std.testing.expectEqualStrings(test_queue_url, send.queue_url);
+    try std.testing.expectEqualStrings("submitted-operation", send.message_body);
+    try std.testing.expectEqualStrings(test_queue_url, receive.queue_url);
+    try std.testing.expectEqual(receive_message_count_max, receive.max_number_of_messages.?);
+    try std.testing.expectEqual(receive_wait_time_seconds, receive.wait_time_seconds.?);
+    try std.testing.expectEqualStrings(test_queue_url, delete.queue_url);
+    try std.testing.expectEqualStrings("receipt", delete.receipt_handle);
+    try std.testing.expectEqualStrings(test_queue_url, attributes.queue_url);
+    try std.testing.expectEqual(@as(usize, 1), attributes.attribute_names.?.len);
+    try std.testing.expectEqual(sqs.types.QueueAttributeName.all, attributes.attribute_names.?[0]);
 }
 
-test "send and delete reject empty and oversized values before requesting AWS" {
-    var fake: FakeSQSClient = .{};
+test "send and delete requests reject empty and oversized values" {
     try std.testing.expectError(
         error.InvalidMessage,
-        send_with_client(&fake, std.testing.allocator, test_queue_url, ""),
+        send_request(test_queue_url, ""),
     );
     const oversized_message = try std.testing.allocator.alloc(u8, message_size_max + 1);
     defer std.testing.allocator.free(oversized_message);
     try std.testing.expectError(
         error.InvalidMessage,
-        send_with_client(&fake, std.testing.allocator, test_queue_url, oversized_message),
+        send_request(test_queue_url, oversized_message),
     );
     try std.testing.expectError(
         error.InvalidReceiptHandle,
-        delete_with_client(&fake, std.testing.allocator, test_queue_url, ""),
+        delete_request(test_queue_url, ""),
     );
     const oversized_receipt = try std.testing.allocator.alloc(u8, receipt_handle_size_max + 1);
     defer std.testing.allocator.free(oversized_receipt);
     try std.testing.expectError(
         error.InvalidReceiptHandle,
-        delete_with_client(&fake, std.testing.allocator, test_queue_url, oversized_receipt),
+        delete_request(test_queue_url, oversized_receipt),
     );
-    try std.testing.expectEqual(@as(u8, 0), fake.send_count);
-    try std.testing.expectEqual(@as(u8, 0), fake.delete_count);
 }
 
 test "receive accepts empty and one valid arbitrary-byte message" {
-    var fake: FakeSQSClient = .{};
-    try std.testing.expect((try receive_with_client(
-        &fake,
-        std.testing.allocator,
-        test_queue_url,
-    )) == null);
-    fake.messages = &.{};
-    try std.testing.expect((try receive_with_client(
-        &fake,
-        std.testing.allocator,
-        test_queue_url,
-    )) == null);
+    try std.testing.expect((try decode_receive_output(.{})) == null);
+    try std.testing.expect((try decode_receive_output(.{ .messages = &.{} })) == null);
 
     const body = [_]u8{ 0x00, 0xFF, '\n' };
     const messages = [_]sqs.types.Message{.{
         .body = &body,
         .receipt_handle = "receipt",
     }};
-    fake.messages = &messages;
-    const message = (try receive_with_client(
-        &fake,
-        std.testing.allocator,
-        test_queue_url,
-    )).?;
+    const message = (try decode_receive_output(.{ .messages = &messages })).?;
     try std.testing.expectEqualSlices(u8, &body, message.body);
     try std.testing.expectEqualStrings("receipt", message.receipt_handle);
 }
@@ -419,10 +308,9 @@ test "receive rejects multiple messages and missing empty or oversized fields" {
         &.{.{ .body = "body", .receipt_handle = "" }},
     };
     for (invalid_responses) |messages| {
-        var fake: FakeSQSClient = .{ .messages = messages };
         try std.testing.expectError(
             error.InvalidServiceResponse,
-            receive_with_client(&fake, std.testing.allocator, test_queue_url),
+            decode_receive_output(.{ .messages = messages }),
         );
     }
 
@@ -432,10 +320,9 @@ test "receive rejects multiple messages and missing empty or oversized fields" {
         .body = oversized_body,
         .receipt_handle = "receipt",
     }};
-    var body_fake: FakeSQSClient = .{ .messages = &body_message };
     try std.testing.expectError(
         error.InvalidServiceResponse,
-        receive_with_client(&body_fake, std.testing.allocator, test_queue_url),
+        decode_receive_output(.{ .messages = &body_message }),
     );
 
     const oversized_receipt = try std.testing.allocator.alloc(u8, receipt_handle_size_max + 1);
@@ -444,23 +331,28 @@ test "receive rejects multiple messages and missing empty or oversized fields" {
         .body = "body",
         .receipt_handle = oversized_receipt,
     }};
-    var receipt_fake: FakeSQSClient = .{ .messages = &receipt_message };
     try std.testing.expectError(
         error.InvalidServiceResponse,
-        receive_with_client(&receipt_fake, std.testing.allocator, test_queue_url),
+        decode_receive_output(.{ .messages = &receipt_message }),
     );
 }
 
 test "attributes preserve all entries and reject malformed service data" {
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try decode_attributes_output(std.testing.allocator, .{})).len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try decode_attributes_output(std.testing.allocator, .{ .attributes = &.{} })).len,
+    );
     const valid = [_]aws.map.StringMapEntry{
         .{ .key = "Known", .value = "value" },
         .{ .key = "Future-Attribute", .value = "é" },
     };
-    var fake: FakeSQSClient = .{ .attributes = &valid };
-    const attributes = try get_attributes_with_client(
-        &fake,
+    const attributes = try decode_attributes_output(
         std.testing.allocator,
-        test_queue_url,
+        .{ .attributes = &valid },
     );
     defer std.testing.allocator.free(attributes);
     try std.testing.expectEqual(@as(usize, 2), attributes.len);
@@ -480,75 +372,25 @@ test "attributes preserve all entries and reject malformed service data" {
         &.{.{ .key = "key", .value = &.{0xFF} }},
     };
     for (invalid) |sdk_attributes| {
-        var invalid_fake: FakeSQSClient = .{ .attributes = sdk_attributes };
         try std.testing.expectError(
             error.InvalidServiceResponse,
-            get_attributes_with_client(
-                &invalid_fake,
+            decode_attributes_output(
                 std.testing.allocator,
-                test_queue_url,
+                .{ .attributes = sdk_attributes },
             ),
         );
     }
 }
 
 test "SDK and conversion allocation errors preserve only OutOfMemory" {
-    const operations = [_]enum { send, receive, delete, attributes }{
-        .send,
-        .receive,
-        .delete,
-        .attributes,
-    };
-    const failures = [_]anyerror{ error.OutOfMemory, error.ConnectionFailed };
-    for (failures) |sdk_error| {
-        for (operations) |sdk_operation| {
-            var fake: FakeSQSClient = .{ .request_error = sdk_error };
-            const expected = if (sdk_error == error.OutOfMemory)
-                error.OutOfMemory
-            else
-                error.AWSFailure;
-            const actual = switch (sdk_operation) {
-                .send => send_with_client(
-                    &fake,
-                    std.testing.allocator,
-                    test_queue_url,
-                    "body",
-                ),
-                .receive => receive_result: {
-                    _ = receive_with_client(
-                        &fake,
-                        std.testing.allocator,
-                        test_queue_url,
-                    ) catch |err| break :receive_result err;
-                    return error.ExpectedFailure;
-                },
-                .delete => delete_with_client(
-                    &fake,
-                    std.testing.allocator,
-                    test_queue_url,
-                    "receipt",
-                ),
-                .attributes => attributes_result: {
-                    _ = get_attributes_with_client(
-                        &fake,
-                        std.testing.allocator,
-                        test_queue_url,
-                    ) catch |err| break :attributes_result err;
-                    return error.ExpectedFailure;
-                },
-            };
-            try std.testing.expectError(expected, actual);
-        }
-    }
-
+    try std.testing.expectEqual(error.OutOfMemory, map_aws_error(error.OutOfMemory));
+    try std.testing.expectEqual(error.AWSFailure, map_aws_error(error.ConnectionFailed));
     const sdk_attributes = [_]aws.map.StringMapEntry{.{ .key = "key", .value = "value" }};
-    var allocation_fake: FakeSQSClient = .{ .attributes = &sdk_attributes };
     try std.testing.expectError(
         error.OutOfMemory,
-        get_attributes_with_client(
-            &allocation_fake,
+        decode_attributes_output(
             std.testing.failing_allocator,
-            test_queue_url,
+            .{ .attributes = &sdk_attributes },
         ),
     );
 }
