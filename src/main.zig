@@ -6,6 +6,13 @@ const operation_persistence = @import("operation_persistence");
 const operation_queue = @import("operation_queue");
 const paseto = @import("paseto");
 
+pub const std_options: std.Options = .{
+    .log_scope_levels = &.{.{
+        .scope = .aws_sdk,
+        .level = .debug,
+    }},
+};
+
 const Allocator = std.mem.Allocator;
 
 const authorization_header_count_max = 256;
@@ -886,6 +893,17 @@ test "AWS SDK exposes the runtime configuration type" {
     comptime {
         std.debug.assert(@TypeOf(aws.Config) == type);
     }
+}
+
+test "AWS SDK debug logging is enabled" {
+    try std.testing.expectEqual(std.log.default_level, std_options.log_level);
+    try std.testing.expectEqual(@as(usize, 1), std_options.log_scope_levels.len);
+    try std.testing.expect(std_options.log_scope_levels[0].scope == .aws_sdk);
+    try std.testing.expectEqual(
+        std.log.Level.debug,
+        std_options.log_scope_levels[0].level,
+    );
+    try std.testing.expect(std.log.logEnabled(.debug, .aws_sdk));
 }
 
 test "config metadata body includes config fields" {
