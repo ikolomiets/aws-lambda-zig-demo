@@ -2,4 +2,5 @@
 zig-out/
 zig-pkg/
 lambda.zip
+/*.log
 .DS_Store

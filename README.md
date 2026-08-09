@@ -5,18 +5,19 @@ A minimal AWS Lambda Function URL demo written in Zig.
 The project builds a custom `provided.al2023` Lambda runtime executable named
 `bootstrap` and a host-native PASETO v4.public utility named `paseto`. The
 stack-aware `persistence.sh` and `queue.sh` commands manage Operations in
-DynamoDB and SQS. The handler authenticates a PASETO v4.public bearer token
-before serving GET and POST requests through the `aws-lambda-zig` runtime
-package. GET returns a plain-text Lambda environment dump, while POST validates
-and hashes an Operation JSON document, derives required tenant metadata from
-the verified token subject, persists the Operation idempotently in DynamoDB,
-submits new work to SQS, and returns the current stored output view without the
-body.
+DynamoDB and SQS, while `lambda_logs.sh` downloads the function's CloudWatch
+logs. The handler authenticates a PASETO v4.public bearer token before serving
+GET and POST requests through the `aws-lambda-zig` runtime package. GET returns
+a plain-text Lambda environment dump, while POST validates and hashes an
+Operation JSON document, derives required tenant metadata from the verified
+token subject, persists the Operation idempotently in DynamoDB, submits new
+work to SQS, and returns the current stored output view without the body.
 
 ## Requirements
 
 - Zig 0.16.0 or newer within the supported 0.16.x line.
 - AWS CLI v2 and AWS SAM CLI for the SAM deployment flow and stack queries.
+- `jq` for the Lambda log download helper.
 - An AWS profile with permission to create Lambda, IAM, and CloudFormation
   resources.
 
@@ -314,6 +315,41 @@ handling, including GET. Resource existence and IAM authorization are checked
 only when POST first calls the services, so DynamoDB failures return a
 sanitized HTTP 500 and SQS send failures return a sanitized HTTP 503.
 
+## Lambda logs
+
+`lambda_logs.sh` downloads the Lambda's CloudWatch events into a root-level
+file named after the deployed function. The stack name is fixed as
+`aws-lambda-zig-demo`; the script resolves its `FunctionName` output and, for
+the default deployment, writes `aws-lambda-zig-demo.log`.
+
+```sh
+./lambda_logs.sh
+```
+
+The helper uses `AWS_PROFILE` and `AWS_REGION`, defaulting to `dev` and
+`ca-central-1`. Override them with the standard AWS CLI environment variables:
+
+```sh
+AWS_PROFILE=dev AWS_REGION=ca-central-1 ./lambda_logs.sh
+```
+
+When the log file is absent or empty, the helper downloads all events retained
+in `/aws/lambda/<function-name>`. On later runs, it reads the final event's UTC
+timestamp and visible CloudWatch event ID, requests events from that millisecond
+inclusively, and appends only unseen events. Event headers use millisecond
+precision:
+
+```text
+2026-08-09T19:21:14.335 [event-id=<CloudWatch-event-id>] message
+```
+
+Embedded message newlines remain as unprefixed continuation lines. The local
+AWS identity needs `cloudformation:DescribeStacks` and `logs:FilterLogEvents`.
+For an expired IAM Identity Center session, run
+`aws sso login --profile "${AWS_PROFILE:-dev}"` and retry. Root-level `.log`
+files are ignored by Git because Lambda output can contain private operational
+details; treat custom copies the same way.
+
 ## Deploy
 
 The supported deployment path is AWS SAM:
@@ -455,6 +491,7 @@ or CloudFront.
 - `src/paseto_cli.zig`: host PASETO v4.public CLI and its tests.
 - `persistence.sh`: stack-aware persistence command and credential setup.
 - `queue.sh`: stack-aware queue command and credential setup.
+- `lambda_logs.sh`: incremental CloudWatch log download helper.
 - `build.zig`: Zig build graph for `bootstrap`, local commands, and tests.
 - `build.zig.zon`: package metadata and pinned dependencies.
 - `template.yaml`: SAM template for the Lambda, Function URL, and permissions.

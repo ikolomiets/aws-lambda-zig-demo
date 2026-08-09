@@ -10,6 +10,7 @@ queue, public Function URL, and Function URL permissions.
 ## Assumptions
 
 - AWS CLI v2 and SAM CLI are installed.
+- `jq` is installed when using `lambda_logs.sh`.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
@@ -420,6 +421,7 @@ to `../aws-lambda-zig`; override it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
 After deployment, SAM prints stack outputs. Look for:
 
 ```text
+FunctionName
 FunctionUrl
 OperationsTableName
 OperationsQueueUrl
@@ -436,9 +438,9 @@ aws cloudformation describe-stacks \
   --region ca-central-1
 ```
 
-`persistence.sh` and `queue.sh` resolve the operations table name and queue URL
-from these stack outputs automatically; normal local command use does not
-require exporting either value.
+`persistence.sh`, `queue.sh`, and `lambda_logs.sh` resolve the operations table
+name, queue URL, and function name from these stack outputs automatically;
+normal local command use does not require exporting those values.
 
 ## 8. Test HTTP GET and POST
 
@@ -545,7 +547,49 @@ Delivery is at least once. The standard queue, acknowledgement loss, and
 concurrent `NEW` retries can create duplicate messages. Consumers must use the
 Operation ID and hash idempotently.
 
-## 9. Create, read, update, and delete persisted Operations
+## 9. Download Lambda logs
+
+Run the stack-aware log helper to download CloudWatch events for the deployed
+function:
+
+```sh
+./lambda_logs.sh
+```
+
+The stack name is fixed as `aws-lambda-zig-demo`. The helper resolves the
+stack's `FunctionName` output and writes a root-level file named after that
+function, such as `aws-lambda-zig-demo.log`. It uses only the standard
+`AWS_PROFILE` and `AWS_REGION` environment variables, defaulting to `dev` and
+`ca-central-1`:
+
+```sh
+AWS_PROFILE=dev AWS_REGION=ca-central-1 ./lambda_logs.sh
+```
+
+The first run downloads all retained events from
+`/aws/lambda/<function-name>`. Subsequent runs parse the final event header,
+query inclusively from its millisecond timestamp, and use the visible
+CloudWatch event ID to avoid appending duplicates at that timestamp. Event
+headers contain a UTC timestamp without a timezone suffix:
+
+```text
+2026-08-09T19:21:14.335 [event-id=<CloudWatch-event-id>] message
+```
+
+Embedded newlines remain as unprefixed continuation lines. The script stages
+and validates the complete paginated AWS response before appending anything.
+The local AWS identity needs `cloudformation:DescribeStacks` and
+`logs:FilterLogEvents`; these are caller permissions and do not change the
+Lambda execution role. Refresh an expired IAM Identity Center session with:
+
+```sh
+aws sso login --profile "${AWS_PROFILE:-dev}"
+```
+
+The derived root-level `.log` file is ignored by Git. Lambda logs can contain
+private operational data, so do not publish or commit copied log files.
+
+## 10. Create, read, update, and delete persisted Operations
 
 `persistence.sh` is the supported local persistence command. It defaults to
 profile `dev`, region `ca-central-1`, and stack `aws-lambda-zig-demo`. It
@@ -653,7 +697,7 @@ account-specific identifiers in this repository. Likewise, a syntactically
 valid but nonexistent queue or missing `SendMessage` permission is discovered
 only when POST attempts submission and returns a sanitized HTTP 503.
 
-## 10. Send, receive, and check queued Operations
+## 11. Send, receive, and check queued Operations
 
 `queue.sh` is the supported local queue command. It defaults to profile `dev`,
 region `ca-central-1`, and stack `aws-lambda-zig-demo`. It exports the selected
@@ -723,7 +767,7 @@ URL is non-empty. Confirm `PROFILE`, `REGION`, and `STACK_NAME`. Configuration
 is checked before Operation input is parsed; AWS failures after configuration
 loading instead report `sqs: AWS request failed`.
 
-## 11. Update the deployed Lambda code
+## 12. Update the deployed Lambda code
 
 After changing Zig source code, rebuild and repackage:
 
@@ -740,7 +784,7 @@ sam deploy --profile dev --region ca-central-1
 
 SAM uploads the new `lambda.zip` and updates the CloudFormation-managed Lambda function.
 
-## 12. Delete the SAM stack
+## 13. Delete the SAM stack
 
 To remove the SAM-managed function, role, operations table, operations queue,
 Function URL, and permissions:
