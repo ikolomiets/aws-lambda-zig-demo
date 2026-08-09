@@ -2,10 +2,10 @@
 
 Use one `Operation` model for input, output, and DynamoDB persistence so that invariants are defined
 once while each view admits only its own fields. `Operation.tenant` is required server-owned
-metadata: Lambda derives it only from the verified PASETO `sub` claim, while the host CLI accepts it
-only through `dynamodb create --tenant`. Caller-supplied Operation JSON cannot set it. The operation
-hash is always BLAKE3-256 of the compact Zig 0.16 `std.json.Value` serialization of the fixed-order
-envelope
+metadata: Lambda derives it only from the verified PASETO `sub` claim, while the persistence
+`create` command accepts it only through `--tenant`. Caller-supplied Operation JSON cannot set it.
+The operation hash is always BLAKE3-256 of the compact Zig 0.16 `std.json.Value` serialization of
+the fixed-order envelope
 `{"tenant":<JSON-encoded-tenant>,"name":<JSON-encoded-name>,"body":<normalized-body>}`. This
 normalization deliberately is not RFC 8785 canonical JSON: insignificant whitespace and equivalent
 string escapes compare equally, but object key order is retained and therefore affects the hash.

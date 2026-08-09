@@ -57,9 +57,9 @@ Lambda ARM64.
 zig build --release -Darch=arm
 ```
 
-The build also installs the host-native `paseto`, `dynamodb`, and `sqs`
-utilities under `zig-out/bin/`. The `sqs` executable is built for the current
-host, not packaged into `lambda.zip`.
+The build also installs the host-native `paseto` utility and the local command
+implementations invoked by `persistence.sh` and `queue.sh`. Only `bootstrap` is
+packaged into `lambda.zip`.
 
 Verify that the built artifact is a Linux ARM64 executable.
 
@@ -155,8 +155,8 @@ table name and non-empty, at-most-2,048-byte queue URL. Each module privately
 owns its respective DynamoDB or SQS client; both clients share the AWS
 configuration and HTTP pool. The module values, configuration, pool, and intake
 adapter are reused across warm invocations. Missing or invalid configuration
-therefore prevents all invocation handling, including GET. The host-native
-`dynamodb` and `sqs` CLIs use the same persistence and queue modules and their
+therefore prevents all invocation handling, including GET. The local
+persistence and queue command implementations use the same modules and
 contracts.
 
 Startup validation makes no DynamoDB or SQS request. A missing table or
@@ -169,9 +169,8 @@ The second inline-policy statement grants the function only `SendMessage`
 access to this stack's operations queue. The handler sends full compact
 `SUBMITTED` Operation JSON, but has no receive, delete, purge, or
 queue-management permissions. The template defines no consumer or Lambda event
-source mapping. The separate host-native `sqs` utility can operate on this
-queue using the local caller's AWS identity; it does not expand the Lambda
-execution role.
+source mapping. The `queue.sh` command can operate on this queue using the local
+caller's AWS identity; it does not expand the Lambda execution role.
 
 `OperationsQueue` is a standard queue with a CloudFormation-generated name.
 The template does not configure FIFO behavior, a dead-letter queue, or custom
@@ -205,10 +204,10 @@ directly into the hash stream, so insignificant whitespace and equivalent
 string escapes do not change the hash, while object member order remains
 significant. The `id`, `state`, `last_updated`, `expires_at`, and `result`
 fields are excluded. Lambda derives tenant exclusively from the verified
-PASETO `sub` claim. The host CLI accepts it only through
-`dynamodb create --tenant`; caller-supplied Operation JSON cannot set it. One
-lifetime arena owns each Operation's tenant, strings, and nested body or result
-Values for a CLI command or Lambda POST.
+PASETO `sub` claim. The persistence `create` command accepts it only through
+`--tenant`; caller-supplied Operation JSON cannot set it. One lifetime arena
+owns each Operation's tenant, strings, and nested body or result Values for a
+persistence command or Lambda POST.
 
 The reference envelope
 `{"tenant":"tenant-a","name":"echo","body":{"message":"hello","count":2}}`
@@ -437,31 +436,9 @@ aws cloudformation describe-stacks \
   --region ca-central-1
 ```
 
-Discover and export the operations table for the host CLI:
-
-```sh
-export OPERATIONS_TABLE_NAME="$(
-  aws cloudformation describe-stacks \
-    --stack-name aws-lambda-zig-demo \
-    --query "Stacks[0].Outputs[?OutputKey=='OperationsTableName'].OutputValue" \
-    --output text \
-    --profile dev \
-    --region ca-central-1
-)"
-```
-
-Discover and export the operations queue URL for the host SQS utility:
-
-```sh
-export OPERATIONS_QUEUE_URL="$(
-  aws cloudformation describe-stacks \
-    --stack-name aws-lambda-zig-demo \
-    --query "Stacks[0].Outputs[?OutputKey=='OperationsQueueUrl'].OutputValue" \
-    --output text \
-    --profile dev \
-    --region ca-central-1
-)"
-```
+`persistence.sh` and `queue.sh` resolve the operations table name and queue URL
+from these stack outputs automatically; normal local command use does not
+require exporting either value.
 
 ## 8. Test HTTP GET and POST
 
@@ -568,17 +545,23 @@ Delivery is at least once. The standard queue, acknowledgement loss, and
 concurrent `NEW` retries can create duplicate messages. Consumers must use the
 Operation ID and hash idempotently.
 
-## 9. Create, read, and update persisted Operations
+## 9. Create, read, update, and delete persisted Operations
 
-Builds install the host-native utility at `zig-out/bin/dynamodb`. It requires
-the table environment variable above and follows standard AWS configuration
-for credentials, region, profile, and endpoint. These examples select the same
-profile and region used for deployment:
+`persistence.sh` is the supported local persistence command. It defaults to
+profile `dev`, region `ca-central-1`, and stack `aws-lambda-zig-demo`. It
+exports the selected profile's temporary credentials, resolves the
+`OperationsTableName` stack output, and runs the requested operation. Override
+the defaults with `PROFILE`, `REGION`, or `STACK_NAME`.
+
+To permanently delete every Operation from the resolved table, run:
 
 ```sh
-export AWS_PROFILE=dev
-export AWS_REGION=ca-central-1
+./persistence.sh delete-all
 ```
+
+`delete-all` does not require the local Zig command implementation to be built.
+It scans and counts the table, requires typing `delete`, deletes every item,
+and verifies that the table is empty. It also requires `jq` locally.
 
 Create an Operation from its unchanged input JSON view while supplying required
 tenant metadata separately. A tenant must be valid UTF-8 between 1 and 64
@@ -588,7 +571,7 @@ bytes:
 operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"echo","body":{"message":"hello","count":2}}'
 printf '%s\n' "$operation_json" \
-  | zig-out/bin/dynamodb create --tenant 'tenant-a'
+  | ./persistence.sh create --tenant 'tenant-a'
 ```
 
 Retry create with the original UUID, tenant, name, and body. When the UUID already
@@ -600,7 +583,7 @@ tenant, returns `dynamodb: operation conflict` with exit code `1`.
 Read the persistent output view:
 
 ```sh
-zig-out/bin/dynamodb read \
+./persistence.sh read \
   --id 00112233-4455-6677-8899-aabbccddeeff
 ```
 
@@ -609,13 +592,13 @@ non-null JSON result no larger than 4,096 input bytes whose compact
 serialization is also no larger than 4,096 bytes:
 
 ```sh
-zig-out/bin/dynamodb update \
+./persistence.sh update \
   --id 00112233-4455-6677-8899-aabbccddeeff \
   --state RUNNING \
   </dev/null
 
 printf '%s\n' '{"message":"done"}' \
-  | zig-out/bin/dynamodb update \
+  | ./persistence.sh update \
       --id 00112233-4455-6677-8899-aabbccddeeff \
       --state SUCCEEDED
 ```
@@ -629,32 +612,28 @@ was missing or a create/update conflict occurred. Both conflict paths emit
 `dynamodb: operation conflict`. Exit code `2` means invocation, validation,
 configuration, AWS, or internal failure.
 
-The caller running the host CLI needs `dynamodb:GetItem`, `dynamodb:PutItem`,
-and `dynamodb:UpdateItem` permissions for the table. The Lambda execution
-role's inline policy does not grant permissions to the local AWS identity.
+The caller running `persistence.sh` needs `dynamodb:GetItem`,
+`dynamodb:PutItem`, and `dynamodb:UpdateItem` permissions for the table, plus
+`cloudformation:DescribeStacks` to resolve the table output. Its `delete-all`
+command additionally needs `dynamodb:Scan` and `dynamodb:DeleteItem`. The
+Lambda execution role's inline policy does not grant these permissions to the
+local AWS identity.
 
-### Troubleshoot DynamoDB CLI configuration
+### Troubleshoot persistence command configuration
 
 `dynamodb: missing or invalid configuration` is emitted before Operation JSON
-is parsed when `OPERATIONS_TABLE_NAME` is missing or invalid, or when the AWS
-configuration chain cannot resolve settings such as the region or profile.
-Confirm table discovery succeeded without printing the account-specific name:
+is parsed when the local command implementation cannot load its AWS settings.
+`persistence.sh` supplies the resolved table name, temporary credentials, and
+region. Confirm `PROFILE`, `REGION`, and `STACK_NAME`; profiles backed by IAM
+Identity Center may need a refreshed session:
 
 ```sh
-test -n "${OPERATIONS_TABLE_NAME:-}" && printf 'table configured\n'
+aws sso login --profile "${PROFILE:-dev}"
 ```
 
-If this prints nothing, repeat the `OperationsTableName` CloudFormation query
-in section 7. Also confirm `AWS_PROFILE` and `AWS_REGION` are set as shown
-above. Profiles backed by IAM Identity Center may need a refreshed session:
-
-```sh
-aws sso login --profile "$AWS_PROFILE"
-```
-
-Changing the piped Operation JSON cannot fix this diagnostic because command
-configuration is checked before input parsing. Failures encountered while
-calling DynamoDB after configuration loading instead report
+Changing the piped Operation JSON cannot fix this diagnostic. Credential-export
+or stack-output lookup failures are reported directly by `persistence.sh`;
+DynamoDB failures after configuration loading instead report
 `dynamodb: AWS request failed`.
 
 ### Troubleshoot Lambda intake initialization
@@ -676,20 +655,11 @@ only when POST attempts submission and returns a sanitized HTTP 503.
 
 ## 10. Send, receive, and check queued Operations
 
-Builds install the host-native utility at `zig-out/bin/sqs`. It requires the
-queue URL from section 7 and follows standard AWS configuration for
-credentials, region, profile, and endpoint:
-
-```sh
-export AWS_PROFILE=dev
-export AWS_REGION=ca-central-1
-```
-
-The repository also includes `queue.sh`, which defaults to profile `dev`, region
-`ca-central-1`, and stack `aws-lambda-zig-demo`. It exports the selected
+`queue.sh` is the supported local queue command. It defaults to profile `dev`,
+region `ca-central-1`, and stack `aws-lambda-zig-demo`. It exports the selected
 profile's temporary credentials, queries the `OperationsQueueUrl` stack
-output, and runs the host utility. Override the defaults with `PROFILE`,
-`REGION`, or `STACK_NAME`.
+output, and runs the requested operation. Override the defaults with
+`PROFILE`, `REGION`, or `STACK_NAME`.
 
 Send an Operation while supplying required tenant metadata separately:
 
@@ -729,14 +699,12 @@ receipt handle. Bodies need not be JSON or canonical Operations and may contain
 embedded newlines.
 
 The consumer keeps the default SIGINT action. Ctrl-C terminates it promptly and
-the shell reports status `130`; the `queue.sh` wrapper preserves this behavior by
-replacing itself with the utility via `exec`. Interruption can occur after a
-message is flushed but before deletion completes, so an already-printed message
-may become visible and be printed again. A response missing the body or receipt
-handle is rejected without deletion. AWS, malformed-response, output, deletion,
-and internal failures stop the loop with exit code `2` and sanitized
-diagnostics. Invocation, validation, and configuration failures also exit with
-code `2`.
+the shell reports status `130`. Interruption can occur after a message is
+flushed but before deletion completes, so an already-printed message may become
+visible and be printed again. A response missing the body or receipt handle is
+rejected without deletion. AWS, malformed-response, output, deletion, and
+internal failures stop the loop with exit code `2` and sanitized diagnostics.
+Invocation, validation, and configuration failures also exit with code `2`.
 
 The caller needs these queue-scoped permissions for the commands it uses:
 
@@ -744,20 +712,16 @@ The caller needs these queue-scoped permissions for the commands it uses:
 - `sqs:ReceiveMessage` and `sqs:DeleteMessage` for `receive`
 - `sqs:GetQueueAttributes` for `check`
 
-The wrapper also needs `cloudformation:DescribeStacks`. These local caller
+`queue.sh` also needs `cloudformation:DescribeStacks`. These local caller
 permissions are independent of the Lambda role, which remains send-only for
-SQS. Top-level and subcommand help work without queue or AWS configuration.
+SQS.
 
-If `sqs: missing or invalid configuration` is emitted, confirm queue discovery
-succeeded without printing the account-specific URL:
-
-```sh
-test -n "${OPERATIONS_QUEUE_URL:-}" && printf 'queue configured\n'
-```
-
-The URL must be non-empty and at most 2,048 bytes. Configuration is checked
-before the Operation input is parsed. Service or credential failures after
-configuration loading instead report `sqs: AWS request failed`.
+If `sqs: missing or invalid configuration` is emitted, the local command
+implementation could not load its AWS settings. `queue.sh` supplies the
+resolved queue URL, temporary credentials, and region, and validates that the
+URL is non-empty. Confirm `PROFILE`, `REGION`, and `STACK_NAME`. Configuration
+is checked before Operation input is parsed; AWS failures after configuration
+loading instead report `sqs: AWS request failed`.
 
 ## 11. Update the deployed Lambda code
 

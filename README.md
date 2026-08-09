@@ -3,15 +3,15 @@
 A minimal AWS Lambda Function URL demo written in Zig.
 
 The project builds a custom `provided.al2023` Lambda runtime executable named
-`bootstrap`, a host-native PASETO v4.public utility named `paseto`, and a
-host-native DynamoDB Operation utility named `dynamodb`, and a host-native SQS
-Operation utility named `sqs`. The handler
-authenticates a PASETO v4.public bearer token before serving GET and POST
-requests through the `aws-lambda-zig` runtime package. GET returns a plain-text
-Lambda environment dump, while POST validates and hashes an Operation JSON
-document, derives required tenant metadata from the verified token subject,
-persists the Operation idempotently in DynamoDB, submits new work to SQS, and
-returns the current stored output view without the body.
+`bootstrap` and a host-native PASETO v4.public utility named `paseto`. The
+stack-aware `persistence.sh` and `queue.sh` commands manage Operations in
+DynamoDB and SQS. The handler authenticates a PASETO v4.public bearer token
+before serving GET and POST requests through the `aws-lambda-zig` runtime
+package. GET returns a plain-text Lambda environment dump, while POST validates
+and hashes an Operation JSON document, derives required tenant metadata from
+the verified token subject, persists the Operation idempotently in DynamoDB,
+submits new work to SQS, and returns the current stored output view without the
+body.
 
 ## Requirements
 
@@ -36,11 +36,11 @@ Build the stripped, single-threaded, ReleaseSafe Linux ARM64 Lambda executable:
 zig build --release -Darch=arm
 ```
 
-This also installs the host-native `zig-out/bin/paseto`,
-`zig-out/bin/dynamodb`, and `zig-out/bin/sqs` developer utilities. The Lambda
+This also installs the host-native `zig-out/bin/paseto` utility and the local
+implementations invoked by `persistence.sh` and `queue.sh`. The Lambda
 `bootstrap` and PASETO utility both use the shared PASETO implementation in
-`src/paseto.zig`; the Operation utilities use the shared model in
-`src/operation.zig`. The Lambda and host utilities reach AWS through
+`src/paseto.zig`; the persistence and queue commands use the shared model in
+`src/operation.zig`. The Lambda and local commands reach AWS through
 `src/operation_persistence.zig` and `src/operation_queue.zig`.
 
 Verify that the output is a statically linked ARM64 Linux executable:
@@ -102,45 +102,32 @@ if one is present, but that safeguard is not a secret-management system and
 does not cover differently named variables. Verification needs only
 `PASETO_PUBLIC_KEY`; it never falls back to the private key.
 
-## DynamoDB CLI
+## Persistence commands
 
-The `dynamodb` utility creates, reads, and updates Operations in the SAM
-stack's DynamoDB table. It requires `OPERATIONS_TABLE_NAME` and uses the
-standard AWS configuration chain, including `AWS_PROFILE`, `AWS_REGION`, AWS
-credential variables, shared AWS configuration files, and configured endpoint
-overrides.
+`persistence.sh` creates, reads, updates, and deletes Operations in the SAM
+stack's DynamoDB table. It defaults to profile `dev`, region
+`ca-central-1`, and stack `aws-lambda-zig-demo`. It exports temporary profile
+credentials and resolves the stack's `OperationsTableName` output. Override
+the defaults with `PROFILE`, `REGION`, or `STACK_NAME`.
+For example, `./persistence.sh read --id <uuid>` performs a stack-aware read.
 
-Discover the CloudFormation-generated table name after deploying the stack:
-
-```sh
-export AWS_PROFILE=dev
-export AWS_REGION=ca-central-1
-export OPERATIONS_TABLE_NAME="$(
-  aws cloudformation describe-stacks \
-    --stack-name aws-lambda-zig-demo \
-    --query "Stacks[0].Outputs[?OutputKey=='OperationsTableName'].OutputValue" \
-    --output text \
-    --profile "$AWS_PROFILE" \
-    --region "$AWS_REGION"
-)"
-```
-
-If the CLI reports `dynamodb: missing or invalid configuration`, it has not
-processed the Operation JSON yet. Confirm that table discovery returned a
-non-empty value without printing the account-specific table name:
+The destructive `delete-all` command can run without first building the local
+Zig command implementation:
 
 ```sh
-test -n "${OPERATIONS_TABLE_NAME:-}" && printf 'table configured\n'
+./persistence.sh delete-all
 ```
 
-The same diagnostic is used when `OPERATIONS_TABLE_NAME` is empty, longer than
-255 bytes, or not a valid DynamoDB table name, and when the AWS configuration
-chain cannot resolve settings such as the region or selected profile. Re-run
-the discovery command above, check `AWS_PROFILE` and `AWS_REGION`, and use
-`aws sso login --profile "$AWS_PROFILE"` first when the profile uses IAM
-Identity Center. Credential or service failures encountered after
-configuration loading are reported separately as `dynamodb: AWS request
-failed`.
+It scans and counts the table's Operations, requires typing `delete`, deletes
+every item, and verifies that the table is empty. It requires `jq` plus
+`cloudformation:DescribeStacks`, `dynamodb:Scan`, and `dynamodb:DeleteItem`
+permissions for the selected local AWS identity.
+
+If a persistence command reports `dynamodb: missing or invalid configuration`,
+it has not processed the Operation JSON yet. Check `PROFILE` and `REGION`, and
+use `aws sso login --profile "${PROFILE:-dev}"` when the profile uses IAM
+Identity Center. Credential or service failures encountered after configuration
+loading are reported separately as `dynamodb: AWS request failed`.
 
 Create an Operation by supplying required tenant metadata separately and
 sending the unchanged input JSON view on standard input. A tenant must be valid
@@ -150,7 +137,7 @@ UTF-8 between 1 and 64 bytes:
 operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"echo","body":{"message":"hello","count":2}}'
 printf '%s\n' "$operation_json" \
-  | zig-out/bin/dynamodb create --tenant 'tenant-a'
+  | ./persistence.sh create --tenant 'tenant-a'
 ```
 
 The Operation hash is the BLAKE3-256 digest of a JSON envelope containing only
@@ -165,14 +152,14 @@ hashes to
 `d271e3bd560113d2b82e42dfc46be33fb90b43d7f4b12114f3da4888eae445d4`.
 
 Tenant is server-owned Operation metadata rather than an input JSON field. The
-CLI accepts it only through `--tenant`, and Lambda derives it exclusively from
-the verified PASETO `sub` claim. Supplying `tenant` inside the JSON document is
-rejected to prevent spoofing.
+`create` command accepts it only through `--tenant`, and Lambda derives it
+exclusively from the verified PASETO `sub` claim. Supplying `tenant` inside the
+JSON document is rejected to prevent spoofing.
 
-Each CLI command and Lambda POST owns its Operation tenant, strings, body, and result
-through one short-lived arena. Optional absence means a field is omitted from
-that Operation view; an explicit JSON `null` remains a distinct
-`std.json.Value`. Terminal results must be present and non-null.
+Each persistence command and Lambda POST owns its Operation tenant, strings,
+body, and result through one short-lived arena. Optional absence means a field
+is omitted from that Operation view; an explicit JSON `null` remains a
+distinct `std.json.Value`. Terminal results must be present and non-null.
 
 A create is safe to retry with the original UUID, tenant, name, and body. If that UUID
 already identifies an Operation with the same Operation hash, the retry
@@ -185,7 +172,7 @@ changes the hash and returns a conflict.
 Read it with a strongly consistent DynamoDB read:
 
 ```sh
-zig-out/bin/dynamodb read \
+./persistence.sh read \
   --id 00112233-4455-6677-8899-aabbccddeeff
 ```
 
@@ -195,13 +182,13 @@ result of at most 4,096 input bytes whose compact serialization is also at most
 4,096 bytes:
 
 ```sh
-zig-out/bin/dynamodb update \
+./persistence.sh update \
   --id 00112233-4455-6677-8899-aabbccddeeff \
   --state RUNNING \
   </dev/null
 
 printf '%s\n' '{"message":"done"}' \
-  | zig-out/bin/dynamodb update \
+  | ./persistence.sh update \
       --id 00112233-4455-6677-8899-aabbccddeeff \
       --state SUCCEEDED
 ```
@@ -235,25 +222,14 @@ strict: legacy records without `tenant` are rejected and must be deleted and
 recreated before this version reads them. There is no fallback decoder or
 migration path in the application.
 
-## SQS CLI
+## Queue commands
 
-The `sqs` utility sends canonical Operations, destructively consumes queued
-messages, and checks the SAM stack's operations queue. It
-requires a non-empty `OPERATIONS_QUEUE_URL` no longer than 2,048 bytes and uses
-the standard AWS configuration chain. Top-level and subcommand help do not
-require AWS configuration:
-
-```sh
-zig-out/bin/sqs --help
-zig-out/bin/sqs send --help
-zig-out/bin/sqs receive --help
-zig-out/bin/sqs check --help
-```
-
-The `queue.sh` wrapper uses `PROFILE`, `REGION`, and `STACK_NAME`, defaulting to
-`dev`, `ca-central-1`, and `aws-lambda-zig-demo`. It exports temporary profile
-credentials, resolves the `OperationsQueueUrl` stack output, and runs the host
-utility. Send a validated Operation input like this:
+`queue.sh` sends canonical Operations, destructively consumes queued messages,
+and checks the SAM stack's operations queue. It uses `PROFILE`, `REGION`, and
+`STACK_NAME`, defaulting to `dev`, `ca-central-1`, and
+`aws-lambda-zig-demo`. It exports temporary profile credentials and resolves
+the `OperationsQueueUrl` stack output. Send a validated Operation input like
+this:
 
 ```sh
 operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
@@ -291,8 +267,7 @@ one newline, flushes standard output, and then deletes the message using its
 receipt handle. Bodies may be noncanonical, non-JSON, or contain newlines.
 
 The consumer runs until SIGINT. It keeps the default signal action, so Ctrl-C
-terminates promptly and the shell reports status `130`. The `queue.sh` wrapper's
-final `exec` passes the signal directly to the utility. Interruption can occur
+terminates promptly and the shell reports status `130`. Interruption can occur
 after output is flushed but before deletion completes; an already-printed
 message may therefore become visible and be printed again. A missing body or
 receipt handle is an invalid AWS response and is not deleted. AWS, malformed
@@ -300,9 +275,9 @@ response, output, deletion, and internal failures stop the loop with exit code
 `2` and a sanitized diagnostic. Invocation, validation, and configuration
 failures also exit with code `2`.
 
-The AWS identity running the direct utility needs `sqs:SendMessage` for
+The AWS identity running `queue.sh` needs `sqs:SendMessage` for
 `send`, `sqs:ReceiveMessage` and `sqs:DeleteMessage` for `receive`, and
-`sqs:GetQueueAttributes` for `check`. The wrapper additionally calls
+`sqs:GetQueueAttributes` for `check`. The command additionally calls
 `cloudformation:DescribeStacks`. These are caller permissions: the Lambda
 execution role remains separate and is intentionally limited to
 `sqs:SendMessage` for this queue.
@@ -474,13 +449,13 @@ or CloudFront.
 - `src/operation.zig`: Operation JSON model, validation, and hash contract.
 - `src/operation_persistence.zig`: DynamoDB Operation mapping and conditional writes.
 - `src/operation_queue.zig`: SQS Operation queue configuration and message contract.
-- `src/persistence_cli.zig`: host DynamoDB Operation persistence CLI and its tests.
-- `src/queue_cli.zig`: host SQS Operation CLI and its tests.
+- `src/persistence_cli.zig`: persistence command implementation and tests.
+- `src/queue_cli.zig`: queue command implementation and tests.
 - `src/paseto.zig`: shared PASETO v4.public issuance and verification.
 - `src/paseto_cli.zig`: host PASETO v4.public CLI and its tests.
-- `persistence.sh`: stack-aware credential and persistence wrapper for the DynamoDB CLI.
-- `queue.sh`: stack-aware credential and queue wrapper for the SQS CLI.
-- `build.zig`: Zig build graph for `bootstrap`, the host utilities, and tests.
+- `persistence.sh`: stack-aware persistence command and credential setup.
+- `queue.sh`: stack-aware queue command and credential setup.
+- `build.zig`: Zig build graph for `bootstrap`, local commands, and tests.
 - `build.zig.zon`: package metadata and pinned dependencies.
 - `template.yaml`: SAM template for the Lambda, Function URL, and permissions.
 - `docs/`: the SAM deployment guide, ADRs, and the Zig style reference.
@@ -496,7 +471,7 @@ zig fmt --check build.zig src/main.zig src/operation.zig src/operation_persisten
   src/paseto_cli.zig
 ```
 
-Run the handler, persistence, and host utility tests with:
+Run the handler and local command tests with:
 
 ```sh
 zig build test
