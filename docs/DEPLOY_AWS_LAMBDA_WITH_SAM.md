@@ -685,7 +685,7 @@ export AWS_PROFILE=dev
 export AWS_REGION=ca-central-1
 ```
 
-The repository also includes `sqs.sh`, which defaults to profile `dev`, region
+The repository also includes `queue.sh`, which defaults to profile `dev`, region
 `ca-central-1`, and stack `aws-lambda-zig-demo`. It exports the selected
 profile's temporary credentials, queries the `OperationsQueueUrl` stack
 output, and runs the host utility. Override the defaults with `PROFILE`,
@@ -696,7 +696,7 @@ Send an Operation while supplying required tenant metadata separately:
 ```sh
 operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"echo","body":{"message":"hello","count":2}}'
-printf '%s\n' "$operation_json" | ./sqs.sh send --tenant 'tenant-a'
+printf '%s\n' "$operation_json" | ./queue.sh send --tenant 'tenant-a'
 ```
 
 `send` validates the input with `src/operation.zig`, derives `last_updated`
@@ -712,13 +712,13 @@ Request every queue attribute and print one JSON object. Unknown future keys
 are retained:
 
 ```sh
-./sqs.sh check
+./queue.sh check
 ```
 
 Consume queued messages until interrupted:
 
 ```sh
-./sqs.sh receive
+./queue.sh receive
 ```
 
 This is a destructive long-running consumer. It requests one message at a time
@@ -729,7 +729,7 @@ receipt handle. Bodies need not be JSON or canonical Operations and may contain
 embedded newlines.
 
 The consumer keeps the default SIGINT action. Ctrl-C terminates it promptly and
-the shell reports status `130`; the `sqs.sh` wrapper preserves this behavior by
+the shell reports status `130`; the `queue.sh` wrapper preserves this behavior by
 replacing itself with the utility via `exec`. Interruption can occur after a
 message is flushed but before deletion completes, so an already-printed message
 may become visible and be printed again. A response missing the body or receipt

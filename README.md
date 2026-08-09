@@ -250,7 +250,7 @@ zig-out/bin/sqs receive --help
 zig-out/bin/sqs check --help
 ```
 
-The `sqs.sh` wrapper uses `PROFILE`, `REGION`, and `STACK_NAME`, defaulting to
+The `queue.sh` wrapper uses `PROFILE`, `REGION`, and `STACK_NAME`, defaulting to
 `dev`, `ca-central-1`, and `aws-lambda-zig-demo`. It exports temporary profile
 credentials, resolves the `OperationsQueueUrl` stack output, and runs the host
 utility. Send a validated Operation input like this:
@@ -258,7 +258,7 @@ utility. Send a validated Operation input like this:
 ```sh
 operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"echo","body":{"message":"hello","count":2}}'
-printf '%s\n' "$operation_json" | ./sqs.sh send --tenant 'tenant-a'
+printf '%s\n' "$operation_json" | ./queue.sh send --tenant 'tenant-a'
 ```
 
 `send` parses and validates the input through the shared Operation model using
@@ -275,13 +275,13 @@ Inspect all queue attributes, including attributes added by future AWS API
 versions:
 
 ```sh
-./sqs.sh check
+./queue.sh check
 ```
 
 Consume messages until interrupted:
 
 ```sh
-./sqs.sh receive
+./queue.sh receive
 ```
 
 `receive` is a destructive long-running consumer. It requests one message at a
@@ -291,7 +291,7 @@ one newline, flushes standard output, and then deletes the message using its
 receipt handle. Bodies may be noncanonical, non-JSON, or contain newlines.
 
 The consumer runs until SIGINT. It keeps the default signal action, so Ctrl-C
-terminates promptly and the shell reports status `130`. The `sqs.sh` wrapper's
+terminates promptly and the shell reports status `130`. The `queue.sh` wrapper's
 final `exec` passes the signal directly to the utility. Interruption can occur
 after output is flushed but before deletion completes; an already-printed
 message may therefore become visible and be printed again. A missing body or
@@ -474,11 +474,12 @@ or CloudFront.
 - `src/operation.zig`: Operation JSON model, validation, and hash contract.
 - `src/operation_persistence.zig`: DynamoDB Operation mapping and conditional writes.
 - `src/operation_queue.zig`: SQS Operation queue configuration and message contract.
-- `src/dynamodb_cli.zig`: host DynamoDB Operation persistence CLI and its tests.
-- `src/sqs_cli.zig`: host SQS Operation CLI and its tests.
+- `src/persistence_cli.zig`: host DynamoDB Operation persistence CLI and its tests.
+- `src/queue_cli.zig`: host SQS Operation CLI and its tests.
 - `src/paseto.zig`: shared PASETO v4.public issuance and verification.
 - `src/paseto_cli.zig`: host PASETO v4.public CLI and its tests.
-- `sqs.sh`: stack-aware credential and queue wrapper for the SQS CLI.
+- `persistence.sh`: stack-aware credential and persistence wrapper for the DynamoDB CLI.
+- `queue.sh`: stack-aware credential and queue wrapper for the SQS CLI.
 - `build.zig`: Zig build graph for `bootstrap`, the host utilities, and tests.
 - `build.zig.zon`: package metadata and pinned dependencies.
 - `template.yaml`: SAM template for the Lambda, Function URL, and permissions.
@@ -491,7 +492,7 @@ Run formatting checks before committing Zig changes:
 
 ```sh
 zig fmt --check build.zig src/main.zig src/operation.zig src/operation_persistence.zig \
-  src/operation_queue.zig src/dynamodb_cli.zig src/sqs_cli.zig src/paseto.zig \
+  src/operation_queue.zig src/persistence_cli.zig src/queue_cli.zig src/paseto.zig \
   src/paseto_cli.zig
 ```
 

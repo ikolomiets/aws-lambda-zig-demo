@@ -137,39 +137,39 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(cli_exe);
 
-    const dynamodb_cli_mod = b.createModule(.{
+    const persistence_cli_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = optimize,
-        .root_source_file = b.path("src/dynamodb_cli.zig"),
+        .root_source_file = b.path("src/persistence_cli.zig"),
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
             .{ .name = "operation", .module = host_operation },
             .{ .name = "operation_persistence", .module = host_operation_persistence },
         },
     });
-    const dynamodb_cli_exe = b.addExecutable(.{
+    const persistence_cli_exe = b.addExecutable(.{
         .name = "dynamodb",
-        .root_module = dynamodb_cli_mod,
+        .root_module = persistence_cli_mod,
     });
 
-    b.installArtifact(dynamodb_cli_exe);
+    b.installArtifact(persistence_cli_exe);
 
-    const sqs_cli_mod = b.createModule(.{
+    const queue_cli_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = optimize,
-        .root_source_file = b.path("src/sqs_cli.zig"),
+        .root_source_file = b.path("src/queue_cli.zig"),
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
             .{ .name = "operation", .module = host_operation },
             .{ .name = "operation_queue", .module = host_operation_queue },
         },
     });
-    const sqs_cli_exe = b.addExecutable(.{
+    const queue_cli_exe = b.addExecutable(.{
         .name = "sqs",
-        .root_module = sqs_cli_mod,
+        .root_module = queue_cli_mod,
     });
 
-    b.installArtifact(sqs_cli_exe);
+    b.installArtifact(queue_cli_exe);
 
     const test_runtime = b.dependency("aws_lambda", .{
         .target = b.graph.host,
@@ -233,15 +233,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
 
-    const dynamodb_cli_tests = b.addTest(.{
-        .root_module = dynamodb_cli_mod,
+    const persistence_cli_tests = b.addTest(.{
+        .root_module = persistence_cli_mod,
     });
-    const run_dynamodb_cli_tests = b.addRunArtifact(dynamodb_cli_tests);
+    const run_persistence_cli_tests = b.addRunArtifact(persistence_cli_tests);
 
-    const sqs_cli_tests = b.addTest(.{
-        .root_module = sqs_cli_mod,
+    const queue_cli_tests = b.addTest(.{
+        .root_module = queue_cli_mod,
     });
-    const run_sqs_cli_tests = b.addRunArtifact(sqs_cli_tests);
+    const run_queue_cli_tests = b.addRunArtifact(queue_cli_tests);
 
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_lambda_tests.step);
@@ -250,6 +250,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_operation_queue_tests.step);
     test_step.dependOn(&run_paseto_tests.step);
     test_step.dependOn(&run_cli_tests.step);
-    test_step.dependOn(&run_dynamodb_cli_tests.step);
-    test_step.dependOn(&run_sqs_cli_tests.step);
+    test_step.dependOn(&run_persistence_cli_tests.step);
+    test_step.dependOn(&run_queue_cli_tests.step);
 }
