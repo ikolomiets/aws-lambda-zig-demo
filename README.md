@@ -335,12 +335,11 @@ AWS_PROFILE=dev AWS_REGION=ca-central-1 ./lambda_logs.sh
 
 When the log file is absent or empty, the helper downloads all events retained
 in `/aws/lambda/<function-name>`. On later runs, it reads the final event's UTC
-timestamp and visible CloudWatch event ID, requests events from that millisecond
-inclusively, and appends only unseen events. Event headers use millisecond
-precision:
+timestamp and requests events beginning with the following millisecond. Event
+headers use millisecond precision:
 
 ```text
-2026-08-09T19:21:14.335 [event-id=<CloudWatch-event-id>] message
+2026-08-09T19:21:14.335 message
 ```
 
 Embedded message newlines remain as unprefixed continuation lines. The local
@@ -348,7 +347,9 @@ AWS identity needs `cloudformation:DescribeStacks` and `logs:FilterLogEvents`.
 For an expired IAM Identity Center session, run
 `aws sso login --profile "${AWS_PROFILE:-dev}"` and retry. Root-level `.log`
 files are ignored by Git because Lambda output can contain private operational
-details; treat custom copies the same way.
+details; treat custom copies the same way. Logs created by earlier versions of
+the helper with `[event-id=...]` headers are unsupported; remove or rename the
+existing log before running the updated helper.
 
 ## Deploy
 

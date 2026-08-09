@@ -86,16 +86,26 @@ trap cleanup EXIT
 readonly response_file="$temporary_dir/response.json"
 readonly selected_events_file="$temporary_dir/selected-events.json"
 readonly rendered_events_file="$temporary_dir/rendered-events.log"
-readonly cursor_ids_file="$temporary_dir/cursor-event-ids.txt"
 
 cursor_epoch_ms=-1
 start_time=0
-: >"$cursor_ids_file"
 
 if [ -s "$log_file" ]; then
+    if awk '
+        /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9][0-9][0-9] \[event-id=[^]]+\] / {
+            found = 1
+            exit
+        }
+        END {
+            exit found ? 0 : 1
+        }
+    ' "$log_file"; then
+        fail "legacy event-id headers are unsupported; remove or rename $log_file"
+    fi
+
     cursor_timestamp="$(
         awk '
-            /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9][0-9][0-9] \[event-id=[^]]+\] / {
+            /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9][0-9][0-9] / {
                 timestamp = substr($0, 1, 23)
             }
             END {
@@ -115,15 +125,7 @@ if [ -s "$log_file" ]; then
     case "$cursor_epoch_ms" in
         "" | *[!0-9]*) fail "invalid final event timestamp in $log_file" ;;
     esac
-    start_time="$cursor_epoch_ms"
-
-    awk -v timestamp="$cursor_timestamp" '
-        index($0, timestamp " [event-id=") == 1 {
-            event_id = substr($0, length(timestamp " [event-id=") + 1)
-            marker = index(event_id, "] ")
-            if (marker > 1) print substr(event_id, 1, marker - 1)
-        }
-    ' "$log_file" >"$cursor_ids_file"
+    start_time=$((cursor_epoch_ms + 1))
 fi
 
 printf '==> Downloading %s logs from %s\n' "$function_name" "$AWS_REGION"
@@ -139,7 +141,6 @@ aws logs filter-log-events \
 
 jq \
     --argjson cursor_epoch_ms "$cursor_epoch_ms" \
-    --rawfile cursor_ids "$cursor_ids_file" \
     '
         def valid_event:
             (.timestamp | type) == "number" and
@@ -156,19 +157,14 @@ jq \
         else
             .
         end
-        | ($cursor_ids
-            | split("\n")
-            | map(select(length > 0))
-            | reduce .[] as $event_id ({}; .[$event_id] = true)
-          ) as $initial_seen
         | reduce .[] as $event (
-            { events: [], last_timestamp: -1, seen: $initial_seen };
+            { events: [], last_timestamp: -1, seen: {} };
             if $event.timestamp < .last_timestamp then
                 error("CloudWatch events are not ordered by timestamp")
             else
                 .last_timestamp = $event.timestamp
                 | ($event.eventId | @uri) as $event_id
-                | if $event.timestamp < $cursor_epoch_ms or .seen[$event_id] then
+                | if $event.timestamp <= $cursor_epoch_ms or .seen[$event_id] then
                     .
                   else
                     .seen[$event_id] = true
@@ -188,9 +184,8 @@ jq -jr '
           + (((($milliseconds % 1000) + 1000) | tostring)[1:4]);
 
     .[]
-    | (.eventId | @uri) as $event_id
     | ((.timestamp | render_timestamp)
-        + " [event-id=" + $event_id + "] "
+        + " "
         + .message)
     | if endswith("\n") then . else . + "\n" end
 ' "$selected_events_file" >"$rendered_events_file" ||

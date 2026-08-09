@@ -568,12 +568,11 @@ AWS_PROFILE=dev AWS_REGION=ca-central-1 ./lambda_logs.sh
 
 The first run downloads all retained events from
 `/aws/lambda/<function-name>`. Subsequent runs parse the final event header,
-query inclusively from its millisecond timestamp, and use the visible
-CloudWatch event ID to avoid appending duplicates at that timestamp. Event
-headers contain a UTC timestamp without a timezone suffix:
+then query beginning with the following millisecond. Event headers contain a
+UTC timestamp without a timezone suffix:
 
 ```text
-2026-08-09T19:21:14.335 [event-id=<CloudWatch-event-id>] message
+2026-08-09T19:21:14.335 message
 ```
 
 Embedded newlines remain as unprefixed continuation lines. The script stages
@@ -587,7 +586,10 @@ aws sso login --profile "${AWS_PROFILE:-dev}"
 ```
 
 The derived root-level `.log` file is ignored by Git. Lambda logs can contain
-private operational data, so do not publish or commit copied log files.
+private operational data, so do not publish or commit copied log files. Logs
+created by earlier versions of the helper with `[event-id=...]` headers are
+unsupported; remove or rename the existing log before running the updated
+helper.
 
 ## 10. Create, read, update, and delete persisted Operations
 
