@@ -257,21 +257,15 @@ recreated before deploying this version; there is no fallback decoder or
 application migration path. CloudFormation configures TTL, so the Lambda role
 does not need an additional DynamoDB control-plane permission.
 
-The Function URLs use `AuthType: NONE`, buffered invocation, wildcard origins
-and headers, and method-specific CORS: intake allows only POST and query allows
-only GET. Their public permissions use the existing intake logical IDs and new
+The Function URLs use `AuthType: NONE` and buffered invocation. CORS is not
+configured because the service targets non-browser HTTP clients. The handlers
+enforce the supported methods: intake allows only POST and query allows only
+GET. Their public permissions use the existing intake logical IDs and new
 query-specific logical IDs.
 
 ```yaml
 AuthType: NONE
 InvokeMode: BUFFERED
-Cors:
-  AllowOrigins:
-    - "*"
-  AllowMethods:
-    - POST # intake; query uses GET
-  AllowHeaders:
-    - "*"
 ```
 
 `AuthType: NONE` and `Principal: "*"` make the Function URL public.
