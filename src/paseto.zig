@@ -777,7 +777,7 @@ test "PASETO V4.local dependency compatibility" {
     const key = "0123456789abcdef0123456789abcdef";
     const message = "zig-paseto compatibility";
     const footer = "kid=integration-test";
-    const implicit = "tenant=aws-lambda-zig-demo";
+    const implicit = "tenant=intake-lambda";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -823,7 +823,7 @@ test "PASETO V4.local rejects invalid key sizes" {
 
 test "PASETO V4.local rejects authenticated mutations" {
     const key = "0123456789abcdef0123456789abcdef";
-    const implicit = "tenant=aws-lambda-zig-demo";
+    const implicit = "tenant=intake-lambda";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -857,7 +857,7 @@ test "PASETO V4.local rejects the wrong implicit assertion" {
     var encoder = implementation.V4Local.init(allocator);
     defer encoder.deinit();
     try encoder.withMessage("zig-paseto compatibility");
-    try encoder.withImplicit("tenant=aws-lambda-zig-demo");
+    try encoder.withImplicit("tenant=intake-lambda");
     var random = std.Random.DefaultPrng.init(0x494d504c49434954);
     const token = try encoder.encode(random.random(), key);
     defer allocator.free(token);

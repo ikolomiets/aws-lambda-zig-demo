@@ -1,4 +1,4 @@
-# Deploy `lambda.zip` to AWS Lambda with SAM
+# Deploy `intake-lambda.zip` to AWS Lambda with SAM
 
 This guide documents how to deploy the Zig Lambda package in this repository
 using AWS SAM and `template.yaml`.
@@ -14,7 +14,7 @@ queue, public Function URL, and Function URL permissions.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
-- `lambda.zip` exists and contains a Linux ARM64 executable named `bootstrap`.
+- `intake-lambda.zip` exists and contains a Linux ARM64 executable named `bootstrap`.
 - The Lambda Function URL is intentionally public for demo HTTP GET and POST testing.
 - `LAMBDA_PRINCIPAL` defaults to `'*'` unless you override the
   `LambdaPrincipal` template parameter.
@@ -60,7 +60,7 @@ zig build --release -Darch=arm
 
 The build also installs the host-native `paseto` utility and the local command
 implementations invoked by `persistence.sh` and `queue.sh`. Only `bootstrap` is
-packaged into `lambda.zip`.
+packaged into `intake-lambda.zip`.
 
 Verify that the built artifact is a Linux ARM64 executable.
 
@@ -74,13 +74,13 @@ Expected executable shape:
 ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
 ```
 
-Create or refresh `lambda.zip`.
+Create or refresh `intake-lambda.zip`.
 
 ```sh
-zip -qj lambda.zip zig-out/bin/bootstrap
+zip -qj intake-lambda.zip zig-out/bin/bootstrap
 ```
 
-SAM reads this zip from the `CodeUri: lambda.zip` property in `template.yaml`.
+SAM reads this zip from the `CodeUri: intake-lambda.zip` property in `template.yaml`.
 
 ## 3. Validate the SAM template
 
@@ -108,8 +108,8 @@ Both commands should report that `template.yaml` is valid.
 
 - `OperationsTable`: `AWS::DynamoDB::Table`
 - `OperationsQueue`: `AWS::SQS::Queue`
-- `DemoFunction`: `AWS::Serverless::Function`
-- `DemoFunctionUrl`: `AWS::Lambda::Url`
+- `IntakeFunction`: `AWS::Serverless::Function`
+- `IntakeFunctionUrl`: `AWS::Lambda::Url`
 - `FunctionUrlInvokeFunctionUrlPermission`: allows `lambda:InvokeFunctionUrl`
 - `FunctionUrlInvokeFunctionPermission`: allows `lambda:InvokeFunction` only
   through the Function URL
@@ -275,10 +275,24 @@ tokens.
 The template defaults to:
 
 ```text
-aws-lambda-zig-demo
+intake-lambda
 ```
 
 You can keep the default or override it during deployment with the `FunctionName` parameter.
+
+The default stack name remains `aws-lambda-zig-demo`. Deploy this rename to that
+existing stack so CloudFormation updates it in place. The renamed function and
+Function URL logical IDs cause CloudFormation to replace the Lambda, Function
+URL, URL permissions, and generated function role; the Function URL therefore
+changes. The `OperationsTable` and `OperationsQueue` logical IDs are unchanged,
+so their persisted and queued data remain attached to the stack. Lambda does
+not automatically delete the prior function's CloudWatch log group, which may
+remain as historical data. Removing historical cloud resources is outside this
+deployment flow.
+
+If `samconfig.toml` contains a saved `FunctionName` override from an earlier
+deployment, update it to `intake-lambda` or pass the parameter explicitly;
+saved overrides take precedence over the template default.
 
 The `LambdaPrincipal` parameter defaults to:
 
@@ -315,7 +329,7 @@ sam deploy --guided \
   --region ca-central-1 \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
-    FunctionName=aws-lambda-zig-demo \
+    FunctionName=intake-lambda \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -325,7 +339,7 @@ Recommended guided answers:
 ```text
 Stack Name: aws-lambda-zig-demo
 AWS Region: ca-central-1
-Parameter FunctionName: aws-lambda-zig-demo
+Parameter FunctionName: intake-lambda
 Parameter LambdaPrincipal: *
 Parameter PasetoPublicKey: <public-key-from-keygen>
 Confirm changes before deploy: Y
@@ -358,7 +372,7 @@ sam deploy \
   --no-confirm-changeset \
   --no-fail-on-empty-changeset \
   --parameter-overrides \
-    FunctionName=aws-lambda-zig-demo \
+    FunctionName=intake-lambda \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -388,7 +402,7 @@ request returns HTTP 401, then verifies that the authenticated request returns
 HTTP 200. The private key and test token are not printed or passed to the
 Lambda environment. Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run` to run the
-local checks, rebuild `lambda.zip`, and validate `template.yaml` without
+local checks, rebuild `intake-lambda.zip`, and validate `template.yaml` without
 deploying to AWS.
 
 For non-dry-run deployments, the helper resolves and verifies the selected AWS
@@ -558,7 +572,7 @@ function:
 
 The stack name is fixed as `aws-lambda-zig-demo`. The helper resolves the
 stack's `FunctionName` output and writes a root-level file named after that
-function, such as `aws-lambda-zig-demo.log`. It uses only the standard
+function, such as `intake-lambda.log`. It uses only the standard
 `AWS_PROFILE` and `AWS_REGION` environment variables, defaulting to `dev` and
 `ca-central-1`:
 
@@ -775,7 +789,7 @@ After changing Zig source code, rebuild and repackage:
 
 ```sh
 zig build --release -Darch=arm
-zip -qj lambda.zip zig-out/bin/bootstrap
+zip -qj intake-lambda.zip zig-out/bin/bootstrap
 ```
 
 Then redeploy the stack:
@@ -784,7 +798,7 @@ Then redeploy the stack:
 sam deploy --profile dev --region ca-central-1
 ```
 
-SAM uploads the new `lambda.zip` and updates the CloudFormation-managed Lambda function.
+SAM uploads the new `intake-lambda.zip` and updates the CloudFormation-managed Lambda function.
 
 ## 13. Delete the SAM stack
 

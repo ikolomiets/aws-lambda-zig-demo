@@ -1,11 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Deploy the aws-lambda-zig demo function with a public Lambda Function URL.
+Description: Deploy the intake Lambda with a public Lambda Function URL.
 
 Parameters:
   FunctionName:
     Type: String
-    Default: aws-lambda-zig-demo
+    Default: intake-lambda
     Description: Name of the Lambda function to create.
   LambdaPrincipal:
     Type: String
@@ -39,12 +39,12 @@ Resources:
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
 
-  DemoFunction:
+  IntakeFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Ref FunctionName
-      Description: Demo function built with aws-lambda-zig.
-      CodeUri: lambda.zip
+      Description: Intake function built with aws-lambda-zig.
+      CodeUri: intake-lambda.zip
       Runtime: provided.al2023
       Handler: bootstrap
       Architectures:
@@ -72,10 +72,10 @@ Resources:
           OPERATIONS_TABLE_NAME: !Ref OperationsTable
           PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 
-  DemoFunctionUrl:
+  IntakeFunctionUrl:
     Type: AWS::Lambda::Url
     Properties:
-      TargetFunctionArn: !GetAtt DemoFunction.Arn
+      TargetFunctionArn: !GetAtt IntakeFunction.Arn
       AuthType: NONE
       InvokeMode: BUFFERED
       Cors:
@@ -89,18 +89,18 @@ Resources:
 
   FunctionUrlInvokeFunctionUrlPermission:
     Type: AWS::Lambda::Permission
-    DependsOn: DemoFunctionUrl
+    DependsOn: IntakeFunctionUrl
     Properties:
-      FunctionName: !Ref DemoFunction
+      FunctionName: !Ref IntakeFunction
       Action: lambda:InvokeFunctionUrl
       Principal: "*"
       FunctionUrlAuthType: NONE
 
   FunctionUrlInvokeFunctionPermission:
     Type: AWS::Lambda::Permission
-    DependsOn: DemoFunctionUrl
+    DependsOn: IntakeFunctionUrl
     Properties:
-      FunctionName: !Ref DemoFunction
+      FunctionName: !Ref IntakeFunction
       Action: lambda:InvokeFunction
       Principal: "*"
       InvokedViaFunctionUrl: true
@@ -114,10 +114,10 @@ Outputs:
     Value: !Ref OperationsQueue
   FunctionName:
     Description: Deployed Lambda function name.
-    Value: !Ref DemoFunction
+    Value: !Ref IntakeFunction
   FunctionArn:
     Description: Deployed Lambda function ARN.
-    Value: !GetAtt DemoFunction.Arn
+    Value: !GetAtt IntakeFunction.Arn
   FunctionUrl:
     Description: Public Lambda Function URL.
-    Value: !GetAtt DemoFunctionUrl.FunctionUrl
+    Value: !GetAtt IntakeFunctionUrl.FunctionUrl

@@ -12,7 +12,7 @@ usage() {
     cat <<'EOF'
 Usage: ./lambda_logs.sh
 
-Download the aws-lambda-zig-demo Lambda logs and append new CloudWatch events
+Download the intake-lambda logs and append new CloudWatch events
 to <function-name>.log in this repository.
 
 Environment overrides:

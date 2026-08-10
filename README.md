@@ -25,9 +25,14 @@ The deployment docs use:
 
 - AWS profile: `dev`
 - Region: `ca-central-1`
-- Function name: `aws-lambda-zig-demo`
+- Function name: `intake-lambda`
 
 Adjust those values for your AWS account as needed.
+
+Deploy the rename to the existing `aws-lambda-zig-demo` stack. CloudFormation
+replaces the Lambda, Function URL, URL permissions, and generated function role,
+so the URL changes. The unchanged table and queue resources remain in the stack,
+preserving persisted Operations and queued messages.
 
 ## Build
 
@@ -59,10 +64,10 @@ ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
 Package the executable for Lambda:
 
 ```sh
-zip -qj lambda.zip zig-out/bin/bootstrap
+zip -qj intake-lambda.zip zig-out/bin/bootstrap
 ```
 
-`lambda.zip` is intentionally ignored by Git because it is a generated
+`intake-lambda.zip` is intentionally ignored by Git because it is a generated
 deployment artifact.
 
 ## PASETO CLI
@@ -320,7 +325,7 @@ sanitized HTTP 500 and SQS send failures return a sanitized HTTP 503.
 `lambda_logs.sh` downloads the Lambda's CloudWatch events into a root-level
 file named after the deployed function. The stack name is fixed as
 `aws-lambda-zig-demo`; the script resolves its `FunctionName` output and, for
-the default deployment, writes `aws-lambda-zig-demo.log`.
+the default deployment, writes `intake-lambda.log`.
 
 ```sh
 ./lambda_logs.sh
@@ -365,7 +370,7 @@ sam deploy --guided \
   --region ca-central-1 \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
-    FunctionName=aws-lambda-zig-demo \
+    FunctionName=intake-lambda \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -482,7 +487,7 @@ or CloudFront.
 
 ## Project Layout
 
-- `src/main.zig`: Lambda entrypoint and request handler.
+- `src/intake_lambda.zig`: Lambda entrypoint and request handler.
 - `src/operation.zig`: Operation JSON model, validation, and hash contract.
 - `src/operation_persistence.zig`: DynamoDB Operation mapping and conditional writes.
 - `src/operation_queue.zig`: SQS Operation queue configuration and message contract.
@@ -504,7 +509,7 @@ or CloudFront.
 Run formatting checks before committing Zig changes:
 
 ```sh
-zig fmt --check build.zig src/main.zig src/operation.zig src/operation_persistence.zig \
+zig fmt --check build.zig src/intake_lambda.zig src/operation.zig src/operation_persistence.zig \
   src/operation_queue.zig src/persistence_cli.zig src/queue_cli.zig src/paseto.zig \
   src/paseto_cli.zig
 ```

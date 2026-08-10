@@ -4,7 +4,7 @@ set -euo pipefail
 PROFILE="${PROFILE:-dev}"
 REGION="${REGION:-ca-central-1}"
 STACK_NAME="${STACK_NAME:-aws-lambda-zig-demo}"
-FUNCTION_NAME="${FUNCTION_NAME:-aws-lambda-zig-demo}"
+FUNCTION_NAME="${FUNCTION_NAME:-intake-lambda}"
 LAMBDA_PRINCIPAL="${LAMBDA_PRINCIPAL:-*}"
 PASETO_PUBLIC_KEY="${PASETO_PUBLIC_KEY:-}"
 LOCAL_AWS_LAMBDA_ROOT="${LOCAL_AWS_LAMBDA_ROOT:-../aws-lambda-zig}"
@@ -22,7 +22,7 @@ Options:
   --profile NAME         AWS CLI profile. Defaults to $PROFILE or dev.
   --region NAME          AWS region. Defaults to $REGION or ca-central-1.
   --stack-name NAME      CloudFormation stack name. Defaults to aws-lambda-zig-demo.
-  --function-name NAME   Lambda function name. Defaults to aws-lambda-zig-demo.
+  --function-name NAME   Lambda function name. Defaults to intake-lambda.
   --lambda-principal VALUE
                          LAMBDA_PRINCIPAL environment value. Defaults to *.
   --use-local-libs       Use local dependency checkouts with zig build --fork.
@@ -254,7 +254,7 @@ cleanup() {
 trap cleanup EXIT
 
 printf '==> Checking Zig formatting\n'
-zig fmt --check build.zig src/main.zig src/paseto.zig src/paseto_cli.zig
+zig fmt --check build.zig src/intake_lambda.zig src/paseto.zig src/paseto_cli.zig
 
 ZIG_BUILD_ARGS=(
     --cache-dir "$CACHE_DIR"
@@ -281,8 +281,8 @@ case "$artifact_type" in
 esac
 printf '%s\n' "$artifact_type"
 
-printf '==> Refreshing lambda.zip\n'
-zip -qj lambda.zip zig-out/bin/bootstrap
+printf '==> Refreshing intake-lambda.zip\n'
+zip -qj intake-lambda.zip zig-out/bin/bootstrap
 
 printf '==> Validating SAM template\n'
 sam validate --template-file template.yaml --region "$REGION"

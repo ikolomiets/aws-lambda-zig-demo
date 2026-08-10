@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
     const lambda_mod = b.createModule(.{
         .target = lambda_target,
         .optimize = optimize,
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/intake_lambda.zig"),
         .strip = true,
         .single_threaded = true,
         .imports = &.{
@@ -177,7 +177,7 @@ pub fn build(b: *std.Build) void {
     const lambda_test_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .Debug,
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/intake_lambda.zig"),
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
             .{ .name = "aws-lambda", .module = test_runtime },
