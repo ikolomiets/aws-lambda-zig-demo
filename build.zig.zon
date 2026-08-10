@@ -37,12 +37,12 @@
             .hash = "aws_sdk-0.0.1-ApQSL17Y_xOC5IhLm247KBZKDcbCRU3qf7GiiiRHcrND",
         },
         .aws_lambda = .{
-            .url = "git+https://github.com/ikolomiets/aws-lambda-zig?ref=c1bd144db63a0a6b4fbdcbed8254e358bde2fe3f#c1bd144db63a0a6b4fbdcbed8254e358bde2fe3f",
-            .hash = "aws_lambda-0.6.1-AMNperHkAQCbP7W44mgEFfcEZCky4HLXZs3HABrMzGOF",
+            .url = "git+https://github.com/ikolomiets/aws-lambda-zig?ref=agent/fix-sqs-review-findings#e3b15bf9b820ba0ad16be50e7d988bb114800c72",
+            .hash = "aws_lambda-0.6.1-AMNperBSAgB3pq0PRvzPA-wbtTTFp5MbNAS7Y33CZ62d",
         },
         .zig_paseto = .{
-            .url = "git+https://github.com/deatil/zig-paseto?ref=d5d43e20c5ba128b879fcb913c96894466bee0ac#d5d43e20c5ba128b879fcb913c96894466bee0ac",
-            .hash = "zig_paseto-1.1.5-hHOU6rOfBAC8c9AR96sTctAf_LIc31QHfHsKL1xil_LQ",
+            .url = "git+https://github.com/ikolomiets/zig-paseto?ref=main#35b4ae94c88bbdad3c0f634e48e0a4f1c5bc4f28",
+            .hash = "zig_paseto-1.1.6-hHOU6rWfBABjVVnH_iCpsyaGU2J4x0_QdtZ8DkkBOVMh",
         },
     },
     .paths = .{
