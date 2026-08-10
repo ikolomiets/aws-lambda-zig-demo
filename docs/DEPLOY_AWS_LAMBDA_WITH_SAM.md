@@ -1,21 +1,23 @@
-# Deploy `intake-lambda.zip` to AWS Lambda with SAM
+# Deploy the intake and query Lambdas with SAM
 
-This guide documents how to deploy the Zig Lambda package in this repository
+This guide documents how to deploy the two Zig Lambda packages in this repository
 using AWS SAM and `template.yaml`.
 
-SAM deploys the Lambda function as a CloudFormation-managed stack. It creates
-the Lambda function, execution role, DynamoDB operations table, SQS operations
-queue, public Function URL, and Function URL permissions.
+SAM deploys both Lambda functions as one CloudFormation-managed stack. It creates
+their execution roles and public Function URLs plus the DynamoDB operations table
+and SQS operations queue used only by the intake Lambda.
 
 ## Assumptions
 
 - AWS CLI v2 and SAM CLI are installed.
+- `zip`, `unzip`, and `file` are installed for package validation.
 - `jq` is installed when using `lambda_logs.sh`.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
-- `intake-lambda.zip` exists and contains a Linux ARM64 executable named `bootstrap`.
-- The Lambda Function URL is intentionally public for demo HTTP GET and POST testing.
+- `intake-lambda.zip` and `query-lambda.zip` each contain one Linux ARM64
+  executable named `bootstrap`.
+- Both Lambda Function URLs are intentionally public for authenticated demo testing.
 - `LAMBDA_PRINCIPAL` defaults to `'*'` unless you override the
   `LambdaPrincipal` template parameter.
 - `PASETO_PUBLIC_KEY` contains the padded Base64 Ed25519 public key generated
@@ -49,9 +51,9 @@ a browser. If resolution or verification fails for a directly configured SSO
 profile, the helper runs `aws sso login --profile <profile>` once and retries.
 Direct `sam` and `aws` commands in this guide still require an active session.
 
-## 2. Build and package the Zig Lambda
+## 2. Build and package the Zig Lambdas
 
-Build the stripped, single-threaded, ReleaseSafe Lambda executable for AWS
+Build the stripped, single-threaded, ReleaseSafe Lambda executables for AWS
 Lambda ARM64.
 
 ```sh
@@ -59,13 +61,13 @@ zig build --release -Darch=arm
 ```
 
 The build also installs the host-native `paseto` utility and the local command
-implementations invoked by `persistence.sh` and `queue.sh`. Only `bootstrap` is
-packaged into `intake-lambda.zip`.
+implementations invoked by `persistence.sh` and `queue.sh`. Each Lambda zip
+contains only its handler's root-level `bootstrap`.
 
-Verify that the built artifact is a Linux ARM64 executable.
+Verify that both built artifacts are Linux ARM64 executables.
 
 ```sh
-file zig-out/bin/bootstrap
+file zig-out/bin/intake/bootstrap zig-out/bin/query/bootstrap
 ```
 
 Expected executable shape:
@@ -74,13 +76,14 @@ Expected executable shape:
 ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
 ```
 
-Create or refresh `intake-lambda.zip`.
+Create or refresh both packages.
 
 ```sh
-zip -qj intake-lambda.zip zig-out/bin/bootstrap
+zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
+zip -qj query-lambda.zip zig-out/bin/query/bootstrap
 ```
 
-SAM reads this zip from the `CodeUri: intake-lambda.zip` property in `template.yaml`.
+SAM reads the packages from the matching `CodeUri` properties in `template.yaml`.
 
 ## 3. Validate the SAM template
 
@@ -113,8 +116,14 @@ Both commands should report that `template.yaml` is valid.
 - `FunctionUrlInvokeFunctionUrlPermission`: allows `lambda:InvokeFunctionUrl`
 - `FunctionUrlInvokeFunctionPermission`: allows `lambda:InvokeFunction` only
   through the Function URL
+- `QueryFunction`: `AWS::Serverless::Function`
+- `QueryFunctionUrl`: `AWS::Lambda::Url`
+- `QueryFunctionUrlInvokeFunctionUrlPermission`: allows `lambda:InvokeFunctionUrl`
+- `QueryFunctionUrlInvokeFunctionPermission`: allows `lambda:InvokeFunction` only
+  through the query Function URL
 
-The function settings are:
+Both functions share the runtime, architecture, memory, timeout, and environment
+settings below. Only the intake function receives the inline DynamoDB and SQS policy:
 
 ```yaml
 Runtime: provided.al2023
@@ -145,18 +154,20 @@ Environment:
     PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 ```
 
-The inline policy grants the function only `GetItem`, `PutItem`, and
+The inline policy grants the intake function only `GetItem`, `PutItem`, and
 `UpdateItem` access to this stack's operations table. The
 `OPERATIONS_TABLE_NAME` environment variable contains the
 CloudFormation-generated physical table name. `OPERATIONS_QUEUE_URL` contains
 the stack queue's generated URL. Both are mandatory: before starting the Lambda
 invocation loop, the bootstrap loads one shared AWS configuration and
 initializes the Operation persistence and queue modules with the validated
-table name and non-empty, at-most-2,048-byte queue URL. Each module privately
+table name and non-empty, at-most-2,048-byte queue URL. Each intake module privately
 owns its respective DynamoDB or SQS client; both clients share the AWS
 configuration and HTTP pool. The module values, configuration, pool, and intake
 adapter are reused across warm invocations. Missing or invalid configuration
-therefore prevents all invocation handling, including GET. The local
+therefore prevents intake invocation handling. The query function mirrors the
+table and queue environment variables only for display; it initializes no AWS
+client and has no DynamoDB or SQS data-plane permissions. The local
 persistence and queue command implementations use the same modules and
 contracts.
 
@@ -246,7 +257,10 @@ recreated before deploying this version; there is no fallback decoder or
 application migration path. CloudFormation configures TTL, so the Lambda role
 does not need an additional DynamoDB control-plane permission.
 
-The Function URL settings are:
+The Function URLs use `AuthType: NONE`, buffered invocation, wildcard origins
+and headers, and method-specific CORS: intake allows only POST and query allows
+only GET. Their public permissions use the existing intake logical IDs and new
+query-specific logical IDs.
 
 ```yaml
 AuthType: NONE
@@ -255,8 +269,7 @@ Cors:
   AllowOrigins:
     - "*"
   AllowMethods:
-    - GET
-    - POST
+    - POST # intake; query uses GET
   AllowHeaders:
     - "*"
 ```
@@ -270,29 +283,58 @@ inside the function. It does not change the Function URL resource permissions.
 `PASETO_PUBLIC_KEY` used by the handler to verify PASETO v4.public bearer
 tokens.
 
-## 5. Choose the function name and environment values
+## 5. Preserve the intake function name and choose environment values
 
 The template defaults to:
 
 ```text
 intake-lambda
+query-lambda
 ```
 
-You can keep the default or override it during deployment with the `FunctionName` parameter.
+They are controlled by `IntakeFunctionName` and `QueryFunctionName`. Before
+updating an existing stack, resolve the current intake physical name and reuse
+it exactly:
 
-The default stack name remains `aws-lambda-zig-demo`. Deploy this rename to that
-existing stack so CloudFormation updates it in place. The renamed function and
-Function URL logical IDs cause CloudFormation to replace the Lambda, Function
-URL, URL permissions, and generated function role; the Function URL therefore
-changes. The `OperationsTable` and `OperationsQueue` logical IDs are unchanged,
-so their persisted and queued data remain attached to the stack. Lambda does
-not automatically delete the prior function's CloudWatch log group, which may
-remain as historical data. Removing historical cloud resources is outside this
-deployment flow.
+```sh
+intake_function_name="$(
+  aws cloudformation describe-stack-resource \
+    --stack-name aws-lambda-zig-demo \
+    --logical-resource-id IntakeFunction \
+    --query StackResourceDetail.PhysicalResourceId \
+    --output text \
+    --profile dev \
+    --region ca-central-1
+)"
+printf '%s\n' "$intake_function_name"
+```
 
-If `samconfig.toml` contains a saved `FunctionName` override from an earlier
-deployment, update it to `intake-lambda` or pass the parameter explicitly;
-saved overrides take precedence over the template default.
+Pass that value as `IntakeFunctionName`. `deploy.sh` performs the same preflight
+and stops before building or deploying if the requested name differs. Use
+`./deploy.sh --migration-check-only` to run only this guard. An absent stack is
+accepted as a first deployment; a matching existing name is accepted; a
+mismatch is rejected. The `IntakeFunction`, `IntakeFunctionUrl`,
+`FunctionUrlInvokeFunctionUrlPermission`, and
+`FunctionUrlInvokeFunctionPermission` logical IDs remain unchanged, so this
+guard keeps the current intake Lambda and URL managed in place.
+
+For a first deployment with no stack, set `intake_function_name=intake-lambda`
+before using the direct SAM commands below.
+
+Remove obsolete `FunctionName=...` entries from `samconfig.toml`, then add
+`IntakeFunctionName=<existing-physical-name>` and
+`QueryFunctionName=query-lambda` if parameter overrides are saved there. The
+removed `FunctionName` parameter and generic function outputs were template
+interfaces, not physical resources, so they require no cleanup.
+
+The automated flow never deletes cloud resources. If an operator deliberately
+changes the physical intake name outside this guard, CloudFormation replaces
+the function because [`FunctionName` changes require replacement](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-lambda-function.html)
+and CloudFormation normally [deletes replaced resources during update cleanup](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-cfn-updating-stacks-update-behaviors.html).
+Review stack events for `DELETE_FAILED`. After validating the replacement,
+inspect the old `/aws/lambda/<old-name>` log group and delete it explicitly if
+it is no longer required; deleting a Lambda does not delete its log group
+([Lambda logging guidance](https://docs.aws.amazon.com/lambda/latest/dg/nodejs-logging.html)).
 
 The `LambdaPrincipal` parameter defaults to:
 
@@ -329,7 +371,8 @@ sam deploy --guided \
   --region ca-central-1 \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
-    FunctionName=intake-lambda \
+    IntakeFunctionName="$intake_function_name" \
+    QueryFunctionName=query-lambda \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -339,7 +382,8 @@ Recommended guided answers:
 ```text
 Stack Name: aws-lambda-zig-demo
 AWS Region: ca-central-1
-Parameter FunctionName: intake-lambda
+Parameter IntakeFunctionName: <existing-physical-name-or-intake-lambda>
+Parameter QueryFunctionName: query-lambda
 Parameter LambdaPrincipal: *
 Parameter PasetoPublicKey: <public-key-from-keygen>
 Confirm changes before deploy: Y
@@ -350,7 +394,7 @@ SAM configuration file: samconfig.toml
 SAM configuration environment: default
 ```
 
-`CAPABILITY_IAM` is required because SAM creates an IAM execution role for the Lambda function.
+`CAPABILITY_IAM` is required because SAM creates IAM execution roles for both functions.
 
 After the first guided deployment, SAM can reuse `samconfig.toml`, so future
 deployments are usually:
@@ -372,7 +416,8 @@ sam deploy \
   --no-confirm-changeset \
   --no-fail-on-empty-changeset \
   --parameter-overrides \
-    FunctionName=intake-lambda \
+    IntakeFunctionName="$intake_function_name" \
+    QueryFunctionName=query-lambda \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -395,14 +440,14 @@ LAMBDA_PRINCIPAL='<lambda-principal>' ./deploy.sh
 ```
 
 `deploy.sh` reads the required `PASETO_PUBLIC_KEY` from the host environment and
-passes it as the `PasetoPublicKey` SAM parameter. When the post-deploy Function
-URL check is enabled, it also requires the corresponding `PASETO_PRIVATE_KEY`
-to issue a 10-second test token. It first verifies that an unauthenticated
-request returns HTTP 401, then verifies that the authenticated request returns
-HTTP 200. The private key and test token are not printed or passed to the
+passes it as the `PasetoPublicKey` SAM parameter. When post-deploy checks are
+enabled, it also requires the corresponding `PASETO_PRIVATE_KEY` to issue a
+short-lived test token. It verifies unauthenticated HTTP 401 for both URLs,
+authenticated query GET 200, authenticated wrong methods 405, and an
+authenticated bodyless intake POST 400. The private key and test token are not printed or passed to the
 Lambda environment. Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run` to run the
-local checks, rebuild `intake-lambda.zip`, and validate `template.yaml` without
+local checks, rebuild both Lambda zip archives, and validate `template.yaml` without
 deploying to AWS.
 
 For non-dry-run deployments, the helper resolves and verifies the selected AWS
@@ -416,14 +461,14 @@ Non-SSO profile failures stop without attempting SSO login. Dry runs make no AWS
 authentication calls, and the helper does not print or write resolved
 credentials.
 
-After a successful deployment, `deploy.sh` reads the
-`OperationsTableName` stack output, waits for the table to exist, and prints a
+After a successful deployment, `deploy.sh` resolves the
+`OperationsTable` physical resource, waits for the table to exist, and prints a
 concise table summary. It fails unless the table is active, uses on-demand
 billing, has only the `id` string partition key, and has no local or global
-secondary indexes. It then reads the `OperationsQueueUrl` output and calls
+secondary indexes. It then resolves the `OperationsQueue` physical resource and calls
 `GetQueueAttributes` to print a concise SQS summary. This probe verifies that
 the deployed queue can be queried but does not enforce SQS attribute values.
-The existing Function URL checks then continue as usual.
+The intake and query Function URL checks then run.
 
 Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run --use-local-libs`
@@ -435,10 +480,12 @@ to `../aws-lambda-zig`; override it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
 After deployment, SAM prints stack outputs. Look for:
 
 ```text
-FunctionName
-FunctionUrl
-OperationsTableName
-OperationsQueueUrl
+IntakeFunctionName
+IntakeFunctionArn
+IntakeFunctionUrl
+QueryFunctionName
+QueryFunctionArn
+QueryFunctionUrl
 ```
 
 You can also query it later with CloudFormation:
@@ -446,22 +493,25 @@ You can also query it later with CloudFormation:
 ```sh
 aws cloudformation describe-stacks \
   --stack-name aws-lambda-zig-demo \
-  --query "Stacks[0].Outputs[?OutputKey=='FunctionUrl'].OutputValue" \
+  --query "Stacks[0].Outputs[?OutputKey=='QueryFunctionUrl'].OutputValue" \
   --output text \
   --profile dev \
   --region ca-central-1
 ```
 
-`persistence.sh`, `queue.sh`, and `lambda_logs.sh` resolve the operations table
-name, queue URL, and function name from these stack outputs automatically;
-normal local command use does not require exporting those values.
+`lambda_logs.sh` resolves the explicit intake or query function-name output.
+`persistence.sh` and `queue.sh` resolve the `OperationsTable` and
+`OperationsQueue` physical resources directly because those data-plane names
+are intentionally not public stack outputs. Normal local command use does not
+require exporting those values.
 
-## 8. Test HTTP GET and POST
+## 8. Test query GET and intake POST
 
-Call the Function URL returned by SAM.
+Call both Function URLs returned by SAM.
 
 ```sh
-curl -i -L <FunctionUrl>
+curl -i -L <IntakeFunctionUrl>
+curl -i -L <QueryFunctionUrl>
 ```
 
 An unauthenticated request is rejected by the handler:
@@ -484,7 +534,7 @@ token="$(
 Send the token in the authorization header:
 
 ```sh
-curl -L -H "Authorization: Bearer $token" <FunctionUrl>
+curl -L -H "Authorization: Bearer $token" <QueryFunctionUrl>
 ```
 
 Expected authenticated response:
@@ -521,7 +571,7 @@ curl -L \
   --data \
     '{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"echo","body":{"message":"hello","count":2}}' \
-  <FunctionUrl>
+  <IntakeFunctionUrl>
 ```
 
 For a new ID, the handler persists `NEW`, submits the full Operation to SQS,
@@ -563,21 +613,21 @@ Operation ID and hash idempotently.
 
 ## 9. Download Lambda logs
 
-Run the stack-aware log helper to download CloudWatch events for the deployed
-function:
+Run the stack-aware log helper with an explicit Lambda selection:
 
 ```sh
-./lambda_logs.sh
+./lambda_logs.sh intake
+./lambda_logs.sh query
 ```
 
-The stack name is fixed as `aws-lambda-zig-demo`. The helper resolves the
-stack's `FunctionName` output and writes a root-level file named after that
-function, such as `intake-lambda.log`. It uses only the standard
+The stack name is fixed as `aws-lambda-zig-demo`. The helper resolves
+`IntakeFunctionName` or `QueryFunctionName` and writes a root-level file named
+after that function, such as `intake-lambda.log`. It uses only the standard
 `AWS_PROFILE` and `AWS_REGION` environment variables, defaulting to `dev` and
 `ca-central-1`:
 
 ```sh
-AWS_PROFILE=dev AWS_REGION=ca-central-1 ./lambda_logs.sh
+AWS_PROFILE=dev AWS_REGION=ca-central-1 ./lambda_logs.sh intake
 ```
 
 The first run downloads all retained events from
@@ -610,7 +660,7 @@ helper.
 `persistence.sh` is the supported local persistence command. It defaults to
 profile `dev`, region `ca-central-1`, and stack `aws-lambda-zig-demo`. It
 exports the selected profile's temporary credentials, resolves the
-`OperationsTableName` stack output, and runs the requested operation. Override
+`OperationsTable` physical resource, and runs the requested operation. Override
 the defaults with `PROFILE`, `REGION`, or `STACK_NAME`.
 
 To permanently delete every Operation from the resolved table, run:
@@ -674,7 +724,7 @@ configuration, AWS, or internal failure.
 
 The caller running `persistence.sh` needs `dynamodb:GetItem`,
 `dynamodb:PutItem`, and `dynamodb:UpdateItem` permissions for the table, plus
-`cloudformation:DescribeStacks` to resolve the table output. Its `delete-all`
+`cloudformation:DescribeStackResource` to resolve the table resource. Its `delete-all`
 command additionally needs `dynamodb:Scan` and `dynamodb:DeleteItem`. The
 Lambda execution role's inline policy does not grant these permissions to the
 local AWS identity.
@@ -692,7 +742,7 @@ aws sso login --profile "${PROFILE:-dev}"
 ```
 
 Changing the piped Operation JSON cannot fix this diagnostic. Credential-export
-or stack-output lookup failures are reported directly by `persistence.sh`;
+or stack-resource lookup failures are reported directly by `persistence.sh`;
 DynamoDB failures after configuration loading instead report
 `dynamodb: AWS request failed`.
 
@@ -717,8 +767,8 @@ only when POST attempts submission and returns a sanitized HTTP 503.
 
 `queue.sh` is the supported local queue command. It defaults to profile `dev`,
 region `ca-central-1`, and stack `aws-lambda-zig-demo`. It exports the selected
-profile's temporary credentials, queries the `OperationsQueueUrl` stack
-output, and runs the requested operation. Override the defaults with
+profile's temporary credentials, resolves the `OperationsQueue` physical
+resource, and runs the requested operation. Override the defaults with
 `PROFILE`, `REGION`, or `STACK_NAME`.
 
 Send an Operation while supplying required tenant metadata separately:
@@ -772,7 +822,7 @@ The caller needs these queue-scoped permissions for the commands it uses:
 - `sqs:ReceiveMessage` and `sqs:DeleteMessage` for `receive`
 - `sqs:GetQueueAttributes` for `check`
 
-`queue.sh` also needs `cloudformation:DescribeStacks`. These local caller
+`queue.sh` also needs `cloudformation:DescribeStackResource`. These local caller
 permissions are independent of the Lambda role, which remains send-only for
 SQS.
 
@@ -789,7 +839,8 @@ After changing Zig source code, rebuild and repackage:
 
 ```sh
 zig build --release -Darch=arm
-zip -qj intake-lambda.zip zig-out/bin/bootstrap
+zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
+zip -qj query-lambda.zip zig-out/bin/query/bootstrap
 ```
 
 Then redeploy the stack:
@@ -798,12 +849,12 @@ Then redeploy the stack:
 sam deploy --profile dev --region ca-central-1
 ```
 
-SAM uploads the new `intake-lambda.zip` and updates the CloudFormation-managed Lambda function.
+SAM uploads both packages and updates their CloudFormation-managed Lambda functions.
 
 ## 13. Delete the SAM stack
 
-To remove the SAM-managed function, role, operations table, operations queue,
-Function URL, and permissions:
+To remove both SAM-managed functions, roles, the operations table and queue,
+Function URLs, and permissions:
 
 ```sh
 sam delete \
@@ -821,7 +872,7 @@ it permanently deletes any queued messages.
 
 ## Security note
 
-This demo intentionally creates a publicly reachable Lambda Function URL, and
-the handler requires a valid PASETO bearer token. For production, consider
+This demo intentionally creates two publicly reachable Lambda Function URLs,
+and both handlers require a valid PASETO bearer token. For production, consider
 combining application authentication with stricter infrastructure
 authorization, narrower IAM policies, or an API Gateway/CloudFront layer.

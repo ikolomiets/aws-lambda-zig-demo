@@ -2,13 +2,14 @@
 
 A minimal AWS Lambda Function URL demo written in Zig.
 
-The project builds a custom `provided.al2023` Lambda runtime executable named
-`bootstrap` and a host-native PASETO v4.public utility named `paseto`. The
+The project builds custom `provided.al2023` intake and query Lambda bootstraps
+and a host-native PASETO v4.public utility named `paseto`. The
 stack-aware `persistence.sh` and `queue.sh` commands manage Operations in
-DynamoDB and SQS, while `lambda_logs.sh` downloads the function's CloudWatch
-logs. The handler authenticates a PASETO v4.public bearer token before serving
-GET and POST requests through the `aws-lambda-zig` runtime package. GET returns
-a plain-text Lambda environment dump, while POST validates and hashes an
+DynamoDB and SQS, while `lambda_logs.sh` downloads either function's CloudWatch
+logs. Both handlers use `src/lambda_auth.zig` to authenticate a PASETO v4.public
+bearer token through the `aws-lambda-zig` runtime package. The query Lambda
+accepts only GET and returns a plain-text Lambda environment dump. The intake
+Lambda accepts only POST, validates and hashes an
 Operation JSON document, derives required tenant metadata from the verified
 token subject, persists the Operation idempotently in DynamoDB, submits new
 work to SQS, and returns the current stored output view without the body.
@@ -25,34 +26,35 @@ The deployment docs use:
 
 - AWS profile: `dev`
 - Region: `ca-central-1`
-- Function name: `intake-lambda`
+- Intake function name: `intake-lambda`
+- Query function name: `query-lambda`
 
 Adjust those values for your AWS account as needed.
 
-Deploy the rename to the existing `aws-lambda-zig-demo` stack. CloudFormation
-replaces the Lambda, Function URL, URL permissions, and generated function role,
-so the URL changes. The unchanged table and queue resources remain in the stack,
-preserving persisted Operations and queued messages.
+Before updating an existing `aws-lambda-zig-demo` stack, reuse the current
+`IntakeFunction` physical name as `IntakeFunctionName`. `deploy.sh` enforces
+that match so the existing intake Lambda and Function URL stay managed in
+place. The query Lambda and its Function URL are added alongside them.
 
 ## Build
 
-Build the stripped, single-threaded, ReleaseSafe Linux ARM64 Lambda executable:
+Build the stripped, single-threaded, ReleaseSafe Linux ARM64 Lambda executables:
 
 ```sh
 zig build --release -Darch=arm
 ```
 
 This also installs the host-native `zig-out/bin/paseto` utility and the local
-implementations invoked by `persistence.sh` and `queue.sh`. The Lambda
-`bootstrap` and PASETO utility both use the shared PASETO implementation in
+implementations invoked by `persistence.sh` and `queue.sh`. Both Lambda
+bootstraps and the PASETO utility use the shared PASETO implementation in
 `src/paseto.zig`; the persistence and queue commands use the shared model in
 `src/operation.zig`. The Lambda and local commands reach AWS through
 `src/operation_persistence.zig` and `src/operation_queue.zig`.
 
-Verify that the output is a statically linked ARM64 Linux executable:
+Verify that both outputs are statically linked ARM64 Linux executables:
 
 ```sh
-file zig-out/bin/bootstrap
+file zig-out/bin/intake/bootstrap zig-out/bin/query/bootstrap
 ```
 
 Expected shape:
@@ -61,14 +63,15 @@ Expected shape:
 ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
 ```
 
-Package the executable for Lambda:
+Package the executables for Lambda:
 
 ```sh
-zip -qj intake-lambda.zip zig-out/bin/bootstrap
+zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
+zip -qj query-lambda.zip zig-out/bin/query/bootstrap
 ```
 
-`intake-lambda.zip` is intentionally ignored by Git because it is a generated
-deployment artifact.
+Both zip archives are intentionally ignored by Git because they are generated
+deployment artifacts.
 
 ## PASETO CLI
 
@@ -113,7 +116,7 @@ does not cover differently named variables. Verification needs only
 `persistence.sh` creates, reads, updates, and deletes Operations in the SAM
 stack's DynamoDB table. It defaults to profile `dev`, region
 `ca-central-1`, and stack `aws-lambda-zig-demo`. It exports temporary profile
-credentials and resolves the stack's `OperationsTableName` output. Override
+credentials and resolves the stack's `OperationsTable` physical resource. Override
 the defaults with `PROFILE`, `REGION`, or `STACK_NAME`.
 For example, `./persistence.sh read --id <uuid>` performs a stack-aware read.
 
@@ -126,7 +129,7 @@ Zig command implementation:
 
 It scans and counts the table's Operations, requires typing `delete`, deletes
 every item, and verifies that the table is empty. It requires `jq` plus
-`cloudformation:DescribeStacks`, `dynamodb:Scan`, and `dynamodb:DeleteItem`
+`cloudformation:DescribeStackResource`, `dynamodb:Scan`, and `dynamodb:DeleteItem`
 permissions for the selected local AWS identity.
 
 If a persistence command reports `dynamodb: missing or invalid configuration`,
@@ -234,7 +237,7 @@ migration path in the application.
 and checks the SAM stack's operations queue. It uses `PROFILE`, `REGION`, and
 `STACK_NAME`, defaulting to `dev`, `ca-central-1`, and
 `aws-lambda-zig-demo`. It exports temporary profile credentials and resolves
-the `OperationsQueueUrl` stack output. Send a validated Operation input like
+the `OperationsQueue` physical resource. Send a validated Operation input like
 this:
 
 ```sh
@@ -284,11 +287,11 @@ failures also exit with code `2`.
 The AWS identity running `queue.sh` needs `sqs:SendMessage` for
 `send`, `sqs:ReceiveMessage` and `sqs:DeleteMessage` for `receive`, and
 `sqs:GetQueueAttributes` for `check`. The command additionally calls
-`cloudformation:DescribeStacks`. These are caller permissions: the Lambda
+`cloudformation:DescribeStackResource`. These are caller permissions: the Lambda
 execution role remains separate and is intentionally limited to
 `sqs:SendMessage` for this queue.
 
-The Lambda Function URL requires the token in an HTTP authorization header:
+Both Lambda Function URLs require the token in an HTTP authorization header:
 
 ```text
 Authorization: Bearer <token>
@@ -299,7 +302,8 @@ expired, or unverifiable credentials receive `401 Unauthorized` with
 `WWW-Authenticate: Bearer`. Missing or invalid public-key configuration and
 internal failures receive a sanitized `500 Internal Server Error`.
 Invalid POST operation documents receive `400 Bad Request`. Authenticated
-methods other than GET and POST receive `405 Method Not Allowed`. A POST that
+non-POST intake methods receive `405 Method Not Allowed` with `Allow: POST`;
+authenticated non-GET query methods receive `405` with `Allow: GET`. A POST that
 reuses an Operation ID with a different server-computed hash receives a
 sanitized `409 Conflict`; DynamoDB and malformed stored-item failures receive
 the static `500 Internal Server Error` response. An SQS submission failure
@@ -309,33 +313,33 @@ Tenant is metadata and part of idempotency identity only. The DynamoDB `id`
 partition key remains globally scoped, and this change does not add
 tenant-scoped keys or new read authorization behavior.
 
-`OPERATIONS_TABLE_NAME` and `OPERATIONS_QUEUE_URL` are mandatory at Lambda
-initialization. The bootstrap validates the non-empty, at-most-2,048-byte queue
+`OPERATIONS_TABLE_NAME` and `OPERATIONS_QUEUE_URL` are mandatory at intake Lambda
+initialization. The intake bootstrap validates the non-empty, at-most-2,048-byte queue
 URL and table name while initializing the Operation persistence and queue
 modules around one shared AWS SDK configuration. Each module privately owns its
 respective DynamoDB or SQS client, and both clients share that configuration
 and its HTTP pool. The module values, configuration, and pool are reused across
-warm invocations. Missing or invalid configuration prevents all request
-handling, including GET. Resource existence and IAM authorization are checked
+warm invocations. Missing or invalid configuration prevents intake request
+handling. Resource existence and IAM authorization are checked
 only when POST first calls the services, so DynamoDB failures return a
 sanitized HTTP 500 and SQS send failures return a sanitized HTTP 503.
 
 ## Lambda logs
 
-`lambda_logs.sh` downloads the Lambda's CloudWatch events into a root-level
+`lambda_logs.sh` downloads one Lambda's CloudWatch events into a root-level
 file named after the deployed function. The stack name is fixed as
-`aws-lambda-zig-demo`; the script resolves its `FunctionName` output and, for
-the default deployment, writes `intake-lambda.log`.
+`aws-lambda-zig-demo`; choose the explicit intake or query output:
 
 ```sh
-./lambda_logs.sh
+./lambda_logs.sh intake
+./lambda_logs.sh query
 ```
 
 The helper uses `AWS_PROFILE` and `AWS_REGION`, defaulting to `dev` and
 `ca-central-1`. Override them with the standard AWS CLI environment variables:
 
 ```sh
-AWS_PROFILE=dev AWS_REGION=ca-central-1 ./lambda_logs.sh
+AWS_PROFILE=dev AWS_REGION=ca-central-1 ./lambda_logs.sh intake
 ```
 
 When the log file is absent or empty, the helper downloads all events retained
@@ -370,7 +374,8 @@ sam deploy --guided \
   --region ca-central-1 \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
-    FunctionName=intake-lambda \
+    IntakeFunctionName=intake-lambda \
+    QueryFunctionName=query-lambda \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -384,18 +389,21 @@ only in the signing environment.
 
 The SAM-managed DynamoDB table and SQS queue, their environment variables, the
 table-scoped `GetItem`, `PutItem`, and `UpdateItem` policy, and the queue-scoped
-`SendMessage` policy are mandatory parts of the runnable application. Deploy
-the complete stack from `template.yaml` with AWS SAM.
+`SendMessage` policy are mandatory parts of the intake Lambda. The query Lambda
+mirrors the table and queue environment values for display but receives only
+the basic logging policy and initializes no AWS clients. Deploy the complete
+stack from `template.yaml` with AWS SAM.
 
 See [docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md)
 for the full SAM workflow.
 
 ## Test The Function URL
 
-After deployment, call the Function URL printed by SAM:
+After deployment, call either Function URL printed by SAM:
 
 ```sh
-curl -i -L <FunctionUrl>
+curl -i -L <IntakeFunctionUrl>
+curl -i -L <QueryFunctionUrl>
 ```
 
 An unauthenticated request receives:
@@ -412,7 +420,7 @@ token="$(
   PASETO_PRIVATE_KEY='<private-key-from-keygen>' \
     zig-out/bin/paseto issue --subject 'example-user' --ttl-seconds 300
 )"
-curl -L -H "Authorization: Bearer $token" <FunctionUrl>
+curl -L -H "Authorization: Bearer $token" <QueryFunctionUrl>
 ```
 
 The authenticated GET response preserves the demo output:
@@ -439,7 +447,7 @@ curl -L \
   --data \
     '{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"echo","body":{"message":"hello","count":2}}' \
-  <FunctionUrl>
+  <IntakeFunctionUrl>
 ```
 
 For a new ID, the response has `SUBMITTED` state, the invocation timestamp, its
@@ -478,8 +486,8 @@ concurrent `NEW` retries can produce duplicate messages, so consumers must
 handle the Operation ID and hash idempotently. Reusing the ID for different
 work or from a different verified subject still returns `409 Conflict`.
 
-The template intentionally creates a publicly reachable Function URL for demo
-HTTP GET and POST testing, while the handler enforces PASETO bearer
+The template intentionally creates publicly reachable intake POST and query
+GET Function URLs for demo testing, while both handlers enforce PASETO bearer
 authentication.
 Production endpoints should also consider stricter infrastructure
 authorization, narrower IAM policies, or a fronting layer such as API Gateway
@@ -487,7 +495,9 @@ or CloudFront.
 
 ## Project Layout
 
-- `src/intake_lambda.zig`: Lambda entrypoint and request handler.
+- `src/intake_lambda.zig`: authenticated POST intake entrypoint and handler.
+- `src/query_lambda.zig`: authenticated GET environment-query entrypoint and handler.
+- `src/lambda_auth.zig`: shared bearer-token parsing and PASETO verification.
 - `src/operation.zig`: Operation JSON model, validation, and hash contract.
 - `src/operation_persistence.zig`: DynamoDB Operation mapping and conditional writes.
 - `src/operation_queue.zig`: SQS Operation queue configuration and message contract.
@@ -497,10 +507,10 @@ or CloudFront.
 - `src/paseto_cli.zig`: host PASETO v4.public CLI and its tests.
 - `persistence.sh`: stack-aware persistence command and credential setup.
 - `queue.sh`: stack-aware queue command and credential setup.
-- `lambda_logs.sh`: incremental CloudWatch log download helper.
-- `build.zig`: Zig build graph for `bootstrap`, local commands, and tests.
+- `lambda_logs.sh`: explicit intake/query CloudWatch log download helper.
+- `build.zig`: Zig build graph for both bootstraps, local commands, and tests.
 - `build.zig.zon`: package metadata and pinned dependencies.
-- `template.yaml`: SAM template for the Lambda, Function URL, and permissions.
+- `template.yaml`: SAM template for both Lambdas, Function URLs, and permissions.
 - `docs/`: the SAM deployment guide, ADRs, and the Zig style reference.
 - `AGENTS.md`: repository guidance for coding agents.
 
@@ -509,9 +519,9 @@ or CloudFront.
 Run formatting checks before committing Zig changes:
 
 ```sh
-zig fmt --check build.zig src/intake_lambda.zig src/operation.zig src/operation_persistence.zig \
-  src/operation_queue.zig src/persistence_cli.zig src/queue_cli.zig src/paseto.zig \
-  src/paseto_cli.zig
+zig fmt --check build.zig src/intake_lambda.zig src/lambda_auth.zig src/query_lambda.zig \
+  src/operation.zig src/operation_persistence.zig src/operation_queue.zig \
+  src/persistence_cli.zig src/queue_cli.zig src/paseto.zig src/paseto_cli.zig
 ```
 
 Run the handler and local command tests with:

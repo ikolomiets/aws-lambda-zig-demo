@@ -33,14 +33,15 @@ export AWS_REGION="$REGION"
 export AWS_EC2_METADATA_DISABLED=true
 
 operations_queue_url="$(
-    aws cloudformation describe-stacks \
+    aws cloudformation describe-stack-resource \
         --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='OperationsQueueUrl'].OutputValue" \
+        --logical-resource-id OperationsQueue \
+        --query StackResourceDetail.PhysicalResourceId \
         --output text \
         --region "$REGION"
-)" || fail "failed to resolve OperationsQueueUrl from stack $STACK_NAME"
-[ -n "$operations_queue_url" ] || fail "stack $STACK_NAME has no OperationsQueueUrl output"
-[ "$operations_queue_url" != "None" ] || fail "stack $STACK_NAME has no OperationsQueueUrl output"
+)" || fail "failed to resolve OperationsQueue from stack $STACK_NAME"
+[ -n "$operations_queue_url" ] || fail "stack $STACK_NAME has no OperationsQueue resource"
+[ "$operations_queue_url" != "None" ] || fail "stack $STACK_NAME has no OperationsQueue resource"
 export OPERATIONS_QUEUE_URL="$operations_queue_url"
 unset operations_queue_url
 

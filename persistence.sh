@@ -41,14 +41,15 @@ export AWS_REGION="$REGION"
 export AWS_EC2_METADATA_DISABLED=true
 
 operations_table_name="$(
-    aws cloudformation describe-stacks \
+    aws cloudformation describe-stack-resource \
         --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='OperationsTableName'].OutputValue" \
+        --logical-resource-id OperationsTable \
+        --query StackResourceDetail.PhysicalResourceId \
         --output text \
         --region "$REGION"
-)" || fail "failed to resolve OperationsTableName from stack $STACK_NAME"
-[ -n "$operations_table_name" ] || fail "stack $STACK_NAME has no OperationsTableName output"
-[ "$operations_table_name" != "None" ] || fail "stack $STACK_NAME has no OperationsTableName output"
+)" || fail "failed to resolve OperationsTable from stack $STACK_NAME"
+[ -n "$operations_table_name" ] || fail "stack $STACK_NAME has no OperationsTable resource"
+[ "$operations_table_name" != "None" ] || fail "stack $STACK_NAME has no OperationsTable resource"
 export OPERATIONS_TABLE_NAME="$operations_table_name"
 
 if [ "$delete_all_command" -eq 1 ]; then

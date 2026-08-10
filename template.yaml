@@ -1,12 +1,16 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Deploy the intake Lambda with a public Lambda Function URL.
+Description: Deploy authenticated intake and query Lambdas with public Function URLs.
 
 Parameters:
-  FunctionName:
+  IntakeFunctionName:
     Type: String
     Default: intake-lambda
-    Description: Name of the Lambda function to create.
+    Description: Name of the operation intake Lambda function.
+  QueryFunctionName:
+    Type: String
+    Default: query-lambda
+    Description: Name of the environment query Lambda function.
   LambdaPrincipal:
     Type: String
     Default: "*"
@@ -42,8 +46,8 @@ Resources:
   IntakeFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Ref FunctionName
-      Description: Intake function built with aws-lambda-zig.
+      FunctionName: !Ref IntakeFunctionName
+      Description: Authenticated operation intake function built with aws-lambda-zig.
       CodeUri: intake-lambda.zip
       Runtime: provided.al2023
       Handler: bootstrap
@@ -82,7 +86,6 @@ Resources:
         AllowOrigins:
           - "*"
         AllowMethods:
-          - GET
           - POST
         AllowHeaders:
           - "*"
@@ -105,19 +108,75 @@ Resources:
       Principal: "*"
       InvokedViaFunctionUrl: true
 
+  QueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref QueryFunctionName
+      Description: Authenticated environment query function built with aws-lambda-zig.
+      CodeUri: query-lambda.zip
+      Runtime: provided.al2023
+      Handler: bootstrap
+      Architectures:
+        - arm64
+      MemorySize: 128
+      Timeout: 3
+      Policies:
+        - AWSLambdaBasicExecutionRole
+      Environment:
+        Variables:
+          LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
+          OPERATIONS_QUEUE_URL: !Ref OperationsQueue
+          OPERATIONS_TABLE_NAME: !Ref OperationsTable
+          PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
+
+  QueryFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt QueryFunction.Arn
+      AuthType: NONE
+      InvokeMode: BUFFERED
+      Cors:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+        AllowHeaders:
+          - "*"
+
+  QueryFunctionUrlInvokeFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: QueryFunctionUrl
+    Properties:
+      FunctionName: !Ref QueryFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  QueryFunctionUrlInvokeFunctionPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: QueryFunctionUrl
+    Properties:
+      FunctionName: !Ref QueryFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
 Outputs:
-  OperationsTableName:
-    Description: CloudFormation-generated DynamoDB operations table name.
-    Value: !Ref OperationsTable
-  OperationsQueueUrl:
-    Description: CloudFormation-generated SQS operations queue URL.
-    Value: !Ref OperationsQueue
-  FunctionName:
-    Description: Deployed Lambda function name.
+  IntakeFunctionName:
+    Description: Deployed operation intake Lambda function name.
     Value: !Ref IntakeFunction
-  FunctionArn:
-    Description: Deployed Lambda function ARN.
+  IntakeFunctionArn:
+    Description: Deployed operation intake Lambda function ARN.
     Value: !GetAtt IntakeFunction.Arn
-  FunctionUrl:
-    Description: Public Lambda Function URL.
+  IntakeFunctionUrl:
+    Description: Public operation intake Lambda Function URL.
     Value: !GetAtt IntakeFunctionUrl.FunctionUrl
+  QueryFunctionName:
+    Description: Deployed environment query Lambda function name.
+    Value: !Ref QueryFunction
+  QueryFunctionArn:
+    Description: Deployed environment query Lambda function ARN.
+    Value: !GetAtt QueryFunction.Arn
+  QueryFunctionUrl:
+    Description: Public environment query Lambda Function URL.
+    Value: !GetAtt QueryFunctionUrl.FunctionUrl

@@ -4,35 +4,42 @@ set -euo pipefail
 PROFILE="${PROFILE:-dev}"
 REGION="${REGION:-ca-central-1}"
 STACK_NAME="${STACK_NAME:-aws-lambda-zig-demo}"
-FUNCTION_NAME="${FUNCTION_NAME:-intake-lambda}"
+INTAKE_FUNCTION_NAME="${INTAKE_FUNCTION_NAME:-intake-lambda}"
+QUERY_FUNCTION_NAME="${QUERY_FUNCTION_NAME:-query-lambda}"
 LAMBDA_PRINCIPAL="${LAMBDA_PRINCIPAL:-*}"
 PASETO_PUBLIC_KEY="${PASETO_PUBLIC_KEY:-}"
 LOCAL_AWS_LAMBDA_ROOT="${LOCAL_AWS_LAMBDA_ROOT:-../aws-lambda-zig}"
 DRY_RUN=0
 CHECK_URL=1
 USE_LOCAL_LIBS=0
+MIGRATION_CHECK_ONLY=0
 
 usage() {
     cat <<'EOF'
 Usage: ./deploy.sh [options]
 
-Build, package, validate, and deploy the Zig Lambda with AWS SAM.
+Build, package, validate, and deploy the Zig Lambdas with AWS SAM.
 
 Options:
   --profile NAME         AWS CLI profile. Defaults to $PROFILE or dev.
   --region NAME          AWS region. Defaults to $REGION or ca-central-1.
   --stack-name NAME      CloudFormation stack name. Defaults to aws-lambda-zig-demo.
-  --function-name NAME   Lambda function name. Defaults to intake-lambda.
+  --intake-function-name NAME
+                         Intake Lambda name. Defaults to intake-lambda.
+  --query-function-name NAME
+                         Query Lambda name. Defaults to query-lambda.
   --lambda-principal VALUE
                          LAMBDA_PRINCIPAL environment value. Defaults to *.
   --use-local-libs       Use local dependency checkouts with zig build --fork.
                          aws_lambda defaults to ../aws-lambda-zig.
   --dry-run              Run local checks, build, package, and validation only.
+  --migration-check-only Validate the existing intake function name, then exit.
   --no-url-check         Skip the post-deploy Function URL HTTP status check.
   -h, --help             Show this help.
 
 Environment overrides:
-  PROFILE, REGION, STACK_NAME, FUNCTION_NAME, LAMBDA_PRINCIPAL,
+  PROFILE, REGION, STACK_NAME, INTAKE_FUNCTION_NAME, QUERY_FUNCTION_NAME,
+  LAMBDA_PRINCIPAL,
   PASETO_PRIVATE_KEY, PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT
 
 Authentication:
@@ -136,6 +143,43 @@ prepare_aws_credentials() {
         fail "AWS credential verification failed after SSO login for profile $profile"
 }
 
+validate_existing_intake_name() {
+    local requested_name="$1"
+    local physical_name
+
+    if physical_name="$(
+        aws cloudformation describe-stack-resource \
+            --stack-name "$STACK_NAME" \
+            --logical-resource-id IntakeFunction \
+            --query StackResourceDetail.PhysicalResourceId \
+            --output text \
+            --region "$REGION" \
+            2>&1
+    )"
+    then
+        case "$physical_name" in
+            "" | None)
+                fail "stack $STACK_NAME returned no physical IntakeFunction name"
+                ;;
+        esac
+        if [ "$physical_name" != "$requested_name" ]; then
+            fail "existing IntakeFunction is $physical_name; set INTAKE_FUNCTION_NAME=$physical_name to update it in place"
+        fi
+        printf '==> Existing IntakeFunction name matches: %s\n' "$physical_name"
+        return 0
+    fi
+
+    case "$physical_name" in
+        *"does not exist"*)
+            printf '==> Stack %s does not exist; no intake-name migration is required\n' \
+                "$STACK_NAME"
+            ;;
+        *)
+            fail "could not inspect IntakeFunction in stack $STACK_NAME"
+            ;;
+    esac
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --profile)
@@ -168,14 +212,26 @@ while [ "$#" -gt 0 ]; do
             [ -n "$STACK_NAME" ] || fail "empty value for --stack-name"
             shift
             ;;
-        --function-name)
+        --intake-function-name)
             need_value "$1" "${2:-}"
-            FUNCTION_NAME="$2"
+            INTAKE_FUNCTION_NAME="$2"
             shift 2
             ;;
-        --function-name=*)
-            FUNCTION_NAME="${1#*=}"
-            [ -n "$FUNCTION_NAME" ] || fail "empty value for --function-name"
+        --intake-function-name=*)
+            INTAKE_FUNCTION_NAME="${1#*=}"
+            [ -n "$INTAKE_FUNCTION_NAME" ] ||
+                fail "empty value for --intake-function-name"
+            shift
+            ;;
+        --query-function-name)
+            need_value "$1" "${2:-}"
+            QUERY_FUNCTION_NAME="$2"
+            shift 2
+            ;;
+        --query-function-name=*)
+            QUERY_FUNCTION_NAME="${1#*=}"
+            [ -n "$QUERY_FUNCTION_NAME" ] ||
+                fail "empty value for --query-function-name"
             shift
             ;;
         --lambda-principal)
@@ -196,6 +252,10 @@ while [ "$#" -gt 0 ]; do
             DRY_RUN=1
             shift
             ;;
+        --migration-check-only)
+            MIGRATION_CHECK_ONLY=1
+            shift
+            ;;
         --no-url-check)
             CHECK_URL=0
             shift
@@ -212,9 +272,17 @@ done
 
 cd "$(dirname "$0")"
 
+[ "$DRY_RUN" -eq 0 ] || [ "$MIGRATION_CHECK_ONLY" -eq 0 ] ||
+    fail "--dry-run and --migration-check-only cannot be combined"
+
 if [ "$DRY_RUN" -eq 0 ]; then
     need_command aws
     prepare_aws_credentials "$PROFILE"
+    validate_existing_intake_name "$INTAKE_FUNCTION_NAME"
+fi
+if [ "$MIGRATION_CHECK_ONLY" -eq 1 ]; then
+    printf '==> Intake-name migration check complete. Skipped build and deploy.\n'
+    exit 0
 fi
 
 [ -n "$PASETO_PUBLIC_KEY" ] ||
@@ -226,6 +294,7 @@ fi
 
 need_command zig
 need_command zip
+need_command unzip
 need_command file
 need_command sam
 if [ "$DRY_RUN" -eq 0 ]; then
@@ -254,7 +323,13 @@ cleanup() {
 trap cleanup EXIT
 
 printf '==> Checking Zig formatting\n'
-zig fmt --check build.zig src/intake_lambda.zig src/paseto.zig src/paseto_cli.zig
+zig fmt --check \
+    build.zig \
+    src/intake_lambda.zig \
+    src/lambda_auth.zig \
+    src/paseto.zig \
+    src/paseto_cli.zig \
+    src/query_lambda.zig
 
 ZIG_BUILD_ARGS=(
     --cache-dir "$CACHE_DIR"
@@ -271,18 +346,31 @@ fi
 printf '==> Running Zig tests\n'
 zig build test "${ZIG_BUILD_ARGS[@]}"
 
-printf '==> Building Linux ARM64 Lambda bootstrap\n'
+printf '==> Removing obsolete root Lambda bootstrap\n'
+rm -f zig-out/bin/bootstrap
+
+printf '==> Building Linux ARM64 Lambda bootstraps\n'
 zig build "${ZIG_BUILD_ARGS[@]}" --release -Darch=arm
 
-artifact_type="$(file zig-out/bin/bootstrap)"
-case "$artifact_type" in
-    *"ELF 64-bit LSB executable"*aarch64*"statically linked"*"stripped"*) ;;
-    *) fail "unexpected bootstrap artifact type: $artifact_type" ;;
-esac
-printf '%s\n' "$artifact_type"
+for bootstrap in zig-out/bin/intake/bootstrap zig-out/bin/query/bootstrap; do
+    artifact_type="$(file "$bootstrap")"
+    case "$artifact_type" in
+        *"ELF 64-bit LSB executable"*aarch64*"statically linked"*"stripped"*) ;;
+        *) fail "unexpected bootstrap artifact type: $artifact_type" ;;
+    esac
+    printf '%s\n' "$artifact_type"
+done
+[ ! -e zig-out/bin/bootstrap ] || fail "obsolete zig-out/bin/bootstrap was recreated"
 
-printf '==> Refreshing intake-lambda.zip\n'
-zip -qj intake-lambda.zip zig-out/bin/bootstrap
+printf '==> Refreshing Lambda zip archives\n'
+rm -f intake-lambda.zip query-lambda.zip
+zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
+zip -qj query-lambda.zip zig-out/bin/query/bootstrap
+for archive in intake-lambda.zip query-lambda.zip; do
+    archive_contents="$(unzip -Z1 "$archive")"
+    [ "$archive_contents" = bootstrap ] ||
+        fail "$archive must contain only a root-level bootstrap"
+done
 
 printf '==> Validating SAM template\n'
 sam validate --template-file template.yaml --region "$REGION"
@@ -304,7 +392,8 @@ sam deploy \
     --no-fail-on-empty-changeset \
     --no-progressbar \
     --parameter-overrides \
-    "FunctionName=$FUNCTION_NAME" \
+    "IntakeFunctionName=$INTAKE_FUNCTION_NAME" \
+    "QueryFunctionName=$QUERY_FUNCTION_NAME" \
     "LambdaPrincipal=$LAMBDA_PRINCIPAL" \
     "PasetoPublicKey=$PASETO_PUBLIC_KEY"
 
@@ -315,15 +404,16 @@ aws cloudformation describe-stacks \
     --output text \
     --region "$REGION"
 
-OPERATIONS_TABLE_NAME="$(aws cloudformation describe-stacks \
+OPERATIONS_TABLE_NAME="$(aws cloudformation describe-stack-resource \
     --stack-name "$STACK_NAME" \
-    --query "Stacks[0].Outputs[?OutputKey=='OperationsTableName'].OutputValue | [0]" \
+    --logical-resource-id OperationsTable \
+    --query StackResourceDetail.PhysicalResourceId \
     --output text \
     --region "$REGION")"
 
 case "$OPERATIONS_TABLE_NAME" in
     "" | None)
-        fail "stack output OperationsTableName is missing or empty"
+        fail "stack resource OperationsTable has no physical name"
         ;;
 esac
 
@@ -359,7 +449,7 @@ read -r \
     GLOBAL_INDEX_COUNT <<<"$TABLE_VALIDATION"
 
 [ "$ACTUAL_TABLE_NAME" = "$OPERATIONS_TABLE_NAME" ] ||
-    fail "DynamoDB table name $ACTUAL_TABLE_NAME does not match stack output $OPERATIONS_TABLE_NAME"
+    fail "DynamoDB table name $ACTUAL_TABLE_NAME does not match stack resource $OPERATIONS_TABLE_NAME"
 [ "$TABLE_STATUS" = ACTIVE ] ||
     fail "DynamoDB table status is $TABLE_STATUS; expected ACTIVE"
 [ "$BILLING_MODE" = PAY_PER_REQUEST ] ||
@@ -381,15 +471,16 @@ read -r \
 [ "$GLOBAL_INDEX_COUNT" = 0 ] ||
     fail "DynamoDB table has $GLOBAL_INDEX_COUNT global secondary indexes; expected 0"
 
-OPERATIONS_QUEUE_URL="$(aws cloudformation describe-stacks \
+OPERATIONS_QUEUE_URL="$(aws cloudformation describe-stack-resource \
     --stack-name "$STACK_NAME" \
-    --query "Stacks[0].Outputs[?OutputKey=='OperationsQueueUrl'].OutputValue | [0]" \
+    --logical-resource-id OperationsQueue \
+    --query StackResourceDetail.PhysicalResourceId \
     --output text \
     --region "$REGION")"
 
 case "$OPERATIONS_QUEUE_URL" in
     "" | None)
-        fail "stack output OperationsQueueUrl is missing or empty"
+        fail "stack resource OperationsQueue has no physical URL"
         ;;
 esac
 
@@ -406,29 +497,68 @@ aws sqs get-queue-attributes \
     --output json \
     --region "$REGION"
 
-FUNCTION_URL="$(aws cloudformation describe-stacks \
+INTAKE_FUNCTION_URL="$(aws cloudformation describe-stacks \
     --stack-name "$STACK_NAME" \
-    --query "Stacks[0].Outputs[?OutputKey=='FunctionUrl'].OutputValue | [0]" \
+    --query "Stacks[0].Outputs[?OutputKey=='IntakeFunctionUrl'].OutputValue | [0]" \
+    --output text \
+    --region "$REGION")"
+QUERY_FUNCTION_URL="$(aws cloudformation describe-stacks \
+    --stack-name "$STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='QueryFunctionUrl'].OutputValue | [0]" \
     --output text \
     --region "$REGION")"
 
-printf 'FunctionUrl: %s\n' "$FUNCTION_URL"
+case "$INTAKE_FUNCTION_URL" in
+    "" | None) fail "stack output IntakeFunctionUrl is missing or empty" ;;
+esac
+case "$QUERY_FUNCTION_URL" in
+    "" | None) fail "stack output QueryFunctionUrl is missing or empty" ;;
+esac
+
+printf 'IntakeFunctionUrl: %s\n' "$INTAKE_FUNCTION_URL"
+printf 'QueryFunctionUrl: %s\n' "$QUERY_FUNCTION_URL"
 
 if [ "$CHECK_URL" -eq 1 ]; then
-    printf '==> Checking unauthenticated Function URL status\n'
-    HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' "$FUNCTION_URL")"
-    [ "$HTTP_STATUS" = 401 ] ||
-        fail "unauthenticated Function URL returned HTTP $HTTP_STATUS; expected 401"
-    printf 'HTTP %s (expected 401)\n' "$HTTP_STATUS"
+    printf '==> Checking unauthenticated intake and query statuses\n'
+    for function_url in "$INTAKE_FUNCTION_URL" "$QUERY_FUNCTION_URL"; do
+        HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' "$function_url")"
+        [ "$HTTP_STATUS" = 401 ] ||
+            fail "unauthenticated Function URL returned HTTP $HTTP_STATUS; expected 401"
+        printf 'HTTP %s (expected 401)\n' "$HTTP_STATUS"
+    done
 
-    printf '==> Checking authenticated Function URL status\n'
+    printf '==> Checking authenticated query GET status\n'
     PASETO_TOKEN="$(
-        ./zig-out/bin/paseto issue --subject deploy-test --ttl-seconds 10
+        ./zig-out/bin/paseto issue --subject deploy-test --ttl-seconds 60
     )"
     HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
         -H "Authorization: Bearer ${PASETO_TOKEN}" \
-        "$FUNCTION_URL")"
+        "$QUERY_FUNCTION_URL")"
     [ "$HTTP_STATUS" = 200 ] ||
-        fail "authenticated Function URL returned HTTP $HTTP_STATUS; expected 200"
+        fail "authenticated query GET returned HTTP $HTTP_STATUS; expected 200"
     printf 'HTTP %s (expected 200)\n' "$HTTP_STATUS"
+
+    printf '==> Checking authenticated wrong-method statuses\n'
+    HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer ${PASETO_TOKEN}" \
+        "$INTAKE_FUNCTION_URL")"
+    [ "$HTTP_STATUS" = 405 ] ||
+        fail "authenticated intake GET returned HTTP $HTTP_STATUS; expected 405"
+    printf 'Intake GET: HTTP %s (expected 405)\n' "$HTTP_STATUS"
+    HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
+        -X POST \
+        -H "Authorization: Bearer ${PASETO_TOKEN}" \
+        "$QUERY_FUNCTION_URL")"
+    [ "$HTTP_STATUS" = 405 ] ||
+        fail "authenticated query POST returned HTTP $HTTP_STATUS; expected 405"
+    printf 'Query POST: HTTP %s (expected 405)\n' "$HTTP_STATUS"
+
+    printf '==> Checking authenticated bodyless intake POST status\n'
+    HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
+        -X POST \
+        -H "Authorization: Bearer ${PASETO_TOKEN}" \
+        "$INTAKE_FUNCTION_URL")"
+    [ "$HTTP_STATUS" = 400 ] ||
+        fail "authenticated bodyless intake POST returned HTTP $HTTP_STATUS; expected 400"
+    printf 'HTTP %s (expected 400)\n' "$HTTP_STATUS"
 fi

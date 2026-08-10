@@ -32,6 +32,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zig-paseto", .module = lambda_paseto_implementation },
         },
     });
+    const lambda_auth = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/lambda_auth.zig"),
+        .imports = &.{
+            .{ .name = "aws-lambda", .module = lambda_runtime },
+            .{ .name = "paseto", .module = lambda_paseto },
+        },
+    });
     const lambda_operation = b.createModule(.{
         .target = lambda_target,
         .optimize = optimize,
@@ -57,7 +66,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const lambda_mod = b.createModule(.{
+    const intake_lambda_mod = b.createModule(.{
         .target = lambda_target,
         .optimize = optimize,
         .root_source_file = b.path("src/intake_lambda.zig"),
@@ -66,6 +75,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "aws", .module = lambda_aws },
             .{ .name = "aws-lambda", .module = lambda_runtime },
+            .{ .name = "lambda_auth", .module = lambda_auth },
             .{ .name = "operation", .module = lambda_operation },
             .{ .name = "operation_persistence", .module = lambda_operation_persistence },
             .{ .name = "operation_queue", .module = lambda_operation_queue },
@@ -73,12 +83,37 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const lambda_exe = b.addExecutable(.{
-        .name = "bootstrap",
-        .root_module = lambda_mod,
+    const intake_lambda_exe = b.addExecutable(.{
+        .name = "intake-bootstrap",
+        .root_module = intake_lambda_mod,
     });
+    const install_intake_lambda = b.addInstallArtifact(intake_lambda_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "bin/intake" } },
+        .dest_sub_path = "bootstrap",
+    });
+    b.getInstallStep().dependOn(&install_intake_lambda.step);
 
-    b.installArtifact(lambda_exe);
+    const query_lambda_mod = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/query_lambda.zig"),
+        .strip = true,
+        .single_threaded = true,
+        .imports = &.{
+            .{ .name = "aws-lambda", .module = lambda_runtime },
+            .{ .name = "lambda_auth", .module = lambda_auth },
+            .{ .name = "paseto", .module = lambda_paseto },
+        },
+    });
+    const query_lambda_exe = b.addExecutable(.{
+        .name = "query-bootstrap",
+        .root_module = query_lambda_mod,
+    });
+    const install_query_lambda = b.addInstallArtifact(query_lambda_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "bin/query" } },
+        .dest_sub_path = "bootstrap",
+    });
+    b.getInstallStep().dependOn(&install_query_lambda.step);
 
     const host_aws_sdk = b.dependency("aws_sdk", .{
         .target = b.graph.host,
@@ -120,6 +155,18 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/paseto.zig"),
         .imports = &.{
             .{ .name = "zig-paseto", .module = host_paseto_implementation },
+        },
+    });
+    const test_runtime = b.dependency("aws_lambda", .{
+        .target = b.graph.host,
+    }).module("lambda");
+    const host_lambda_auth = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .root_source_file = b.path("src/lambda_auth.zig"),
+        .imports = &.{
+            .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "paseto", .module = host_paseto },
         },
     });
     const cli_mod = b.createModule(.{
@@ -171,9 +218,6 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(queue_cli_exe);
 
-    const test_runtime = b.dependency("aws_lambda", .{
-        .target = b.graph.host,
-    }).module("lambda");
     const lambda_test_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .Debug,
@@ -181,6 +225,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
             .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "lambda_auth", .module = host_lambda_auth },
             .{ .name = "operation", .module = host_operation },
             .{ .name = "operation_persistence", .module = host_operation_persistence },
             .{ .name = "operation_queue", .module = host_operation_queue },
@@ -191,6 +236,26 @@ pub fn build(b: *std.Build) void {
         .root_module = lambda_test_mod,
     });
     const run_lambda_tests = b.addRunArtifact(lambda_tests);
+
+    const query_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .root_source_file = b.path("src/query_lambda.zig"),
+        .imports = &.{
+            .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "lambda_auth", .module = host_lambda_auth },
+            .{ .name = "paseto", .module = host_paseto },
+        },
+    });
+    const query_tests = b.addTest(.{
+        .root_module = query_test_mod,
+    });
+    const run_query_tests = b.addRunArtifact(query_tests);
+
+    const lambda_auth_tests = b.addTest(.{
+        .root_module = host_lambda_auth,
+    });
+    const run_lambda_auth_tests = b.addRunArtifact(lambda_auth_tests);
 
     const operation_tests = b.addTest(.{
         .root_module = host_operation,
@@ -244,6 +309,8 @@ pub fn build(b: *std.Build) void {
     const run_queue_cli_tests = b.addRunArtifact(queue_cli_tests);
 
     const test_step = b.step("test", "Run unit and integration tests");
+    test_step.dependOn(&run_lambda_auth_tests.step);
+    test_step.dependOn(&run_query_tests.step);
     test_step.dependOn(&run_lambda_tests.step);
     test_step.dependOn(&run_operation_tests.step);
     test_step.dependOn(&run_operation_persistence_tests.step);

@@ -3,7 +3,7 @@
 ## Repository and Sources of Truth
 
 This repository is a small Zig 0.16.0 AWS Lambda example. The root build files
-define the Lambda bootstrap executable, application code lives in `src/`, AWS
+define the intake and query Lambda bootstrap executables, application code lives in `src/`, AWS
 deployment material lives in `template.yaml`, `deploy.sh`, and `docs/`, and the
 vendored `aws_lambda` dependency is under `zig-pkg/`.
 
@@ -11,8 +11,10 @@ Use these sources in order:
 
 - `build.zig` and `build.zig.zon` define the supported Zig version, target
   selection, dependency graph, optimization mode, and installed executable.
-- `src/intake_lambda.zig` is the Lambda entrypoint and request handler.
-- `template.yaml` defines the SAM-managed Lambda, Function URL, permissions,
+- `src/intake_lambda.zig` is the authenticated POST intake entrypoint and handler.
+- `src/query_lambda.zig` is the authenticated GET environment-query entrypoint and handler.
+- `src/lambda_auth.zig` is the shared bearer-token and PASETO verification module.
+- `template.yaml` defines the SAM-managed Lambdas, Function URLs, permissions,
   memory, timeout, runtime, and architecture.
 - `deploy.sh` implements the supported automated AWS SAM deployment flow.
 - `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md` documents the supported deployment flow.
@@ -50,9 +52,8 @@ the affected change.
 
 ## Architecture and Change Scope
 
-Keep the project small. The current application has a single handler in
-`src/intake_lambda.zig`; do not add modules, layers, or helper packages until there is
-real behavior that needs that structure.
+Keep the project small. The application has two handlers and one shared authentication
+module; do not add modules, layers, or helper packages until real behavior needs that structure.
 
 Before changing deployment behavior, read the SAM template, deployment helper,
 and SAM deployment doc. Public Function URL settings are intentionally demo-oriented;
@@ -62,8 +63,8 @@ effect.
 
 Treat generated build artifacts as artifacts:
 
-- `zig-out/bin/bootstrap` is produced by `zig build`.
-- `intake-lambda.zip` packages `zig-out/bin/bootstrap` for Lambda/SAM deployment.
+- `zig-out/bin/intake/bootstrap` and `zig-out/bin/query/bootstrap` are produced by `zig build`.
+- `intake-lambda.zip` and `query-lambda.zip` package their matching bootstraps for Lambda/SAM.
 
 Only refresh artifacts when the task requires a deployable package.
 
@@ -101,7 +102,7 @@ AWS details that should remain private. Do not check in:
 - Local deployment artifacts, generated packages, or command output that embeds
   account data.
 
-Use placeholders such as `<account-id>`, `<FunctionUrl>`, `<role-name>`, or
+Use placeholders such as `<account-id>`, `<IntakeFunctionUrl>`, `<role-name>`, or
 environment variables in documentation. When docs need a live value, document
 the AWS CLI query that retrieves it instead of recording the value itself.
 
@@ -109,11 +110,12 @@ the AWS CLI query that retrieves it instead of recording the value itself.
 
 Use these local checks:
 
-- `zig fmt --check build.zig src/intake_lambda.zig`: verify Zig formatting.
+- `zig fmt --check build.zig src/intake_lambda.zig src/lambda_auth.zig src/query_lambda.zig`:
+  verify Zig formatting.
 - `zig build --release -Darch=arm`: build the stripped, single-threaded,
-  ReleaseSafe Linux ARM64 Lambda `bootstrap`.
-- `zip -qj intake-lambda.zip zig-out/bin/bootstrap`: refresh the deployable package
-  when a new package is required.
+  ReleaseSafe Linux ARM64 intake and query Lambda bootstraps.
+- `zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap` and
+  `zip -qj query-lambda.zip zig-out/bin/query/bootstrap`: refresh deployable packages when required.
 - `sam validate --template-file template.yaml --region ca-central-1`: validate
   the SAM template when `template.yaml` changes.
 - `sam validate --lint --template-file template.yaml --region ca-central-1`:

@@ -2,5 +2,6 @@
 zig-out/
 zig-pkg/
 intake-lambda.zip
+query-lambda.zip
 /*.log
 .DS_Store

@@ -10,10 +10,10 @@ readonly stack_name="aws-lambda-zig-demo"
 
 usage() {
     cat <<'EOF'
-Usage: ./lambda_logs.sh
+Usage: ./lambda_logs.sh intake|query
 
-Download the intake-lambda logs and append new CloudWatch events
-to <function-name>.log in this repository.
+Download one Lambda's logs and append new CloudWatch events to
+<function-name>.log in this repository.
 
 Environment overrides:
   AWS_PROFILE    AWS CLI profile. Defaults to dev.
@@ -31,17 +31,21 @@ need_command() {
 }
 
 case "$#" in
-    0) ;;
-    1)
-        case "$1" in
-            -h | --help)
-                usage
-                exit 0
-                ;;
-            *) fail "unknown option: $1" ;;
-        esac
+    1) ;;
+    *) fail "specify exactly one Lambda: intake or query" ;;
+esac
+case "$1" in
+    -h | --help)
+        usage
+        exit 0
         ;;
-    *) fail "this command accepts no arguments" ;;
+    intake)
+        readonly function_output_key="IntakeFunctionName"
+        ;;
+    query)
+        readonly function_output_key="QueryFunctionName"
+        ;;
+    *) fail "unknown Lambda: $1; expected intake or query" ;;
 esac
 
 need_command aws
@@ -52,20 +56,21 @@ cd "$(dirname "$0")"
 function_name="$(
     aws cloudformation describe-stacks \
         --stack-name "$stack_name" \
-        --query "Stacks[0].Outputs[?OutputKey=='FunctionName'].OutputValue | [0]" \
+        --query "Stacks[0].Outputs[?OutputKey=='$function_output_key'].OutputValue | [0]" \
         --output text \
         --no-cli-pager
-)" || fail "failed to resolve FunctionName from stack $stack_name; run: aws sso login --profile $AWS_PROFILE"
+)" || fail "failed to resolve $function_output_key from stack $stack_name; run: aws sso login --profile $AWS_PROFILE"
 
 case "$function_name" in
     "" | None)
-        fail "stack $stack_name has no FunctionName output"
+        fail "stack $stack_name has no $function_output_key output"
         ;;
     *[!A-Za-z0-9_-]*)
-        fail "stack $stack_name returned an invalid FunctionName"
+        fail "stack $stack_name returned an invalid $function_output_key"
         ;;
 esac
-[ "${#function_name}" -le 64 ] || fail "stack $stack_name returned an invalid FunctionName"
+[ "${#function_name}" -le 64 ] ||
+    fail "stack $stack_name returned an invalid $function_output_key"
 
 readonly function_name
 readonly log_group_name="/aws/lambda/$function_name"
