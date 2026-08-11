@@ -1,7 +1,6 @@
-.zig-cache/
+.zig-*/
 zig-out/
 zig-pkg/
-intake-lambda.zip
-query-lambda.zip
-/*.log
+*.zip
+*.log
 .DS_Store
