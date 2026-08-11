@@ -527,16 +527,17 @@ if [ "$CHECK_URL" -eq 1 ]; then
         printf 'HTTP %s (expected 401)\n' "$HTTP_STATUS"
     done
 
-    printf '==> Checking authenticated query GET status\n'
+    printf '==> Checking authenticated tenant-scoped query GET status\n'
+    PASETO_SUBJECT="deploy-query-test-${RANDOM}-${RANDOM}"
     PASETO_TOKEN="$(
-        ./zig-out/bin/paseto issue --subject deploy-test --ttl-seconds 60
+        ./zig-out/bin/paseto issue --subject "$PASETO_SUBJECT" --ttl-seconds 60
     )"
     HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
         -H "Authorization: Bearer ${PASETO_TOKEN}" \
-        "$QUERY_FUNCTION_URL")"
-    [ "$HTTP_STATUS" = 200 ] ||
-        fail "authenticated query GET returned HTTP $HTTP_STATUS; expected 200"
-    printf 'HTTP %s (expected 200)\n' "$HTTP_STATUS"
+        "${QUERY_FUNCTION_URL%/}/00000000-0000-4000-8000-000000000000")"
+    [ "$HTTP_STATUS" = 404 ] ||
+        fail "authenticated query GET returned HTTP $HTTP_STATUS; expected 404"
+    printf 'HTTP %s (expected tenant-safe 404)\n' "$HTTP_STATUS"
 
     printf '==> Checking authenticated wrong-method statuses\n'
     HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \

@@ -99,8 +99,11 @@ pub fn build(b: *std.Build) void {
         .strip = true,
         .single_threaded = true,
         .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
             .{ .name = "aws-lambda", .module = lambda_runtime },
             .{ .name = "lambda_auth", .module = lambda_auth },
+            .{ .name = "operation", .module = lambda_operation },
+            .{ .name = "operation_persistence", .module = lambda_operation_persistence },
         },
     });
     const query_lambda_exe = b.addExecutable(.{
@@ -239,8 +242,11 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
         .root_source_file = b.path("src/query_lambda.zig"),
         .imports = &.{
+            .{ .name = "aws", .module = host_aws },
             .{ .name = "aws-lambda", .module = test_runtime },
             .{ .name = "lambda_auth", .module = host_lambda_auth },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "operation_persistence", .module = host_operation_persistence },
         },
     });
     const query_tests = b.addTest(.{

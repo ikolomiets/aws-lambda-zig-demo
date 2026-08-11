@@ -10,9 +10,10 @@ hash.
 _Avoid_: Job, task
 
 **Operation Tenant**:
-Required server-owned UTF-8 metadata identifying who requested an operation. Lambda derives it only
-from the verified PASETO `sub` claim; the host CLI accepts it only as create-command metadata. It is
-part of idempotency identity, but does not scope the DynamoDB partition key or authorize reads.
+Required server-owned UTF-8 metadata identifying the subject that requested and may read an
+Operation; Lambda derives it only from the verified PASETO `sub` claim, while the host CLI accepts
+it only as create-command metadata. It is part of idempotency identity and authorizes query reads
+after the globally keyed DynamoDB lookup, but does not scope the partition key.
 _Avoid_: Customer ID, partition key
 
 **Operation Body**:

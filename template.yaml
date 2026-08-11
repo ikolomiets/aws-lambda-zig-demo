@@ -10,7 +10,7 @@ Parameters:
   QueryFunctionName:
     Type: String
     Default: query-lambda
-    Description: Name of the environment query Lambda function.
+    Description: Name of the operation query Lambda function.
   LambdaPrincipal:
     Type: String
     Default: "*"
@@ -105,7 +105,7 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Ref QueryFunctionName
-      Description: Authenticated environment query function built with aws-lambda-zig.
+      Description: Authenticated tenant-scoped operation query built with aws-lambda-zig.
       CodeUri: query-lambda.zip
       Runtime: provided.al2023
       Handler: bootstrap
@@ -115,10 +115,15 @@ Resources:
       Timeout: 3
       Policies:
         - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource: !GetAtt OperationsTable.Arn
       Environment:
         Variables:
           LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
-          OPERATIONS_QUEUE_URL: !Ref OperationsQueue
           OPERATIONS_TABLE_NAME: !Ref OperationsTable
           PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 
@@ -158,11 +163,11 @@ Outputs:
     Description: Public operation intake Lambda Function URL.
     Value: !GetAtt IntakeFunctionUrl.FunctionUrl
   QueryFunctionName:
-    Description: Deployed environment query Lambda function name.
+    Description: Deployed operation query Lambda function name.
     Value: !Ref QueryFunction
   QueryFunctionArn:
-    Description: Deployed environment query Lambda function ARN.
+    Description: Deployed operation query Lambda function ARN.
     Value: !GetAtt QueryFunction.Arn
   QueryFunctionUrl:
-    Description: Public environment query Lambda Function URL.
+    Description: Public tenant-scoped operation query Lambda Function URL.
     Value: !GetAtt QueryFunctionUrl.FunctionUrl

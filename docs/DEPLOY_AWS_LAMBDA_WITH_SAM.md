@@ -5,7 +5,7 @@ using AWS SAM and `template.yaml`.
 
 SAM deploys both Lambda functions as one CloudFormation-managed stack. It creates
 their execution roles and public Function URLs plus the DynamoDB operations table
-and SQS operations queue used only by the intake Lambda.
+used by both Lambdas and the SQS operations queue used only by the intake Lambda.
 
 ## Assumptions
 
@@ -122,8 +122,8 @@ Both commands should report that `template.yaml` is valid.
 - `QueryFunctionUrlInvokeFunctionPermission`: allows `lambda:InvokeFunction` only
   through the query Function URL
 
-Both functions share the runtime, architecture, memory, timeout, and environment
-settings below. Only the intake function receives the inline DynamoDB and SQS policy:
+Both functions share the runtime, architecture, memory, timeout, basic logging
+policy, PASETO configuration, and operations-table environment value:
 
 ```yaml
 Runtime: provided.al2023
@@ -134,6 +134,18 @@ MemorySize: 128
 Timeout: 3
 Policies:
   - AWSLambdaBasicExecutionRole
+Environment:
+  Variables:
+    LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
+    OPERATIONS_TABLE_NAME: !Ref OperationsTable
+    PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
+```
+
+The intake function additionally receives `OPERATIONS_QUEUE_URL` and the
+following table-write and queue-send permissions:
+
+```yaml
+Policies:
   - Version: "2012-10-17"
     Statement:
       - Effect: Allow
@@ -148,32 +160,29 @@ Policies:
         Resource: !GetAtt OperationsQueue.Arn
 Environment:
   Variables:
-    LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
     OPERATIONS_QUEUE_URL: !Ref OperationsQueue
-    OPERATIONS_TABLE_NAME: !Ref OperationsTable
-    PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 ```
 
-The inline policy grants the intake function only `GetItem`, `PutItem`, and
-`UpdateItem` access to this stack's operations table. The
-`OPERATIONS_TABLE_NAME` environment variable contains the
-CloudFormation-generated physical table name. `OPERATIONS_QUEUE_URL` contains
-the stack queue's generated URL. Both are mandatory: before starting the Lambda
-invocation loop, the bootstrap loads one shared AWS configuration and
-initializes the Operation persistence and queue modules with the validated
-table name and non-empty, at-most-2,048-byte queue URL. Each intake module privately
-owns its respective DynamoDB or SQS client; both clients share the AWS
-configuration and HTTP pool. The module values, configuration, pool, and intake
-adapter are reused across warm invocations. Missing or invalid configuration
-therefore prevents intake invocation handling. The query function mirrors the
-table and queue environment variables only for display; it initializes no AWS
-client and has no DynamoDB or SQS data-plane permissions. The local
-persistence and queue command implementations use the same modules and
+The query function receives its own inline policy containing only
+`dynamodb:GetItem` for this stack's operations table. It does not receive
+`OPERATIONS_QUEUE_URL` or any SQS permission.
+
+`OPERATIONS_TABLE_NAME` contains the CloudFormation-generated physical table
+name. Before either invocation loop starts, its bootstrap loads an AWS
+configuration and initializes the Operation persistence module with the
+validated table name. The query bootstrap reuses that configuration,
+persistence client, HTTP pool, and adapter across warm invocations. The intake
+bootstrap also validates `OPERATIONS_QUEUE_URL`, initializes the queue module,
+and reuses both clients with its shared AWS configuration. Missing or invalid
+configuration prevents the affected Lambda from handling invocations. The
+local persistence and queue command implementations use the same modules and
 contracts.
 
 Startup validation makes no DynamoDB or SQS request. A missing table or
 insufficient DynamoDB permission is discovered by a POST persistence request
-and returned as a sanitized HTTP 500. A missing queue, insufficient
+and returned by intake as a sanitized HTTP 500. A query DynamoDB request or
+service failure returns a sanitized HTTP 503, while a malformed stored item or
+unexpected failure returns HTTP 500. A missing queue, insufficient
 `SendMessage` permission, or another SQS send failure is returned as a
 sanitized HTTP 503.
 
@@ -245,10 +254,13 @@ New items and every successful update set `expires_at` to
 Result-size validation remains in the application rather than a DynamoDB
 condition expression.
 
-Tenant is metadata and part of idempotency identity. UUIDs and the `id`
-partition key remain globally scoped, so reusing a UUID under another tenant
-changes the hash and returns an Operation conflict. This contract does not add
-tenant-scoped keys, secondary indexes, or new read authorization behavior.
+Tenant is server-owned metadata, part of idempotency identity, and the query
+authorization boundary. UUIDs and the `id` partition key remain globally
+scoped, so reusing a UUID under another tenant changes the hash and returns an
+Operation conflict. Query performs the globally keyed `GetItem`, then returns
+the Operation only when its stored tenant equals the verified PASETO subject.
+Missing and cross-tenant items are indistinguishable `404 Not Found` responses.
+No tenant-scoped key or secondary index is introduced.
 
 DynamoDB TTL deletion is asynchronous. An item becomes eligible for deletion
 at `expires_at` but may remain readable until DynamoDB removes it. Legacy rows
@@ -260,7 +272,7 @@ does not need an additional DynamoDB control-plane permission.
 The Function URLs use `AuthType: NONE` and buffered invocation. CORS is not
 configured because the service targets non-browser HTTP clients. The handlers
 enforce the supported methods: intake allows only POST and query allows only
-GET. Their public permissions use the existing intake logical IDs and new
+`GET /<uuid>`. Their public permissions use the existing intake logical IDs and new
 query-specific logical IDs.
 
 ```yaml
@@ -437,9 +449,10 @@ LAMBDA_PRINCIPAL='<lambda-principal>' ./deploy.sh
 passes it as the `PasetoPublicKey` SAM parameter. When post-deploy checks are
 enabled, it also requires the corresponding `PASETO_PRIVATE_KEY` to issue a
 short-lived test token. It verifies unauthenticated HTTP 401 for both URLs,
-authenticated query GET 200, authenticated wrong methods 405, and an
-authenticated bodyless intake POST 400. The private key and test token are not printed or passed to the
-Lambda environment. Use
+an authenticated query of a valid UUID with a unique test subject returns a
+tenant-safe 404, authenticated wrong methods return 405, and an authenticated
+bodyless intake POST returns 400. The private key and test token are not printed
+or passed to the Lambda environment. Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run` to run the
 local checks, rebuild both Lambda zip archives, and validate `template.yaml` without
 deploying to AWS.
@@ -525,37 +538,6 @@ token="$(
 )"
 ```
 
-Send the token in the authorization header:
-
-```sh
-curl -L -H "Authorization: Bearer $token" <QueryFunctionUrl>
-```
-
-Expected authenticated response:
-
-```text
-Hello, example-user!
-
-ConfigMeta
-...
-
-RequestMeta
-...
-
-Environment
-LAMBDA_PRINCIPAL=*
-OPERATIONS_QUEUE_URL=<CloudFormation-generated-queue-url>
-OPERATIONS_TABLE_NAME=<CloudFormation-generated-table-name>
-PASETO_PUBLIC_KEY=<public-key-from-keygen>
-...
-```
-
-The response should render directly in a browser because the handler returns:
-
-```text
-Content-Type: text/plain; charset=utf-8
-```
-
 POST an Operation JSON document with the same bearer token:
 
 ```sh
@@ -584,6 +566,24 @@ expiry, the verified subject as tenant, and the stable hash:
   "hash": "f4142429f9f7373c34b7b5eeab555ed5b4534a746193c40bfca65bb73f9a3014"
 }
 ```
+
+Read the Operation with the same token subject and UUID:
+
+```sh
+curl -L \
+  -H "Authorization: Bearer $token" \
+  <QueryFunctionUrl>/00112233-4455-6677-8899-aabbccddeeff
+```
+
+The query performs a strongly consistent read and returns the same compact
+bodyless Operation JSON shown above with `Content-Type: application/json`.
+Terminal Operations also include `result`; pending Operations do not. The path
+must contain exactly one UUID segment. Query strings and GET bodies cannot
+supply or alter the ID. Missing and cross-tenant Operations both return the
+same static `404 Not Found` response. DynamoDB request or service failures
+return static HTTP 503; malformed items and other unexpected failures remain
+sanitized HTTP 500 responses. DynamoDB TTL remains asynchronous, so an item is
+readable while it is still stored even after `expires_at`.
 
 The SQS message is the exact compact full Operation JSON with `id`, `tenant`,
 `name`, `body`, `state`, `last_updated`, `expires_at`, and `hash`, and no
@@ -740,7 +740,7 @@ or stack-resource lookup failures are reported directly by `persistence.sh`;
 DynamoDB failures after configuration loading instead report
 `dynamodb: AWS request failed`.
 
-### Troubleshoot Lambda intake initialization
+### Troubleshoot Lambda initialization
 
 The SAM template supplies `OPERATIONS_TABLE_NAME`, `OPERATIONS_QUEUE_URL`, and
 their scoped IAM policies together. Removing either variable, configuring an
@@ -756,6 +756,12 @@ logs and the SAM-managed stack resources without recording live table names or
 account-specific identifiers in this repository. Likewise, a syntactically
 valid but nonexistent queue or missing `SendMessage` permission is discovered
 only when POST attempts submission and returns a sanitized HTTP 503.
+
+The query Lambda requires only `OPERATIONS_TABLE_NAME`; it has no queue
+configuration. A missing or invalid table-name setting exits during query INIT.
+A nonexistent table, missing `GetItem` permission, or DynamoDB service failure
+is discovered by the first authenticated `GET /<uuid>` and returns a sanitized
+HTTP 503. A malformed stored item returns a sanitized HTTP 500.
 
 ## 11. Send, receive, and check queued Operations
 

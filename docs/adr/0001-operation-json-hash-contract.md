@@ -22,6 +22,8 @@ The reference envelope
 `{"tenant":"tenant-a","name":"echo","body":{"message":"hello","count":2}}` has lowercase
 digest `d271e3bd560113d2b82e42dfc46be33fb90b43d7f4b12114f3da4888eae445d4`. Tenant is therefore part
 of idempotency identity. UUIDs remain globally scoped: reusing a UUID under another tenant produces
-a different hash and an Operation conflict. This metadata does not introduce tenant-scoped table
-keys or new read authorization behavior. Changing the shared model, hash algorithm, envelope, or
-normalization rules requires an explicit schema migration or a new versioned contract.
+a different hash and an Operation conflict. Query reads by the global UUID and then requires the
+stored tenant to match the verified PASETO subject; missing and cross-tenant items share one `404`
+response. This authorization boundary does not introduce tenant-scoped table keys. Changing the
+shared model, hash algorithm, envelope, or normalization rules requires an explicit schema migration
+or a new versioned contract.

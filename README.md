@@ -8,7 +8,8 @@ stack-aware `persistence.sh` and `queue.sh` commands manage Operations in
 DynamoDB and SQS, while `lambda_logs.sh` downloads either function's CloudWatch
 logs. Both handlers use `src/lambda_auth.zig` to authenticate a PASETO v4.public
 bearer token through the `aws-lambda-zig` runtime package. The query Lambda
-accepts only GET and returns a plain-text Lambda environment dump. The intake
+accepts only `GET /<uuid>`, strongly reads the Operation from DynamoDB, and
+returns it only when its tenant matches the verified token subject. The intake
 Lambda accepts only POST, validates and hashes an
 Operation JSON document, derives required tenant metadata from the verified
 token subject, persists the Operation idempotently in DynamoDB, submits new
@@ -303,15 +304,20 @@ expired, or unverifiable credentials receive `401 Unauthorized` with
 internal failures receive a sanitized `500 Internal Server Error`.
 Invalid POST operation documents receive `400 Bad Request`. Authenticated
 non-POST intake methods receive `405 Method Not Allowed` with `Allow: POST`;
-authenticated non-GET query methods receive `405` with `Allow: GET`. A POST that
+authenticated non-GET query methods receive `405` with `Allow: GET`. Query
+paths that are not exactly one UUID segment receive `400 Bad Request`. Missing
+Operations and Operations owned by another tenant both receive the same static
+`404 Not Found` response. A POST that
 reuses an Operation ID with a different server-computed hash receives a
-sanitized `409 Conflict`; DynamoDB and malformed stored-item failures receive
-the static `500 Internal Server Error` response. An SQS submission failure
-receives a static `503 Service Unavailable` response.
+sanitized `409 Conflict`. Query DynamoDB request or service failures and intake
+SQS submission failures receive a static `503 Service Unavailable` response.
+Malformed stored items and other unexpected failures receive the static
+`500 Internal Server Error` response.
 
-Tenant is metadata and part of idempotency identity only. The DynamoDB `id`
-partition key remains globally scoped, and this change does not add
-tenant-scoped keys or new read authorization behavior.
+Tenant is server-owned metadata, part of idempotency identity, and the query
+authorization boundary. The DynamoDB `id` partition key remains globally
+scoped; query authorization is enforced after `GetItem` by comparing the stored
+tenant with the verified token subject.
 
 `OPERATIONS_TABLE_NAME` and `OPERATIONS_QUEUE_URL` are mandatory at intake Lambda
 initialization. The intake bootstrap validates the non-empty, at-most-2,048-byte queue
@@ -323,6 +329,13 @@ warm invocations. Missing or invalid configuration prevents intake request
 handling. Resource existence and IAM authorization are checked
 only when POST first calls the services, so DynamoDB failures return a
 sanitized HTTP 500 and SQS send failures return a sanitized HTTP 503.
+
+`OPERATIONS_TABLE_NAME` is also mandatory at query Lambda initialization. The
+query bootstrap initializes one AWS SDK configuration and one Operation
+persistence client and reuses them across warm invocations. It does not receive
+`OPERATIONS_QUEUE_URL` or initialize an SQS client. Query DynamoDB request or
+service failures return sanitized HTTP 503; malformed items and unexpected
+failures return sanitized HTTP 500.
 
 ## Lambda logs
 
@@ -390,9 +403,10 @@ only in the signing environment.
 The SAM-managed DynamoDB table and SQS queue, their environment variables, the
 table-scoped `GetItem`, `PutItem`, and `UpdateItem` policy, and the queue-scoped
 `SendMessage` policy are mandatory parts of the intake Lambda. The query Lambda
-mirrors the table and queue environment values for display but receives only
-the basic logging policy and initializes no AWS clients. Deploy the complete
-stack from `template.yaml` with AWS SAM.
+receives only `OPERATIONS_TABLE_NAME` and table-scoped `GetItem` in addition to
+the basic logging policy. It initializes a reusable DynamoDB persistence client
+and has no SQS permissions. Deploy the complete stack from `template.yaml` with
+AWS SAM.
 
 See [docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md)
 for the full SAM workflow.
@@ -413,29 +427,13 @@ HTTP/2 401
 WWW-Authenticate: Bearer
 ```
 
-Issue a token with the matching private key, then call the URL with it:
+Issue a token with the matching private key:
 
 ```sh
 token="$(
   PASETO_PRIVATE_KEY='<private-key-from-keygen>' \
     zig-out/bin/paseto issue --subject 'example-user' --ttl-seconds 300
 )"
-curl -L -H "Authorization: Bearer $token" <QueryFunctionUrl>
-```
-
-The authenticated GET response preserves the demo output:
-
-```text
-Hello, example-user!
-
-ConfigMeta
-...
-
-RequestMeta
-...
-
-Environment
-...
 ```
 
 POST an Operation JSON document with the same bearer token:
@@ -465,6 +463,20 @@ hash. The input body is intentionally omitted:
   "hash": "f4142429f9f7373c34b7b5eeab555ed5b4534a746193c40bfca65bb73f9a3014"
 }
 ```
+
+Read the Operation with the same token subject and UUID:
+
+```sh
+curl -L \
+  -H "Authorization: Bearer $token" \
+  <QueryFunctionUrl>/00112233-4455-6677-8899-aabbccddeeff
+```
+
+The query response is the same compact bodyless Operation output JSON shown
+above. Terminal Operations additionally include `result`; pending Operations
+do not. The ID comes only from the single `rawPath` segment: query strings and
+GET bodies neither provide nor alter it. A different token subject receives the
+same `404 Not Found` response as a missing Operation.
 
 For `NEW`, the handler combines the persisted identity with the parsed input
 body, refreshes both timestamps from the invocation time, and sends the exact
@@ -496,7 +508,7 @@ or CloudFront.
 ## Project Layout
 
 - `src/intake_lambda.zig`: authenticated POST intake entrypoint and handler.
-- `src/query_lambda.zig`: authenticated GET environment-query entrypoint and handler.
+- `src/query_lambda.zig`: authenticated tenant-scoped Operation GET entrypoint and handler.
 - `src/lambda_auth.zig`: shared bearer-token parsing and PASETO verification.
 - `src/operation.zig`: Operation JSON model, validation, and hash contract.
 - `src/operation_persistence.zig`: DynamoDB Operation mapping and conditional writes.
