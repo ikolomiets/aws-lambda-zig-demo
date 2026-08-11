@@ -15,6 +15,8 @@ pub const std_options: std.Options = .{
 const Allocator = std.mem.Allocator;
 
 const bad_request_body = "Bad Request\n";
+const cache_entry_count_max: usize = 1024;
+const cache_ttl_ns: i96 = std.time.ns_per_s;
 const content_type_json = "application/json";
 const content_type_text = "text/plain; charset=utf-8";
 const internal_server_error_body = "Internal Server Error\n";
@@ -27,6 +29,9 @@ const service_unavailable_body = "Service Unavailable\n";
 const unauthorized_body = "Unauthorized\n";
 
 comptime {
+    std.debug.assert(cache_entry_count_max > 0);
+    std.debug.assert(cache_entry_count_max <= std.math.maxInt(u32));
+    std.debug.assert(cache_ttl_ns > 0);
     std.debug.assert(lambda_auth.subject_size_max == operation.tenant_size_max);
 }
 
@@ -40,7 +45,7 @@ pub fn main(init: std.process.Init) void {
     };
     defer resources.deinit();
 
-    installRuntimeQueryAdapter(QueryAdapter.init(&resources));
+    installRuntimeQueryAdapter(QueryAdapter.init(&resources, &resources.cache));
     defer uninstallRuntimeQueryAdapter();
     lambda.handle(init, handler, .{});
 }
@@ -49,19 +54,133 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
     const query = runtime_query_adapter orelse {
         return error.PersistenceNotInitialized;
     };
-    const now = std.Io.Clock.real.now(ctx.io).toSeconds();
+    const authentication_now = std.Io.Clock.real.now(ctx.io).toSeconds();
+    const monotonic_now_ns = std.Io.Clock.awake.now(ctx.io).toNanoseconds();
     return handleInvocation(
         ctx.arena,
         event,
         @field(ctx, "_").kv,
         query,
-        now,
+        authentication_now,
+        monotonic_now_ns,
     );
+}
+
+const CacheEntry = struct {
+    tenant: []u8,
+    body: []u8,
+    inserted_at_ns: i96,
+};
+
+const OperationCache = struct {
+    allocator: Allocator,
+    entries: std.AutoHashMap(u128, CacheEntry),
+
+    const Self = @This();
+
+    fn init(cache: *Self, allocator: Allocator) void {
+        cache.* = .{
+            .allocator = allocator,
+            .entries = std.AutoHashMap(u128, CacheEntry).init(allocator),
+        };
+        std.debug.assert(cache.entries.count() == 0);
+    }
+
+    fn deinit(cache: *Self) void {
+        var iterator = cache.entries.valueIterator();
+        var entry_count: usize = 0;
+        while (iterator.next()) |entry| {
+            std.debug.assert(entry_count < cache_entry_count_max);
+            entry_count += 1;
+            cache.allocator.free(entry.tenant);
+            cache.allocator.free(entry.body);
+        }
+        std.debug.assert(entry_count == cache.entries.count());
+        cache.entries.deinit();
+        cache.* = undefined;
+    }
+
+    fn getFresh(cache: *Self, id: u128, now_ns: i96) ?*const CacheEntry {
+        std.debug.assert(cache.entries.count() <= cache_entry_count_max);
+        const entry = cache.entries.getPtr(id) orelse return null;
+        if (entryIsFresh(entry, now_ns)) return entry;
+
+        cache.remove(id);
+        std.debug.assert(!cache.entries.contains(id));
+        return null;
+    }
+
+    fn insert(
+        cache: *Self,
+        id: u128,
+        options: struct {
+            tenant: []const u8,
+            body: []const u8,
+            inserted_at_ns: i96,
+        },
+    ) Allocator.Error!bool {
+        std.debug.assert(options.tenant.len > 0);
+        std.debug.assert(options.tenant.len <= operation.tenant_size_max);
+        std.debug.assert(options.body.len > 0);
+        std.debug.assert(cache.entries.count() <= cache_entry_count_max);
+        std.debug.assert(!cache.entries.contains(id));
+
+        if (cache.entries.count() == cache_entry_count_max) {
+            cache.removeExpired(options.inserted_at_ns);
+            if (cache.entries.count() == cache_entry_count_max) return false;
+        }
+        std.debug.assert(cache.entries.count() < cache_entry_count_max);
+
+        const tenant = try cache.allocator.dupe(u8, options.tenant);
+        errdefer cache.allocator.free(tenant);
+        const body = try cache.allocator.dupe(u8, options.body);
+        errdefer cache.allocator.free(body);
+        try cache.entries.putNoClobber(id, .{
+            .tenant = tenant,
+            .body = body,
+            .inserted_at_ns = options.inserted_at_ns,
+        });
+        std.debug.assert(cache.entries.contains(id));
+        std.debug.assert(cache.entries.count() <= cache_entry_count_max);
+        return true;
+    }
+
+    fn removeExpired(cache: *Self, now_ns: i96) void {
+        var expired_ids: [cache_entry_count_max]u128 = undefined;
+        var expired_count: usize = 0;
+        var scanned_count: usize = 0;
+        var iterator = cache.entries.iterator();
+        while (iterator.next()) |entry| {
+            std.debug.assert(scanned_count < cache_entry_count_max);
+            scanned_count += 1;
+            if (entryIsFresh(entry.value_ptr, now_ns)) continue;
+            std.debug.assert(expired_count < expired_ids.len);
+            expired_ids[expired_count] = entry.key_ptr.*;
+            expired_count += 1;
+        }
+        std.debug.assert(scanned_count == cache.entries.count());
+
+        for (expired_ids[0..expired_count]) |id| cache.remove(id);
+        std.debug.assert(cache.entries.count() + expired_count == scanned_count);
+    }
+
+    fn remove(cache: *Self, id: u128) void {
+        const removed = cache.entries.fetchRemove(id) orelse unreachable;
+        cache.allocator.free(removed.value.tenant);
+        cache.allocator.free(removed.value.body);
+        std.debug.assert(cache.entries.count() < cache_entry_count_max);
+    }
+};
+
+fn entryIsFresh(entry: *const CacheEntry, now_ns: i96) bool {
+    std.debug.assert(now_ns >= entry.inserted_at_ns);
+    return now_ns - entry.inserted_at_ns < cache_ttl_ns;
 }
 
 const RuntimeResources = struct {
     config: aws.Config,
     persistence: operation_persistence.Persistence,
+    cache: OperationCache,
 
     fn init(resources: *RuntimeResources, process_init: std.process.Init) !void {
         resources.config = aws.Config.load(
@@ -78,9 +197,12 @@ const RuntimeResources = struct {
             &resources.config,
             process_init.environ_map,
         ) catch return error.PersistenceConfigurationFailure;
+
+        OperationCache.init(&resources.cache, process_init.gpa);
     }
 
     fn deinit(resources: *RuntimeResources) void {
+        resources.cache.deinit();
         resources.persistence.deinit();
         resources.config.deinit();
         resources.* = undefined;
@@ -97,13 +219,14 @@ const RuntimeResources = struct {
 
 const QueryAdapter = struct {
     context: *anyopaque,
+    cache: *OperationCache,
     read_fn: *const fn (
         *anyopaque,
         Allocator,
         u128,
     ) anyerror!operation.Operation,
 
-    fn init(pointer: anytype) QueryAdapter {
+    fn init(pointer: anytype, cache: *OperationCache) QueryAdapter {
         const Pointer = @TypeOf(pointer);
         const pointer_info = @typeInfo(Pointer);
         comptime std.debug.assert(pointer_info == .pointer);
@@ -121,6 +244,7 @@ const QueryAdapter = struct {
         };
         return .{
             .context = pointer,
+            .cache = cache,
             .read_fn = Adapter.read,
         };
     }
@@ -151,9 +275,17 @@ fn handleInvocation(
     event: []const u8,
     environment: *const std.process.Environ.Map,
     query: QueryAdapter,
-    now: i64,
+    authentication_now: i64,
+    monotonic_now_ns: i96,
 ) []const u8 {
-    const outcome = invocationOutcome(allocator, event, environment, query, now);
+    const outcome = invocationOutcome(
+        allocator,
+        event,
+        environment,
+        query,
+        authentication_now,
+        monotonic_now_ns,
+    );
     return encodeOutcome(allocator, outcome) catch internal_server_error_response;
 }
 
@@ -172,7 +304,8 @@ fn invocationOutcome(
     event: []const u8,
     environment: *const std.process.Environ.Map,
     query: QueryAdapter,
-    now: i64,
+    authentication_now: i64,
+    monotonic_now_ns: i96,
 ) InvocationOutcome {
     const request = lambda.url.parseRequest(allocator, event) catch {
         return .internal_server_error;
@@ -182,7 +315,7 @@ fn invocationOutcome(
         allocator,
         &request,
         environment,
-        now,
+        authentication_now,
     ) catch |err| {
         return switch (err) {
             error.Unauthorized => .unauthorized,
@@ -195,7 +328,13 @@ fn invocationOutcome(
         return .method_not_allowed;
     };
     if (method != .GET) return .method_not_allowed;
-    return queryInvocationOutcome(allocator, identity.subject, &request, query);
+    return queryInvocationOutcome(
+        allocator,
+        identity.subject,
+        &request,
+        query,
+        monotonic_now_ns,
+    );
 }
 
 fn queryInvocationOutcome(
@@ -203,6 +342,7 @@ fn queryInvocationOutcome(
     tenant: []const u8,
     request: *const lambda.url.Request,
     query: QueryAdapter,
+    monotonic_now_ns: i96,
 ) InvocationOutcome {
     std.debug.assert(tenant.len > 0);
     std.debug.assert(tenant.len <= operation.tenant_size_max);
@@ -210,6 +350,14 @@ fn queryInvocationOutcome(
     const id = operationIDFromRawPath(request.raw_path) catch {
         return .bad_request;
     };
+    if (query.cache.getFresh(id, monotonic_now_ns)) |cached| {
+        if (!std.mem.eql(u8, cached.tenant, tenant)) return .not_found;
+        const body = allocator.dupe(u8, cached.body) catch {
+            return .internal_server_error;
+        };
+        return .{ .success = body };
+    }
+
     var operation_arena = std.heap.ArenaAllocator.init(allocator);
     defer operation_arena.deinit();
     const persisted = query.read(operation_arena.allocator(), id) catch |err| {
@@ -219,11 +367,18 @@ fn queryInvocationOutcome(
             else => .internal_server_error,
         };
     };
-    if (!std.mem.eql(u8, persisted.tenant, tenant)) return .not_found;
-
     const body = operationOutputBody(allocator, &persisted) catch {
         return .internal_server_error;
     };
+    _ = query.cache.insert(id, .{
+        .tenant = persisted.tenant,
+        .body = body,
+        .inserted_at_ns = monotonic_now_ns,
+    }) catch false;
+    if (!std.mem.eql(u8, persisted.tenant, tenant)) {
+        allocator.free(body);
+        return .not_found;
+    }
     return .{ .success = body };
 }
 
@@ -323,12 +478,37 @@ fn handleInvocationForTest(
     fake: *FakeQuery,
     now: i64,
 ) []const u8 {
+    var cache: OperationCache = undefined;
+    OperationCache.init(&cache, std.testing.allocator);
+    defer cache.deinit();
+
+    return handleInvocationWithCacheForTest(
+        allocator,
+        event,
+        environment,
+        fake,
+        &cache,
+        now,
+        0,
+    );
+}
+
+fn handleInvocationWithCacheForTest(
+    allocator: Allocator,
+    event: []const u8,
+    environment: *const std.process.Environ.Map,
+    fake: *FakeQuery,
+    cache: *OperationCache,
+    authentication_now: i64,
+    monotonic_now_ns: i96,
+) []const u8 {
     return handleInvocation(
         allocator,
         event,
         environment,
-        QueryAdapter.init(fake),
-        now,
+        QueryAdapter.init(fake, cache),
+        authentication_now,
+        monotonic_now_ns,
     );
 }
 
@@ -345,6 +525,21 @@ fn testOperation(tenant: []const u8, state: operation.State) operation.Operation
         .result = if (operation.stateIsTerminal(state)) .{ .string = "done" } else null,
         .hash = [_]u8{0xab} ** 32,
     };
+}
+
+fn fillTestCache(cache: *OperationCache, inserted_at_ns: i96) !void {
+    for (0..cache_entry_count_max) |index| {
+        const inserted = try cache.insert(@intCast(index), .{
+            .tenant = "cache-fill-tenant",
+            .body = "{}",
+            .inserted_at_ns = inserted_at_ns,
+        });
+        try std.testing.expect(inserted);
+    }
+    try std.testing.expectEqual(
+        @as(u32, cache_entry_count_max),
+        cache.entries.count(),
+    );
 }
 
 test "AWS SDK exposes the runtime configuration type" {
@@ -433,6 +628,273 @@ test "authenticated GET returns exact terminal operation JSON with result" {
         "\\\"expires_at\\\":1700086523,\\\"result\\\":\\\"done\\\"," ++
         "\\\"hash\\\":\\\"" ++ ("ab" ** 32) ++ "\\\"}\"}";
     try std.testing.expectEqualStrings(expected, response);
+}
+
+test "second lookup before one second uses cached response" {
+    const token = try testToken(0x77);
+    defer std.testing.allocator.free(token);
+    var environment = try testEnvironment(0x77);
+    defer environment.deinit();
+    const event = try testQueryRequestEvent(token);
+    defer std.testing.allocator.free(event);
+    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .running) };
+    var cache: OperationCache = undefined;
+    OperationCache.init(&cache, std.testing.allocator);
+    defer cache.deinit();
+
+    const first = handleInvocationWithCacheForTest(
+        std.testing.allocator,
+        event,
+        &environment,
+        &fake,
+        &cache,
+        1000,
+        10,
+    );
+    defer std.testing.allocator.free(first);
+    fake.response = testOperation("lambda-test-user", .succeeded);
+    const second = handleInvocationWithCacheForTest(
+        std.testing.allocator,
+        event,
+        &environment,
+        &fake,
+        &cache,
+        1000,
+        10 + cache_ttl_ns - 1,
+    );
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(std.mem.indexOf(u8, second, "RUNNING") != null);
+    try std.testing.expectEqual(@as(u8, 1), fake.read_count);
+    try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
+}
+
+test "cache entry expires and is replaced at exactly one second" {
+    const token = try testToken(0x78);
+    defer std.testing.allocator.free(token);
+    var environment = try testEnvironment(0x78);
+    defer environment.deinit();
+    const event = try testQueryRequestEvent(token);
+    defer std.testing.allocator.free(event);
+    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .running) };
+    var cache: OperationCache = undefined;
+    OperationCache.init(&cache, std.testing.allocator);
+    defer cache.deinit();
+
+    const first = handleInvocationWithCacheForTest(
+        std.testing.allocator,
+        event,
+        &environment,
+        &fake,
+        &cache,
+        1000,
+        0,
+    );
+    defer std.testing.allocator.free(first);
+    fake.response = testOperation("lambda-test-user", .succeeded);
+    const second = handleInvocationWithCacheForTest(
+        std.testing.allocator,
+        event,
+        &environment,
+        &fake,
+        &cache,
+        1000,
+        cache_ttl_ns,
+    );
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expect(std.mem.indexOf(u8, first, "RUNNING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "SUCCEEDED") != null);
+    try std.testing.expectEqual(@as(u8, 2), fake.read_count);
+    try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
+}
+
+test "foreign request populates ID-only cache for owning tenant" {
+    const foreign_token = try testToken(0x79);
+    defer std.testing.allocator.free(foreign_token);
+    const owner_token = try testTokenForSubject(0x79, "owning-tenant");
+    defer std.testing.allocator.free(owner_token);
+    var environment = try testEnvironment(0x79);
+    defer environment.deinit();
+    const foreign_event = try testQueryRequestEvent(foreign_token);
+    defer std.testing.allocator.free(foreign_event);
+    const owner_event = try testQueryRequestEvent(owner_token);
+    defer std.testing.allocator.free(owner_event);
+    var fake = FakeQuery{ .response = testOperation("owning-tenant", .running) };
+    var cache: OperationCache = undefined;
+    OperationCache.init(&cache, std.testing.allocator);
+    defer cache.deinit();
+
+    const foreign_response = handleInvocationWithCacheForTest(
+        std.testing.allocator,
+        foreign_event,
+        &environment,
+        &fake,
+        &cache,
+        1000,
+        0,
+    );
+    defer std.testing.allocator.free(foreign_response);
+    fake.read_error = error.AWSFailure;
+    const owner_response = handleInvocationWithCacheForTest(
+        std.testing.allocator,
+        owner_event,
+        &environment,
+        &fake,
+        &cache,
+        1000,
+        cache_ttl_ns - 1,
+    );
+    defer std.testing.allocator.free(owner_response);
+
+    try std.testing.expect(std.mem.indexOf(u8, foreign_response, "statusCode\":404") != null);
+    try expectNotContains(foreign_response, "owning-tenant");
+    try std.testing.expect(std.mem.indexOf(u8, owner_response, "statusCode\":200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, owner_response, "owning-tenant") != null);
+    try std.testing.expectEqual(@as(u8, 1), fake.read_count);
+    try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
+}
+
+test "missing operations are fetched on every request" {
+    const token = try testToken(0x7a);
+    defer std.testing.allocator.free(token);
+    var environment = try testEnvironment(0x7a);
+    defer environment.deinit();
+    const event = try testQueryRequestEvent(token);
+    defer std.testing.allocator.free(event);
+    var fake = FakeQuery{ .read_error = error.OperationNotFound };
+    var cache: OperationCache = undefined;
+    OperationCache.init(&cache, std.testing.allocator);
+    defer cache.deinit();
+
+    for (0..2) |monotonic_now_ns| {
+        const response = handleInvocationWithCacheForTest(
+            std.testing.allocator,
+            event,
+            &environment,
+            &fake,
+            &cache,
+            1000,
+            @intCast(monotonic_now_ns),
+        );
+        defer std.testing.allocator.free(response);
+        try std.testing.expect(std.mem.indexOf(u8, response, "statusCode\":404") != null);
+    }
+    try std.testing.expectEqual(@as(u8, 2), fake.read_count);
+    try std.testing.expectEqual(@as(u32, 0), cache.entries.count());
+}
+
+test "full fresh cache serves fetched record without caching it" {
+    const token = try testToken(0x7b);
+    defer std.testing.allocator.free(token);
+    var environment = try testEnvironment(0x7b);
+    defer environment.deinit();
+    const event = try testQueryRequestEvent(token);
+    defer std.testing.allocator.free(event);
+    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .running) };
+    var cache: OperationCache = undefined;
+    OperationCache.init(&cache, std.testing.allocator);
+    defer cache.deinit();
+    try fillTestCache(&cache, 0);
+    const target_id = testOperation("lambda-test-user", .running).id;
+    std.debug.assert(target_id >= cache_entry_count_max);
+
+    for (0..2) |_| {
+        const response = handleInvocationWithCacheForTest(
+            std.testing.allocator,
+            event,
+            &environment,
+            &fake,
+            &cache,
+            1000,
+            cache_ttl_ns - 1,
+        );
+        defer std.testing.allocator.free(response);
+        try std.testing.expect(std.mem.indexOf(u8, response, "statusCode\":200") != null);
+        try std.testing.expectEqual(
+            @as(u32, cache_entry_count_max),
+            cache.entries.count(),
+        );
+        try std.testing.expect(!cache.entries.contains(target_id));
+    }
+    try std.testing.expectEqual(@as(u8, 2), fake.read_count);
+}
+
+test "full cache removes all expired entries before admitting fetched record" {
+    const token = try testToken(0x7c);
+    defer std.testing.allocator.free(token);
+    var environment = try testEnvironment(0x7c);
+    defer environment.deinit();
+    const event = try testQueryRequestEvent(token);
+    defer std.testing.allocator.free(event);
+    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .running) };
+    var cache: OperationCache = undefined;
+    OperationCache.init(&cache, std.testing.allocator);
+    defer cache.deinit();
+    try fillTestCache(&cache, 0);
+    const target_id = testOperation("lambda-test-user", .running).id;
+    std.debug.assert(target_id >= cache_entry_count_max);
+
+    const first = handleInvocationWithCacheForTest(
+        std.testing.allocator,
+        event,
+        &environment,
+        &fake,
+        &cache,
+        1000,
+        cache_ttl_ns,
+    );
+    defer std.testing.allocator.free(first);
+    const second = handleInvocationWithCacheForTest(
+        std.testing.allocator,
+        event,
+        &environment,
+        &fake,
+        &cache,
+        1000,
+        cache_ttl_ns,
+    );
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expectEqual(@as(u8, 1), fake.read_count);
+    try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
+    try std.testing.expect(cache.entries.contains(target_id));
+}
+
+test "cache allocation failures serve fetched response without caching" {
+    const token = try testToken(0x7d);
+    defer std.testing.allocator.free(token);
+    var environment = try testEnvironment(0x7d);
+    defer environment.deinit();
+    const event = try testQueryRequestEvent(token);
+    defer std.testing.allocator.free(event);
+
+    for ([_]usize{ 0, 1, 2 }) |fail_index| {
+        var failing_allocator = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        var cache: OperationCache = undefined;
+        OperationCache.init(&cache, failing_allocator.allocator());
+        defer cache.deinit();
+        var fake = FakeQuery{ .response = testOperation("lambda-test-user", .running) };
+
+        const response = handleInvocationWithCacheForTest(
+            std.testing.allocator,
+            event,
+            &environment,
+            &fake,
+            &cache,
+            1000,
+            0,
+        );
+        defer std.testing.allocator.free(response);
+        try std.testing.expect(std.mem.indexOf(u8, response, "statusCode\":200") != null);
+        try std.testing.expectEqual(@as(u8, 1), fake.read_count);
+        try std.testing.expectEqual(@as(u32, 0), cache.entries.count());
+    }
 }
 
 test "missing malformed nested and trailing paths do not read persistence" {
@@ -672,9 +1134,22 @@ fn testRequestEvent(options: TestRequestOptions) ![]u8 {
     return event.toOwnedSlice();
 }
 
+fn testQueryRequestEvent(token: []const u8) ![]u8 {
+    return testRequestEvent(.{
+        .method = .GET,
+        .token = token,
+        .raw_path = "/00112233-4455-6677-8899-aabbccddeeff",
+    });
+}
+
 fn testToken(seed_byte: u8) ![]u8 {
+    return testTokenForSubject(seed_byte, "lambda-test-user");
+}
+
+fn testTokenForSubject(seed_byte: u8, subject: []const u8) ![]u8 {
     return lambda_auth.testing.issue_token(std.testing.allocator, .{
         .seed_byte = seed_byte,
+        .subject = subject,
         .now = 1000,
         .ttl_seconds = 60,
     });
