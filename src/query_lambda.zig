@@ -1,7 +1,6 @@
 const std = @import("std");
 const lambda = @import("aws-lambda");
 const lambda_auth = @import("lambda_auth");
-const paseto = @import("paseto");
 
 const content_type_text = "text/plain; charset=utf-8";
 const environment_count_max = 512;
@@ -67,7 +66,7 @@ fn invocationOutcome(
         return .internal_server_error;
     };
     defer request.deinit(allocator);
-    var claims = lambda_auth.authenticate(
+    var identity = lambda_auth.authenticate(
         allocator,
         &request,
         environment,
@@ -78,7 +77,7 @@ fn invocationOutcome(
             error.InternalFailure => .internal_server_error,
         };
     };
-    defer claims.deinit();
+    defer identity.deinit();
 
     const method = request.request_context.http.method orelse {
         return .method_not_allowed;
@@ -86,7 +85,7 @@ fn invocationOutcome(
     if (method != .GET) return .method_not_allowed;
     const body = get_handler_body(
         allocator,
-        claims.sub,
+        identity.subject,
         config,
         request_metadata,
         environment,
@@ -134,7 +133,7 @@ fn get_handler_body(
     environment: *const std.process.Environ.Map,
 ) ![]const u8 {
     std.debug.assert(subject.len > 0);
-    std.debug.assert(subject.len <= paseto.subject_size_max);
+    std.debug.assert(subject.len <= lambda_auth.subject_size_max);
 
     var count_buffer: [1024]u8 = undefined;
     var counter: std.Io.Writer.Discarding = .init(&count_buffer);
@@ -171,7 +170,7 @@ fn get_handler_body_write(
     environment: *const std.process.Environ.Map,
 ) !void {
     std.debug.assert(subject.len > 0);
-    std.debug.assert(subject.len <= paseto.subject_size_max);
+    std.debug.assert(subject.len <= lambda_auth.subject_size_max);
 
     try writer.print("Hello, {s}!\n\n", .{subject});
     try configMetadataBodyWrite(writer, config);
@@ -255,13 +254,15 @@ fn writerCountToUsize(count: u64) !usize {
 }
 
 test "authenticated GET returns environment details for the token subject" {
-    var key_pair = testKeyPair(0x71);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x71,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x71);
     try environment.put("CUSTOM_VALUE", "query-demo");
     const event = try testAuthorizationEvent(std.testing.allocator, .GET, token, null);
     defer std.testing.allocator.free(event);
@@ -361,13 +362,15 @@ test "query body allocates its final body once" {
 }
 
 test "query authenticates before routing and allows only GET" {
-    var key_pair = testKeyPair(0x72);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x72,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x72);
 
     const post_event = try testAuthorizationEvent(
         std.testing.allocator,
@@ -425,9 +428,11 @@ test "query failures return only sanitized static responses" {
     try std.testing.expectEqualStrings(internal_server_error_response, malformed_response);
     try expectNotContains(malformed_response, event_marker);
 
-    var key_pair = testKeyPair(0x73);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x73,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     const event = try testAuthorizationEvent(std.testing.allocator, .GET, token, null);
     defer std.testing.allocator.free(event);
@@ -483,37 +488,6 @@ fn testAuthorizationEvent(
     }
     try event.writer.writeByte('}');
     return event.toOwnedSlice();
-}
-
-fn testKeyPair(seed_byte: u8) paseto.Ed25519.KeyPair {
-    const seed = [_]u8{seed_byte} ** paseto.Ed25519.KeyPair.seed_length;
-    return paseto.Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
-}
-
-fn testToken(
-    key_pair: *const paseto.Ed25519.KeyPair,
-    now: i64,
-    ttl_seconds: i64,
-) ![]u8 {
-    var random = std.Random.DefaultPrng.init(0x51554552594c414d);
-    return paseto.issue(
-        std.testing.allocator,
-        random.random(),
-        &key_pair.secret_key,
-        .{
-            .subject = "lambda-test-user",
-            .now = now,
-            .ttl_seconds = ttl_seconds,
-        },
-    );
-}
-
-fn putTestPublicKey(
-    environment: *std.process.Environ.Map,
-    public_key: paseto.Ed25519.PublicKey,
-) !void {
-    var buffer: [paseto.public_key_base64_size]u8 = undefined;
-    try environment.put("PASETO_PUBLIC_KEY", paseto.encodePublicKey(public_key, &buffer));
 }
 
 fn expectContains(haystack: []const u8, needle: []const u8) !void {

@@ -79,7 +79,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation", .module = lambda_operation },
             .{ .name = "operation_persistence", .module = lambda_operation_persistence },
             .{ .name = "operation_queue", .module = lambda_operation_queue },
-            .{ .name = "paseto", .module = lambda_paseto },
         },
     });
 
@@ -102,7 +101,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "aws-lambda", .module = lambda_runtime },
             .{ .name = "lambda_auth", .module = lambda_auth },
-            .{ .name = "paseto", .module = lambda_paseto },
         },
     });
     const query_lambda_exe = b.addExecutable(.{
@@ -229,7 +227,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation", .module = host_operation },
             .{ .name = "operation_persistence", .module = host_operation_persistence },
             .{ .name = "operation_queue", .module = host_operation_queue },
-            .{ .name = "paseto", .module = host_paseto },
         },
     });
     const lambda_tests = b.addTest(.{
@@ -244,7 +241,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "aws-lambda", .module = test_runtime },
             .{ .name = "lambda_auth", .module = host_lambda_auth },
-            .{ .name = "paseto", .module = host_paseto },
         },
     });
     const query_tests = b.addTest(.{

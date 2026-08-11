@@ -5,7 +5,6 @@ const lambda_auth = @import("lambda_auth");
 const operation = @import("operation");
 const operation_persistence = @import("operation_persistence");
 const operation_queue = @import("operation_queue");
-const paseto = @import("paseto");
 
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{.{
@@ -31,7 +30,7 @@ const unauthorized_body = "Unauthorized\n";
 
 comptime {
     std.debug.assert(operation_message_size_max > operation.body_size_max);
-    std.debug.assert(paseto.subject_size_max == operation.tenant_size_max);
+    std.debug.assert(lambda_auth.subject_size_max == operation.tenant_size_max);
 }
 
 var runtime_intake_adapter: ?IntakeAdapter = null;
@@ -299,19 +298,19 @@ fn invocationOutcome(
         return .internal_server_error;
     };
     defer request.deinit(allocator);
-    var claims = lambda_auth.authenticate(allocator, &request, env, now) catch |err| {
+    var identity = lambda_auth.authenticate(allocator, &request, env, now) catch |err| {
         return switch (err) {
             error.Unauthorized => .unauthorized,
             error.InternalFailure => .internal_server_error,
         };
     };
-    defer claims.deinit();
+    defer identity.deinit();
 
     const method = request.request_context.http.method orelse {
         return .method_not_allowed;
     };
     if (method != .POST) return .method_not_allowed;
-    return post_invocation_outcome(allocator, claims.sub, &request, intake, now);
+    return post_invocation_outcome(allocator, identity.subject, &request, intake, now);
 }
 
 fn post_invocation_outcome(
@@ -653,13 +652,15 @@ test "AWS SDK debug logging is enabled" {
 }
 
 test "authenticated POST submits a new operation and returns it without its body" {
-    var key_pair = testKeyPair(0x42);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1_700_000_000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x42,
+        .now = 1_700_000_000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x42);
 
     const inputs = [_][]const u8{
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
@@ -741,13 +742,15 @@ test "authenticated POST submits a new operation and returns it without its body
 }
 
 test "POST queues every JSON body variant as exact full Operation JSON" {
-    var key_pair = testKeyPair(0x51);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1_700_000_000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x51,
+        .now = 1_700_000_000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x51);
 
     const bodies = [_][]const u8{ "null", "false", "42", "\"text\"", "[1]", "{\"a\":1}" };
     const messages = [_][]const u8{
@@ -822,13 +825,11 @@ test "POST queues every JSON body variant as exact full Operation JSON" {
 }
 
 test "POST derives tenant and hash from distinct bounded verified subjects" {
-    var key_pair = testKeyPair(0x49);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x49);
     const subjects = [_][]const u8{
-        "a" ** paseto.subject_size_max,
+        "a" ** lambda_auth.subject_size_max,
         "tenant-b",
     };
     const input =
@@ -837,7 +838,12 @@ test "POST derives tenant and hash from distinct bounded verified subjects" {
     var hashes: [subjects.len][32]u8 = undefined;
 
     for (subjects, 0..) |subject, index| {
-        const token = try testTokenForSubject(&key_pair, subject, 1000, 60);
+        const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+            .seed_byte = 0x49,
+            .subject = subject,
+            .now = 1000,
+            .ttl_seconds = 60,
+        });
         defer std.testing.allocator.free(token);
         const event = try test_authorization_request_event(
             std.testing.allocator,
@@ -868,13 +874,15 @@ test "POST derives tenant and hash from distinct bounded verified subjects" {
 }
 
 test "matching NEW POST retries submission with the invocation timestamp" {
-    var key_pair = testKeyPair(0x52);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1_700_000_500, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x52,
+        .now = 1_700_000_500,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x52);
     const input =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
@@ -929,13 +937,15 @@ test "matching NEW POST retries submission with the invocation timestamp" {
 test "matching POST retry returns the latest stored persistent view" {
     var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer result_arena.deinit();
-    var key_pair = testKeyPair(0x45);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1_700_000_000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x45,
+        .now = 1_700_000_000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x45);
 
     var expected_hash: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(
@@ -996,13 +1006,15 @@ test "matching POST retry returns the latest stored persistent view" {
 test "matching POST in every later state returns without another submission" {
     var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer result_arena.deinit();
-    var key_pair = testKeyPair(0x53);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1_700_000_000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x53,
+        .now = 1_700_000_000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x53);
     const input =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
@@ -1065,13 +1077,15 @@ test "matching POST in every later state returns without another submission" {
 }
 
 test "POST conflict returns only the static conflict response" {
-    var key_pair = testKeyPair(0x46);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x46,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x46);
     var fake = FakeIntake{ .create_error = error.OperationConflict };
     const event = try test_authorization_request_event(
         std.testing.allocator,
@@ -1100,13 +1114,15 @@ test "POST conflict returns only the static conflict response" {
 }
 
 test "POST persistence failures return only the static internal error" {
-    var key_pair = testKeyPair(0x47);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x47,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x47);
     const event = try test_authorization_request_event(
         std.testing.allocator,
         .POST,
@@ -1144,13 +1160,15 @@ test "POST persistence failures return only the static internal error" {
 }
 
 test "SQS failure leaves NEW unchanged and a matching POST can retry submission" {
-    var key_pair = testKeyPair(0x50);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x50,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x50);
     const event = try test_authorization_request_event(
         std.testing.allocator,
         .POST,
@@ -1197,13 +1215,15 @@ test "SQS failure leaves NEW unchanged and a matching POST can retry submission"
 }
 
 test "persistence update failure after send returns only the static internal error" {
-    var key_pair = testKeyPair(0x54);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x54,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x54);
     const event = try test_authorization_request_event(
         std.testing.allocator,
         .POST,
@@ -1237,13 +1257,15 @@ test "persistence update failure after send returns only the static internal err
 }
 
 test "concurrent submitted update conflict reconciles with a consistent read" {
-    var key_pair = testKeyPair(0x55);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x55,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x55);
     const event = try test_authorization_request_event(
         std.testing.allocator,
         .POST,
@@ -1295,13 +1317,15 @@ test "concurrent submitted update conflict reconciles with a consistent read" {
 }
 
 test "unreconciled conditional update conflicts remain sanitized" {
-    var key_pair = testKeyPair(0x56);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x56,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x56);
     const event = try test_authorization_request_event(
         std.testing.allocator,
         .POST,
@@ -1370,13 +1394,15 @@ test "unreconciled conditional update conflicts remain sanitized" {
 }
 
 test "warm invocations reuse one adapter without retaining request data" {
-    var key_pair = testKeyPair(0x48);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x48,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x48);
     var fake: FakeIntake = .{};
     const intake = IntakeAdapter.init(&fake);
     const inputs = [_][]const u8{
@@ -1419,13 +1445,15 @@ test "warm invocations reuse one adapter without retaining request data" {
 }
 
 test "authenticated POST rejects missing and invalid operation JSON" {
-    var key_pair = testKeyPair(0x43);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x43,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x43);
     var fake: FakeIntake = .{};
 
     const invalid_inputs = [_]?[]const u8{
@@ -1466,13 +1494,15 @@ test "authenticated POST rejects missing and invalid operation JSON" {
 }
 
 test "authentication precedes method routing" {
-    var key_pair = testKeyPair(0x44);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x44,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x44);
     var fake: FakeIntake = .{};
 
     const unsupported_event = try test_authorization_request_event(
@@ -1599,17 +1629,21 @@ test "missing and malformed credentials return a Bearer challenge" {
 }
 
 test "wrong and expired tokens return a sanitized unauthorized response" {
-    var key_pair = testKeyPair(0x51);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    var wrong_key_pair = testKeyPair(0x52);
-    defer paseto.wipeSecretKey(&wrong_key_pair.secret_key);
-    const wrong_token = try testToken(&wrong_key_pair, 1000, 60);
+    const wrong_token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x52,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(wrong_token);
-    const expired_token = try testToken(&key_pair, 1000, 1);
+    const expired_token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x51,
+        .now = 1000,
+        .ttl_seconds = 1,
+    });
     defer std.testing.allocator.free(expired_token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try lambda_auth.testing.put_public_key(&environment, 0x51);
     var fake: FakeIntake = .{};
 
     const tokens = [_][]const u8{ wrong_token, expired_token };
@@ -1638,9 +1672,11 @@ test "wrong and expired tokens return a sanitized unauthorized response" {
 }
 
 test "missing and invalid public key configuration return sanitized errors" {
-    var key_pair = testKeyPair(0x61);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x61,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     const event = try testAuthorizationEvent(
         std.testing.allocator,
@@ -1773,57 +1809,6 @@ fn test_authorization_request_event(
     std.debug.assert(event.written().len > token.len);
     std.debug.assert(event.written().len > header_name.len);
     return event.toOwnedSlice();
-}
-
-fn testKeyPair(seed_byte: u8) paseto.Ed25519.KeyPair {
-    const seed = [_]u8{seed_byte} ** paseto.Ed25519.KeyPair.seed_length;
-    const key_pair = paseto.Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
-    std.debug.assert(
-        key_pair.secret_key.toBytes().len == paseto.Ed25519.SecretKey.encoded_length,
-    );
-    std.debug.assert(
-        key_pair.public_key.toBytes().len == paseto.Ed25519.PublicKey.encoded_length,
-    );
-    return key_pair;
-}
-
-fn testToken(
-    key_pair: *const paseto.Ed25519.KeyPair,
-    now: i64,
-    ttl_seconds: i64,
-) ![]u8 {
-    return testTokenForSubject(key_pair, "lambda-test-user", now, ttl_seconds);
-}
-
-fn testTokenForSubject(
-    key_pair: *const paseto.Ed25519.KeyPair,
-    subject: []const u8,
-    now: i64,
-    ttl_seconds: i64,
-) ![]u8 {
-    std.debug.assert(ttl_seconds > 0);
-    var random = std.Random.DefaultPrng.init(0x4c414d4244415554);
-    return paseto.issue(
-        std.testing.allocator,
-        random.random(),
-        &key_pair.secret_key,
-        .{
-            .subject = subject,
-            .now = now,
-            .ttl_seconds = ttl_seconds,
-        },
-    );
-}
-
-fn putTestPublicKey(
-    environment: *std.process.Environ.Map,
-    public_key: paseto.Ed25519.PublicKey,
-) !void {
-    var buffer: [paseto.public_key_base64_size]u8 = undefined;
-    const encoded = paseto.encodePublicKey(public_key, &buffer);
-    try environment.put("PASETO_PUBLIC_KEY", encoded);
-    std.debug.assert(environment.get("PASETO_PUBLIC_KEY") != null);
-    std.debug.assert(encoded.len == paseto.public_key_base64_size);
 }
 
 fn expectUnauthorized(response: []const u8) !void {

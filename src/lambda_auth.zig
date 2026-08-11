@@ -4,9 +4,24 @@ const paseto = @import("paseto");
 
 const authorization_header_count_max = 256;
 
+pub const subject_size_max = paseto.subject_size_max;
+
 pub const Error = error{
     InternalFailure,
     Unauthorized,
+};
+
+/// Owns the authenticated identity for the lifetime of a Lambda invocation.
+pub const Identity = struct {
+    subject: []u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(identity: *Identity) void {
+        std.debug.assert(identity.subject.len > 0);
+        std.debug.assert(identity.subject.len <= subject_size_max);
+        identity.allocator.free(identity.subject);
+        identity.* = undefined;
+    }
 };
 
 pub fn authenticate(
@@ -14,7 +29,7 @@ pub fn authenticate(
     request: *const lambda.url.Request,
     environment: *const std.process.Environ.Map,
     now: i64,
-) Error!paseto.Claims {
+) Error!Identity {
     const token = bearerToken(request) catch return error.Unauthorized;
     const public_key_encoded = environment.get("PASETO_PUBLIC_KEY") orelse {
         return error.InternalFailure;
@@ -22,11 +37,19 @@ pub fn authenticate(
     const public_key = paseto.decodePublicKey(public_key_encoded) catch {
         return error.InternalFailure;
     };
-    return paseto.verify(allocator, token, public_key, now) catch |err| {
+    const claims = paseto.verify(allocator, token, public_key, now) catch |err| {
         return switch (err) {
             error.InvalidToken => error.Unauthorized,
             else => error.InternalFailure,
         };
+    };
+    std.debug.assert(claims.sub.len > 0);
+    std.debug.assert(claims.sub.len <= subject_size_max);
+    std.debug.assert(claims.exp > now);
+    // Identity assumes ownership of the verified subject and its allocator.
+    return .{
+        .subject = claims.sub,
+        .allocator = claims.allocator,
     };
 }
 
@@ -65,14 +88,16 @@ fn bearerToken(request: *const lambda.url.Request) error{InvalidCredentials}![]c
 }
 
 test "valid bearer token authenticates its subject" {
-    var key_pair = testKeyPair(0x41);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x41,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
 
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try testing.put_public_key(&environment, 0x41);
 
     const event = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -83,24 +108,26 @@ test "valid bearer token authenticates its subject" {
     const request = try lambda.url.parseRequest(std.testing.allocator, event);
     defer request.deinit(std.testing.allocator);
 
-    var claims = try authenticate(
+    var identity = try authenticate(
         std.testing.allocator,
         &request,
         &environment,
         1000,
     );
-    defer claims.deinit();
-    try std.testing.expectEqualStrings("lambda-test-user", claims.sub);
+    defer identity.deinit();
+    try std.testing.expectEqualStrings("lambda-test-user", identity.subject);
 }
 
 test "authorization header and bearer scheme are case insensitive" {
-    var key_pair = testKeyPair(0x42);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x42,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try testing.put_public_key(&environment, 0x42);
     const event = try std.fmt.allocPrint(
         std.testing.allocator,
         "{{\"headers\":{{\"authorization\":\"bEaReR {s}\"}}}}",
@@ -110,14 +137,14 @@ test "authorization header and bearer scheme are case insensitive" {
     const request = try lambda.url.parseRequest(std.testing.allocator, event);
     defer request.deinit(std.testing.allocator);
 
-    var claims = try authenticate(
+    var identity = try authenticate(
         std.testing.allocator,
         &request,
         &environment,
         1000,
     );
-    defer claims.deinit();
-    try std.testing.expectEqualStrings("lambda-test-user", claims.sub);
+    defer identity.deinit();
+    try std.testing.expectEqualStrings("lambda-test-user", identity.subject);
 }
 
 test "missing malformed duplicate and oversized bearer credentials are unauthorized" {
@@ -174,18 +201,22 @@ test "missing malformed duplicate and oversized bearer credentials are unauthori
 }
 
 test "expired and wrongly signed tokens are unauthorized" {
-    var key_pair = testKeyPair(0x51);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    var wrong_key_pair = testKeyPair(0x52);
-    defer paseto.wipeSecretKey(&wrong_key_pair.secret_key);
-    const wrong_token = try testToken(&wrong_key_pair, 1000, 60);
+    const wrong_token = try testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x52,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(wrong_token);
-    const expired_token = try testToken(&key_pair, 1000, 1);
+    const expired_token = try testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x51,
+        .now = 1000,
+        .ttl_seconds = 1,
+    });
     defer std.testing.allocator.free(expired_token);
 
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try putTestPublicKey(&environment, key_pair.public_key);
+    try testing.put_public_key(&environment, 0x51);
 
     for ([_][]const u8{ wrong_token, expired_token }) |token| {
         const event = try std.fmt.allocPrint(
@@ -204,9 +235,11 @@ test "expired and wrongly signed tokens are unauthorized" {
 }
 
 test "missing and invalid public key configuration are internal failures" {
-    var key_pair = testKeyPair(0x61);
-    defer paseto.wipeSecretKey(&key_pair.secret_key);
-    const token = try testToken(&key_pair, 1000, 60);
+    const token = try testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x61,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
     defer std.testing.allocator.free(token);
     const event = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -230,33 +263,55 @@ test "missing and invalid public key configuration are internal failures" {
     );
 }
 
-fn testKeyPair(seed_byte: u8) paseto.Ed25519.KeyPair {
-    const seed = [_]u8{seed_byte} ** paseto.Ed25519.KeyPair.seed_length;
-    return paseto.Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
-}
+pub const testing = struct {
+    pub const TokenOptions = struct {
+        seed_byte: u8,
+        subject: []const u8 = "lambda-test-user",
+        now: i64,
+        ttl_seconds: i64,
+    };
 
-fn testToken(
-    key_pair: *const paseto.Ed25519.KeyPair,
-    now: i64,
-    ttl_seconds: i64,
-) ![]u8 {
-    var random = std.Random.DefaultPrng.init(0x4c414d4244415554);
-    return paseto.issue(
-        std.testing.allocator,
-        random.random(),
-        &key_pair.secret_key,
-        .{
-            .subject = "lambda-test-user",
-            .now = now,
-            .ttl_seconds = ttl_seconds,
-        },
-    );
-}
+    pub fn issue_token(
+        allocator: std.mem.Allocator,
+        options: TokenOptions,
+    ) ![]u8 {
+        var key_pair = test_key_pair(options.seed_byte);
+        defer paseto.wipeSecretKey(&key_pair.secret_key);
+        var random = std.Random.DefaultPrng.init(0x4c414d4244415554);
+        return paseto.issue(
+            allocator,
+            random.random(),
+            &key_pair.secret_key,
+            .{
+                .subject = options.subject,
+                .now = options.now,
+                .ttl_seconds = options.ttl_seconds,
+            },
+        );
+    }
 
-fn putTestPublicKey(
-    environment: *std.process.Environ.Map,
-    public_key: paseto.Ed25519.PublicKey,
-) !void {
-    var buffer: [paseto.public_key_base64_size]u8 = undefined;
-    try environment.put("PASETO_PUBLIC_KEY", paseto.encodePublicKey(public_key, &buffer));
-}
+    pub fn put_public_key(
+        environment: *std.process.Environ.Map,
+        seed_byte: u8,
+    ) !void {
+        var key_pair = test_key_pair(seed_byte);
+        defer paseto.wipeSecretKey(&key_pair.secret_key);
+        var buffer: [paseto.public_key_base64_size]u8 = undefined;
+        const encoded = paseto.encodePublicKey(key_pair.public_key, &buffer);
+        try environment.put("PASETO_PUBLIC_KEY", encoded);
+        std.debug.assert(environment.get("PASETO_PUBLIC_KEY") != null);
+        std.debug.assert(encoded.len == paseto.public_key_base64_size);
+    }
+
+    fn test_key_pair(seed_byte: u8) paseto.Ed25519.KeyPair {
+        const seed = [_]u8{seed_byte} ** paseto.Ed25519.KeyPair.seed_length;
+        const key_pair = paseto.Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
+        std.debug.assert(
+            key_pair.secret_key.toBytes().len == paseto.Ed25519.SecretKey.encoded_length,
+        );
+        std.debug.assert(
+            key_pair.public_key.toBytes().len == paseto.Ed25519.PublicKey.encoded_length,
+        );
+        return key_pair;
+    }
+};
