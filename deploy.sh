@@ -6,6 +6,7 @@ REGION="${REGION:-ca-central-1}"
 STACK_NAME="${STACK_NAME:-aws-lambda-zig-demo}"
 INTAKE_FUNCTION_NAME="${INTAKE_FUNCTION_NAME:-intake-lambda}"
 QUERY_FUNCTION_NAME="${QUERY_FUNCTION_NAME:-query-lambda}"
+EXECUTION_FUNCTION_NAME="${EXECUTION_FUNCTION_NAME:-execution-lambda}"
 LAMBDA_PRINCIPAL="${LAMBDA_PRINCIPAL:-*}"
 PASETO_PUBLIC_KEY="${PASETO_PUBLIC_KEY:-}"
 LOCAL_AWS_LAMBDA_ROOT="${LOCAL_AWS_LAMBDA_ROOT:-../aws-lambda-zig}"
@@ -28,6 +29,8 @@ Options:
                          Intake Lambda name. Defaults to intake-lambda.
   --query-function-name NAME
                          Query Lambda name. Defaults to query-lambda.
+  --execution-function-name NAME
+                         Execution Lambda name. Defaults to execution-lambda.
   --lambda-principal VALUE
                          LAMBDA_PRINCIPAL environment value. Defaults to *.
   --use-local-libs       Use local dependency checkouts with zig build --fork.
@@ -39,7 +42,7 @@ Options:
 
 Environment overrides:
   PROFILE, REGION, STACK_NAME, INTAKE_FUNCTION_NAME, QUERY_FUNCTION_NAME,
-  LAMBDA_PRINCIPAL,
+  EXECUTION_FUNCTION_NAME, LAMBDA_PRINCIPAL,
   PASETO_PRIVATE_KEY, PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT
 
 Authentication:
@@ -234,6 +237,17 @@ while [ "$#" -gt 0 ]; do
                 fail "empty value for --query-function-name"
             shift
             ;;
+        --execution-function-name)
+            need_value "$1" "${2:-}"
+            EXECUTION_FUNCTION_NAME="$2"
+            shift 2
+            ;;
+        --execution-function-name=*)
+            EXECUTION_FUNCTION_NAME="${1#*=}"
+            [ -n "$EXECUTION_FUNCTION_NAME" ] ||
+                fail "empty value for --execution-function-name"
+            shift
+            ;;
         --lambda-principal)
             need_value "$1" "${2:-}"
             LAMBDA_PRINCIPAL="$2"
@@ -325,6 +339,7 @@ trap cleanup EXIT
 printf '==> Checking Zig formatting\n'
 zig fmt --check \
     build.zig \
+    src/execution_lambda.zig \
     src/intake_lambda.zig \
     src/lambda_auth.zig \
     src/paseto.zig \
@@ -352,7 +367,11 @@ rm -f zig-out/bin/bootstrap
 printf '==> Building Linux ARM64 Lambda bootstraps\n'
 zig build "${ZIG_BUILD_ARGS[@]}" --release -Darch=arm
 
-for bootstrap in zig-out/bin/intake/bootstrap zig-out/bin/query/bootstrap; do
+for bootstrap in \
+    zig-out/bin/intake/bootstrap \
+    zig-out/bin/query/bootstrap \
+    zig-out/bin/execution/bootstrap
+do
     artifact_type="$(file "$bootstrap")"
     case "$artifact_type" in
         *"ELF 64-bit LSB executable"*aarch64*"statically linked"*"stripped"*) ;;
@@ -363,10 +382,11 @@ done
 [ ! -e zig-out/bin/bootstrap ] || fail "obsolete zig-out/bin/bootstrap was recreated"
 
 printf '==> Refreshing Lambda zip archives\n'
-rm -f intake-lambda.zip query-lambda.zip
+rm -f intake-lambda.zip query-lambda.zip execution-lambda.zip
 zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
 zip -qj query-lambda.zip zig-out/bin/query/bootstrap
-for archive in intake-lambda.zip query-lambda.zip; do
+zip -qj execution-lambda.zip zig-out/bin/execution/bootstrap
+for archive in intake-lambda.zip query-lambda.zip execution-lambda.zip; do
     archive_contents="$(unzip -Z1 "$archive")"
     [ "$archive_contents" = bootstrap ] ||
         fail "$archive must contain only a root-level bootstrap"
@@ -394,6 +414,7 @@ sam deploy \
     --parameter-overrides \
     "IntakeFunctionName=$INTAKE_FUNCTION_NAME" \
     "QueryFunctionName=$QUERY_FUNCTION_NAME" \
+    "ExecutionFunctionName=$EXECUTION_FUNCTION_NAME" \
     "LambdaPrincipal=$LAMBDA_PRINCIPAL" \
     "PasetoPublicKey=$PASETO_PUBLIC_KEY"
 

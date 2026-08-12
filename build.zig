@@ -116,6 +116,26 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&install_query_lambda.step);
 
+    const execution_lambda_mod = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/execution_lambda.zig"),
+        .strip = true,
+        .single_threaded = true,
+        .imports = &.{
+            .{ .name = "aws-lambda", .module = lambda_runtime },
+        },
+    });
+    const execution_lambda_exe = b.addExecutable(.{
+        .name = "execution-bootstrap",
+        .root_module = execution_lambda_mod,
+    });
+    const install_execution_lambda = b.addInstallArtifact(execution_lambda_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "bin/execution" } },
+        .dest_sub_path = "bootstrap",
+    });
+    b.getInstallStep().dependOn(&install_execution_lambda.step);
+
     const host_aws_sdk = b.dependency("aws_sdk", .{
         .target = b.graph.host,
         .optimize = optimize,
@@ -254,6 +274,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_query_tests = b.addRunArtifact(query_tests);
 
+    const execution_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+        .root_source_file = b.path("src/execution_lambda.zig"),
+        .imports = &.{
+            .{ .name = "aws-lambda", .module = test_runtime },
+        },
+    });
+    const execution_tests = b.addTest(.{
+        .root_module = execution_test_mod,
+    });
+    const run_execution_tests = b.addRunArtifact(execution_tests);
+
     const lambda_auth_tests = b.addTest(.{
         .root_module = host_lambda_auth,
     });
@@ -313,6 +346,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_lambda_auth_tests.step);
     test_step.dependOn(&run_query_tests.step);
+    test_step.dependOn(&run_execution_tests.step);
     test_step.dependOn(&run_lambda_tests.step);
     test_step.dependOn(&run_operation_tests.step);
     test_step.dependOn(&run_operation_persistence_tests.step);

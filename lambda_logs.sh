@@ -10,7 +10,7 @@ readonly stack_name="aws-lambda-zig-demo"
 
 usage() {
     cat <<'EOF'
-Usage: ./lambda_logs.sh intake|query
+Usage: ./lambda_logs.sh intake|query|execution
 
 Download one Lambda's logs and append new CloudWatch events to
 <function-name>.log in this repository.
@@ -32,7 +32,7 @@ need_command() {
 
 case "$#" in
     1) ;;
-    *) fail "specify exactly one Lambda: intake or query" ;;
+    *) fail "specify exactly one Lambda: intake, query, or execution" ;;
 esac
 case "$1" in
     -h | --help)
@@ -45,7 +45,10 @@ case "$1" in
     query)
         readonly function_output_key="QueryFunctionName"
         ;;
-    *) fail "unknown Lambda: $1; expected intake or query" ;;
+    execution)
+        readonly function_output_key="ExecutionFunctionName"
+        ;;
+    *) fail "unknown Lambda: $1; expected intake, query, or execution" ;;
 esac
 
 need_command aws

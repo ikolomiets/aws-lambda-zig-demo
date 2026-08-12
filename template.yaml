@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Deploy authenticated intake and query Lambdas with public Function URLs.
+Description: Deploy intake, query, and SQS-driven execution Lambdas.
 
 Parameters:
   IntakeFunctionName:
@@ -11,6 +11,10 @@ Parameters:
     Type: String
     Default: query-lambda
     Description: Name of the operation query Lambda function.
+  ExecutionFunctionName:
+    Type: String
+    Default: execution-lambda
+    Description: Name of the operation execution Lambda function.
   LambdaPrincipal:
     Type: String
     Default: "*"
@@ -152,6 +156,34 @@ Resources:
       Principal: "*"
       InvokedViaFunctionUrl: true
 
+  ExecutionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref ExecutionFunctionName
+      Description: SQS-driven operation execution function built with aws-lambda-zig.
+      CodeUri: execution-lambda.zip
+      Runtime: provided.al2023
+      Handler: bootstrap
+      Architectures:
+        - arm64
+      MemorySize: 128
+      Timeout: 3
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - SQSPollerPolicy:
+            QueueName: !GetAtt OperationsQueue.QueueName
+
+  ExecutionFunctionOperationsQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref ExecutionFunction
+      EventSourceArn: !GetAtt OperationsQueue.Arn
+      Enabled: true
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 0
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
 Outputs:
   IntakeFunctionName:
     Description: Deployed operation intake Lambda function name.
@@ -171,3 +203,9 @@ Outputs:
   QueryFunctionUrl:
     Description: Public tenant-scoped operation query Lambda Function URL.
     Value: !GetAtt QueryFunctionUrl.FunctionUrl
+  ExecutionFunctionName:
+    Description: Deployed operation execution Lambda function name.
+    Value: !Ref ExecutionFunction
+  ExecutionFunctionArn:
+    Description: Deployed operation execution Lambda function ARN.
+    Value: !GetAtt ExecutionFunction.Arn
