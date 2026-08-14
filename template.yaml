@@ -172,6 +172,15 @@ Resources:
         - AWSLambdaBasicExecutionRole
         - SQSPollerPolicy:
             QueueName: !GetAtt OperationsQueue.QueueName
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+              Resource: !GetAtt OperationsTable.Arn
+      Environment:
+        Variables:
+          OPERATIONS_TABLE_NAME: !Ref OperationsTable
 
   ExecutionFunctionOperationsQueueMapping:
     Type: AWS::Lambda::EventSourceMapping

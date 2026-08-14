@@ -123,7 +123,10 @@ pub fn build(b: *std.Build) void {
         .strip = true,
         .single_threaded = true,
         .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
             .{ .name = "aws-lambda", .module = lambda_runtime },
+            .{ .name = "operation", .module = lambda_operation },
+            .{ .name = "operation_persistence", .module = lambda_operation_persistence },
         },
     });
     const execution_lambda_exe = b.addExecutable(.{
@@ -279,7 +282,10 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
         .root_source_file = b.path("src/execution_lambda.zig"),
         .imports = &.{
+            .{ .name = "aws", .module = host_aws },
             .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "operation_persistence", .module = host_operation_persistence },
         },
     });
     const execution_tests = b.addTest(.{

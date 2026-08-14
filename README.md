@@ -14,8 +14,10 @@ Lambda accepts only POST, validates and hashes an
 Operation JSON document, derives required tenant metadata from the verified
 token subject, persists the Operation idempotently in DynamoDB, submits new
 work to SQS, and returns the current stored output view without the body.
-The execution Lambda consumes SQS batches, logs each record's message ID and
-body, and acknowledges successfully parsed batches through Lambda's partial-batch contract.
+The execution Lambda consumes SQS batches and best-effort completes valid
+`SUBMITTED` Operations in DynamoDB with `result: {"success":true}`. It logs
+each record's message ID and body, then acknowledges every parsed record even
+when validation or the conditional update fails.
 
 ## Requirements
 
@@ -345,13 +347,27 @@ persistence client and reuses them across warm invocations. It does not receive
 service failures return sanitized HTTP 503; malformed items and unexpected
 failures return sanitized HTTP 500.
 
-The execution Lambda has no authentication or application environment variables and no Function
-URL. Lambda polls `OperationsQueue` in batches of at most 10 records with no batching delay and
-invokes the handler with the SQS event. The handler parses the event through `aws_lambda.sqs`,
-emits one debug log entry per record containing only its message ID and body, and returns
-`{"batchItemFailures":[]}`. Malformed events and allocation failures escape the handler so Lambda
-retries the batch. The partial-batch response contract is enabled for future per-record failure
-reporting; this version acknowledges every successfully parsed record.
+The execution Lambda has no authentication configuration or Function URL. It
+receives `OPERATIONS_TABLE_NAME`, reuses one AWS SDK configuration and DynamoDB
+persistence client across warm invocations, and has table-scoped
+`dynamodb:UpdateItem` permission without `GetItem`. Lambda polls
+`OperationsQueue` in batches of at most 10 records with no batching delay.
+
+For every record, the handler retains the debug log containing its message ID
+and body, parses the complete Operation output, and accepts only a `SUBMITTED`
+Operation with a body and no result. Immediately before each accepted record's
+conditional update it samples the real-time clock independently. The update
+requires the stored canonical ID, tenant, name, `SUBMITTED` state, queued hash,
+and absent result; it does not compare the queued timestamps. A match becomes
+`SUCCEEDED` with the exact compact result `{"success":true}`, a fresh
+`last_updated`, and `expires_at` exactly 86,400 seconds later.
+
+Processing is deliberately best effort. Successful, invalid, conflicting, and
+service-failing records are logged concisely and processing continues. After a
+valid top-level SQS event, the handler always returns
+`{"batchItemFailures":[]}`, so none of those individual outcomes is retried by
+SQS. Malformed top-level events and failures that prevent response encoding may
+still fail and retry the invocation.
 
 ## Lambda logs
 
@@ -426,10 +442,11 @@ table-scoped `GetItem`, `PutItem`, and `UpdateItem` policy, and the queue-scoped
 `SendMessage` policy are mandatory parts of the intake Lambda. The query Lambda
 receives only `OPERATIONS_TABLE_NAME` and table-scoped `GetItem` in addition to
 the basic logging policy. It initializes a reusable DynamoDB persistence client
-and has no SQS permissions. The execution Lambda receives basic logging and queue-scoped polling
-permissions. Its explicit event source mapping consumes `OperationsQueue` with partial-batch
-failure reporting enabled. Deploy the complete stack from `template.yaml` with
-AWS SAM.
+and has no SQS permissions. The execution Lambda receives
+`OPERATIONS_TABLE_NAME`, table-scoped `UpdateItem`, basic logging, and
+queue-scoped polling permissions; it does not receive `GetItem`. Its explicit
+event source mapping consumes `OperationsQueue` with partial-batch failure
+reporting enabled. Deploy the complete stack from `template.yaml` with AWS SAM.
 
 See [docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md)
 for the full SAM workflow.
@@ -519,7 +536,10 @@ when the same Operation has advanced beyond `NEW`.
 Delivery is at least once. The standard queue, acknowledgement loss, and
 concurrent `NEW` retries can produce duplicate messages, so consumers must
 handle the Operation ID and hash idempotently. Reusing the ID for different
-work or from a different verified subject still returns `409 Conflict`.
+work or from a different verified subject still returns `409 Conflict`. The
+execution consumer conditionally completes only the first matching queued
+snapshot. It intentionally acknowledges invalid records, update conflicts,
+and DynamoDB service failures without requesting a per-record retry.
 
 The template intentionally creates publicly reachable intake POST and query
 GET Function URLs for demo testing, while both Function URL handlers enforce PASETO bearer

@@ -4,8 +4,9 @@ This guide documents how to deploy the three Zig Lambda packages in this reposit
 using AWS SAM and `template.yaml`.
 
 SAM deploys all three Lambda functions as one CloudFormation-managed stack. It creates
-their execution roles, public Function URLs for intake and query, the DynamoDB operations table
-used by those HTTP Lambdas, and the SQS operations queue sent by intake and consumed by execution.
+their execution roles, public Function URLs for intake and query, the DynamoDB
+operations table shared by all three Lambdas, and the SQS operations queue sent
+by intake and consumed by execution.
 
 ## Assumptions
 
@@ -172,29 +173,47 @@ The query function receives its own inline policy containing only
 `dynamodb:GetItem` for this stack's operations table. It does not receive
 `OPERATIONS_QUEUE_URL` or any SQS permission.
 
-The execution function uses the same `provided.al2023` ARM64 runtime, 128 MB memory, 3-second
-timeout, and basic logging policy. It has no Function URL, authentication configuration, or
-application environment variables. `SQSPollerPolicy` grants queue-scoped polling permissions for
-`OperationsQueue`.
+The execution function uses the same `provided.al2023` ARM64 runtime, 128 MB
+memory, 3-second timeout, and basic logging policy. It has no Function URL or
+authentication configuration. `SQSPollerPolicy` grants queue-scoped polling
+permissions for `OperationsQueue`. Its environment contains
+`OPERATIONS_TABLE_NAME`, and a separate inline policy grants only
+`dynamodb:UpdateItem` on this stack's operations table; execution does not
+receive `dynamodb:GetItem`.
 
 The explicit event source mapping is enabled with `BatchSize: 10`,
-`MaximumBatchingWindowInSeconds: 0`, and `ReportBatchItemFailures`. Lambda polls the queue and
-invokes execution with SQS events. The handler parses each event through `aws_lambda.sqs`, emits
-one debug log entry per record containing only `message_id` and `body`, and returns the exact
-successful partial-batch response `{"batchItemFailures":[]}`. Malformed events and allocation
-failures propagate so Lambda retries the batch. This version does not parse Operation JSON, update
-DynamoDB, or execute work; every successfully parsed record is acknowledged.
+`MaximumBatchingWindowInSeconds: 0`, and `ReportBatchItemFailures`. Lambda polls
+the queue and invokes execution with SQS events. For each record, the handler
+retains the debug log containing `message_id` and `body`, parses and validates
+the complete Operation output, and attempts completion only for a `SUBMITTED`
+Operation with a body and no result. It logs success, failure, or skipped-invalid
+without logging DynamoDB item contents.
+
+Completion is one conditional `UpdateItem`. The condition checks canonical
+`id`, stored `tenant` and `name`, stored `state = SUBMITTED`, the queued hash,
+and an absent stored `result`; timestamps are intentionally not conditions.
+Each record samples the real-time clock immediately before its own attempt. A
+successful update sets `state = SUCCEEDED`, stores the compact DynamoDB string
+`{"success":true}` as `result`, sets `last_updated` to that sample, and sets
+`expires_at` to exactly 86,400 seconds later. It requests neither success
+attributes nor the conflicting item on conditional failure.
+
+Processing is best effort: valid successes, invalid messages, conflicts, and
+AWS failures all advance to the next record. Every valid top-level SQS event
+returns exactly `{"batchItemFailures":[]}`, so those record outcomes receive no
+SQS retry. A malformed top-level event or a failure that prevents response
+encoding can still fail and retry the invocation.
 
 `OPERATIONS_TABLE_NAME` contains the CloudFormation-generated physical table
-name. Before either invocation loop starts, its bootstrap loads an AWS
-configuration and initializes the Operation persistence module with the
-validated table name. The query bootstrap reuses that configuration,
-persistence client, HTTP pool, and adapter across warm invocations. The intake
-bootstrap also validates `OPERATIONS_QUEUE_URL`, initializes the queue module,
-and reuses both clients with its shared AWS configuration. Missing or invalid
-configuration prevents the affected Lambda from handling invocations. The
-local persistence and queue command implementations use the same modules and
-contracts.
+name. Before each of the three invocation loops starts, its bootstrap loads an
+AWS configuration and initializes the Operation persistence module with the
+validated table name. The query and execution bootstraps reuse that
+configuration, persistence client, HTTP pool, and adapter across warm
+invocations. The intake bootstrap also validates `OPERATIONS_QUEUE_URL`,
+initializes the queue module, and reuses both clients with its shared AWS
+configuration. Missing or invalid configuration prevents the affected Lambda
+from handling invocations. The local persistence and queue command
+implementations use the same modules and contracts.
 
 Startup validation makes no DynamoDB or SQS request. A missing table or
 insufficient DynamoDB permission is discovered by a POST persistence request
@@ -202,15 +221,18 @@ and returned by intake as a sanitized HTTP 500. A query DynamoDB request or
 service failure returns a sanitized HTTP 503, while a malformed stored item or
 unexpected failure returns HTTP 500. A missing queue, insufficient
 `SendMessage` permission, or another SQS send failure is returned as a
-sanitized HTTP 503.
+sanitized HTTP 503. Execution discovers a missing table, insufficient
+`UpdateItem` permission, or another DynamoDB service failure while processing a
+record, logs the failure, and acknowledges that record without retrying it.
 
 The second intake inline-policy statement grants that function only `SendMessage`
 access to this stack's operations queue. The handler sends full compact
 `SUBMITTED` Operation JSON, but has no receive, delete, purge, or
-queue-management permissions. Execution receives its separate queue-scoped poller policy; neither
-role grants queue-management access. The `queue.sh` command uses the local caller's AWS identity
-and does not expand either Lambda role. Its `receive` command competes with the enabled execution
-event source mapping for messages.
+queue-management permissions. Execution receives its separate queue-scoped
+poller policy and table-scoped `UpdateItem`; neither role grants
+queue-management access. The `queue.sh` command uses the local caller's AWS
+identity and does not expand either Lambda role. Its `receive` command competes
+with the enabled execution event source mapping for messages.
 
 `OperationsQueue` is a standard queue with a CloudFormation-generated name.
 The template does not configure FIFO behavior, a dead-letter queue, or custom
@@ -257,18 +279,19 @@ has lowercase BLAKE3-256 digest
 Never persist `body`. The 4,096-byte `result` bound is an application-enforced
 constraint because DynamoDB and CloudFormation cannot enforce a per-attribute
 size limit. Terminal result input and its compact serialization must both fit
-the bound. The adapter serializes result Values into fixed request buffers and
-validates immediately before every `PutItem` or `UpdateItem`. On reads, it
+the bound. The adapter serializes caller-provided result Values into fixed
+request buffers and validates them immediately before persistence; execution
+instead uses its fixed compact success result. On reads, the adapter
 parses the stored string once into the caller's arena and requires the string
 to equal the compact reserialization, rejecting malformed, duplicate-key,
 explicit-null, oversized, or noncanonical items. Creates use
 `attribute_not_exists(id)` and request `ALL_OLD` when that condition fails. A
 failed create condition succeeds as an idempotent retry only when the returned
-item has the submitted tenant and Operation hash, regardless of its current state;
-otherwise it is an Operation conflict. Reads are strongly consistent. Updates
-condition on the previously read snapshot, including the old `expires_at`,
-preserve `id`, `tenant`, `name`, and `hash`, and return and validate `ALL_NEW`.
-New items and every successful update set `expires_at` to
+item has the submitted tenant and Operation hash, regardless of its current
+state; otherwise it is an Operation conflict. Reads are strongly consistent.
+Read-modify-write updates condition on the previously read snapshot, including
+the old `expires_at`, preserve `id`, `tenant`, `name`, and `hash`, and return
+and validate `ALL_NEW`. New items and every successful update set `expires_at` to
 `last_updated + 86,400`.
 Result-size validation remains in the application rather than a DynamoDB
 condition expression.
@@ -637,7 +660,9 @@ a different verified subject returns the static `409 Conflict` response.
 
 Delivery is at least once. The standard queue, acknowledgement loss, and
 concurrent `NEW` retries can create duplicate messages. Consumers must use the
-Operation ID and hash idempotently.
+Operation ID and hash idempotently. Execution conditionally completes only a
+matching still-`SUBMITTED` item with no result, but it deliberately acknowledges
+invalid records, conflicts, and service failures without a per-record retry.
 
 ## 9. Download Lambda logs
 
@@ -777,12 +802,12 @@ DynamoDB failures after configuration loading instead report
 
 ### Troubleshoot Lambda initialization
 
-The SAM template supplies `OPERATIONS_TABLE_NAME`, `OPERATIONS_QUEUE_URL`, and
-their scoped IAM policies together. Removing either variable, configuring an
-empty or oversized queue URL, or configuring an invalid DynamoDB table name
-makes the bootstrap exit during Lambda INIT, before it requests an invocation.
-Check the deployed template and function configuration; no HTTP response can
-be produced for an INIT failure.
+The SAM template supplies the intake Lambda with `OPERATIONS_TABLE_NAME`,
+`OPERATIONS_QUEUE_URL`, and their scoped IAM policies together. Removing either
+variable, configuring an empty or oversized queue URL, or configuring an
+invalid DynamoDB table name makes the intake bootstrap exit during Lambda INIT,
+before it requests an invocation. Check the deployed template and function
+configuration; no HTTP response can be produced for an INIT failure.
 
 A syntactically valid but nonexistent table, or missing `PutItem` permission,
 does not fail INIT because startup makes no DynamoDB request. The first valid,
@@ -797,6 +822,12 @@ configuration. A missing or invalid table-name setting exits during query INIT.
 A nonexistent table, missing `GetItem` permission, or DynamoDB service failure
 is discovered by the first authenticated `GET /<uuid>` and returns a sanitized
 HTTP 503. A malformed stored item returns a sanitized HTTP 500.
+
+The execution Lambda also requires only `OPERATIONS_TABLE_NAME` as application
+configuration. A missing or invalid setting exits during execution INIT. A
+nonexistent table, missing `UpdateItem` permission, or DynamoDB service failure
+is discovered during a record completion attempt. Execution logs that failure,
+continues the batch, and acknowledges the record without requesting a retry.
 
 ## 11. Send, receive, and check queued Operations
 

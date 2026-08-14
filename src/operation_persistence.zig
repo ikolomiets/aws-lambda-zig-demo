@@ -13,11 +13,13 @@ const hash_size = 64;
 const attribute_count_min = 7;
 const attribute_count_max = 8;
 const create_condition = "attribute_not_exists(id)";
+const completion_result = "{\"success\":true}";
 
 comptime {
     std.debug.assert(id_size == 36);
     std.debug.assert(hash_size == 2 * 32);
     std.debug.assert(attribute_count_max == attribute_count_min + 1);
+    std.debug.assert(completion_result.len <= operation.result_size_max);
 }
 
 /// Stores and retrieves Operations using the repository's fixed DynamoDB item contract.
@@ -120,6 +122,28 @@ pub const Persistence = struct {
         try validateUpdateResult(&updated, replacement);
         return updated;
     }
+
+    /// Completes a queued submitted Operation if its stored identity still matches.
+    pub fn complete(
+        self: *Self,
+        arena: Allocator,
+        submitted: *const operation.Operation,
+        now: operation.UnixSeconds,
+    ) !void {
+        var request: CompletionRequest = undefined;
+        try completionRequestInit(&request, submitted, now);
+        var diagnostic: dynamodb.ServiceError = undefined;
+        _ = self.client.updateItem(arena, .{
+            .condition_expression = completion_condition,
+            .expression_attribute_names = &request.names,
+            .expression_attribute_values = &request.values,
+            .key = &request.key,
+            .table_name = self.table_name,
+            .update_expression = completion_update,
+        }, .{ .diagnostic = &diagnostic }) catch |err| {
+            return writeError(err, &diagnostic, error.OperationConflict);
+        };
+    }
 };
 
 const CreateRequest = struct {
@@ -152,6 +176,16 @@ const UpdateRequest = struct {
     value_count: u8,
     condition_expression: []const u8,
     update_expression: []const u8,
+};
+
+const CompletionRequest = struct {
+    id_buffer: [id_size]u8,
+    hash_buffer: [hash_size]u8,
+    timestamp_buffer: [32]u8,
+    expires_at_buffer: [32]u8,
+    key: [1]Attribute,
+    names: [5]AttributeName,
+    values: [9]Attribute,
 };
 
 fn createRequestInit(request: *CreateRequest, source: *const operation.Operation) !void {
@@ -247,6 +281,41 @@ fn updateRequestResult(
     std.debug.assert(request.value_count <= request.values.len);
 }
 
+fn completionRequestInit(
+    request: *CompletionRequest,
+    submitted: *const operation.Operation,
+    now: operation.UnixSeconds,
+) !void {
+    try validateCompletion(submitted);
+    const expires_at = try operation.expires_at_from_last_updated(now);
+    const id = operation.uuidToString(submitted.id, &request.id_buffer);
+    request.hash_buffer = std.fmt.bytesToHex(submitted.hash.?, .lower);
+    request.key = .{stringAttribute("id", id)};
+    request.names = .{
+        .{ .key = "#hash", .value = "hash" },
+        .{ .key = "#name", .value = "name" },
+        .{ .key = "#result", .value = "result" },
+        .{ .key = "#state", .value = "state" },
+        .{ .key = "#tenant", .value = "tenant" },
+    };
+    request.values = .{
+        stringAttribute(":id", id),
+        stringAttribute(":tenant", submitted.tenant),
+        stringAttribute(":name", submitted.name),
+        stringAttribute(":submitted", operation.stateToString(.submitted)),
+        stringAttribute(":hash", &request.hash_buffer),
+        stringAttribute(":succeeded", operation.stateToString(.succeeded)),
+        numberAttribute(":now", timestampString(now, &request.timestamp_buffer)),
+        numberAttribute(":expires_at", timestampString(
+            expires_at,
+            &request.expires_at_buffer,
+        )),
+        stringAttribute(":result", completion_result),
+    };
+    std.debug.assert(request.key.len == 1);
+    std.debug.assert(request.values.len == 9);
+}
+
 fn updateValue(request: *UpdateRequest, key: []const u8, value: AttributeValue) void {
     std.debug.assert(request.value_count < request.values.len);
     request.values[request.value_count] = .{ .key = key, .value = value };
@@ -270,6 +339,12 @@ const update_without_result =
 const update_with_result =
     "SET #state = :new_state, last_updated = :new_time, " ++
     "expires_at = :new_expires_at, #result = :new_result";
+const completion_condition =
+    "id = :id AND #tenant = :tenant AND #name = :name AND " ++
+    "#state = :submitted AND #hash = :hash AND attribute_not_exists(#result)";
+const completion_update =
+    "SET #state = :succeeded, #result = :result, " ++
+    "last_updated = :now, expires_at = :expires_at";
 
 fn decodeItem(arena: Allocator, item: []const Attribute) !operation.Operation {
     if (item.len < attribute_count_min) return error.InvalidItem;
@@ -388,6 +463,17 @@ fn validateStored(source: *const operation.Operation) !void {
     if (!operation.stateIsTerminal(state)) {
         if (source.result != null) return error.UnexpectedResult;
     }
+}
+
+fn validateCompletion(submitted: *const operation.Operation) !void {
+    if (submitted.state != .submitted) return error.InvalidState;
+    if (submitted.body == null) return error.MissingBody;
+    if (submitted.result != null) return error.UnexpectedResult;
+    var persisted = submitted.*;
+    persisted.body = null;
+    try validateStored(&persisted);
+    std.debug.assert(persisted.state == .submitted);
+    std.debug.assert(persisted.result == null);
 }
 
 fn validateUpdate(
@@ -893,6 +979,87 @@ test "updates snapshot every stored field and return all new attributes" {
         .table_name = "operations",
     };
     try std.testing.expectEqual(dynamodb.types.ReturnValue.all_new, input.return_values.?);
+}
+
+test "completion condition matches queued identity without timestamp conditions" {
+    var submitted = testOperation(.submitted, null);
+    submitted.body = .{ .bool = true };
+    var request: CompletionRequest = undefined;
+    try completionRequestInit(&request, &submitted, 1_800_000_000);
+
+    try std.testing.expectEqualStrings(
+        "id = :id AND #tenant = :tenant AND #name = :name AND " ++
+            "#state = :submitted AND #hash = :hash AND attribute_not_exists(#result)",
+        completion_condition,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, completion_condition, "last_updated") == null);
+    try std.testing.expect(std.mem.indexOf(u8, completion_condition, "expires_at") == null);
+    try std.testing.expectEqualStrings(test_id, try stringValue(request.key[0].value));
+    try std.testing.expectEqualStrings(test_id, try stringValue(
+        findAttribute(&request.values, ":id").?,
+    ));
+    try std.testing.expectEqualStrings("tenant-a", try stringValue(
+        findAttribute(&request.values, ":tenant").?,
+    ));
+    try std.testing.expectEqualStrings("echo", try stringValue(
+        findAttribute(&request.values, ":name").?,
+    ));
+    try std.testing.expectEqualStrings("SUBMITTED", try stringValue(
+        findAttribute(&request.values, ":submitted").?,
+    ));
+    try std.testing.expectEqualStrings("ab" ** 32, try stringValue(
+        findAttribute(&request.values, ":hash").?,
+    ));
+}
+
+test "completion persists exact success result and record timestamp without returns" {
+    var submitted = testOperation(.submitted, null);
+    submitted.body = .{ .bool = true };
+    var request: CompletionRequest = undefined;
+    try completionRequestInit(&request, &submitted, 1_800_000_123);
+
+    try std.testing.expectEqualStrings(
+        "SET #state = :succeeded, #result = :result, " ++
+            "last_updated = :now, expires_at = :expires_at",
+        completion_update,
+    );
+    try std.testing.expectEqualStrings("SUCCEEDED", try stringValue(
+        findAttribute(&request.values, ":succeeded").?,
+    ));
+    try std.testing.expectEqualStrings(completion_result, try stringValue(
+        findAttribute(&request.values, ":result").?,
+    ));
+    try std.testing.expectEqualStrings("1800000123", try numberValue(
+        findAttribute(&request.values, ":now").?,
+    ));
+    try std.testing.expectEqualStrings("1800086523", try numberValue(
+        findAttribute(&request.values, ":expires_at").?,
+    ));
+
+    const input = dynamodb.UpdateItemInput{
+        .condition_expression = completion_condition,
+        .expression_attribute_names = &request.names,
+        .expression_attribute_values = &request.values,
+        .key = &request.key,
+        .table_name = "operations",
+        .update_expression = completion_update,
+    };
+    try std.testing.expect(input.return_values == null);
+    try std.testing.expect(input.return_values_on_condition_check_failure == null);
+}
+
+test "completion accepts only submitted operations with body and no result" {
+    var submitted = testOperation(.submitted, null);
+    submitted.body = .null;
+    try validateCompletion(&submitted);
+
+    submitted.state = .running;
+    try std.testing.expectError(error.InvalidState, validateCompletion(&submitted));
+    submitted = testOperation(.submitted, null);
+    try std.testing.expectError(error.MissingBody, validateCompletion(&submitted));
+    submitted.body = .null;
+    submitted.result = .null;
+    try std.testing.expectError(error.UnexpectedResult, validateCompletion(&submitted));
 }
 
 test "updates remove replace and preserve result across arbitrary state changes" {

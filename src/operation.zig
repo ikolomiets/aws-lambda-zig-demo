@@ -8,13 +8,17 @@ pub const body_size_max = 4096;
 pub const result_size_max = 4096;
 pub const name_size_max = 64;
 pub const tenant_size_max = 64;
+pub const output_size_max = body_size_max + result_size_max + 2048;
 pub const ttl_seconds: UnixSeconds = 24 * 60 * 60;
 const uuid_string_size = 36;
+const hash_string_size = 64;
 
 comptime {
     std.debug.assert(body_size_max == result_size_max);
+    std.debug.assert(output_size_max > body_size_max + result_size_max);
     std.debug.assert(ttl_seconds == 86_400);
     std.debug.assert(uuid_string_size == 36);
+    std.debug.assert(hash_string_size == 2 * 32);
 }
 
 pub const State = enum {
@@ -75,6 +79,18 @@ const InputFields = struct {
     state: ?[]const u8 = null,
 };
 
+const OutputFields = struct {
+    id: ?[]const u8 = null,
+    tenant: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    body: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+    last_updated: ?[]const u8 = null,
+    expires_at: ?[]const u8 = null,
+    result: ?[]const u8 = null,
+    hash: ?[]const u8 = null,
+};
+
 /// Parses the input view into values owned by the lifetime arena.
 pub fn parseInputJSON(
     arena: Allocator,
@@ -115,6 +131,50 @@ pub fn parseInputJSON(
         .expires_at = expires_at,
         .hash = hash,
     };
+}
+
+/// Parses the complete output view into values owned by the lifetime arena.
+pub fn parseOutputJSON(arena: Allocator, output_json: []const u8) !Operation {
+    if (output_json.len > output_size_max) return error.OutputTooLarge;
+    const fields = try scanOutputFields(arena, output_json);
+    const id_text = try parseJSONString(arena, fields.id orelse return error.MissingField);
+    const id = try uuidFromString(id_text);
+    var id_buffer: [uuid_string_size]u8 = undefined;
+    if (!std.mem.eql(u8, id_text, uuidToString(id, &id_buffer))) {
+        return error.InvalidUUID;
+    }
+    const tenant = try parseJSONString(arena, fields.tenant orelse return error.MissingField);
+    const name = try parseJSONString(arena, fields.name orelse return error.MissingField);
+    const state_text = try parseJSONString(arena, fields.state orelse return error.MissingField);
+    const hash_text = try parseJSONString(arena, fields.hash orelse return error.MissingField);
+
+    const body = if (fields.body) |body_json| body: {
+        if (body_json.len > body_size_max) return error.BodyTooLarge;
+        break :body try parseJSONValue(arena, body_json);
+    } else null;
+    const result = if (fields.result) |result_json| result: {
+        if (result_json.len > result_size_max) return error.ResultTooLarge;
+        break :result try parseJSONValue(arena, result_json);
+    } else null;
+    const parsed: Operation = .{
+        .id = id,
+        .tenant = tenant,
+        .name = name,
+        .body = body,
+        .state = try stateFromString(state_text),
+        .last_updated = try parseJSONInteger(
+            arena,
+            fields.last_updated orelse return error.MissingField,
+        ),
+        .expires_at = try parseJSONInteger(
+            arena,
+            fields.expires_at orelse return error.MissingField,
+        ),
+        .result = result,
+        .hash = try hashFromString(hash_text),
+    };
+    _ = try validateView(&parsed);
+    return parsed;
 }
 
 /// Computes the fixed DynamoDB expiration timestamp for an Operation update.
@@ -270,6 +330,75 @@ fn scanInputFields(arena: Allocator, input_json: []const u8) !InputFields {
     return fields;
 }
 
+fn scanOutputFields(arena: Allocator, output_json: []const u8) !OutputFields {
+    var scanner = std.json.Scanner.initCompleteInput(arena, output_json);
+    defer scanner.deinit();
+
+    const first = scanner.next() catch |err| return jsonError(err);
+    if (first != .object_begin) return error.InvalidJSON;
+
+    var fields: OutputFields = .{};
+    var field_count: u8 = 0;
+    while (true) {
+        const token = scanner.nextAllocMax(
+            arena,
+            .alloc_always,
+            output_json.len,
+        ) catch |err| return jsonError(err);
+        if (token == .object_end) break;
+        const field_name = switch (token) {
+            .allocated_string => |value| value,
+            else => return error.InvalidJSON,
+        };
+        const value_start = try jsonValueStart(output_json, scanner.cursor);
+        try scannerSkipValue(&scanner);
+        const value_json = output_json[value_start..scanner.cursor];
+        try setOutputField(&fields, field_name, value_json);
+        field_count += 1;
+        std.debug.assert(field_count <= 9);
+    }
+    const last = scanner.next() catch |err| return jsonError(err);
+    if (last != .end_of_document) return error.InvalidJSON;
+    return fields;
+}
+
+fn setOutputField(
+    fields: *OutputFields,
+    field_name: []const u8,
+    value_json: []const u8,
+) !void {
+    if (std.mem.eql(u8, field_name, "id")) {
+        if (fields.id != null) return error.DuplicateField;
+        fields.id = value_json;
+    } else if (std.mem.eql(u8, field_name, "tenant")) {
+        if (fields.tenant != null) return error.DuplicateField;
+        fields.tenant = value_json;
+    } else if (std.mem.eql(u8, field_name, "name")) {
+        if (fields.name != null) return error.DuplicateField;
+        fields.name = value_json;
+    } else if (std.mem.eql(u8, field_name, "body")) {
+        if (fields.body != null) return error.DuplicateField;
+        fields.body = value_json;
+    } else if (std.mem.eql(u8, field_name, "state")) {
+        if (fields.state != null) return error.DuplicateField;
+        fields.state = value_json;
+    } else if (std.mem.eql(u8, field_name, "last_updated")) {
+        if (fields.last_updated != null) return error.DuplicateField;
+        fields.last_updated = value_json;
+    } else if (std.mem.eql(u8, field_name, "expires_at")) {
+        if (fields.expires_at != null) return error.DuplicateField;
+        fields.expires_at = value_json;
+    } else if (std.mem.eql(u8, field_name, "result")) {
+        if (fields.result != null) return error.DuplicateField;
+        fields.result = value_json;
+    } else if (std.mem.eql(u8, field_name, "hash")) {
+        if (fields.hash != null) return error.DuplicateField;
+        fields.hash = value_json;
+    } else {
+        return error.UnknownField;
+    }
+}
+
 fn setInputField(
     fields: *InputFields,
     field_name: []const u8,
@@ -334,6 +463,12 @@ fn parseJSONString(arena: Allocator, json: []const u8) ![]const u8 {
     }) catch |err| return jsonError(err);
 }
 
+fn parseJSONInteger(arena: Allocator, json: []const u8) !UnixSeconds {
+    return std.json.parseFromSliceLeaky(UnixSeconds, arena, json, .{
+        .max_value_len = json.len,
+    }) catch |err| return jsonError(err);
+}
+
 fn parseInputState(arena: Allocator, state_json: []const u8) !State {
     const state_string = try parseJSONString(arena, state_json);
     const state = try stateFromString(state_string);
@@ -380,9 +515,22 @@ fn parseJSONValue(arena: Allocator, json: []const u8) !JSONValue {
     }) catch |err| return jsonError(err);
 }
 
+fn hashFromString(value: []const u8) ![32]u8 {
+    if (value.len != hash_string_size) return error.InvalidHash;
+    for (value) |character| {
+        if (character >= '0' and character <= '9') continue;
+        if (character >= 'a' and character <= 'f') continue;
+        return error.InvalidHash;
+    }
+    var hash: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&hash, value) catch return error.InvalidHash;
+    return hash;
+}
+
 fn validateView(operation: *const Operation) !bool {
     try validateTenant(operation.tenant);
     try validateName(operation.name);
+    if (operation.body) |*body| try validateBodySize(body);
     const state = operation.state orelse return error.MissingState;
     const last_updated = operation.last_updated orelse return error.MissingLastUpdated;
     const expires_at = operation.expires_at orelse return error.MissingExpiresAt;
@@ -400,6 +548,13 @@ fn validateView(operation: *const Operation) !bool {
     }
     if (operation.result) |*result| try validateResultSize(result);
     return result_present;
+}
+
+fn validateBodySize(body: *const JSONValue) !void {
+    var count_buffer: [256]u8 = undefined;
+    var counter: std.Io.Writer.Discarding = .init(&count_buffer);
+    try std.json.Stringify.value(body.*, .{}, &counter.writer);
+    if (counter.fullCount() > body_size_max) return error.BodyTooLarge;
 }
 
 /// Validates server-owned tenant metadata at every ingress and storage boundary.
@@ -1154,6 +1309,199 @@ test "output distinguishes object explicit-null and absent bodies" {
             "\"hash\":\"abababababababababababababababab" ++
             "abababababababababababababababab\"}",
         absent_output,
+    );
+}
+
+test "every valid output shape round trips through the output parser" {
+    var value_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer value_arena.deinit();
+    const bodies = [_]?JSONValue{
+        null,
+        .null,
+        try parseJSONValue(value_arena.allocator(), "{\"message\":\"hello\"}"),
+    };
+    const states = [_]State{ .new, .submitted, .running, .succeeded, .failed };
+    for (states) |state| {
+        for (bodies) |body| {
+            const result: ?JSONValue = if (stateIsTerminal(state))
+                try parseResultJSON(value_arena.allocator(), "{\"success\":true}")
+            else
+                null;
+            const source: Operation = .{
+                .id = try uuidFromString(test_uuid),
+                .tenant = test_tenant,
+                .name = "echo",
+                .body = body,
+                .state = state,
+                .last_updated = test_now,
+                .expires_at = test_now + ttl_seconds,
+                .result = result,
+                .hash = [_]u8{0xAB} ** 32,
+            };
+            const serialized = try testOutput(&source);
+            defer std.testing.allocator.free(serialized);
+            var parse_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer parse_arena.deinit();
+            const parsed = try parseOutputJSON(parse_arena.allocator(), serialized);
+            const round_trip = try testOutput(&parsed);
+            defer std.testing.allocator.free(round_trip);
+            try std.testing.expectEqualStrings(serialized, round_trip);
+        }
+    }
+
+    const explicit_null_result = Operation{
+        .id = try uuidFromString(test_uuid),
+        .tenant = test_tenant,
+        .name = "echo",
+        .state = .submitted,
+        .last_updated = test_now,
+        .expires_at = test_now + ttl_seconds,
+        .result = .null,
+        .hash = [_]u8{0xAB} ** 32,
+    };
+    const serialized = try testOutput(&explicit_null_result);
+    defer std.testing.allocator.free(serialized);
+    const parsed = try parseOutputJSON(value_arena.allocator(), serialized);
+    try std.testing.expect(parsed.result.? == .null);
+}
+
+test "output parser preserves strings and JSON Values in its arena" {
+    const serialized = try std.testing.allocator.dupe(
+        u8,
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
+            "\"body\":{\"message\":\"hello\"},\"state\":\"SUCCEEDED\"," ++
+            "\"last_updated\":1700000000,\"expires_at\":1700086400," ++
+            "\"result\":{\"success\":true},\"hash\":\"" ++ ("ab" ** 32) ++ "\"}",
+    );
+    defer std.testing.allocator.free(serialized);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try parseOutputJSON(arena.allocator(), serialized);
+    @memset(serialized, 'x');
+
+    try std.testing.expectEqualStrings("tenant-a", parsed.tenant);
+    try std.testing.expectEqualStrings("echo", parsed.name);
+    try expectValueJSON("{\"message\":\"hello\"}", &parsed.body.?);
+    try expectValueJSON("{\"success\":true}", &parsed.result.?);
+}
+
+test "output parser requires all owned fields and rejects extra fields" {
+    const hash = "ab" ** 32;
+    const missing = [_][]const u8{
+        "{\"tenant\":\"tenant-a\",\"name\":\"echo\",\"state\":\"SUBMITTED\"," ++
+            "\"last_updated\":1700000000,\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
+        "{\"id\":\"" ++ test_uuid ++ "\",\"name\":\"echo\",\"state\":\"SUBMITTED\"," ++
+            "\"last_updated\":1700000000,\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
+        "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"state\":\"SUBMITTED\"," ++
+            "\"last_updated\":1700000000,\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
+        "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
+            "\"last_updated\":1700000000,\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
+        "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
+            "\"state\":\"SUBMITTED\",\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
+        "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000,\"hash\":\"" ++ hash ++ "\"}",
+        "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000,\"expires_at\":1700086400}",
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (missing) |input| {
+        try std.testing.expectError(error.MissingField, parseOutputJSON(arena.allocator(), input));
+    }
+
+    const prefix =
+        "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
+        "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+        "\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"";
+    try std.testing.expectError(
+        error.DuplicateField,
+        parseOutputJSON(arena.allocator(), prefix ++ ",\"name\":\"again\"}"),
+    );
+    try std.testing.expectError(
+        error.UnknownField,
+        parseOutputJSON(arena.allocator(), prefix ++ ",\"extra\":true}"),
+    );
+    try std.testing.expectError(
+        error.InvalidJSON,
+        parseOutputJSON(arena.allocator(), prefix ++ ",\"body\":[}"),
+    );
+}
+
+test "output parser rejects oversized and invariant-breaking fields" {
+    const prefix =
+        "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"echo\",";
+    const suffix =
+        ",\"last_updated\":1700000000,\"expires_at\":1700086400," ++
+        "\"hash\":\"" ++ ("ab" ** 32) ++ "\"}";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectError(
+        error.InvalidTenant,
+        parseOutputJSON(
+            arena.allocator(),
+            "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"" ++
+                ("a" ** (tenant_size_max + 1)) ++ "\",\"name\":\"echo\"," ++
+                "\"state\":\"SUBMITTED\"" ++ suffix,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidName,
+        parseOutputJSON(
+            arena.allocator(),
+            "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"" ++
+                ("a" ** (name_size_max + 1)) ++ "\",\"state\":\"SUBMITTED\"" ++ suffix,
+        ),
+    );
+    try std.testing.expectError(
+        error.BodyTooLarge,
+        parseOutputJSON(
+            arena.allocator(),
+            prefix ++ "\"body\":\"" ++ ("a" ** (body_size_max - 1)) ++
+                "\",\"state\":\"SUBMITTED\"" ++ suffix,
+        ),
+    );
+    try std.testing.expectError(
+        error.ResultTooLarge,
+        parseOutputJSON(
+            arena.allocator(),
+            prefix ++ "\"state\":\"SUCCEEDED\",\"result\":\"" ++
+                ("a" ** (result_size_max - 1)) ++ "\"" ++ suffix,
+        ),
+    );
+    try std.testing.expectError(
+        error.OutputTooLarge,
+        parseOutputJSON(arena.allocator(), " " ** (output_size_max + 1)),
+    );
+    try std.testing.expectError(
+        error.UnexpectedResult,
+        parseOutputJSON(
+            arena.allocator(),
+            prefix ++ "\"state\":\"SUBMITTED\",\"result\":true" ++ suffix,
+        ),
+    );
+    try std.testing.expectError(
+        error.MissingResult,
+        parseOutputJSON(arena.allocator(), prefix ++ "\"state\":\"SUCCEEDED\"" ++ suffix),
+    );
+    try std.testing.expectError(
+        error.InvalidExpiresAt,
+        parseOutputJSON(
+            arena.allocator(),
+            prefix ++ "\"state\":\"SUBMITTED\"" ++
+                ",\"last_updated\":1700000000,\"expires_at\":1700086401," ++
+                "\"hash\":\"" ++ ("ab" ** 32) ++ "\"}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidHash,
+        parseOutputJSON(
+            arena.allocator(),
+            prefix ++ "\"state\":\"SUBMITTED\"," ++
+                "\"last_updated\":1700000000,\"expires_at\":1700086400," ++
+                "\"hash\":\"" ++ ("AB" ** 32) ++ "\"}",
+        ),
     );
 }
 
