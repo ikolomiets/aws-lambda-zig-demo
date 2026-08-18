@@ -820,7 +820,14 @@ zig fmt --check build.zig src/execution_lambda.zig src/intake_lambda.zig \
   src/persistence_cli.zig src/queue_cli.zig src/paseto.zig src/paseto_cli.zig
 ```
 
-Run the handler and local command tests with:
+Run only the dependency-free deployment-helper regression tests with:
+
+```sh
+zig build test-deploy
+```
+
+The shell tests mock AWS commands, so they require no AWS credentials or
+network access. Run all Zig tests and deployment-helper regression tests with:
 
 ```sh
 zig build test

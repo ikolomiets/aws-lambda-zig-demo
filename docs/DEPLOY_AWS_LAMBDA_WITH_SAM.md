@@ -85,6 +85,23 @@ active session.
 
 ## 2. Build and package the Zig Lambdas
 
+Run the full local test graph before packaging. This includes the Zig tests and
+the dependency-free deployment-helper regression tests:
+
+```sh
+zig build test
+```
+
+To run only the deployment-helper regression tests, use:
+
+```sh
+zig build test-deploy
+```
+
+The deployment-helper tests replace AWS commands with shell mocks, so they
+require no AWS credentials or network access. `deploy.sh` invokes only
+`zig build test`, which includes these tests exactly once.
+
 Build the stripped, single-threaded, ReleaseSafe Lambda executables for AWS
 Lambda ARM64.
 

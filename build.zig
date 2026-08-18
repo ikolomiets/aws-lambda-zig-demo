@@ -349,6 +349,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_queue_cli_tests = b.addRunArtifact(queue_cli_tests);
 
+    const wireguard_discovery_test = b.addSystemCommand(&.{"bash"});
+    wireguard_discovery_test.addFileArg(
+        b.path("tests/deploy_wireguard_discovery_test.sh"),
+    );
+
+    const cleanup_lifecycle_test = b.addSystemCommand(&.{"bash"});
+    cleanup_lifecycle_test.addFileArg(
+        b.path("tests/deploy_cleanup_lifecycle_test.sh"),
+    );
+
+    const deploy_test_step = b.step(
+        "test-deploy",
+        "Run deployment helper regression tests",
+    );
+    deploy_test_step.dependOn(&wireguard_discovery_test.step);
+    deploy_test_step.dependOn(&cleanup_lifecycle_test.step);
+
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_lambda_auth_tests.step);
     test_step.dependOn(&run_query_tests.step);
@@ -361,4 +378,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_persistence_cli_tests.step);
     test_step.dependOn(&run_queue_cli_tests.step);
+    test_step.dependOn(deploy_test_step);
 }

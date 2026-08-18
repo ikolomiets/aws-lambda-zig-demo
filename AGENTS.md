@@ -117,6 +117,11 @@ Use these local checks:
 
 - `zig fmt --check build.zig src/execution_lambda.zig src/intake_lambda.zig src/lambda_auth.zig src/query_lambda.zig`:
   verify Zig formatting.
+- `zig build test-deploy`: run only the dependency-free deployment-helper
+  regression tests; these use mocked AWS commands and require no credentials or
+  network access.
+- `zig build test`: run the Zig tests and the deployment-helper regression
+  tests.
 - `zig build --release -Darch=arm`: build the stripped, single-threaded,
   ReleaseSafe Linux ARM64 intake, query, and execution Lambda bootstraps.
 - `zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap` and
