@@ -1,6 +1,13 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Deploy intake, query, and SQS-driven execution Lambdas.
+Description: Deploy intake, query, and execution Lambdas with an optional WireGuard gateway.
+
+# Opt-in network parameters intentionally default to empty and are guarded by a Rule.
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        - W1030
 
 Parameters:
   IntakeFunctionName:
@@ -22,6 +29,117 @@ Parameters:
   PasetoPublicKey:
     Type: String
     Description: Padded Base64 Ed25519 public key used to verify PASETO tokens.
+  EnableWireGuardGateway:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Whether to provision the optional EC2 WireGuard gateway.
+  RetainExecutionVpcCleanupResources:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Internal deploy-helper switch retaining Lambda ENI cleanup resources during VPC detachment.
+  VpcId:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^vpc-([0-9a-f]{8}|[0-9a-f]{17})$'
+    ConstraintDescription: Must be an EC2 VPC ID.
+    Description: ID of the existing VPC for the optional WireGuard gateway.
+  GatewayPublicSubnetId:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^subnet-([0-9a-f]{8}|[0-9a-f]{17})$'
+    ConstraintDescription: Must be an EC2 subnet ID.
+    Description: ID of the existing public subnet for the WireGuard gateway.
+  LambdaSubnetId:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^subnet-([0-9a-f]{8}|[0-9a-f]{17})$'
+    ConstraintDescription: Must be an EC2 subnet ID.
+    Description: ID of the existing private subnet reserved for the execution Lambda.
+  LambdaRouteTableId:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^rtb-([0-9a-f]{8}|[0-9a-f]{17})$'
+    ConstraintDescription: Must be an EC2 route-table ID.
+    Description: ID of the route table associated with the Lambda subnet.
+  LambdaSubnetCidr:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/([0-9]|[12][0-9]|3[0-2])$'
+    ConstraintDescription: Must be an IPv4 CIDR block.
+    Description: IPv4 CIDR block of the Lambda subnet.
+  WireGuardPrivateKeyParameterName:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^/(?![Aa][Ww][Ss]|[Ss][Ss][Mm])[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$'
+    ConstraintDescription: Must be an absolute Parameter Store path that does not begin with aws or ssm.
+    Description: Absolute path of the SecureString containing the gateway private key.
+  WireGuardPrivateKeyParameterVersion:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Version of the WireGuard private-key Parameter Store parameter.
+  WireGuardGatewayPublicKey:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[A-Za-z0-9+/]{43}=$'
+    ConstraintDescription: Must be a padded 44-character WireGuard Base64 public key.
+    Description: Public key derived from the gateway private key.
+  WireGuardWorkstationPublicKey:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[A-Za-z0-9+/]{43}=$'
+    ConstraintDescription: Must be a padded 44-character WireGuard Base64 public key.
+    Description: Public key of the development workstation WireGuard peer.
+  WireGuardAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Parameter Store path resolving to the ARM64 gateway AMI.
+  WireGuardInstanceType:
+    Type: String
+    Default: t4g.nano
+    Description: ARM64 EC2 instance type for the WireGuard gateway.
+
+Rules:
+  WireGuardGatewayInputsRequired:
+    RuleCondition: !Equals [!Ref EnableWireGuardGateway, "true"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref VpcId, ""]]
+        AssertDescription: VpcId is required when the WireGuard gateway is enabled.
+      - Assert: !Not [!Equals [!Ref GatewayPublicSubnetId, ""]]
+        AssertDescription: GatewayPublicSubnetId is required when the gateway is enabled.
+      - Assert: !Not [!Equals [!Ref LambdaSubnetId, ""]]
+        AssertDescription: LambdaSubnetId is required when the WireGuard gateway is enabled.
+      - Assert: !Not [!Equals [!Ref LambdaRouteTableId, ""]]
+        AssertDescription: LambdaRouteTableId is required when the gateway is enabled.
+      - Assert: !Not [!Equals [!Ref LambdaSubnetCidr, ""]]
+        AssertDescription: LambdaSubnetCidr is required when the WireGuard gateway is enabled.
+      - Assert: !Not [!Equals [!Ref WireGuardPrivateKeyParameterName, ""]]
+        AssertDescription: The private-key parameter name is required when the gateway is enabled.
+      - Assert: !Not [!Equals [!Ref WireGuardGatewayPublicKey, ""]]
+        AssertDescription: The gateway public key is required when the gateway is enabled.
+      - Assert: !Not [!Equals [!Ref WireGuardWorkstationPublicKey, ""]]
+        AssertDescription: The workstation public key is required when the gateway is enabled.
+      - Assert: !Not [!Equals [!Ref WireGuardAmiId, ""]]
+        AssertDescription: WireGuardAmiId is required when the WireGuard gateway is enabled.
+      - Assert: !Not [!Equals [!Ref WireGuardInstanceType, ""]]
+        AssertDescription: WireGuardInstanceType is required when the gateway is enabled.
+  ExecutionVpcCleanupVpcRequired:
+    RuleCondition: !Equals [!Ref RetainExecutionVpcCleanupResources, "true"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref VpcId, ""]]
+        AssertDescription: VpcId is required while execution VPC cleanup resources are retained.
+
+Conditions:
+  WireGuardGatewayEnabled: !Equals [!Ref EnableWireGuardGateway, "true"]
+  ExecutionVpcCleanupResourcesRetained: !Or
+    - !Condition WireGuardGatewayEnabled
+    - !Equals [!Ref RetainExecutionVpcCleanupResources, "true"]
 
 Resources:
   OperationsTable:
@@ -156,6 +274,60 @@ Resources:
       Principal: "*"
       InvokedViaFunctionUrl: true
 
+  # Keep this role explicit so the deploy helper can retain ENI cleanup permissions
+  # only between the VPC-detach and cleanup phases.
+  ExecutionFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub lambda.${AWS::URLSuffix}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ExecutionFunctionSqsPoller
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ChangeMessageVisibility
+                  - sqs:ChangeMessageVisibilityBatch
+                  - sqs:DeleteMessage
+                  - sqs:DeleteMessageBatch
+                  - sqs:GetQueueAttributes
+                  - sqs:ReceiveMessage
+                Resource: !GetAtt OperationsQueue.Arn
+        - PolicyName: ExecutionFunctionOperationUpdate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt OperationsTable.Arn
+        - !If
+          - ExecutionVpcCleanupResourcesRetained
+          - PolicyName: ExecutionFunctionVpcAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DescribeSubnets
+                    - ec2:DeleteNetworkInterface
+                    - ec2:AssignPrivateIpAddresses
+                    - ec2:UnassignPrivateIpAddresses
+                  Resource: "*"
+          - !Ref AWS::NoValue
+
   ExecutionFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -168,19 +340,17 @@ Resources:
         - arm64
       MemorySize: 128
       Timeout: 3
-      Policies:
-        - AWSLambdaBasicExecutionRole
-        - SQSPollerPolicy:
-            QueueName: !GetAtt OperationsQueue.QueueName
-        - Version: "2012-10-17"
-          Statement:
-            - Effect: Allow
-              Action:
-                - dynamodb:UpdateItem
-              Resource: !GetAtt OperationsTable.Arn
+      Role: !GetAtt ExecutionFunctionRole.Arn
       Environment:
         Variables:
           OPERATIONS_TABLE_NAME: !Ref OperationsTable
+      VpcConfig: !If
+        - WireGuardGatewayEnabled
+        - SecurityGroupIds:
+            - !Ref ExecutionLambdaSecurityGroup
+          SubnetIds:
+            - !Ref LambdaSubnetId
+        - !Ref AWS::NoValue
 
   ExecutionFunctionOperationsQueueMapping:
     Type: AWS::Lambda::EventSourceMapping
@@ -192,6 +362,236 @@ Resources:
       MaximumBatchingWindowInSeconds: 0
       FunctionResponseTypes:
         - ReportBatchItemFailures
+
+  ExecutionLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: ExecutionVpcCleanupResourcesRetained
+    # The gateway and cleanup Rules exclude an empty VPC before this resource exists.
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1030
+    Properties:
+      GroupDescription: Execution Lambda egress to TigerBeetle and AWS APIs.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - Description: TigerBeetle traffic through the WireGuard gateway.
+          IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 10.200.0.2/32
+        - Description: HTTPS access through the subnet NAT or VPC endpoints.
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  WireGuardGatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: WireGuardGatewayEnabled
+    # The gateway Rule excludes empty opt-in defaults before this resource exists.
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1030
+    Properties:
+      GroupDescription: WireGuard gateway ingress and egress.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: Public WireGuard tunnel endpoint.
+          IpProtocol: udp
+          FromPort: 51820
+          ToPort: 51820
+          CidrIp: 0.0.0.0/0
+        - Description: TigerBeetle traffic from the Lambda subnet.
+          IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: !Ref LambdaSubnetCidr
+      SecurityGroupEgress:
+        - Description: Initial package installation, SSM, and WireGuard traffic.
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  WireGuardGatewayRole:
+    Type: AWS::IAM::Role
+    Condition: WireGuardGatewayEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub ec2.${AWS::URLSuffix}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WireGuardGatewaySessionManager
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:UpdateInstanceInformation
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+        - PolicyName: WireGuardGatewayPrivateKeyRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${WireGuardPrivateKeyParameterName}
+
+  WireGuardGatewayInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: WireGuardGatewayEnabled
+    Properties:
+      Roles:
+        - !Ref WireGuardGatewayRole
+
+  WireGuardGatewayLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: WireGuardGatewayEnabled
+    # The gateway Rule excludes the empty subnet default before this resource exists.
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1030
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref WireGuardAmiId
+        InstanceType: !Ref WireGuardInstanceType
+        IamInstanceProfile:
+          Name: !Ref WireGuardGatewayInstanceProfile
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: 1
+          HttpTokens: required
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: true
+            DeleteOnTermination: true
+            DeviceIndex: 0
+            Groups:
+              - !Ref WireGuardGatewaySecurityGroup
+            SubnetId: !Ref GatewayPublicSubnetId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${AWS::StackName}-wireguard-gateway
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/bin/bash
+              set -euo pipefail
+              umask 077
+
+              install_attempt=1
+              until dnf install -y wireguard-tools; do
+                  if [ "$install_attempt" -ge 5 ]; then
+                      echo "WireGuard package installation failed after five attempts." >&2
+                      exit 1
+                  fi
+                  install_attempt=$((install_attempt + 1))
+                  sleep 10
+              done
+
+              private_key=""
+              parameter_attempt=1
+              while [ "$parameter_attempt" -le 5 ]; do
+                  if private_key="$(aws ssm get-parameter \
+                      --region '${AWS::Region}' \
+                      --name '${WireGuardPrivateKeyParameterName}:${WireGuardPrivateKeyParameterVersion}' \
+                      --with-decryption \
+                      --query 'Parameter.Value' \
+                      --output text)"; then
+                      break
+                  fi
+                  if [ "$parameter_attempt" -ge 5 ]; then
+                      echo "WireGuard private-key retrieval failed after five attempts." >&2
+                      exit 1
+                  fi
+                  parameter_attempt=$((parameter_attempt + 1))
+                  sleep 10
+              done
+
+              if [ -z "$private_key" ]; then
+                  echo "WireGuard private-key retrieval returned an empty value." >&2
+                  exit 1
+              fi
+
+              derived_public_key="$(printf '%s\n' "$private_key" | wg pubkey)"
+              if [ "$derived_public_key" != '${WireGuardGatewayPublicKey}' ]; then
+                  unset private_key derived_public_key
+                  echo "WireGuard gateway public key does not match the private key." >&2
+                  exit 1
+              fi
+              unset derived_public_key
+
+              printf '%s\n' 'net.ipv4.ip_forward=1' \
+                  > /etc/sysctl.d/99-wireguard-forwarding.conf
+              sysctl --system >/dev/null
+
+              install -d -m 0700 /etc/wireguard
+              cat > /etc/wireguard/wg0.conf <<EOF
+              [Interface]
+              Address = 10.200.0.1/24
+              ListenPort = 51820
+              PrivateKey = $private_key
+
+              [Peer]
+              PublicKey = ${WireGuardWorkstationPublicKey}
+              AllowedIPs = 10.200.0.2/32
+              EOF
+              chmod 0600 /etc/wireguard/wg0.conf
+              unset private_key
+
+              systemctl enable --now wg-quick@wg0
+              wg show wg0 >/dev/null
+              ip -4 address show dev wg0 | grep -Fq 'inet 10.200.0.1/24 '
+              [ "$(sysctl -n net.ipv4.ip_forward)" = "1" ]
+
+  WireGuardGatewayInstance:
+    Type: AWS::EC2::Instance
+    Condition: WireGuardGatewayEnabled
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WireGuardGatewayLaunchTemplate
+        Version: !GetAtt WireGuardGatewayLaunchTemplate.LatestVersionNumber
+      SourceDestCheck: false
+
+  WireGuardGatewayElasticIp:
+    Type: AWS::EC2::EIP
+    Condition: WireGuardGatewayEnabled
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-wireguard-gateway
+
+  WireGuardGatewayElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Condition: WireGuardGatewayEnabled
+    Properties:
+      AllocationId: !GetAtt WireGuardGatewayElasticIp.AllocationId
+      InstanceId: !Ref WireGuardGatewayInstance
+
+  WireGuardLambdaRoute:
+    Type: AWS::EC2::Route
+    Condition: WireGuardGatewayEnabled
+    DependsOn: WireGuardGatewayElasticIpAssociation
+    Properties:
+      RouteTableId: !Ref LambdaRouteTableId
+      DestinationCidrBlock: 10.200.0.0/24
+      InstanceId: !Ref WireGuardGatewayInstance
 
 Outputs:
   IntakeFunctionName:
@@ -218,3 +618,31 @@ Outputs:
   ExecutionFunctionArn:
     Description: Deployed operation execution Lambda function ARN.
     Value: !GetAtt ExecutionFunction.Arn
+  WireGuardGatewayInstanceId:
+    Condition: WireGuardGatewayEnabled
+    Description: EC2 instance ID of the WireGuard gateway.
+    Value: !Ref WireGuardGatewayInstance
+  WireGuardGatewayElasticIp:
+    Condition: WireGuardGatewayEnabled
+    Description: Elastic IPv4 address of the WireGuard gateway.
+    Value: !Ref WireGuardGatewayElasticIp
+  WireGuardGatewayEndpoint:
+    Condition: WireGuardGatewayEnabled
+    Description: Public UDP endpoint of the WireGuard gateway.
+    Value: !Sub ${WireGuardGatewayElasticIp}:51820
+  WireGuardGatewayPublicKey:
+    Condition: WireGuardGatewayEnabled
+    Description: Public key of the WireGuard gateway.
+    Value: !Ref WireGuardGatewayPublicKey
+  WireGuardGatewayAddress:
+    Condition: WireGuardGatewayEnabled
+    Description: Address of the gateway on the WireGuard overlay.
+    Value: 10.200.0.1/24
+  WireGuardWorkstationAddress:
+    Condition: WireGuardGatewayEnabled
+    Description: Address of the workstation on the WireGuard overlay.
+    Value: 10.200.0.2/24
+  TigerBeetleEndpoint:
+    Condition: WireGuardGatewayEnabled
+    Description: TigerBeetle endpoint reachable through WireGuard.
+    Value: 10.200.0.2:3000

@@ -6,7 +6,10 @@ using AWS SAM and `template.yaml`.
 SAM deploys all three Lambda functions as one CloudFormation-managed stack. It creates
 their execution roles, public Function URLs for intake and query, the DynamoDB
 operations table shared by all three Lambdas, and the SQS operations queue sent
-by intake and consumed by execution.
+by intake and consumed by execution. It can also provision an optional EC2
+WireGuard gateway that routes execution-Lambda traffic to TigerBeetle on a
+development workstation. The gateway is disabled by default; enabling it adds
+EC2 and Elastic IP charges.
 
 ## Assumptions
 
@@ -24,6 +27,33 @@ by intake and consumed by execution.
 - `PASETO_PUBLIC_KEY` contains the padded Base64 Ed25519 public key generated
   by `zig-out/bin/paseto keygen`. The corresponding private key remains only
   in the token-signing environment.
+
+Enabling the WireGuard gateway additionally requires:
+
+- An existing VPC with distinct public gateway and Lambda subnets.
+- An internet gateway and an active `0.0.0.0/0` route from the gateway public
+  subnet to that internet gateway.
+- The effective Lambda-subnet route table, with no route already claiming
+  `10.200.0.0/24` unless that route is owned by the existing deployment of this
+  stack.
+- DynamoDB reachability from the Lambda subnet through NAT or a DynamoDB
+  gateway endpoint. A public-subnet internet-gateway route alone does not give
+  a VPC-attached Lambda internet access.
+- For the recommended isolated topology, an unused IPv4 `/28` in the VPC and
+  permission to create and tag a subnet, route table, route-table association,
+  and DynamoDB gateway endpoint.
+- Local WireGuard tools (`wg` and the platform-specific interface helper) on a
+  workstation that can initiate outbound UDP/51820 to the gateway Elastic IP.
+- `wg` must be on `PATH` for `deploy.sh` to generate the default gateway pair
+  when both default SSM parameters are absent.
+- Permission for the deployment identity to create the additional EC2
+  instance, Elastic IP, security groups, route, IAM role and instance profile,
+  and launch template, as well as the execution-Lambda network interface.
+- `ssm:GetParameter` and `ssm:PutParameter` on
+  `/applications/${STACK_NAME}/wireguard/gateway-private-key` and
+  `/applications/${STACK_NAME}/wireguard/gateway-public-key`, plus
+  `ssm:DeleteParameter` on
+  the private path for rollback if paired creation fails.
 
 ## 1. Refresh AWS SSO credentials
 
@@ -46,11 +76,12 @@ arn:aws:sts::<account-id>:assumed-role/AWSReservedSSO_.../<user>
 ```
 
 When using `deploy.sh`, this refresh is automatic when needed. Before building,
-the helper resolves the selected profile to temporary environment credentials
-and verifies them with STS. Valid cached credentials are reused without opening
-a browser. If resolution or verification fails for a directly configured SSO
-profile, the helper runs `aws sso login --profile <profile>` once and retries.
-Direct `sam` and `aws` commands in this guide still require an active session.
+the helper clears inherited static credential variables, selects the configured
+refreshable profile, and verifies it with STS. Valid cached credentials are
+reused without opening a browser. If verification fails for a directly
+configured SSO profile, the helper runs `aws sso login --profile <profile>` once
+and retries. Direct `sam` and `aws` commands in this guide still require an
+active session.
 
 ## 2. Build and package the Zig Lambdas
 
@@ -126,7 +157,36 @@ Both commands should report that `template.yaml` is valid.
 - `QueryFunctionUrlInvokeFunctionPermission`: allows `lambda:InvokeFunction` only
   through the query Function URL
 - `ExecutionFunction`: `AWS::Serverless::Function`
+- `ExecutionFunctionRole`: `AWS::IAM::Role`
 - `ExecutionFunctionOperationsQueueMapping`: `AWS::Lambda::EventSourceMapping`
+
+When `EnableWireGuardGateway=true`, the template also creates:
+
+- `ExecutionLambdaSecurityGroup`: `AWS::EC2::SecurityGroup`
+- `WireGuardGatewaySecurityGroup`: `AWS::EC2::SecurityGroup`
+- `WireGuardGatewayRole`: `AWS::IAM::Role`
+- `WireGuardGatewayInstanceProfile`: `AWS::IAM::InstanceProfile`
+- `WireGuardGatewayLaunchTemplate`: `AWS::EC2::LaunchTemplate`
+- `WireGuardGatewayInstance`: `AWS::EC2::Instance`
+- `WireGuardGatewayElasticIp`: `AWS::EC2::EIP`
+- `WireGuardGatewayElasticIpAssociation`: `AWS::EC2::EIPAssociation`
+- `WireGuardLambdaRoute`: `AWS::EC2::Route`
+
+Every gateway resource and output is conditional. The internal
+`RetainExecutionVpcCleanupResources` parameter temporarily keeps only
+`ExecutionLambdaSecurityGroup` and the execution role's EC2 network-interface
+policy during a `deploy.sh` disablement transition. In steady disabled state,
+the execution Lambda has no VPC attachment or EC2 network-interface
+permissions, and the empty gateway parameter defaults create no gateway or
+cleanup resources.
+
+The gateway security group admits public IPv4 UDP/51820 and private TCP/3000
+from `LambdaSubnetCidr`; it allows IPv4 egress for bootstrap, SSM, and tunnel
+traffic. The launch template creates one ARM64 Amazon Linux network interface
+in the public subnet, requires IMDSv2, and bootstraps a routed `wg0` interface
+at `10.200.0.1/24`. The instance has source/destination checking disabled. Its
+Elastic IP and the Lambda-subnet route to `10.200.0.0/24` follow the
+stack-managed instance lifecycle.
 
 The intake and query functions share the runtime, architecture, memory, timeout, basic logging
 policy, PASETO configuration, and operations-table environment value:
@@ -175,11 +235,15 @@ The query function receives its own inline policy containing only
 
 The execution function uses the same `provided.al2023` ARM64 runtime, 128 MB
 memory, 3-second timeout, and basic logging policy. It has no Function URL or
-authentication configuration. `SQSPollerPolicy` grants queue-scoped polling
-permissions for `OperationsQueue`. Its environment contains
-`OPERATIONS_TABLE_NAME`, and a separate inline policy grants only
-`dynamodb:UpdateItem` on this stack's operations table; execution does not
-receive `dynamodb:GetItem`.
+authentication configuration. Its explicit role grants queue-scoped polling
+permissions for `OperationsQueue` and only `dynamodb:UpdateItem` on this
+stack's operations table; execution does not receive `dynamodb:GetItem`. When
+the gateway is enabled, the role also receives the six EC2 network-interface
+actions required by a VPC-attached Lambda. The function is attached to the
+single `LambdaSubnetId` with a stack-managed security group that permits only
+TCP/3000 to `10.200.0.2/32` and TCP/443 for DynamoDB access through the
+subnet's NAT or VPC endpoint path. The current handler has no TigerBeetle
+client and does not consume a TigerBeetle environment variable.
 
 The explicit event source mapping is enabled with `BatchSize: 10`,
 `MaximumBatchingWindowInSeconds: 0`, and `ReportBatchItemFailures`. Lambda polls
@@ -331,7 +395,7 @@ inside the function. It does not change the Function URL resource permissions.
 `PASETO_PUBLIC_KEY` used by the handler to verify PASETO v4.public bearer
 tokens.
 
-## 5. Preserve the intake function name and choose environment values
+## 5. Preserve the intake function name and choose deployment values
 
 The template defaults to:
 
@@ -411,6 +475,313 @@ export PASETO_PUBLIC_KEY='<public-key-from-keygen>'
 `PasetoPublicKey` has no default. Deployment must provide it, and tokens must
 be signed by the corresponding private key.
 
+The optional gateway parameters are:
+
+| Parameter | Meaning |
+| --- | --- |
+| `EnableWireGuardGateway` | `true` enables the gateway; defaults to `false`. |
+| `RetainExecutionVpcCleanupResources` | Internal `deploy.sh` lifecycle switch; retains only the execution security group and ENI permissions between detach and cleanup phases. Defaults to `false`. |
+| `VpcId` | Existing VPC containing both supplied subnets. |
+| `GatewayPublicSubnetId` | Existing public subnet for the EC2 gateway. |
+| `LambdaSubnetId` | Distinct existing subnet for the execution Lambda. |
+| `LambdaRouteTableId` | Effective route table for `LambdaSubnetId`. |
+| `LambdaSubnetCidr` | Primary IPv4 CIDR of `LambdaSubnetId`; it must not overlap `10.200.0.0/24`. |
+| `WireGuardPrivateKeyParameterName` | Absolute path of the external gateway-private-key SSM `SecureString`. |
+| `WireGuardPrivateKeyParameterVersion` | Exact positive version to retrieve; defaults to `1`. |
+| `WireGuardGatewayPublicKey` | Padded Base64 public key matching the stored gateway private key. |
+| `WireGuardWorkstationPublicKey` | Padded Base64 public key matching the workstation private key. |
+| `WireGuardAmiId` | Public SSM parameter resolving to an ARM64 Amazon Linux 2023 AMI. |
+| `WireGuardInstanceType` | ARM64 gateway instance type; defaults to `t4g.nano`. |
+
+### Provision a dedicated Lambda subnet and DynamoDB endpoint
+
+The recommended development topology keeps the existing internet-routed subnet
+for the EC2 gateway and creates a dedicated Lambda subnet in the same
+availability zone. The Lambda subnet has no automatic public IPv4 assignment
+and an explicitly associated route table with only the VPC-local route. A
+DynamoDB gateway endpoint is associated only with that route table. Omitting an
+endpoint policy intentionally selects the AWS default full-access endpoint
+policy; the Lambda role's table-scoped IAM policy remains the authorization
+boundary.
+
+Recheck the live VPC, availability zone, CIDR availability, and gateway default
+route immediately before creation. The following example uses the selected
+`172.31.48.0/28` default but keeps live identifiers out of the repository:
+
+```sh
+gateway_subnet_id='<existing-public-gateway-subnet-id>'
+lambda_subnet_cidr='172.31.48.0/28'
+vpc_id="$(aws ec2 describe-subnets \
+  --subnet-ids "$gateway_subnet_id" \
+  --query 'Subnets[0].VpcId' \
+  --output text \
+  --profile dev \
+  --region ca-central-1)"
+availability_zone="$(aws ec2 describe-subnets \
+  --subnet-ids "$gateway_subnet_id" \
+  --query 'Subnets[0].AvailabilityZone' \
+  --output text \
+  --profile dev \
+  --region ca-central-1)"
+gateway_route_table_id="$(aws ec2 describe-route-tables \
+  --filters "Name=association.subnet-id,Values=$gateway_subnet_id" \
+  --query 'RouteTables[0].RouteTableId' \
+  --output text \
+  --profile dev \
+  --region ca-central-1)"
+if [ "$gateway_route_table_id" = None ]; then
+  gateway_route_table_id="$(aws ec2 describe-route-tables \
+    --filters "Name=vpc-id,Values=$vpc_id" \
+      'Name=association.main,Values=true' \
+    --query 'RouteTables[0].RouteTableId' \
+    --output text \
+    --profile dev \
+    --region ca-central-1)"
+fi
+aws ec2 describe-route-tables \
+  --route-table-ids "$gateway_route_table_id" \
+  --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0' && State=='active'].GatewayId" \
+  --profile dev \
+  --region ca-central-1
+aws ec2 describe-subnets \
+  --filters "Name=vpc-id,Values=$vpc_id" \
+  --query 'Subnets[].[SubnetId,CidrBlock,AvailabilityZone]' \
+  --output table \
+  --profile dev \
+  --region ca-central-1
+```
+
+Stop if the selected CIDR is already allocated, the public subnet is not in
+`ca-central-1a`, or its effective route table does not have an active internet
+gateway default route. Once those checks pass, create and tag the manual
+resources:
+
+```sh
+lambda_subnet_id="$(aws ec2 create-subnet \
+  --vpc-id "$vpc_id" \
+  --availability-zone "$availability_zone" \
+  --cidr-block "$lambda_subnet_cidr" \
+  --tag-specifications \
+    'ResourceType=subnet,Tags=[{Key=Project,Value=aws-lambda-zig-demo},{Key=Purpose,Value=wireguard-execution-lambda},{Key=ManagedBy,Value=manual},{Key=Name,Value=aws-lambda-zig-demo-wireguard-lambda}]' \
+  --query Subnet.SubnetId \
+  --output text \
+  --profile dev \
+  --region ca-central-1)"
+aws ec2 modify-subnet-attribute \
+  --subnet-id "$lambda_subnet_id" \
+  --no-map-public-ip-on-launch \
+  --profile dev \
+  --region ca-central-1
+
+lambda_route_table_id="$(aws ec2 create-route-table \
+  --vpc-id "$vpc_id" \
+  --tag-specifications \
+    'ResourceType=route-table,Tags=[{Key=Project,Value=aws-lambda-zig-demo},{Key=Purpose,Value=wireguard-execution-lambda},{Key=ManagedBy,Value=manual},{Key=Name,Value=aws-lambda-zig-demo-wireguard-lambda-route-table}]' \
+  --query RouteTable.RouteTableId \
+  --output text \
+  --profile dev \
+  --region ca-central-1)"
+lambda_route_table_association_id="$(aws ec2 associate-route-table \
+  --subnet-id "$lambda_subnet_id" \
+  --route-table-id "$lambda_route_table_id" \
+  --query AssociationId \
+  --output text \
+  --profile dev \
+  --region ca-central-1)"
+
+dynamodb_endpoint_id="$(aws ec2 create-vpc-endpoint \
+  --vpc-id "$vpc_id" \
+  --vpc-endpoint-type Gateway \
+  --service-name com.amazonaws.ca-central-1.dynamodb \
+  --route-table-ids "$lambda_route_table_id" \
+  --tag-specifications \
+    'ResourceType=vpc-endpoint,Tags=[{Key=Project,Value=aws-lambda-zig-demo},{Key=Purpose,Value=wireguard-execution-lambda},{Key=ManagedBy,Value=manual},{Key=Name,Value=aws-lambda-zig-demo-wireguard-dynamodb}]' \
+  --query VpcEndpoint.VpcEndpointId \
+  --output text \
+  --profile dev \
+  --region ca-central-1)"
+for endpoint_attempt in $(seq 1 30); do
+  endpoint_state="$(aws ec2 describe-vpc-endpoints \
+    --vpc-endpoint-ids "$dynamodb_endpoint_id" \
+    --query 'VpcEndpoints[0].State' \
+    --output text \
+    --profile dev \
+    --region ca-central-1)"
+  [ "$endpoint_state" != available ] || break
+  [ "$endpoint_state" = pending ] || exit 1
+  sleep 2
+done
+[ "$endpoint_state" = available ]
+```
+
+Record the four returned identifiers only in the operator session. If a step
+fails before deployment starts, delete only resources created in that attempt,
+in reverse order: endpoint, route-table association, route table, then subnet.
+Once deployment starts, retain the topology for diagnosis or retry.
+
+These resources are operator-owned outside SAM. Disabling or deleting the
+stack removes the stack-owned `10.200.0.0/24` route and VPC attachment but does
+not remove this subnet, route table, association, or endpoint. For intentional
+final cleanup, first disable or delete the stack, then run:
+
+```sh
+aws ec2 delete-vpc-endpoints \
+  --vpc-endpoint-ids "$dynamodb_endpoint_id" \
+  --profile dev \
+  --region ca-central-1
+for endpoint_attempt in $(seq 1 30); do
+  endpoint_state="$(aws ec2 describe-vpc-endpoints \
+    --vpc-endpoint-ids "$dynamodb_endpoint_id" \
+    --query 'VpcEndpoints[0].State' \
+    --output text \
+    --profile dev \
+    --region ca-central-1 2>/dev/null || true)"
+  case "$endpoint_state" in deleted | None | '') break ;; esac
+  sleep 2
+done
+aws ec2 disassociate-route-table \
+  --association-id "$lambda_route_table_association_id" \
+  --profile dev \
+  --region ca-central-1
+aws ec2 delete-route-table \
+  --route-table-id "$lambda_route_table_id" \
+  --profile dev \
+  --region ca-central-1
+aws ec2 delete-subnet \
+  --subnet-id "$lambda_subnet_id" \
+  --profile dev \
+  --region ca-central-1
+```
+
+### Create the workstation key
+
+The workstation private key remains workstation-owned and is never generated
+or stored by AWS deployment tooling. Create it in a protected directory and
+keep the private file for the workstation configuration in section 7:
+
+```sh
+wireguard_key_dir="$(mktemp -d "${TMPDIR:-/tmp}/aws-lambda-zig-wireguard.XXXXXX")"
+chmod 700 "$wireguard_key_dir"
+(
+  umask 077
+  wg genkey >"$wireguard_key_dir/workstation.private"
+  wg pubkey <"$wireguard_key_dir/workstation.private" \
+    >"$wireguard_key_dir/workstation.public"
+)
+wireguard_workstation_public_key="$(tr -d '\n' <"$wireguard_key_dir/workstation.public")"
+```
+
+Never put the workstation private key in `template.yaml`, a command line,
+shell history, an environment passed to `deploy.sh`, stack parameters or
+outputs, documentation, or the repository.
+
+### Default gateway keypair managed by `deploy.sh`
+
+For stack `aws-lambda-zig-demo`, the helper uses these external parameters:
+
+| Value | Default parameter | Type |
+| --- | --- | --- |
+| Gateway private key | `/applications/aws-lambda-zig-demo/wireguard/gateway-private-key` | `SecureString`, encrypted with `alias/aws/ssm` |
+| Gateway public key | `/applications/aws-lambda-zig-demo/wireguard/gateway-public-key` | `String` |
+
+The paths follow `/applications/${STACK_NAME}/wireguard/...` for another stack
+name. Parameter Store reserves names beginning with `aws` or `ssm`, ignoring
+case, so `deploy.sh` and `template.yaml` reject custom paths with either prefix.
+If both
+exist, `deploy.sh` validates their types and the public-key format and uses the
+current private version. If neither exists, it requires `wg`, generates the
+pair under `umask 077` in a mode-0700 temporary directory, creates both without
+`--overwrite`, and removes the directory on success or failure. The private
+value is supplied through a mode-0600 `--cli-input-json file://...` request,
+never a command argument or environment variable. If the second creation
+fails, the helper rolls back only the private parameter created by that
+invocation.
+
+The two parameters are operator-owned, survive gateway disablement and stack
+deletion, and are never overwritten or rotated implicitly. A lone parameter is
+treated as an error and is left untouched. Repair it by deriving and creating
+the missing matching value, or delete the lone value and let `deploy.sh`
+generate a new pair. Do not combine an existing half with newly generated key
+material.
+
+If the private parameter exists and the public parameter is missing, derive
+the public key without writing or printing the private value, then create the
+missing `String` without `--overwrite`:
+
+```sh
+private_parameter_name="/applications/${STACK_NAME:-aws-lambda-zig-demo}/wireguard/gateway-private-key"
+public_parameter_name="/applications/${STACK_NAME:-aws-lambda-zig-demo}/wireguard/gateway-public-key"
+repaired_gateway_public_key="$(
+  aws ssm get-parameter \
+    --name "$private_parameter_name" \
+    --with-decryption \
+    --query Parameter.Value \
+    --output text \
+    --profile dev \
+    --region ca-central-1 |
+    wg pubkey
+)"
+aws ssm put-parameter \
+  --name "$public_parameter_name" \
+  --description 'WireGuard gateway public key' \
+  --type String \
+  --value "$repaired_gateway_public_key" \
+  --profile dev \
+  --region ca-central-1
+```
+
+If only the public parameter exists, its private key cannot be reconstructed.
+Restore the exact private value from a protected backup, or delete the lone
+public parameter and rerun first enablement to create a fresh pair. Wrong types
+or a malformed public value likewise require an intentional operator repair;
+the helper will not overwrite them.
+
+### Manual gateway pair for direct SAM or a custom path
+
+Direct `sam deploy` does not run helper discovery, generation, validation, or
+stack-value reuse. Generate and store the gateway pair first, then pass every
+WireGuard template parameter explicitly. The following uses a custom path and
+keeps the private value out of the argument list:
+
+```sh
+wireguard_parameter_name='/applications/<stack-name>/wireguard/gateway-private-key'
+wireguard_public_parameter_name='/applications/<stack-name>/wireguard/gateway-public-key'
+(
+  umask 077
+  wg genkey >"$wireguard_key_dir/gateway.private"
+  wg pubkey <"$wireguard_key_dir/gateway.private" \
+    >"$wireguard_key_dir/gateway.public"
+  {
+    printf '{"Name":"%s","Description":"WireGuard gateway private key","Type":"SecureString","KeyId":"alias/aws/ssm","Value":"' \
+      "$wireguard_parameter_name"
+    tr -d '\r\n' <"$wireguard_key_dir/gateway.private"
+    printf '"}\n'
+  } >"$wireguard_key_dir/private-put.json"
+)
+wireguard_parameter_version="$(
+  aws ssm put-parameter \
+    --cli-input-json "file://$wireguard_key_dir/private-put.json" \
+    --query Version \
+    --output text \
+    --profile dev \
+    --region ca-central-1
+)"
+wireguard_gateway_public_key="$(tr -d '\r\n' <"$wireguard_key_dir/gateway.public")"
+aws ssm put-parameter \
+  --name "$wireguard_public_parameter_name" \
+  --description 'WireGuard gateway public key' \
+  --type String \
+  --value "$wireguard_gateway_public_key" \
+  --profile dev \
+  --region ca-central-1
+printf 'Recorded SSM parameter version: %s\n' "$wireguard_parameter_version"
+```
+
+These create-only commands intentionally omit `--overwrite`. If either path
+already exists, stop and inspect the pair rather than replacing it. The
+gateway private key remains only in the external `SecureString`; securely
+remove the local gateway files after the direct deployment is configured.
+
 ## 6. Deploy with SAM guided mode
 
 Run:
@@ -447,7 +818,7 @@ SAM configuration file: samconfig.toml
 SAM configuration environment: default
 ```
 
-`CAPABILITY_IAM` is required because SAM creates IAM execution roles for all three functions.
+`CAPABILITY_IAM` is required for the Lambda and optional gateway IAM roles.
 
 After the first guided deployment, SAM can reuse `samconfig.toml`, so future
 deployments are usually:
@@ -455,6 +826,10 @@ deployments are usually:
 ```sh
 sam deploy --profile dev --region ca-central-1
 ```
+
+An enabled guided deployment can save account-specific VPC, subnet, route
+table, and SSM parameter identifiers in `samconfig.toml`. Treat that file as
+local deployment state and do not commit it with live values.
 
 Equivalent non-interactive deployment command:
 
@@ -474,6 +849,75 @@ sam deploy \
     ExecutionFunctionName=execution-lambda \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
+```
+
+The preceding commands leave a new or already-disabled stack disabled. Do not
+use a single direct SAM update to transition an enabled stack to disabled: it
+does not perform the required Lambda VPC-detach wait and could remove ENI
+permissions too early. Use `deploy.sh` for disablement, or manually reproduce
+its two phases with `RetainExecutionVpcCleanupResources=true`, a verified wait
+for zero VPC-configured Lambda versions and zero ENIs on the retained security
+group, then `RetainExecutionVpcCleanupResources=false`. Direct SAM commands also
+do not perform `deploy.sh` subnet discovery, SSM generation, or enabled-stack
+reuse.
+To enable the gateway in guided mode, supply every opt-in parameter. Use the
+variables populated by the manual key workflow above and replace only the
+network placeholders:
+
+```sh
+sam deploy --guided \
+  --template-file template.yaml \
+  --profile dev \
+  --region ca-central-1 \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides \
+    IntakeFunctionName="$intake_function_name" \
+    QueryFunctionName=query-lambda \
+    ExecutionFunctionName=execution-lambda \
+    LambdaPrincipal='*' \
+    PasetoPublicKey="$PASETO_PUBLIC_KEY" \
+    EnableWireGuardGateway=true \
+    VpcId='<vpc-id>' \
+    GatewayPublicSubnetId='<gateway-public-subnet-id>' \
+    LambdaSubnetId='<lambda-subnet-id>' \
+    LambdaRouteTableId='<lambda-route-table-id>' \
+    LambdaSubnetCidr='<lambda-subnet-cidr>' \
+    WireGuardPrivateKeyParameterName="$wireguard_parameter_name" \
+    WireGuardPrivateKeyParameterVersion="$wireguard_parameter_version" \
+    WireGuardGatewayPublicKey="$wireguard_gateway_public_key" \
+    WireGuardWorkstationPublicKey="$wireguard_workstation_public_key" \
+    WireGuardInstanceType=t4g.nano
+```
+
+The equivalent enabled non-interactive command is:
+
+```sh
+sam deploy \
+  --template-file template.yaml \
+  --stack-name aws-lambda-zig-demo \
+  --profile dev \
+  --region ca-central-1 \
+  --capabilities CAPABILITY_IAM \
+  --resolve-s3 \
+  --no-confirm-changeset \
+  --no-fail-on-empty-changeset \
+  --parameter-overrides \
+    IntakeFunctionName="$intake_function_name" \
+    QueryFunctionName=query-lambda \
+    ExecutionFunctionName=execution-lambda \
+    LambdaPrincipal='*' \
+    PasetoPublicKey="$PASETO_PUBLIC_KEY" \
+    EnableWireGuardGateway=true \
+    VpcId='<vpc-id>' \
+    GatewayPublicSubnetId='<gateway-public-subnet-id>' \
+    LambdaSubnetId='<lambda-subnet-id>' \
+    LambdaRouteTableId='<lambda-route-table-id>' \
+    LambdaSubnetCidr='<lambda-subnet-cidr>' \
+    WireGuardPrivateKeyParameterName="$wireguard_parameter_name" \
+    WireGuardPrivateKeyParameterVersion="$wireguard_parameter_version" \
+    WireGuardGatewayPublicKey="$wireguard_gateway_public_key" \
+    WireGuardWorkstationPublicKey="$wireguard_workstation_public_key" \
+    WireGuardInstanceType=t4g.nano
 ```
 
 The repository also includes a scripted shortcut for the same build, package,
@@ -500,6 +944,79 @@ EXECUTION_FUNCTION_NAME='<execution-function-name>' ./deploy.sh
 ./deploy.sh --execution-function-name '<execution-function-name>'
 ```
 
+`deploy.sh` resolves each gateway value from CLI, then environment, then a
+previously enabled stack, then SSM/default discovery. Gateway enablement itself
+is always explicit. Assuming the PASETO variables above remain set, the minimal
+first enablement needs only the workstation public key when networking has one
+valid pair:
+
+```sh
+WIREGUARD_WORKSTATION_PUBLIC_KEY="$wireguard_workstation_public_key" \
+./deploy.sh --enable-wireguard-gateway
+```
+
+The helper considers available IPv4 subnets. A gateway candidate has an active
+internet-gateway default route. A Lambda candidate is distinct, in the same VPC
+and availability zone, and reaches DynamoDB through an active NAT default route
+or a DynamoDB gateway endpoint on its effective route table. Neither subnet may
+overlap `10.200.0.0/24`. An explicit VPC or one subnet narrows the search. Each
+constrained subnet is inspected once. If no pair remains, the helper prints
+rejection counts for gateway routing, Lambda DynamoDB access, CIDR overlap,
+subnet identity, VPC, and availability zone. AWS API or malformed-response
+failures are reported separately instead of being counted as topology
+rejections. If multiple pairs remain, the helper prints every pair and a
+specific ambiguity error. Use the reported IDs to constrain that selection:
+
+```sh
+./deploy.sh \
+  --enable-wireguard-gateway \
+  --gateway-public-subnet-id '<gateway-public-subnet-id>' \
+  --lambda-subnet-id '<lambda-subnet-id>' \
+  --wireguard-workstation-public-key "$wireguard_workstation_public_key"
+```
+
+`VPC_ID`/`--vpc-id` also constrains candidates. `LAMBDA_SUBNET_CIDR` and
+`LAMBDA_ROUTE_TABLE_ID` remain supported as optional assertions: the helper
+derives both from AWS and rejects a mismatch. It prints the selected VPC,
+availability zone, two subnets, Lambda CIDR, and effective route table.
+
+For a pre-existing custom private parameter, supply the matching pinned
+version and gateway public key; custom paths never receive automatic key
+generation:
+
+```sh
+./deploy.sh \
+  --enable-wireguard-gateway \
+  --wireguard-private-key-parameter-name '<custom-private-parameter-path>' \
+  --wireguard-private-key-parameter-version '<matching-version>' \
+  --wireguard-gateway-public-key "$wireguard_gateway_public_key" \
+  --wireguard-workstation-public-key "$wireguard_workstation_public_key"
+```
+
+A subsequent deployment keeps the gateway enabled only when it again receives
+`--enable-wireguard-gateway` or `ENABLE_WIREGUARD_GATEWAY=1`. When the existing
+stack is enabled, unspecified subnet, workstation-key, gateway-key, and
+instance-type values are reused, including the pinned private-key version. A
+deployment without explicit enablement sends `EnableWireGuardGateway=false`,
+but does so in two phases. The detach phase sets
+`RetainExecutionVpcCleanupResources=true`, removing the gateway, Elastic IP,
+route, related resources, and execution VPC attachment while retaining the
+execution security group and ENI-deletion permission. The helper then polls for
+up to 20 minutes until the current function and every published version have an
+empty VPC configuration and no ENI references the retained security group. The
+cleanup phase sets `RetainExecutionVpcCleanupResources=false` only after those
+checks pass. A timeout stops before cleanup; a later `deploy.sh` run recognizes
+the retained phase and resumes the same guarded wait. Both external SSM
+parameters remain operator-owned. After teardown, a later enablement recovers
+the current default SSM pair but does not reuse gateway inputs from the disabled
+stack.
+
+Before building, `deploy.sh` validates local gateway syntax. A non-dry-run
+deployment discovers and verifies the topology, including the DynamoDB path,
+checks for a conflicting `10.200.0.0/24` route, and reads SSM parameter metadata
+without decrypting the private value. `--dry-run` performs no AWS discovery or
+key creation and reports that gateway preflight is deferred.
+
 `deploy.sh` reads the required `PASETO_PUBLIC_KEY` from the host environment and
 passes it as the `PasetoPublicKey` SAM parameter. When post-deploy checks are
 enabled, it also requires the corresponding `PASETO_PRIVATE_KEY` to issue a
@@ -512,16 +1029,24 @@ or passed to the Lambda environment. Use
 local checks, rebuild all three Lambda zip archives, and validate `template.yaml` without
 deploying to AWS.
 
-For non-dry-run deployments, the helper resolves and verifies the selected AWS
-profile before starting local work. It exports the resolved credentials only to
-the script process and its children, so SAM and the post-deploy AWS commands use
-the same credential snapshot instead of resolving the SSO profile again. When
-resolution or STS verification fails for a profile configured with `sso_session`
-or the legacy `sso_start_url`, it runs one interactive `aws sso login`, resolves
-the credentials again, and stops if login, resolution, or verification fails.
-Non-SSO profile failures stop without attempting SSO login. Dry runs make no AWS
-authentication calls, and the helper does not print or write resolved
-credentials.
+For non-dry-run deployments, the helper clears inherited static AWS credential
+variables, exports `AWS_PROFILE` for the selected refreshable profile, passes
+the same profile explicitly to SAM, and verifies it before starting local work.
+SAM and post-deploy AWS commands can therefore refresh an `sso_session` instead
+of inheriting a finite credential snapshot. When STS verification fails for a
+profile configured with `sso_session` or the legacy `sso_start_url`, the helper
+runs one interactive `aws sso login` and verifies again. Non-SSO profile
+failures stop without attempting SSO login. Dry runs make no AWS authentication
+calls, and the helper does not print or write resolved credentials.
+
+Before formatting, building, packaging, or validating, the helper queries the
+existing stack and stops when its status ends in `_IN_PROGRESS`. If a local SAM
+waiter or post-deployment check fails after deployment begins, it queries
+CloudFormation with the refreshable profile and distinguishes an update that is
+still running, a terminal CloudFormation failure, and remote success followed
+by a local failure. Do not rerun deployment against an active stack. Wait for
+CloudFormation to reach a terminal state before retrying; after a bounded VPC
+cleanup timeout, a later `deploy.sh` run resumes the retained cleanup phase.
 
 After a successful deployment, `deploy.sh` resolves the
 `OperationsTable` physical resource, waits for the table to exist, and prints a
@@ -530,14 +1055,15 @@ billing, has only the `id` string partition key, and has no local or global
 secondary indexes. It then resolves the `OperationsQueue` physical resource and calls
 `GetQueueAttributes` to print a concise SQS summary. This probe verifies that
 the deployed queue can be queried but does not enforce SQS attribute values.
-The intake and query Function URL checks then run.
+For an enabled deployment, it also prints the seven conditional, non-secret
+gateway outputs. The intake and query Function URL checks then run.
 
 Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run --use-local-libs`
 to build with local dependency checkouts. The `aws_lambda` checkout defaults
 to `../aws-lambda-zig`; override it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
 
-## 7. Read the stack outputs
+## 7. Configure and operate the WireGuard gateway
 
 After deployment, SAM prints stack outputs. Look for:
 
@@ -552,6 +1078,18 @@ ExecutionFunctionName
 ExecutionFunctionArn
 ```
 
+An enabled deployment also emits these conditional outputs:
+
+```text
+WireGuardGatewayInstanceId
+WireGuardGatewayElasticIp
+WireGuardGatewayEndpoint
+WireGuardGatewayPublicKey
+WireGuardGatewayAddress
+WireGuardWorkstationAddress
+TigerBeetleEndpoint
+```
+
 You can also query it later with CloudFormation:
 
 ```sh
@@ -563,11 +1101,263 @@ aws cloudformation describe-stacks \
   --region ca-central-1
 ```
 
+Read all conditional gateway outputs without recording their live values in
+the repository:
+
+```sh
+aws cloudformation describe-stacks \
+  --stack-name aws-lambda-zig-demo \
+  --query "Stacks[0].Outputs[?OutputKey=='WireGuardGatewayInstanceId' || OutputKey=='WireGuardGatewayElasticIp' || OutputKey=='WireGuardGatewayEndpoint' || OutputKey=='WireGuardGatewayPublicKey' || OutputKey=='WireGuardGatewayAddress' || OutputKey=='WireGuardWorkstationAddress' || OutputKey=='TigerBeetleEndpoint'].[OutputKey,OutputValue]" \
+  --output table \
+  --profile dev \
+  --region ca-central-1
+```
+
 `lambda_logs.sh` resolves the explicit intake, query, or execution function-name output.
 `persistence.sh` and `queue.sh` resolve the `OperationsTable` and
 `OperationsQueue` physical resources directly because those data-plane names
 are intentionally not public stack outputs. Normal local command use does not
 require exporting those values.
+
+### Configure the workstation
+
+Install the workstation private key into the platform's protected WireGuard
+configuration using mode `0600` or an equivalent secret-store permission. Use
+this peer shape, replacing the placeholders with the protected private key,
+the gateway public key, conditional Elastic IP output, and supplied Lambda
+subnet CIDR:
+
+```ini
+[Interface]
+Address = 10.200.0.2/24
+PrivateKey = <workstation-private-key>
+
+[Peer]
+PublicKey = <gateway-public-key>
+Endpoint = <WireGuardGatewayElasticIp>:51820
+AllowedIPs = <LambdaSubnetCidr>
+PersistentKeepalive = 25
+```
+
+`AllowedIPs` intentionally contains only the Lambda subnet, not the entire
+VPC. This installs the return route for traffic whose source is the Lambda
+subnet while keeping unrelated VPC traffic out of the development tunnel. The
+workstation firewall must permit TigerBeetle TCP/3000 from
+`LambdaSubnetCidr`. TigerBeetle must listen on `10.200.0.2:3000` or another
+socket that includes the WireGuard interface; binding only to loopback or a
+different local interface is insufficient. The gateway performs routing, not
+NAT.
+
+### Check the instance and tunnel
+
+Resolve the instance ID, wait for both EC2 status checks, and confirm that the
+instance has registered with Systems Manager:
+
+```sh
+gateway_instance_id="$(
+  aws cloudformation describe-stacks \
+    --stack-name aws-lambda-zig-demo \
+    --query "Stacks[0].Outputs[?OutputKey=='WireGuardGatewayInstanceId'].OutputValue | [0]" \
+    --output text \
+    --profile dev \
+    --region ca-central-1
+)"
+
+aws ec2 wait instance-status-ok \
+  --instance-ids "$gateway_instance_id" \
+  --profile dev \
+  --region ca-central-1
+
+aws ssm describe-instance-information \
+  --filters "Key=InstanceIds,Values=$gateway_instance_id" \
+  --query 'InstanceInformationList[0].[InstanceId,PingStatus,PlatformName]' \
+  --output table \
+  --profile dev \
+  --region ca-central-1
+```
+
+Start an administrative session through Session Manager. No SSH key or public
+TCP/22 ingress is configured:
+
+```sh
+aws ssm start-session \
+  --target "$gateway_instance_id" \
+  --profile dev \
+  --region ca-central-1
+```
+
+Inside the session, use these checks. Do not print or copy
+`/etc/wireguard/wg0.conf`, because it contains the gateway private key:
+
+```sh
+sudo systemctl status wg-quick@wg0 --no-pager
+sudo wg show wg0
+sysctl net.ipv4.ip_forward
+ip -4 route
+sudo journalctl -u wg-quick@wg0 --no-pager
+sudo journalctl -u cloud-final.service --no-pager
+sudo tail -n 200 /var/log/cloud-init-output.log
+```
+
+On the workstation, activate the interface with the platform's WireGuard tool,
+then run `sudo wg show`. A recent handshake and RX/TX counters increasing after
+test traffic confirm the encrypted tunnel.
+
+The steady-state workstation `AllowedIPs` deliberately omits the gateway's
+`10.200.0.1/32` address, so it rejects gateway-originated inner packets while
+accepting forwarded packets from `LambdaSubnetCidr`. For the isolated
+EC2-to-workstation diagnostic, temporarily add `10.200.0.1/32` to the
+workstation peer's `AllowedIPs`, apply the peer change, run these commands from
+the EC2 session, and then restore the documented Lambda-subnet-only value:
+
+```sh
+ping -c 3 10.200.0.2
+timeout 5 bash -c '</dev/tcp/10.200.0.2/3000'
+```
+
+ICMP may be disabled by the workstation firewall; the TCP/3000 result is the
+decisive TigerBeetle reachability check.
+
+Inspect the AWS routing and forwarding controls from the operator shell:
+
+```sh
+aws ec2 describe-route-tables \
+  --route-table-ids '<lambda-route-table-id>' \
+  --query "RouteTables[0].Routes[?DestinationCidrBlock=='10.200.0.0/24']" \
+  --profile dev \
+  --region ca-central-1
+
+aws ec2 describe-instance-attribute \
+  --instance-id "$gateway_instance_id" \
+  --attribute sourceDestCheck \
+  --profile dev \
+  --region ca-central-1
+
+aws cloudformation describe-stack-resources \
+  --stack-name aws-lambda-zig-demo \
+  --query "StackResources[?LogicalResourceId=='ExecutionLambdaSecurityGroup' || LogicalResourceId=='WireGuardGatewaySecurityGroup'].[LogicalResourceId,PhysicalResourceId]" \
+  --output table \
+  --profile dev \
+  --region ca-central-1
+
+aws ec2 describe-security-groups \
+  --group-ids '<execution-lambda-security-group-id>' \
+    '<wireguard-gateway-security-group-id>' \
+  --profile dev \
+  --region ca-central-1
+
+aws lambda get-function-configuration \
+  --function-name '<execution-function-name>' \
+  --query VpcConfig \
+  --profile dev \
+  --region ca-central-1
+```
+
+The route target must be the gateway instance, source/destination checking
+must be `false`, the execution security group must have only the documented
+TCP/3000 and TCP/443 egress, and the gateway group must match the documented
+ingress and egress. To test reboot recovery, explicitly reboot, wait for status
+checks again, reconnect with Session Manager, and repeat the interface and
+forwarding checks:
+
+```sh
+aws ec2 reboot-instances \
+  --instance-ids "$gateway_instance_id" \
+  --profile dev \
+  --region ca-central-1
+aws ec2 wait instance-status-ok \
+  --instance-ids "$gateway_instance_id" \
+  --profile dev \
+  --region ca-central-1
+```
+
+### Diagnose failures
+
+| Symptom | Likely cause and next check |
+| --- | --- |
+| No recent handshake | Confirm workstation WireGuard is running, outbound UDP/51820 is allowed, the endpoint is the current Elastic IP, and the two peers use matching public keys. |
+| Bootstrap reports a public-key mismatch | The selected SSM version does not contain the private key matching `WireGuardGatewayPublicKey`; correct the version/public-key pair and redeploy. |
+| Handshake succeeds but routed counters do not increase | Check the workstation peer `AllowedIPs = <LambdaSubnetCidr>` and the gateway peer route `10.200.0.2/32`. |
+| EC2 reaches neither `10.200.0.2` nor TCP/3000 | Check workstation WireGuard state, local routes, and its firewall before checking AWS. |
+| EC2 reaches `10.200.0.2`, but not TCP/3000 | Permit TCP/3000 from `LambdaSubnetCidr` and make TigerBeetle listen on `10.200.0.2:3000` or an inclusive bind address. |
+| EC2 works, but Lambda cannot reach the overlay | Confirm the `10.200.0.0/24` VPC route, `SourceDestCheck=false`, execution VPC attachment, and TCP/3000 security-group egress. |
+| Execution loses DynamoDB access after VPC attachment | Restore the Lambda subnet's NAT path or DynamoDB gateway endpoint; an internet gateway on the public gateway subnet does not provide Lambda egress. |
+| SSM registration or bootstrap fails | Check gateway-subnet internet routing, the instance role, `cloud-init` logs, and the exact SSM parameter name/version. The role can read only that parameter. |
+
+### Rotate WireGuard keys
+
+`deploy.sh` never rotates either parameter implicitly. To rotate the default
+gateway pair, generate both values in a new protected directory, update the
+private and public parameters back-to-back, and capture the returned private
+version. Do not deploy the intermediate state where only one value is updated:
+
+```sh
+rotation_private_parameter_name="/applications/${STACK_NAME:-aws-lambda-zig-demo}/wireguard/gateway-private-key"
+rotation_public_parameter_name="/applications/${STACK_NAME:-aws-lambda-zig-demo}/wireguard/gateway-public-key"
+rotation_key_dir="$(mktemp -d "${TMPDIR:-/tmp}/aws-lambda-zig-wireguard-rotate.XXXXXX")"
+chmod 700 "$rotation_key_dir"
+(
+  umask 077
+  wg genkey >"$rotation_key_dir/gateway.private"
+  wg pubkey <"$rotation_key_dir/gateway.private" \
+    >"$rotation_key_dir/gateway.public"
+  {
+    printf '{"Name":"%s","Description":"WireGuard gateway private key","Type":"SecureString","KeyId":"alias/aws/ssm","Overwrite":true,"Value":"' \
+      "$rotation_private_parameter_name"
+    tr -d '\r\n' <"$rotation_key_dir/gateway.private"
+    printf '"}\n'
+  } >"$rotation_key_dir/private-put.json"
+)
+
+rotated_parameter_version="$(
+  aws ssm put-parameter \
+    --cli-input-json "file://$rotation_key_dir/private-put.json" \
+    --query Version \
+    --output text \
+    --profile dev \
+    --region ca-central-1
+)"
+rotated_gateway_public_key="$(tr -d '\r\n' <"$rotation_key_dir/gateway.public")"
+aws ssm put-parameter \
+  --name "$rotation_public_parameter_name" \
+  --description 'WireGuard gateway public key' \
+  --type String \
+  --value "$rotated_gateway_public_key" \
+  --overwrite \
+  --profile dev \
+  --region ca-central-1
+printf 'Recorded rotated SSM parameter version: %s\n' \
+  "$rotated_parameter_version"
+```
+
+If the public update fails, retain the protected directory and retry that
+exact public value; do not generate another private key or run a deployment.
+After both updates succeed, rerun the complete enabled SAM or `deploy.sh`
+command with
+`WireGuardPrivateKeyParameterVersion` set to
+`$rotated_parameter_version` and `WireGuardGatewayPublicKey` set to
+`$rotated_gateway_public_key`. Update the workstation peer's `PublicKey` to
+the same rotated public key. Expect a brief tunnel interruption while both
+sides change.
+
+After both SSM updates and the deployment succeed, securely remove
+`private-put.json`, `gateway.private`, and `gateway.public`, then remove the
+rotation directory. The public key may remain in the shell variable; no private
+value was exported.
+
+Changing the SSM values alone does not reconfigure a running instance. The new
+private version and matching public key create a launch-template version and replace
+the stateless gateway; the Elastic IP and route remain stack-managed and
+follow the replacement. To rotate the workstation key, keep its new private
+key local, pass only its new public key as `WireGuardWorkstationPublicKey`,
+redeploy, and update the workstation interface. Verify a new handshake and
+TCP/3000 connectivity after either rotation.
+
+The workstation-initiated handshake, routed TCP/3000 connection, execution
+Lambda VPC attachment, reboot recovery, and key rotation are cloud acceptance
+checks and remain unexecuted until an operator explicitly authorizes and runs
+the deployment. A real TigerBeetle request from Lambda remains deferred: the
+current execution handler does not contain a TigerBeetle client.
 
 ## 8. Test query GET and intake POST
 
@@ -923,8 +1713,8 @@ SAM uploads all three packages and updates their CloudFormation-managed Lambda f
 
 ## 13. Delete the SAM stack
 
-To remove all three SAM-managed functions, roles, the operations table and queue,
-Function URLs, and permissions:
+To remove all three SAM-managed functions, roles, the operations table and
+queue, Function URLs, permissions, and any enabled gateway resources:
 
 ```sh
 sam delete \
@@ -940,10 +1730,49 @@ recovery is disabled; this demo configuration provides no recovery capability.
 The operations queue uses the same deletion policies, so deleting or replacing
 it permanently deletes any queued messages.
 
+For an enabled deployment, stack deletion also terminates the EC2 gateway,
+releases its Elastic IP, removes the `10.200.0.0/24` route and security groups,
+and deletes the stack-owned launch template, IAM role, and instance profile.
+The gateway private/public SSM parameters are intentionally external and are
+not deleted. The workstation keys and TigerBeetle process and data are also
+workstation-owned and remain untouched.
+
+After confirming that neither the gateway nor its keys will be reused, the
+operator can explicitly delete both external parameters and securely remove the
+local key files according to workstation policy:
+
+```sh
+aws ssm delete-parameters \
+  --names \
+    '/<stack-name>/wireguard/gateway-private-key' \
+    '/<stack-name>/wireguard/gateway-public-key' \
+  --profile dev \
+  --region ca-central-1
+rm -f '<private-key-directory>/gateway.private' \
+  '<private-key-directory>/gateway.public' \
+  '<private-key-directory>/workstation.private' \
+  '<private-key-directory>/workstation.public'
+rmdir '<private-key-directory>'
+```
+
 ## Security note
 
 This demo intentionally creates two publicly reachable Lambda Function URLs,
-and both Function URL handlers require a valid PASETO bearer token. The execution Lambda has no
-Function URL and is invoked from SQS. For production, consider
-combining application authentication with stricter infrastructure
+and both Function URL handlers require a valid PASETO bearer token. The
+execution Lambda has no Function URL and is invoked from SQS. For production,
+consider combining application authentication with stricter infrastructure
 authorization, narrower IAM policies, or an API Gateway/CloudFront layer.
+
+When the gateway is enabled, IPv4 UDP/51820 is deliberately open from
+`0.0.0.0/0` because the NAT public address of the development workstation is
+not predictable. WireGuard authenticates the configured peer and remains
+silent to unauthenticated handshakes, but removing a security-group source
+filter increases exposure to UDP scanning and floods and to future kernel or
+WireGuard vulnerabilities. The gateway opens no IPv6 ingress, SSH, public
+TigerBeetle TCP port, or other public ingress. Keep the gateway disabled when
+it is not needed and account for its EC2 and Elastic IP cost while enabled.
+
+No private WireGuard key is a CloudFormation parameter, template value, tag,
+log, or stack output. The instance role can read only the configured external
+SSM parameter and intentionally has no `kms:Decrypt` permission because the
+workflow uses the AWS-managed `aws/ssm` key.
