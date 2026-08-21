@@ -5,13 +5,13 @@ const c = @import("tigerbeetle_c");
 const assert = std.debug.assert;
 
 const cluster_id: u128 = 0;
-const cluster_addresses = "127.0.0.1:3000";
+const cluster_addresses_default = "127.0.0.1:3000";
 const ledger: u32 = 1;
 const account_code: u16 = 1;
 const transfer_code: u16 = 1;
 const transfer_amount: u128 = 10;
 const linked_transfer_amount_total: u128 = transfer_amount * 2;
-const unique_id_count = 19;
+const unique_id_count = 20;
 
 const account_linked_flag: u16 = @intCast(c.TB_ACCOUNT_LINKED);
 const account_created: u32 = @intCast(c.TB_CREATE_ACCOUNT_CREATED);
@@ -27,6 +27,7 @@ const account_ledger_must_not_be_zero: u32 = @intCast(
 );
 const transfer_linked_flag: u16 = @intCast(c.TB_TRANSFER_LINKED);
 const transfer_created: u32 = @intCast(c.TB_CREATE_TRANSFER_CREATED);
+const transfer_exists: u32 = @intCast(c.TB_CREATE_TRANSFER_EXISTS);
 const transfer_linked_event_failed: u32 = @intCast(
     c.TB_CREATE_TRANSFER_LINKED_EVENT_FAILED,
 );
@@ -48,6 +49,7 @@ comptime {
     assert(c.TB_TRANSFER_LINKED > 0);
     assert(c.TB_TRANSFER_LINKED <= std.math.maxInt(u16));
     assert(c.TB_CREATE_TRANSFER_CREATED <= std.math.maxInt(u32));
+    assert(c.TB_CREATE_TRANSFER_EXISTS <= std.math.maxInt(u32));
     assert(c.TB_CREATE_TRANSFER_LINKED_EVENT_FAILED <= std.math.maxInt(u32));
     assert(c.TB_CREATE_TRANSFER_LINKED_EVENT_CHAIN_OPEN <= std.math.maxInt(u32));
     assert(c.TB_CREATE_TRANSFER_DEBIT_ACCOUNT_NOT_FOUND <= std.math.maxInt(u32));
@@ -76,6 +78,7 @@ const TestIds = struct {
     linked_missing_debit_account: u128,
     invalid_debit_transfer: u128,
     open_chain_transfer: u128,
+    operation_account: u128,
 
     fn generate(io: std.Io) !TestIds {
         const timestamp_ms_raw = std.Io.Clock.real.now(io).toMilliseconds();
@@ -110,6 +113,7 @@ const TestIds = struct {
             .linked_missing_debit_account = base_id + 16,
             .invalid_debit_transfer = base_id + 17,
             .open_chain_transfer = base_id + 18,
+            .operation_account = base_id + 19,
         };
         ids.assert_valid();
         return ids;
@@ -147,6 +151,7 @@ const TestIds = struct {
             ids.linked_missing_debit_account,
             ids.invalid_debit_transfer,
             ids.open_chain_transfer,
+            ids.operation_account,
         };
     }
 
@@ -171,7 +176,8 @@ const TestIds = struct {
                 "  rolled_back_transfer={x}\n" ++
                 "  linked_missing_debit_account={x}\n" ++
                 "  invalid_debit_transfer={x}\n" ++
-                "  open_chain_transfer={x}\n",
+                "  open_chain_transfer={x}\n" ++
+                "  operation_account={x}\n",
             .{
                 @errorName(failure),
                 ids.debit_account,
@@ -193,6 +199,7 @@ const TestIds = struct {
                 ids.linked_missing_debit_account,
                 ids.invalid_debit_transfer,
                 ids.open_chain_transfer,
+                ids.operation_account,
             },
         );
     }
@@ -221,6 +228,10 @@ const AccountBalancePair = struct {
     credit_account: AccountBalance,
 };
 
+fn cluster_addresses() []const u8 {
+    return if (std.c.getenv("TIGERBEETLE_ADDRESSES")) |addresses| std.mem.span(addresses) else cluster_addresses_default;
+}
+
 test "live account, transfer, and linked chain operations" {
     const ids = try TestIds.generate(std.testing.io);
     run_live_scenario(&ids) catch |failure| {
@@ -235,9 +246,11 @@ fn run_live_scenario(ids: *const TestIds) !void {
         std.testing.allocator,
         std.testing.io,
         cluster_id,
-        cluster_addresses,
+        cluster_addresses(),
     );
     defer client.destroy();
+
+    try run_execution_accounting_workflow(client, ids);
 
     const accounts = [_]tigerbeetle.Account{
         make_account(ids.debit_account),
@@ -279,6 +292,62 @@ fn run_live_scenario(ids: *const TestIds) !void {
     try create_linked_transfers_successfully(client, ids);
     try roll_back_linked_transfers(client, ids);
     try reject_open_transfer_chain(client, ids);
+}
+
+fn run_execution_accounting_workflow(
+    client: *tigerbeetle.Client,
+    ids: *const TestIds,
+) !void {
+    const prerequisite = try client.lookupAccounts(&.{1});
+    defer std.testing.allocator.free(prerequisite);
+    try std.testing.expectEqual(@as(usize, 1), prerequisite.len);
+    try std.testing.expectEqual(@as(u128, 1), prerequisite[0].id);
+    try std.testing.expectEqual(ledger, prerequisite[0].ledger);
+    const credit_before = AccountBalance.from_account(&prerequisite[0]);
+
+    const account = make_account(ids.operation_account);
+    const account_results = try client.createAccounts(&.{account});
+    defer std.testing.allocator.free(account_results);
+    try std.testing.expectEqual(@as(usize, 1), account_results.len);
+    try std.testing.expect(tigerbeetle.create_account_succeeded(account_results[0].status));
+    try std.testing.expectEqual(account_created, account_results[0].status);
+
+    const account_replay = try client.createAccounts(&.{account});
+    defer std.testing.allocator.free(account_replay);
+    try std.testing.expectEqual(@as(usize, 1), account_replay.len);
+    try std.testing.expect(tigerbeetle.create_account_succeeded(account_replay[0].status));
+    try std.testing.expectEqual(account_exists, account_replay[0].status);
+
+    var transfer = make_transfer(ids.operation_account, ids.operation_account, 1);
+    transfer.amount = 100;
+    const transfer_results = try client.createTransfers(&.{transfer});
+    defer std.testing.allocator.free(transfer_results);
+    try std.testing.expectEqual(@as(usize, 1), transfer_results.len);
+    try std.testing.expect(tigerbeetle.create_transfer_succeeded(transfer_results[0].status));
+    try std.testing.expectEqual(transfer_created, transfer_results[0].status);
+
+    const transfer_replay = try client.createTransfers(&.{transfer});
+    defer std.testing.allocator.free(transfer_replay);
+    try std.testing.expectEqual(@as(usize, 1), transfer_replay.len);
+    try std.testing.expect(tigerbeetle.create_transfer_succeeded(transfer_replay[0].status));
+    try std.testing.expectEqual(transfer_exists, transfer_replay[0].status);
+
+    const balances = try lookup_account_balances(client, ids.operation_account, 1);
+    const expected_credit_posted = try std.math.add(u128, credit_before.credits_posted, 100);
+    try std.testing.expectEqual(@as(u128, 100), balances.debit_account.debits_posted);
+    try std.testing.expectEqual(expected_credit_posted, balances.credit_account.credits_posted);
+    try std.testing.expectEqual(
+        credit_before.debits_pending,
+        balances.credit_account.debits_pending,
+    );
+    try std.testing.expectEqual(
+        credit_before.debits_posted,
+        balances.credit_account.debits_posted,
+    );
+    try std.testing.expectEqual(
+        credit_before.credits_pending,
+        balances.credit_account.credits_pending,
+    );
 }
 
 fn create_accounts(

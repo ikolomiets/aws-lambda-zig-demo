@@ -41,13 +41,43 @@ tigerbeetle_c_artifacts/lib/aarch64-linux-gnu.2.27/libtb_client.a
 The current immutable release asset is:
 
 ```text
+https://github.com/ikolomiets/aws-lambda-zig-demo/releases/download/tigerbeetle-c-97c7a8ef385270ebe0e1b75959d3d21d134629df-pr3695-dde119796197d30e73cfc706cc18f58efee78735-pr3914-ce5d8f5ff585b0d3505a0f69946473fa2138b220/tigerbeetle-c-97c7a8ef385270ebe0e1b75959d3d21d134629df-pr3695-dde119796197d30e73cfc706cc18f58efee78735-pr3914-ce5d8f5ff585b0d3505a0f69946473fa2138b220.tar.gz
+```
+
+The release tag and asset identify the base and both patch heads. The verified tarball SHA-256 is
+`5b64418ebdb3deb54b99c4374a916a869ced0b5bd8ace4dfa0a60c0cb5acd08b` and its size is 540,991 bytes.
+The Zig package content hash is
+`tigerbeetle_c_artifacts-65535.0.0+g97c7a8ef3.pr3695-fTLGi0aNGQC3xlGJoqTt6DVm9fZPGoBrSKcdqoZZgjNd`.
+The root `build.zig.zon` records this hash with the URL. The package uses the Zig 0.16-compatible
+version field `65535.0.0+g97c7a8ef3.pr3695`; the full requested provenance identifier
+`65535.0.0+g97c7a8ef3.pr3695.gdde119796.pr3914.gce5d8f5ff` is retained in the release tag and
+`PROVENANCE.md` because Zig 0.16 rejects version fields longer than 32 bytes. Do not mix a header
+and archive from different TigerBeetle revisions or replace a release asset in place.
+
+The package records these payload checksums in `SHA256SUMS`:
+
+```text
+include/tb_client.h                                      3ad1dd26fb67f3c89c971072cf22ad4a833971f6a40947ca562db2685587964d
+lib/aarch64-linux-gnu.2.27/libtb_client.a                 66dc4532b426d52b5305f223d2a0206b4947822d1ce1eb8a69acc03c3467b142
+lib/aarch64-macos/libtb_client.a                          3cd3c36a86a7b3d1eb935482c753924eb8d7a8d2d25e7e65827bede0a7d82a3c
+LICENSE                                                    0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594
+```
+
+The Linux archive is built for `aarch64-linux-gnu.2.27` and registers nonblocking sockets,
+timerfds, and eventfds with TigerBeetle's epoll backend. The macOS archive remains
+`aarch64-macos` and retains the Darwin backend. The header checksum and exported `tb_client_*`
+symbol set match the previous release. The backport also decodes raw Linux syscall results with
+`std.os.linux.E.init`, avoiding libc-aware errno decoding in the glibc-linked client. The previous
+release remains available for rollback at:
+
+```text
 https://github.com/ikolomiets/aws-lambda-zig-demo/releases/download/tigerbeetle-c-97c7a8ef385270ebe0e1b75959d3d21d134629df/tigerbeetle-c-97c7a8ef385270ebe0e1b75959d3d21d134629df.tar.gz
 ```
 
-The Zig package content hash is
-`tigerbeetle_c_artifacts-65535.0.0+g97c7a8ef3-fTLGi3omGQBhYU4lFlngO8hjBP2md7KVLT-PSX2IxNjy`.
-The root `build.zig.zon` records this hash with the URL. Do not mix a header and archive from
-different TigerBeetle revisions or replace a release asset in place.
+`PROVENANCE.md` records the exact upstream commits, nine-file PR review, manually resolved
+initialization-error mapping, patched source-tree hash, Zig compiler and SDK shim, build command,
+targets, CPU features, and payload checksums. It is part of the package and is verified with the
+same immutable release asset.
 
 On a clean machine, fetch dependencies before building:
 
@@ -316,7 +346,9 @@ and needs no live TigerBeetle cluster.
 ## Live integration tests
 
 `tests/tigerbeetle_integration.zig` exercises the public wrapper against cluster ID `0` at
-`127.0.0.1:3000`. The test root also receives `tigerbeetle_c` as a test-only import so it can assert
+`127.0.0.1:3000` by default. A test-only `TIGERBEETLE_ADDRESSES` environment variable can override
+that address (for example, for a Docker-host gateway); production Lambda configuration is not
+changed by this override. The test root also receives `tigerbeetle_c` as a test-only import so it can assert
 the exact C flags and statuses for created objects, existing accounts, linked-chain failures,
 open-ended chains, an account with ledger zero, and a transfer with a missing debit account. The
 wrapper itself does not re-export those constants, and business validation statuses remain result
@@ -337,6 +369,10 @@ The live test uses one long-lived, single-caller `Client`. Its baseline scenario
 accounts, retries one identical account, performs account lookups with a missing ID, posts a
 transfer, and proves that a transfer rejected for a missing debit account leaves both existing
 balances unchanged.
+
+The execution-accounting preflight first looks up operator-provisioned account `1` (ledger `1`),
+creates a unique account, posts a `100`-unit transfer from it to account `1`, and replays both
+requests to verify the identical `exists` results. It never creates or modifies account `1`.
 
 The linked-account scenarios cover all three chain outcomes:
 

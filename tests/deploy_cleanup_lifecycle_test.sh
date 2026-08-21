@@ -24,16 +24,12 @@ assert_contains() {
     esac
 }
 
-test_refreshable_profile_credentials() (
+test_fresh_sso_login() (
+    aws_call_count=0
     aws() {
         case "$*" in
-            "sts get-caller-identity --profile dev "*) return 0 ;;
-            "sts get-caller-identity --query Arn --output text") return 0 ;;
-            "configure export-credentials "*)
-                printf '%s\n' 'export AWS_ACCESS_KEY_ID=finite-snapshot'
-                printf '%s\n' 'export AWS_SECRET_ACCESS_KEY=finite-secret'
-                printf '%s\n' 'export AWS_SESSION_TOKEN=finite-session'
-                printf '%s\n' 'export AWS_CREDENTIAL_EXPIRATION=2000-01-01T00:00:00Z'
+            "sso login --profile dev")
+                aws_call_count=$((aws_call_count + 1))
                 return 0
                 ;;
             *) fail_test "unexpected credential AWS call: $*" ;;
@@ -48,10 +44,13 @@ test_refreshable_profile_credentials() (
     export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
     export AWS_CREDENTIAL_EXPIRATION AWS_PROFILE
 
-    prepare_aws_credentials dev
+    prepare_aws_sso_session dev
+
+    [ "$aws_call_count" -eq 1 ] ||
+        fail_test "deployment did not perform exactly one fresh SSO login"
 
     [ "${AWS_PROFILE:-}" = dev ] ||
-        fail_test "deployment did not select the refreshable dev profile"
+        fail_test "deployment did not select the dev SSO profile"
     [ -z "${AWS_ACCESS_KEY_ID:-}" ] ||
         fail_test "deployment retained a finite access-key snapshot"
     [ -z "${AWS_SECRET_ACCESS_KEY:-}" ] ||
@@ -118,6 +117,34 @@ test_phase_selection() {
     [ "$mode" = enabled ] ||
         fail_test "explicit enablement did not select enabled mode"
 }
+
+test_tigerbeetle_configuration() (
+    TIGERBEETLE_CLUSTER_ID=0
+    TIGERBEETLE_ADDRESSES=10.200.0.2:3000
+    validate_tigerbeetle_configuration
+
+    TIGERBEETLE_CLUSTER_ID=340282366920938463463374607431768211455
+    TIGERBEETLE_ADDRESSES=127.0.0.1:3000,127.0.0.1:3001
+    validate_tigerbeetle_configuration
+    build_sam_parameter_overrides false
+    joined_overrides=" ${SAM_PARAMETER_OVERRIDES[*]} "
+    assert_contains "$joined_overrides" \
+        " TigerBeetleClusterId=340282366920938463463374607431768211455 "
+    assert_contains "$joined_overrides" \
+        " TigerBeetleAddresses=127.0.0.1:3000,127.0.0.1:3001 "
+
+    TIGERBEETLE_CLUSTER_ID=340282366920938463463374607431768211456
+    if validation_output="$(validate_tigerbeetle_configuration 2>&1)"; then
+        fail_test "out-of-range TigerBeetle cluster ID was accepted"
+    fi
+    assert_contains "$validation_output" "unsigned 128-bit integer"
+    TIGERBEETLE_CLUSTER_ID=0
+    TIGERBEETLE_ADDRESSES="127.0.0.1:3000 127.0.0.1:3001"
+    if validation_output="$(validate_tigerbeetle_configuration 2>&1)"; then
+        fail_test "TigerBeetle addresses containing whitespace were accepted"
+    fi
+    assert_contains "$validation_output" "must not contain whitespace"
+)
 
 test_enabled_stack_detach_plan() (
     aws() {
@@ -221,10 +248,11 @@ test_detach_precedes_cleanup() {
         fail_test "detach and cleanup phases ran in the wrong order: $actual_calls"
 }
 
-test_refreshable_profile_credentials
+test_fresh_sso_login
 test_in_progress_stack_guard
 test_cloudformation_outcome_reporting
 test_phase_selection
+test_tigerbeetle_configuration
 test_enabled_stack_detach_plan
 test_cleanup_readiness
 test_cleanup_refuses_blocking_eni

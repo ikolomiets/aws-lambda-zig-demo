@@ -66,6 +66,23 @@ fn tigerbeetle_target_unsupported(target: std.Target) noreturn {
     );
 }
 
+fn execution_lambda_target(
+    b: *std.Build,
+    arch: lambda.Arch,
+) std.Build.ResolvedTarget {
+    if (arch != .arm) {
+        std.debug.panic("the TigerBeetle execution Lambda requires -Darch=arm", .{});
+    }
+    return b.resolveTargetQuery(.{
+        .cpu_arch = .aarch64,
+        .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.neoverse_n1 },
+        .cpu_features_add = std.Target.aarch64.featureSet(&.{.crypto}),
+        .os_tag = .linux,
+        .abi = .gnu,
+        .glibc_version = .{ .major = 2, .minor = 34, .patch = 0 },
+    });
+}
+
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{
         .preferred_optimize_mode = .ReleaseSafe,
@@ -76,7 +93,13 @@ pub fn build(b: *std.Build) void {
         b.release_mode = .safe;
     }
     const tigerbeetle_c_artifacts = b.dependency("tigerbeetle_c_artifacts", .{});
-    const lambda_target = lambda.resolveTargetQuery(b, lambda.archOption(b));
+    const lambda_arch = b.option(
+        lambda.Arch,
+        "arch",
+        "Lambda CPU architecture (defaults to arm)",
+    ) orelse .arm;
+    const lambda_target = lambda.resolveTargetQuery(b, lambda_arch);
+    const execution_target = execution_lambda_target(b, lambda_arch);
     const lambda_aws_sdk = b.dependency("aws_sdk", .{
         .target = lambda_target,
         .optimize = optimize,
@@ -131,6 +154,42 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sqs", .module = lambda_sqs },
         },
     });
+    const execution_aws_sdk = b.dependency("aws_sdk", .{
+        .target = execution_target,
+        .optimize = optimize,
+    });
+    const execution_aws = execution_aws_sdk.module("aws");
+    const execution_dynamodb = execution_aws_sdk.module("dynamodb");
+    const execution_runtime = b.dependency("aws_lambda", .{
+        .target = execution_target,
+    }).module("lambda");
+    const execution_operation = b.createModule(.{
+        .target = execution_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/operation.zig"),
+    });
+    const execution_operation_persistence = b.createModule(.{
+        .target = execution_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/operation_persistence.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = execution_aws },
+            .{ .name = "dynamodb", .module = execution_dynamodb },
+            .{ .name = "operation", .module = execution_operation },
+        },
+    });
+    const tigerbeetle_c_lambda = add_tigerbeetle_c_module(
+        b,
+        tigerbeetle_c_artifacts,
+        execution_target,
+        optimize,
+    );
+    const tigerbeetle_lambda = add_tigerbeetle_module(
+        b,
+        execution_target,
+        optimize,
+        tigerbeetle_c_lambda,
+    );
 
     const intake_lambda_mod = b.createModule(.{
         .target = lambda_target,
@@ -183,16 +242,18 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_query_lambda.step);
 
     const execution_lambda_mod = b.createModule(.{
-        .target = lambda_target,
+        .target = execution_target,
         .optimize = optimize,
         .root_source_file = b.path("src/execution_lambda.zig"),
         .strip = true,
-        .single_threaded = true,
+        // TigerBeetle completes requests from its native client thread.
+        .single_threaded = false,
         .imports = &.{
-            .{ .name = "aws", .module = lambda_aws },
-            .{ .name = "aws-lambda", .module = lambda_runtime },
-            .{ .name = "operation", .module = lambda_operation },
-            .{ .name = "operation_persistence", .module = lambda_operation_persistence },
+            .{ .name = "aws", .module = execution_aws },
+            .{ .name = "aws-lambda", .module = execution_runtime },
+            .{ .name = "operation", .module = execution_operation },
+            .{ .name = "operation_persistence", .module = execution_operation_persistence },
+            .{ .name = tigerbeetle_import_name, .module = tigerbeetle_lambda },
         },
     });
     const execution_lambda_exe = b.addExecutable(.{
@@ -212,6 +273,18 @@ pub fn build(b: *std.Build) void {
     const host_aws = host_aws_sdk.module("aws");
     const host_dynamodb = host_aws_sdk.module("dynamodb");
     const host_sqs = host_aws_sdk.module("sqs");
+    const tigerbeetle_c_host = add_tigerbeetle_c_module(
+        b,
+        tigerbeetle_c_artifacts,
+        b.graph.host,
+        .Debug,
+    );
+    const tigerbeetle_host = add_tigerbeetle_module(
+        b,
+        b.graph.host,
+        .Debug,
+        tigerbeetle_c_host,
+    );
     const host_operation = b.createModule(.{
         .target = b.graph.host,
         .optimize = optimize,
@@ -347,11 +420,13 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
         .root_source_file = b.path("src/execution_lambda.zig"),
+        .single_threaded = false,
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
             .{ .name = "aws-lambda", .module = test_runtime },
             .{ .name = "operation", .module = host_operation },
             .{ .name = "operation_persistence", .module = host_operation_persistence },
+            .{ .name = tigerbeetle_import_name, .module = tigerbeetle_host },
         },
     });
     const execution_tests = b.addTest(.{
@@ -415,12 +490,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_queue_cli_tests = b.addRunArtifact(queue_cli_tests);
 
-    const tigerbeetle_c_host = add_tigerbeetle_c_module(
-        b,
-        tigerbeetle_c_artifacts,
-        b.graph.host,
-        .Debug,
-    );
     const tigerbeetle_c_abi_macos_test_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .Debug,
@@ -441,12 +510,6 @@ pub fn build(b: *std.Build) void {
     );
     tigerbeetle_c_abi_macos_step.dependOn(&run_tigerbeetle_c_abi_macos_test.step);
 
-    const tigerbeetle_host = add_tigerbeetle_module(
-        b,
-        b.graph.host,
-        .Debug,
-        tigerbeetle_c_host,
-    );
     const tigerbeetle_tests = b.addTest(.{
         .name = tigerbeetle_import_name,
         .root_module = tigerbeetle_host,
@@ -476,7 +539,7 @@ pub fn build(b: *std.Build) void {
     );
     const tigerbeetle_integration_test_step = b.step(
         "test-tigerbeetle",
-        "Run live TigerBeetle integration tests against 127.0.0.1:3000",
+        "Run live TigerBeetle integration tests against TIGERBEETLE_ADDRESSES or 127.0.0.1:3000",
     );
     tigerbeetle_integration_test_step.dependOn(
         &run_tigerbeetle_integration_tests.step,

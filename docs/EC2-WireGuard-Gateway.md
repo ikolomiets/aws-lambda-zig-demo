@@ -8,10 +8,10 @@ workstation. The gateway is disabled by default and is intended for development
 and controlled integration testing.
 
 The EC2 instance is a replaceable, stateless network appliance. It runs no
-application logic and stores no TigerBeetle data. The current execution Lambda
-handler also has no TigerBeetle client; the implementation provides the network
-path, while an end-to-end TigerBeetle request from Lambda remains a separate
-cloud acceptance test.
+application logic and stores no TigerBeetle data. The execution Lambda owns a
+process-lifetime TigerBeetle client and sends its account and transfer requests
+through this path. End-to-end traffic remains a cloud acceptance test until an
+operator explicitly deploys and exercises it.
 
 The traffic path is:
 
@@ -23,6 +23,15 @@ Execution Lambda
   -> development workstation
   -> TigerBeetle
 ```
+
+For each valid queued Operation, execution creates account `Operation.id`
+(ledger/code `1`), then creates transfer `Operation.id` from that account to
+account `1` for amount `100` (ledger/code `1`), and only then conditionally
+marks DynamoDB `SUCCEEDED`. The two event types require separate requests.
+Stable IDs make duplicate delivery replay-safe: `created` and identical
+`exists` proceed, while a definite rejection is acknowledged and leaves the
+Operation `SUBMITTED`. Client/request uncertainty and DynamoDB service
+uncertainty are reported as SQS partial-batch failures.
 
 Enabling the gateway incurs EC2 and public IPv4/Elastic IP charges.
 
@@ -97,10 +106,13 @@ stack.
 
 ## 4. Template parameters and conditions
 
-The optional template interface is:
+The TigerBeetle endpoint parameters are always present; the remaining template
+interface controls the optional managed gateway:
 
 | Parameter | Behavior |
 | --- | --- |
+| `TigerBeetleClusterId` | Unsigned 128-bit decimal cluster ID; defaults to `0`. |
+| `TigerBeetleAddresses` | Comma-separated replica addresses; defaults to `10.200.0.2:3000`. |
 | `EnableWireGuardGateway` | `true` creates the gateway and VPC-attaches execution; defaults to `false`. |
 | `RetainExecutionVpcCleanupResources` | Internal `deploy.sh` switch used only between detach and cleanup phases; defaults to `false`. |
 | `VpcId` | Existing VPC containing both subnets. |
@@ -302,15 +314,23 @@ Neither stack disablement nor stack deletion removes the external SSM pair.
 ## 10. Deployment and disablement lifecycle
 
 Before any non-dry-run build, `deploy.sh` clears inherited static AWS credential
-variables, exports the selected refreshable profile, verifies it with STS, and
-performs one SSO login retry for an SSO-backed profile when necessary. It stops
-before local work when the stack status ends in `_IN_PROGRESS`.
+variables, exports the selected SSO-backed profile, and unconditionally runs
+`aws sso login` to obtain a fresh access token. Login happens before stack
+inspection or other AWS discovery, and a failure stops the deployment;
+non-SSO profiles are unsupported. Dry runs make no AWS authentication calls.
+The helper stops before local work when the stack status ends in
+`_IN_PROGRESS`.
 
 The helper then runs Zig formatting and tests, builds all three Linux ARM64
 bootstraps, refreshes their zip archives, and runs both SAM validations. An
 enabled deployment uses one SAM update with the resolved gateway parameters.
 After success, the helper prints the seven conditional gateway outputs and
 continues with the DynamoDB, SQS, and optional Function URL checks.
+
+Intake and query are stripped, statically linked executables. Execution is
+multithread-capable for the native TigerBeetle callback thread and is a stripped
+ARM64 glibc executable reported as dynamically linked; Amazon Linux 2023
+provides its dynamic loader and system libraries.
 
 Running `deploy.sh` later without explicit gateway enablement disables an
 enabled gateway with two CloudFormation updates:
@@ -330,6 +350,10 @@ If the bounded wait fails, the second update is not attempted. Rerun
 `deploy.sh` after CloudFormation is no longer in progress; it recognizes the
 retained state and resumes the guarded wait. Never start another deployment
 while CloudFormation still reports an `_IN_PROGRESS` state.
+
+Gateway disablement does not disable the SQS event-source mapping. Execution
+continues consuming and uses `TigerBeetleAddresses`; provide another reachable
+trusted endpoint or expect TigerBeetle timeouts to return per-record retries.
 
 `--dry-run` checks the syntax of supplied gateway inputs but deliberately skips
 AWS discovery, SSM inspection or generation, topology preflight, and deployment.
@@ -395,9 +419,12 @@ After an explicitly authorized cloud deployment, validate in this order:
    increasing RX/TX counters.
 4. Verify the VPC route target, `SourceDestCheck=false`, both security groups,
    and the execution Lambda VPC configuration.
-5. Verify TCP/3000 from the routed Lambda path. The current handler cannot yet
-   perform a real TigerBeetle request, so that test remains deferred until a
-   client is implemented or a dedicated connectivity probe is authorized.
+5. Pre-provision TigerBeetle account `1` on ledger `1` with flags compatible
+   with receiving credits. Submit a unique valid Operation and verify that
+   execution creates account `Operation.id`, posts transfer `Operation.id` for
+   amount `100` from that account to account `1`, then marks DynamoDB
+   `SUCCEEDED`. A duplicate delivery must replay both IDs as identical
+   `exists` without changing balances a second time.
 6. Reboot the gateway and repeat the interface, forwarding, handshake, and
    routed-connectivity checks to verify bootstrap persistence.
 

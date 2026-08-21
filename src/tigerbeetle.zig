@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("tigerbeetle_c");
 
 const assert = std.debug.assert;
@@ -7,6 +8,16 @@ pub const Account = c.tb_account_t;
 pub const Transfer = c.tb_transfer_t;
 pub const CreateAccountResult = c.tb_create_account_result_t;
 pub const CreateTransferResult = c.tb_create_transfer_result_t;
+
+pub fn create_account_succeeded(status: u32) bool {
+    return status == c.TB_CREATE_ACCOUNT_CREATED or
+        status == c.TB_CREATE_ACCOUNT_EXISTS;
+}
+
+pub fn create_transfer_succeeded(status: u32) bool {
+    return status == c.TB_CREATE_TRANSFER_CREATED or
+        status == c.TB_CREATE_TRANSFER_EXISTS;
+}
 
 pub const Error = error{
     OutOfMemory,
@@ -484,6 +495,47 @@ test "all packet statuses map to wrapper errors" {
         check_packet_status(packet_status_u8(c.TB_PACKET_INVALID_DATA_SIZE)),
     );
     try std.testing.expectError(error.MalformedResult, check_packet_status(std.math.maxInt(u8)));
+}
+
+test "linux client init maps file descriptor exhaustion to SystemResources" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const original_limits = try std.posix.getrlimit(.NOFILE);
+    defer std.posix.setrlimit(.NOFILE, original_limits) catch unreachable;
+
+    var exhausted_limits = original_limits;
+    exhausted_limits.cur = 0;
+    try std.posix.setrlimit(.NOFILE, exhausted_limits);
+
+    const result = Client.create(
+        std.testing.allocator,
+        std.testing.io,
+        0,
+        "127.0.0.1:3000",
+    );
+    try std.testing.expectError(error.SystemResources, result);
+}
+
+test "account creation accepts only created and identical exists" {
+    try std.testing.expect(create_account_succeeded(c.TB_CREATE_ACCOUNT_CREATED));
+    try std.testing.expect(create_account_succeeded(c.TB_CREATE_ACCOUNT_EXISTS));
+    try std.testing.expect(!create_account_succeeded(
+        c.TB_CREATE_ACCOUNT_EXISTS_WITH_DIFFERENT_LEDGER,
+    ));
+    try std.testing.expect(!create_account_succeeded(
+        c.TB_CREATE_ACCOUNT_LEDGER_MUST_NOT_BE_ZERO,
+    ));
+}
+
+test "transfer creation accepts only created and identical exists" {
+    try std.testing.expect(create_transfer_succeeded(c.TB_CREATE_TRANSFER_CREATED));
+    try std.testing.expect(create_transfer_succeeded(c.TB_CREATE_TRANSFER_EXISTS));
+    try std.testing.expect(!create_transfer_succeeded(
+        c.TB_CREATE_TRANSFER_EXISTS_WITH_DIFFERENT_AMOUNT,
+    ));
+    try std.testing.expect(!create_transfer_succeeded(
+        c.TB_CREATE_TRANSFER_CREDIT_ACCOUNT_NOT_FOUND,
+    ));
 }
 
 test "empty public operations return owned slices without native submission" {

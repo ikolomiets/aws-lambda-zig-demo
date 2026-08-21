@@ -7,6 +7,8 @@ STACK_NAME="${STACK_NAME:-aws-lambda-zig-demo}"
 INTAKE_FUNCTION_NAME="${INTAKE_FUNCTION_NAME:-intake-lambda}"
 QUERY_FUNCTION_NAME="${QUERY_FUNCTION_NAME:-query-lambda}"
 EXECUTION_FUNCTION_NAME="${EXECUTION_FUNCTION_NAME:-execution-lambda}"
+TIGERBEETLE_CLUSTER_ID="${TIGERBEETLE_CLUSTER_ID:-0}"
+TIGERBEETLE_ADDRESSES="${TIGERBEETLE_ADDRESSES:-10.200.0.2:3000}"
 LAMBDA_PRINCIPAL="${LAMBDA_PRINCIPAL:-*}"
 PASETO_PUBLIC_KEY="${PASETO_PUBLIC_KEY:-}"
 LOCAL_AWS_LAMBDA_ROOT="${LOCAL_AWS_LAMBDA_ROOT:-../aws-lambda-zig}"
@@ -46,6 +48,10 @@ Options:
                          Query Lambda name. Defaults to query-lambda.
   --execution-function-name NAME
                          Execution Lambda name. Defaults to execution-lambda.
+  --tigerbeetle-cluster-id ID
+                         Unsigned decimal cluster ID. Defaults to 0.
+  --tigerbeetle-addresses ADDRESSES
+                         Comma-separated replica addresses. Defaults to 10.200.0.2:3000.
   --lambda-principal VALUE
                          LAMBDA_PRINCIPAL environment value. Defaults to *.
   --enable-wireguard-gateway
@@ -77,7 +83,8 @@ Options:
 
 Environment overrides:
   PROFILE, REGION, STACK_NAME, INTAKE_FUNCTION_NAME, QUERY_FUNCTION_NAME,
-  EXECUTION_FUNCTION_NAME, LAMBDA_PRINCIPAL, PASETO_PRIVATE_KEY,
+  EXECUTION_FUNCTION_NAME, TIGERBEETLE_CLUSTER_ID, TIGERBEETLE_ADDRESSES,
+  LAMBDA_PRINCIPAL, PASETO_PRIVATE_KEY,
   PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT, ENABLE_WIREGUARD_GATEWAY,
   VPC_ID, GATEWAY_PUBLIC_SUBNET_ID, LAMBDA_SUBNET_ID,
   LAMBDA_ROUTE_TABLE_ID, LAMBDA_SUBNET_CIDR,
@@ -86,9 +93,10 @@ Environment overrides:
   WIREGUARD_WORKSTATION_PUBLIC_KEY, WIREGUARD_INSTANCE_TYPE
 
 Authentication:
-  Non-dry-run deployments clear inherited static credentials and verify the
-  selected refreshable profile before building. If verification fails for an
-  SSO-backed profile, the script runs aws sso login once and retries.
+  Non-dry-run deployments require an SSO-backed AWS CLI profile. The script
+  clears inherited static credentials, selects the configured profile, and
+  always runs aws sso login to obtain a fresh token before AWS discovery or
+  local build work. Dry runs make no AWS authentication calls.
 
 Gateway resolution:
   Values resolve from CLI, environment, a previously enabled stack, then
@@ -228,6 +236,34 @@ validate_wireguard_gateway_syntax() {
     [ -z "$GATEWAY_PUBLIC_SUBNET_ID" ] || [ -z "$LAMBDA_SUBNET_ID" ] ||
         [ "$GATEWAY_PUBLIC_SUBNET_ID" != "$LAMBDA_SUBNET_ID" ] ||
         fail "GATEWAY_PUBLIC_SUBNET_ID and LAMBDA_SUBNET_ID must differ"
+}
+
+validate_tigerbeetle_configuration() {
+    local cluster_id_normalized="$TIGERBEETLE_CLUSTER_ID"
+    local cluster_id_max=340282366920938463463374607431768211455
+
+    [[ "$TIGERBEETLE_CLUSTER_ID" =~ ^[0-9]+$ ]] ||
+        fail "TIGERBEETLE_CLUSTER_ID must be an unsigned decimal integer"
+    while [ "${#cluster_id_normalized}" -gt 1 ] &&
+        [ "${cluster_id_normalized#0}" != "$cluster_id_normalized" ]
+    do
+        cluster_id_normalized="${cluster_id_normalized#0}"
+    done
+    if [ "${#cluster_id_normalized}" -gt "${#cluster_id_max}" ]; then
+        fail "TIGERBEETLE_CLUSTER_ID must fit in an unsigned 128-bit integer"
+    fi
+    if [ "${#cluster_id_normalized}" -eq "${#cluster_id_max}" ] &&
+        [[ "$cluster_id_normalized" > "$cluster_id_max" ]]
+    then
+        fail "TIGERBEETLE_CLUSTER_ID must fit in an unsigned 128-bit integer"
+    fi
+
+    [ -n "$TIGERBEETLE_ADDRESSES" ] ||
+        fail "TIGERBEETLE_ADDRESSES must not be empty"
+    [ "${#TIGERBEETLE_ADDRESSES}" -le 4096 ] ||
+        fail "TIGERBEETLE_ADDRESSES must be at most 4096 characters"
+    [[ ! "$TIGERBEETLE_ADDRESSES" =~ [[:space:]] ]] ||
+        fail "TIGERBEETLE_ADDRESSES must not contain whitespace"
 }
 
 validate_wireguard_gateway_configuration() {
@@ -987,15 +1023,6 @@ preflight_wireguard_gateway() {
     printf '==> WireGuard gateway VPC topology checks passed\n'
 }
 
-profile_uses_sso() {
-    local profile="$1"
-
-    if aws configure get sso_session --profile "$profile" >/dev/null 2>&1; then
-        return 0
-    fi
-    aws configure get sso_start_url --profile "$profile" >/dev/null 2>&1
-}
-
 clear_aws_credentials() {
     unset AWS_ACCESS_KEY_ID
     unset AWS_SECRET_ACCESS_KEY
@@ -1004,17 +1031,7 @@ clear_aws_credentials() {
     unset AWS_CREDENTIAL_EXPIRATION
 }
 
-verify_aws_credentials() {
-    local profile="$1"
-
-    aws sts get-caller-identity \
-        --profile "$profile" \
-        --query Arn \
-        --output text \
-        >/dev/null 2>&1
-}
-
-prepare_aws_credentials() {
+prepare_aws_sso_session() {
     local profile="$1"
 
     clear_aws_credentials
@@ -1022,21 +1039,9 @@ prepare_aws_credentials() {
     AWS_PROFILE="$profile"
     export AWS_PROFILE
 
-    printf '==> Verifying refreshable AWS profile %s\n' "$profile"
-    if verify_aws_credentials "$profile"; then
-        return 0
-    fi
-
-    profile_uses_sso "$profile" ||
-        fail "AWS credential resolution failed for non-SSO profile $profile"
-
-    printf '==> Refreshing AWS SSO session for profile %s\n' "$profile"
+    printf '==> Obtaining fresh AWS SSO token for profile %s\n' "$profile"
     aws sso login --profile "$profile" ||
         fail "AWS SSO login failed for profile $profile"
-
-    printf '==> Re-verifying refreshable AWS profile %s\n' "$profile"
-    verify_aws_credentials "$profile" ||
-        fail "AWS credential verification failed after SSO login for profile $profile"
 }
 
 ensure_stack_not_in_progress() {
@@ -1277,6 +1282,8 @@ build_sam_parameter_overrides() {
         "IntakeFunctionName=$INTAKE_FUNCTION_NAME"
         "QueryFunctionName=$QUERY_FUNCTION_NAME"
         "ExecutionFunctionName=$EXECUTION_FUNCTION_NAME"
+        "TigerBeetleClusterId=$TIGERBEETLE_CLUSTER_ID"
+        "TigerBeetleAddresses=$TIGERBEETLE_ADDRESSES"
         "LambdaPrincipal=$LAMBDA_PRINCIPAL"
         "PasetoPublicKey=$PASETO_PUBLIC_KEY"
         "RetainExecutionVpcCleanupResources=$retain_cleanup_resources"
@@ -1465,6 +1472,28 @@ while [ "$#" -gt 0 ]; do
                 fail "empty value for --execution-function-name"
             shift
             ;;
+        --tigerbeetle-cluster-id)
+            need_value "$1" "${2:-}"
+            TIGERBEETLE_CLUSTER_ID="$2"
+            shift 2
+            ;;
+        --tigerbeetle-cluster-id=*)
+            TIGERBEETLE_CLUSTER_ID="${1#*=}"
+            [ -n "$TIGERBEETLE_CLUSTER_ID" ] ||
+                fail "empty value for --tigerbeetle-cluster-id"
+            shift
+            ;;
+        --tigerbeetle-addresses)
+            need_value "$1" "${2:-}"
+            TIGERBEETLE_ADDRESSES="$2"
+            shift 2
+            ;;
+        --tigerbeetle-addresses=*)
+            TIGERBEETLE_ADDRESSES="${1#*=}"
+            [ -n "$TIGERBEETLE_ADDRESSES" ] ||
+                fail "empty value for --tigerbeetle-addresses"
+            shift
+            ;;
         --lambda-principal)
             need_value "$1" "${2:-}"
             LAMBDA_PRINCIPAL="$2"
@@ -1628,12 +1657,13 @@ trap cleanup EXIT
     fail "--dry-run and --migration-check-only cannot be combined"
 
 if [ "$MIGRATION_CHECK_ONLY" -eq 0 ]; then
+    validate_tigerbeetle_configuration
     validate_wireguard_gateway_syntax
 fi
 
 if [ "$DRY_RUN" -eq 0 ]; then
     need_command aws
-    prepare_aws_credentials "$PROFILE"
+    prepare_aws_sso_session "$PROFILE"
     ensure_stack_not_in_progress
     validate_existing_intake_name "$INTAKE_FUNCTION_NAME"
 fi
@@ -1727,8 +1757,7 @@ zig build "${ZIG_BUILD_ARGS[@]}" --release -Darch=arm
 
 for bootstrap in \
     zig-out/bin/intake/bootstrap \
-    zig-out/bin/query/bootstrap \
-    zig-out/bin/execution/bootstrap
+    zig-out/bin/query/bootstrap
 do
     artifact_type="$(file "$bootstrap")"
     case "$artifact_type" in
@@ -1737,6 +1766,12 @@ do
     esac
     printf '%s\n' "$artifact_type"
 done
+execution_artifact_type="$(file zig-out/bin/execution/bootstrap)"
+case "$execution_artifact_type" in
+    *"ELF 64-bit LSB executable"*aarch64*"dynamically linked"*"stripped"*) ;;
+    *) fail "unexpected execution bootstrap artifact type: $execution_artifact_type" ;;
+esac
+printf '%s\n' "$execution_artifact_type"
 [ ! -e zig-out/bin/bootstrap ] || fail "obsolete zig-out/bin/bootstrap was recreated"
 
 printf '==> Refreshing Lambda zip archives\n'

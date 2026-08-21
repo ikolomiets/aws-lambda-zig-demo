@@ -22,6 +22,20 @@ Parameters:
     Type: String
     Default: execution-lambda
     Description: Name of the operation execution Lambda function.
+  TigerBeetleClusterId:
+    Type: String
+    Default: "0"
+    AllowedPattern: '^[0-9]{1,39}$'
+    ConstraintDescription: Must be an unsigned decimal 128-bit cluster ID.
+    Description: TigerBeetle cluster ID used by the execution Lambda.
+  TigerBeetleAddresses:
+    Type: String
+    Default: 10.200.0.2:3000
+    MinLength: 1
+    MaxLength: 4096
+    AllowedPattern: '^\S+$'
+    ConstraintDescription: Must be a non-empty address list without whitespace.
+    Description: Comma-separated TigerBeetle replica addresses used by the execution Lambda.
   LambdaPrincipal:
     Type: String
     Default: "*"
@@ -164,6 +178,8 @@ Resources:
     Type: AWS::SQS::Queue
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
+    Properties:
+      VisibilityTimeout: 90
 
   IntakeFunction:
     Type: AWS::Serverless::Function
@@ -339,11 +355,13 @@ Resources:
       Architectures:
         - arm64
       MemorySize: 128
-      Timeout: 3
+      Timeout: 15
       Role: !GetAtt ExecutionFunctionRole.Arn
       Environment:
         Variables:
           OPERATIONS_TABLE_NAME: !Ref OperationsTable
+          TIGERBEETLE_ADDRESSES: !Ref TigerBeetleAddresses
+          TIGERBEETLE_CLUSTER_ID: !Ref TigerBeetleClusterId
       VpcConfig: !If
         - WireGuardGatewayEnabled
         - SecurityGroupIds:

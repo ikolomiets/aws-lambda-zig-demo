@@ -14,10 +14,11 @@ Lambda accepts only POST, validates and hashes an
 Operation JSON document, derives required tenant metadata from the verified
 token subject, persists the Operation idempotently in DynamoDB, submits new
 work to SQS, and returns the current stored output view without the body.
-The execution Lambda consumes SQS batches and best-effort completes valid
-`SUBMITTED` Operations in DynamoDB with `result: {"success":true}`. It logs
-each record's message ID and body, then acknowledges every parsed record even
-when validation or the conditional update fails.
+The execution Lambda consumes SQS batches, creates a replay-safe TigerBeetle
+account and transfer for each valid `SUBMITTED` Operation, then conditionally
+completes DynamoDB with `result: {"success":true}`. Definite rejections are
+acknowledged; TigerBeetle or DynamoDB uncertainty is returned through SQS
+partial-batch failures.
 
 ## Requirements
 
@@ -45,7 +46,7 @@ alongside them.
 
 ## Build
 
-Build the stripped, single-threaded, ReleaseSafe Linux ARM64 Lambda executables:
+Build the stripped ReleaseSafe Linux ARM64 Lambda executables:
 
 ```sh
 zig build --release -Darch=arm
@@ -58,7 +59,7 @@ bootstraps and the PASETO utility use the shared PASETO implementation in
 `src/operation.zig`. The Lambda and local commands reach AWS through
 `src/operation_persistence.zig` and `src/operation_queue.zig`.
 
-Verify that all three Lambda outputs are statically linked ARM64 Linux executables:
+Verify the ARM64 Linux executables:
 
 ```sh
 file zig-out/bin/intake/bootstrap \
@@ -66,10 +67,13 @@ file zig-out/bin/intake/bootstrap \
   zig-out/bin/execution/bootstrap
 ```
 
-Expected shape:
+Intake and query are statically linked and single-threaded. Execution is
+multithread-capable for the TigerBeetle callback thread and is a dynamically
+linked glibc executable. All three are stripped.
 
 ```text
-ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
+intake/query: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
+execution:    ELF 64-bit LSB executable, ARM aarch64, dynamically linked, stripped
 ```
 
 Package the executables for Lambda:
@@ -348,26 +352,28 @@ service failures return sanitized HTTP 503; malformed items and unexpected
 failures return sanitized HTTP 500.
 
 The execution Lambda has no authentication configuration or Function URL. It
-receives `OPERATIONS_TABLE_NAME`, reuses one AWS SDK configuration and DynamoDB
-persistence client across warm invocations, and has table-scoped
-`dynamodb:UpdateItem` permission without `GetItem`. Lambda polls
-`OperationsQueue` in batches of at most 10 records with no batching delay.
+receives `OPERATIONS_TABLE_NAME`, `TIGERBEETLE_CLUSTER_ID`, and
+`TIGERBEETLE_ADDRESSES`; it reuses its AWS resources and one TigerBeetle client
+across warm invocations. It has table-scoped `dynamodb:UpdateItem` permission
+without `GetItem`. Lambda polls `OperationsQueue` in batches of at most 10
+records with no batching delay.
 
 For every record, the handler retains the debug log containing its message ID
 and body, parses the complete Operation output, and accepts only a `SUBMITTED`
-Operation with a body and no result. Immediately before each accepted record's
-conditional update it samples the real-time clock independently. The update
+Operation with a body and no result. It creates account `Operation.id` on
+ledger/code `1`, then transfer `Operation.id` from that account to account `1`
+for amount `100` on ledger/code `1`. Only after both return `created` or
+identical `exists` does it sample the real-time clock. The conditional update
 requires the stored canonical ID, tenant, name, `SUBMITTED` state, queued hash,
 and absent result; it does not compare the queued timestamps. A match becomes
 `SUCCEEDED` with the exact compact result `{"success":true}`, a fresh
 `last_updated`, and `expires_at` exactly 86,400 seconds later.
 
-Processing is deliberately best effort. Successful, invalid, conflicting, and
-service-failing records are logged concisely and processing continues. After a
-valid top-level SQS event, the handler always returns
-`{"batchItemFailures":[]}`, so none of those individual outcomes is retried by
-SQS. Malformed top-level events and failures that prevent response encoding may
-still fail and retry the invocation.
+Processing continues after every record. Invalid records, definite
+TigerBeetle rejections, and DynamoDB conflicts are acknowledged. TigerBeetle
+client/request errors and DynamoDB service uncertainty add the exact message ID
+to `batchItemFailures`. Account `1` must be pre-provisioned on ledger `1`; the
+executor never creates it.
 
 ## Lambda logs
 
@@ -442,9 +448,10 @@ only in the signing environment.
 `deploy.sh` can provision an EC2 WireGuard gateway and VPC-attach the execution
 Lambda so the Lambda subnet can reach TigerBeetle on a development workstation.
 The feature is opt-in and disabled by default. Enabling it incurs EC2 and public
-IPv4/Elastic IP costs. The current execution handler does not yet contain a
-TigerBeetle client, so the feature provisions the network path but does not by
-itself exercise a TigerBeetle request from Lambda.
+IPv4/Elastic IP costs. The execution handler sends its account and transfer
+requests through this path. The SQS mapping stays enabled when the gateway is
+disabled, so another trusted route must reach the configured address or records
+will retry after TigerBeetle timeouts.
 
 The fixed initial network configuration is:
 
@@ -647,16 +654,18 @@ A later re-enable after teardown recovers the current default SSM pair but does
 not reuse values from the disabled stack.
 
 Before any non-dry-run build, the helper clears inherited static AWS credential
-variables, selects the configured refreshable profile, verifies it with STS,
-and performs SSO login once when required. It also stops immediately when the
-stack status ends in `_IN_PROGRESS`; do not start another deployment while
-CloudFormation is still operating. If SAM or a post-deployment check fails
-after deployment starts, the helper reports whether CloudFormation is still in
-progress, reached a terminal failure, or completed successfully despite the
-local failure. Leave an `_IN_PROGRESS` stack alone until CloudFormation reaches
-a terminal state; after a bounded VPC-cleanup timeout, rerun `deploy.sh` only
-when the stack is no longer in progress so it can resume the retained cleanup
-phase.
+variables, selects the configured SSO-backed profile, and unconditionally runs
+`aws sso login` to obtain a fresh access token. Login happens before stack
+inspection or other AWS discovery, and a login failure stops the deployment;
+non-SSO profiles are unsupported. Dry runs make no AWS authentication calls.
+The helper also stops immediately when the stack status ends in `_IN_PROGRESS`;
+do not start another deployment while CloudFormation is still operating. If
+SAM or a post-deployment check fails after deployment starts, the helper reports
+whether CloudFormation is still in progress, reached a terminal failure, or
+completed successfully despite the local failure. Leave an `_IN_PROGRESS`
+stack alone until CloudFormation reaches a terminal state; after a bounded
+VPC-cleanup timeout, rerun `deploy.sh` only when the stack is no longer in
+progress so it can resume the retained cleanup phase.
 
 If only one default parameter exists, the helper stops without modifying it.
 Repair the pair by deriving and storing the missing matching value, or delete
@@ -681,7 +690,8 @@ table-scoped `GetItem`, `PutItem`, and `UpdateItem` policy, and the queue-scoped
 receives only `OPERATIONS_TABLE_NAME` and table-scoped `GetItem` in addition to
 the basic logging policy. It initializes a reusable DynamoDB persistence client
 and has no SQS permissions. The execution Lambda receives
-`OPERATIONS_TABLE_NAME`, table-scoped `UpdateItem`, basic logging, and
+`OPERATIONS_TABLE_NAME`, `TIGERBEETLE_CLUSTER_ID`,
+`TIGERBEETLE_ADDRESSES`, table-scoped `UpdateItem`, basic logging, and
 queue-scoped polling permissions; it does not receive `GetItem`. Its explicit
 event source mapping consumes `OperationsQueue` with partial-batch failure
 reporting enabled. Deploy the complete stack from `template.yaml` with AWS SAM.
@@ -776,8 +786,10 @@ concurrent `NEW` retries can produce duplicate messages, so consumers must
 handle the Operation ID and hash idempotently. Reusing the ID for different
 work or from a different verified subject still returns `409 Conflict`. The
 execution consumer conditionally completes only the first matching queued
-snapshot. It intentionally acknowledges invalid records, update conflicts,
-and DynamoDB service failures without requesting a per-record retry.
+snapshot after replay-safe TigerBeetle accounting. It acknowledges invalid
+records, definite TigerBeetle rejections, and update conflicts. TigerBeetle
+client/request errors and DynamoDB service uncertainty request a per-record
+retry.
 
 The template intentionally creates publicly reachable intake POST and query
 GET Function URLs for demo testing, while both Function URL handlers enforce PASETO bearer
