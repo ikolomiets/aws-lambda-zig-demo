@@ -424,7 +424,7 @@ pub fn build(b: *std.Build) void {
     const tigerbeetle_c_abi_macos_test_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .Debug,
-        .root_source_file = b.path("src/tigerbeetle_c_abi_test.zig"),
+        .root_source_file = b.path("tests/tigerbeetle_c_abi.zig"),
         .imports = &.{
             .{ .name = tigerbeetle_c_import_name, .module = tigerbeetle_c_host },
         },
@@ -497,7 +497,7 @@ pub fn build(b: *std.Build) void {
     const tigerbeetle_c_abi_linux_test_mod = b.createModule(.{
         .target = tigerbeetle_linux_target,
         .optimize = .Debug,
-        .root_source_file = b.path("src/tigerbeetle_c_abi_test.zig"),
+        .root_source_file = b.path("tests/tigerbeetle_c_abi.zig"),
         .imports = &.{
             .{ .name = tigerbeetle_c_import_name, .module = tigerbeetle_c_linux },
         },
