@@ -1,6 +1,71 @@
 const std = @import("std");
 const lambda = @import("aws_lambda");
 
+const tigerbeetle_c_import_name = "tigerbeetle_c";
+const tigerbeetle_import_name = "tigerbeetle";
+
+fn add_tigerbeetle_c_module(
+    b: *std.Build,
+    tigerbeetle_c_artifacts: *std.Build.Dependency,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const translated_c = b.addTranslateC(.{
+        .root_source_file = tigerbeetle_c_artifacts.path("include/tb_client.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const module = translated_c.createModule();
+    std.debug.assert(module.link_libc == true);
+    module.addObjectFile(tigerbeetle_c_artifacts.path(tigerbeetle_archive_path(target.result)));
+    module.linkSystemLibrary("m", .{ .needed = true, .use_pkg_config = .no });
+    module.linkSystemLibrary("dl", .{ .needed = true, .use_pkg_config = .no });
+    return module;
+}
+
+fn add_tigerbeetle_module(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    tigerbeetle_c: *std.Build.Module,
+) *std.Build.Module {
+    return b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/tigerbeetle.zig"),
+        // TigerBeetle completes packets from its native client thread.
+        .single_threaded = false,
+        .imports = &.{
+            .{ .name = tigerbeetle_c_import_name, .module = tigerbeetle_c },
+        },
+    });
+}
+
+fn tigerbeetle_archive_path(target: std.Target) []const u8 {
+    if (target.cpu.arch != .aarch64) {
+        tigerbeetle_target_unsupported(target);
+    }
+
+    return switch (target.os.tag) {
+        .macos => "lib/aarch64-macos/libtb_client.a",
+        .linux => if (target.isGnuLibC())
+            "lib/aarch64-linux-gnu.2.27/libtb_client.a"
+        else
+            tigerbeetle_target_unsupported(target),
+        else => tigerbeetle_target_unsupported(target),
+    };
+}
+
+fn tigerbeetle_target_unsupported(target: std.Target) noreturn {
+    std.debug.panic(
+        "unsupported TigerBeetle C target {s}-{s}-{s}; " ++
+            "expected aarch64-macos or glibc aarch64-linux",
+        .{ @tagName(target.cpu.arch), @tagName(target.os.tag), @tagName(target.abi) },
+    );
+}
+
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{
         .preferred_optimize_mode = .ReleaseSafe,
@@ -10,6 +75,7 @@ pub fn build(b: *std.Build) void {
         std.debug.assert(optimize == .ReleaseSafe);
         b.release_mode = .safe;
     }
+    const tigerbeetle_c_artifacts = b.dependency("tigerbeetle_c_artifacts", .{});
     const lambda_target = lambda.resolveTargetQuery(b, lambda.archOption(b));
     const lambda_aws_sdk = b.dependency("aws_sdk", .{
         .target = lambda_target,
@@ -349,6 +415,128 @@ pub fn build(b: *std.Build) void {
     });
     const run_queue_cli_tests = b.addRunArtifact(queue_cli_tests);
 
+    const tigerbeetle_c_host = add_tigerbeetle_c_module(
+        b,
+        tigerbeetle_c_artifacts,
+        b.graph.host,
+        .Debug,
+    );
+    const tigerbeetle_c_abi_macos_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .root_source_file = b.path("src/tigerbeetle_c_abi_test.zig"),
+        .imports = &.{
+            .{ .name = tigerbeetle_c_import_name, .module = tigerbeetle_c_host },
+        },
+    });
+    const tigerbeetle_c_abi_macos_test = b.addTest(.{
+        .root_module = tigerbeetle_c_abi_macos_test_mod,
+    });
+    const run_tigerbeetle_c_abi_macos_test = b.addRunArtifact(
+        tigerbeetle_c_abi_macos_test,
+    );
+    const tigerbeetle_c_abi_macos_step = b.step(
+        "test-tigerbeetle-c-abi",
+        "Run the TigerBeetle C ABI smoke test on Apple Silicon macOS",
+    );
+    tigerbeetle_c_abi_macos_step.dependOn(&run_tigerbeetle_c_abi_macos_test.step);
+
+    const tigerbeetle_host = add_tigerbeetle_module(
+        b,
+        b.graph.host,
+        .Debug,
+        tigerbeetle_c_host,
+    );
+    const tigerbeetle_tests = b.addTest(.{
+        .name = tigerbeetle_import_name,
+        .root_module = tigerbeetle_host,
+    });
+    const run_tigerbeetle_tests = b.addRunArtifact(tigerbeetle_tests);
+    const tigerbeetle_test_step = b.step(
+        "test-tigerbeetle-wrapper",
+        "Run the offline TigerBeetle Zig wrapper tests",
+    );
+    tigerbeetle_test_step.dependOn(&run_tigerbeetle_tests.step);
+
+    const tigerbeetle_integration_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .root_source_file = b.path("tests/tigerbeetle_integration.zig"),
+        .imports = &.{
+            .{ .name = tigerbeetle_import_name, .module = tigerbeetle_host },
+            .{ .name = tigerbeetle_c_import_name, .module = tigerbeetle_c_host },
+        },
+    });
+    const tigerbeetle_integration_tests = b.addTest(.{
+        .name = "tigerbeetle-integration",
+        .root_module = tigerbeetle_integration_test_mod,
+    });
+    const run_tigerbeetle_integration_tests = b.addRunArtifact(
+        tigerbeetle_integration_tests,
+    );
+    const tigerbeetle_integration_test_step = b.step(
+        "test-tigerbeetle",
+        "Run live TigerBeetle integration tests against 127.0.0.1:3000",
+    );
+    tigerbeetle_integration_test_step.dependOn(
+        &run_tigerbeetle_integration_tests.step,
+    );
+
+    const tigerbeetle_linux_target = b.resolveTargetQuery(.{
+        .cpu_arch = .aarch64,
+        .os_tag = .linux,
+        .abi = .gnu,
+        .glibc_version = .{ .major = 2, .minor = 27, .patch = 0 },
+    });
+    const tigerbeetle_c_linux = add_tigerbeetle_c_module(
+        b,
+        tigerbeetle_c_artifacts,
+        tigerbeetle_linux_target,
+        .Debug,
+    );
+    const tigerbeetle_c_abi_linux_test_mod = b.createModule(.{
+        .target = tigerbeetle_linux_target,
+        .optimize = .Debug,
+        .root_source_file = b.path("src/tigerbeetle_c_abi_test.zig"),
+        .imports = &.{
+            .{ .name = tigerbeetle_c_import_name, .module = tigerbeetle_c_linux },
+        },
+    });
+    const tigerbeetle_c_abi_linux_test = b.addTest(.{
+        .root_module = tigerbeetle_c_abi_linux_test_mod,
+    });
+    const tigerbeetle_c_abi_linux_output = b.addWriteFiles();
+    _ = tigerbeetle_c_abi_linux_output.addCopyFile(
+        tigerbeetle_c_abi_linux_test.getEmittedBin(),
+        "tigerbeetle-c-abi-linux",
+    );
+    const tigerbeetle_c_abi_linux_step = b.step(
+        "test-tigerbeetle-c-abi-linux",
+        "Compile the TigerBeetle C ABI smoke test for glibc ARM64 Linux",
+    );
+    tigerbeetle_c_abi_linux_step.dependOn(&tigerbeetle_c_abi_linux_output.step);
+
+    const tigerbeetle_linux = add_tigerbeetle_module(
+        b,
+        tigerbeetle_linux_target,
+        .Debug,
+        tigerbeetle_c_linux,
+    );
+    const tigerbeetle_linux_test = b.addTest(.{
+        .name = tigerbeetle_import_name,
+        .root_module = tigerbeetle_linux,
+    });
+    const tigerbeetle_linux_output = b.addWriteFiles();
+    _ = tigerbeetle_linux_output.addCopyFile(
+        tigerbeetle_linux_test.getEmittedBin(),
+        "tigerbeetle-wrapper-linux",
+    );
+    const tigerbeetle_linux_step = b.step(
+        "test-tigerbeetle-wrapper-linux",
+        "Compile the TigerBeetle Zig wrapper tests for glibc ARM64 Linux",
+    );
+    tigerbeetle_linux_step.dependOn(&tigerbeetle_linux_output.step);
+
     const wireguard_discovery_test = b.addSystemCommand(&.{"bash"});
     wireguard_discovery_test.addFileArg(
         b.path("tests/deploy_wireguard_discovery_test.sh"),
@@ -378,5 +566,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_persistence_cli_tests.step);
     test_step.dependOn(&run_queue_cli_tests.step);
+    test_step.dependOn(&run_tigerbeetle_tests.step);
     test_step.dependOn(deploy_test_step);
 }

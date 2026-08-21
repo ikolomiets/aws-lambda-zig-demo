@@ -32,6 +32,10 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        .tigerbeetle_c_artifacts = .{
+            .url = "https://github.com/ikolomiets/aws-lambda-zig-demo/releases/download/tigerbeetle-c-97c7a8ef385270ebe0e1b75959d3d21d134629df/tigerbeetle-c-97c7a8ef385270ebe0e1b75959d3d21d134629df.tar.gz",
+            .hash = "tigerbeetle_c_artifacts-65535.0.0+g97c7a8ef3-fTLGi3omGQBhYU4lFlngO8hjBP2md7KVLT-PSX2IxNjy",
+        },
         .aws_sdk = .{
             .url = "git+https://github.com/ikolomiets/aws-sdk-zig?ref=agent/parse-modeled-aws-json-errors#778dcfe1423cf3b3a1bfe56e1e461b99b80124bd",
             .hash = "aws_sdk-0.0.1-ApQSL17Y_xOC5IhLm247KBZKDcbCRU3qf7GiiiRHcrND",
