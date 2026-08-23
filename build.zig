@@ -610,12 +610,18 @@ pub fn build(b: *std.Build) void {
         b.path("tests/deploy_cleanup_lifecycle_test.sh"),
     );
 
+    const gateway_interface_test = b.addSystemCommand(&.{"bash"});
+    gateway_interface_test.addFileArg(
+        b.path("tests/deploy_gateway_interface_test.sh"),
+    );
+
     const deploy_test_step = b.step(
         "test-deploy",
         "Run deployment helper regression tests",
     );
     deploy_test_step.dependOn(&wireguard_discovery_test.step);
     deploy_test_step.dependOn(&cleanup_lifecycle_test.step);
+    deploy_test_step.dependOn(&gateway_interface_test.step);
 
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_lambda_auth_tests.step);

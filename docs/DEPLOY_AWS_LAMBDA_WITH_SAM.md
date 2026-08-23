@@ -42,7 +42,7 @@ Enabling the WireGuard gateway additionally requires:
   association. The stack creates the DynamoDB gateway endpoint.
 - Local WireGuard tools (`wg` and the platform-specific interface helper) on a
   workstation that can initiate outbound UDP/51820 to the gateway Elastic IP.
-- `wg` must be on `PATH` for `deploy.sh` to generate the default gateway pair
+- `wg` must be on `PATH` for `wireguard-gateway-setup.sh` to generate the default gateway pair
   when both default SSM parameters are absent.
 - Permission for the deployment identity to create the additional EC2
   instance, Elastic IP, security groups, route, IAM role and instance profile,
@@ -76,7 +76,7 @@ Expected ARN shape:
 arn:aws:sts::<account-id>:assumed-role/AWSReservedSSO_.../<user>
 ```
 
-Every non-dry-run `deploy.sh` invocation requires an SSO-backed profile. The
+Every non-dry-run deployment-helper invocation requires an SSO-backed profile. The
 helper clears inherited static credential variables, exports the selected
 profile, and unconditionally runs `aws sso login --profile <profile>` to obtain
 a fresh access token before AWS discovery or local build work. A login failure
@@ -241,7 +241,7 @@ When `EnableWireGuardGateway=true`, the template also creates:
 Every gateway resource and output is conditional. The internal
 `RetainExecutionVpcCleanupResources` parameter temporarily keeps
 `ExecutionDynamoDBGatewayEndpoint`, `ExecutionLambdaSecurityGroup`, and the
-execution role's EC2 network-interface policy during a `deploy.sh` disablement
+execution role's EC2 network-interface policy during a setup-script disablement
 transition. In steady disabled state, the execution Lambda has no VPC
 attachment or EC2 network-interface permissions, and the empty gateway
 parameter defaults create no gateway or cleanup resources.
@@ -573,7 +573,7 @@ The optional gateway parameters are:
 | Parameter | Meaning |
 | --- | --- |
 | `EnableWireGuardGateway` | `true` enables the gateway; defaults to `false`. |
-| `RetainExecutionVpcCleanupResources` | Internal `deploy.sh` lifecycle switch; retains the DynamoDB endpoint, execution security group, and ENI permissions between detach and cleanup phases. Defaults to `false`. |
+| `RetainExecutionVpcCleanupResources` | Internal `wireguard-gateway-setup.sh` lifecycle switch; retains the DynamoDB endpoint, execution security group, and ENI permissions between detach and cleanup phases. Defaults to `false`. |
 | `VpcId` | Existing VPC containing both supplied subnets. |
 | `GatewayPublicSubnetId` | Existing public subnet for the EC2 gateway. |
 | `LambdaSubnetId` | Distinct existing subnet for the execution Lambda. |
@@ -724,10 +724,10 @@ permitted only when the endpoint is `available`, is a `Gateway` endpoint for
 `com.amazonaws.<region>.dynamodb` in `VpcId`, is associated exclusively with
 `LambdaRouteTableId`, and has exactly the documented default full-access
 policy. A shared endpoint or custom policy is rejected and is never changed by
-`deploy.sh`.
+the setup script.
 
 Keep the live endpoint ID only in the operator session. First run
-`deploy.sh --enable-wireguard-gateway` through preflight and stop at its import
+`wireguard-gateway-setup.sh` through preflight and stop at its import
 error; any other endpoint validation error must be resolved without this
 procedure. CloudFormation import operations cannot add or modify stack outputs,
 and unspecified parameters use the new template's defaults. Create an
@@ -805,7 +805,7 @@ Do not execute unless the change set is `CREATE_COMPLETE` and `AVAILABLE` and
 contains exactly one change: `Import`, `ExecutionDynamoDBGatewayEndpoint`,
 `AWS::EC2::VPCEndpoint`. Delete the change set and investigate if anything else
 appears. Once that exact check passes, execute it and verify the stack and
-resource ownership before returning to `deploy.sh`:
+resource ownership before returning to `wireguard-gateway-setup.sh`:
 
 ```sh
 aws cloudformation execute-change-set \
@@ -842,7 +842,7 @@ decisive checks. Remove both temporary templates only after verification:
 rm -f -- "$import_source_template" "$packaged_template"
 ```
 
-Then rerun `deploy.sh --enable-wireguard-gateway` with the same network inputs.
+Then rerun `wireguard-gateway-setup.sh` with the same network inputs.
 That normal deployment adds `ExecutionDynamoDBGatewayEndpointId` to the stack
 outputs; adding it was intentionally deferred because outputs cannot change
 during the import operation.
@@ -866,10 +866,10 @@ wireguard_workstation_public_key="$(tr -d '\n' <"$wireguard_key_dir/workstation.
 ```
 
 Never put the workstation private key in `template.yaml`, a command line,
-shell history, an environment passed to `deploy.sh`, stack parameters or
+shell history, an environment passed to either deployment helper, stack parameters or
 outputs, documentation, or the repository.
 
-### Default gateway keypair managed by `deploy.sh`
+### Default gateway keypair managed by `wireguard-gateway-setup.sh`
 
 For stack `aws-lambda-zig-demo`, the helper uses these external parameters:
 
@@ -880,9 +880,9 @@ For stack `aws-lambda-zig-demo`, the helper uses these external parameters:
 
 The paths follow `/applications/${STACK_NAME}/wireguard/...` for another stack
 name. Parameter Store reserves names beginning with `aws` or `ssm`, ignoring
-case, so `deploy.sh` and `template.yaml` reject custom paths with either prefix.
+case, so `wireguard-gateway-setup.sh` and `template.yaml` reject custom paths with either prefix.
 If both
-exist, `deploy.sh` validates their types and the public-key format and uses the
+exist, `wireguard-gateway-setup.sh` validates their types and the public-key format and uses the
 current private version. If neither exists, it requires `wg`, generates the
 pair under `umask 077` in a mode-0700 temporary directory, creates both without
 `--overwrite`, and removes the directory on success or failure. The private
@@ -894,7 +894,7 @@ invocation.
 The two parameters are operator-owned, survive gateway disablement and stack
 deletion, and are never overwritten or rotated implicitly. A lone parameter is
 treated as an error and is left untouched. Repair it by deriving and creating
-the missing matching value, or delete the lone value and let `deploy.sh`
+the missing matching value, or delete the lone value and let `wireguard-gateway-setup.sh`
 generate a new pair. Do not combine an existing half with newly generated key
 material.
 
@@ -1048,12 +1048,12 @@ sam deploy \
 The preceding commands leave a new or already-disabled stack disabled. Do not
 use a single direct SAM update to transition an enabled stack to disabled: it
 does not perform the required Lambda VPC-detach wait and could remove ENI
-permissions too early. Use `deploy.sh` for disablement, or manually reproduce
+permissions too early. Use `wireguard-gateway-setup.sh --disable` for disablement, or manually reproduce
 its two phases with `RetainExecutionVpcCleanupResources=true`, a verified wait
 for zero VPC-configured Lambda versions and zero ENIs on the retained security
 group, both `VpcId` and `LambdaRouteTableId` preserved, then
 `RetainExecutionVpcCleanupResources=false`. This keeps the endpoint until the
-final phase. Direct SAM commands also do not perform `deploy.sh` subnet
+final phase. Direct SAM commands also do not perform setup-script subnet
 discovery, SSM generation, or enabled-stack reuse.
 To enable the gateway in guided mode, supply every opt-in parameter. Use the
 variables populated by the manual key workflow above and replace only the
@@ -1125,6 +1125,14 @@ export PASETO_PUBLIC_KEY='<public-key-from-keygen>'
 unset PASETO_PRIVATE_KEY
 ```
 
+Routine `deploy.sh` runs preserve all existing WireGuard-related CloudFormation
+parameters, whether the gateway is enabled or disabled. A new stack uses the
+template defaults and remains disabled. Gateway flags are rejected by
+`deploy.sh`, while gateway-specific environment variables are not read; use
+`wireguard-gateway-setup.sh` for any gateway lifecycle change. A routine
+deployment also rejects the internal retained-cleanup state until explicit
+teardown finishes.
+
 Override the environment value with either form:
 
 ```sh
@@ -1139,15 +1147,15 @@ EXECUTION_FUNCTION_NAME='<execution-function-name>' ./deploy.sh
 ./deploy.sh --execution-function-name '<execution-function-name>'
 ```
 
-`deploy.sh` resolves each gateway value from CLI, then environment, then a
-previously enabled stack, then SSM/default discovery. Gateway enablement itself
-is always explicit. Assuming the PASETO variables above remain set, the minimal
-first enablement needs only the workstation public key when networking has one
-valid pair:
+`wireguard-gateway-setup.sh` resolves each gateway value from CLI, then
+environment, then a previously enabled stack, then SSM/default discovery.
+Enablement is implicit. Assuming the PASETO variables above remain set, the
+minimal first enablement needs only the workstation public key when networking
+has one valid pair:
 
 ```sh
 WIREGUARD_WORKSTATION_PUBLIC_KEY="$wireguard_workstation_public_key" \
-./deploy.sh --enable-wireguard-gateway
+./wireguard-gateway-setup.sh
 ```
 
 The helper considers available IPv4 subnets. A gateway candidate has an active
@@ -1164,8 +1172,7 @@ prints every pair and a specific ambiguity error. Use the reported IDs to
 constrain that selection:
 
 ```sh
-./deploy.sh \
-  --enable-wireguard-gateway \
+./wireguard-gateway-setup.sh \
   --gateway-public-subnet-id '<gateway-public-subnet-id>' \
   --lambda-subnet-id '<lambda-subnet-id>' \
   --wireguard-workstation-public-key "$wireguard_workstation_public_key"
@@ -1181,20 +1188,23 @@ version and gateway public key; custom paths never receive automatic key
 generation:
 
 ```sh
-./deploy.sh \
-  --enable-wireguard-gateway \
+./wireguard-gateway-setup.sh \
   --wireguard-private-key-parameter-name '<custom-private-parameter-path>' \
   --wireguard-private-key-parameter-version '<matching-version>' \
   --wireguard-gateway-public-key "$wireguard_gateway_public_key" \
   --wireguard-workstation-public-key "$wireguard_workstation_public_key"
 ```
 
-A subsequent deployment keeps the gateway enabled only when it again receives
-`--enable-wireguard-gateway` or `ENABLE_WIREGUARD_GATEWAY=1`. When the existing
-stack is enabled, unspecified subnet, workstation-key, gateway-key, and
-instance-type values are reused, including the pinned private-key version. A
-deployment without explicit enablement sends `EnableWireGuardGateway=false`,
-but does so in two phases. The detach phase sets
+Re-running `wireguard-gateway-setup.sh` reconfigures the enabled gateway and
+reuses unspecified subnet, workstation-key, gateway-key, instance-type, and
+pinned private-key-version values. Routine `deploy.sh` runs preserve that state.
+Explicit teardown is:
+
+```sh
+./wireguard-gateway-setup.sh --disable
+```
+
+The detach phase sets
 `RetainExecutionVpcCleanupResources=true`, removing the gateway, Elastic IP,
 route, related resources, and execution VPC attachment while retaining the
 stack-managed DynamoDB endpoint, execution security group, and ENI-deletion
@@ -1204,17 +1214,19 @@ published version have an empty VPC configuration and no ENI references the
 retained security group. The cleanup phase sets
 `RetainExecutionVpcCleanupResources=false` only after those checks pass,
 removing the endpoint and its prefix-list route before the retained group and
-permission disappear. A timeout stops before cleanup; a later `deploy.sh` run
-recognizes the retained phase and resumes the same guarded wait. Both external
+permission disappear. A timeout stops before cleanup; a later
+`wireguard-gateway-setup.sh --disable` run recognizes the retained phase and
+resumes the same guarded wait. Both external
 SSM parameters remain operator-owned. After teardown, a later enablement
 recovers the current default SSM pair but does not reuse gateway inputs from the
 disabled stack.
 
-Before building, `deploy.sh` validates the TigerBeetle cluster ID and address
-list and local gateway syntax. Set `TIGERBEETLE_CLUSTER_ID` and
-`TIGERBEETLE_ADDRESSES`, or pass `--tigerbeetle-cluster-id` and
+Before building, the shared runner validates the TigerBeetle cluster ID and
+address list; the setup script also validates gateway syntax. Set
+`TIGERBEETLE_CLUSTER_ID` and `TIGERBEETLE_ADDRESSES`, or pass
+`--tigerbeetle-cluster-id` and
 `--tigerbeetle-addresses`, to override their defaults. A non-dry-run
-deployment discovers and verifies the topology, including DynamoDB endpoint
+setup discovers and verifies the topology, including DynamoDB endpoint
 creation eligibility or stack ownership, checks for a conflicting
 `10.200.0.0/24` route, and reads SSM parameter metadata without decrypting the
 private value. A legacy unmanaged endpoint triggers the import procedure above;
@@ -1249,17 +1261,19 @@ CloudFormation with the selected SSO profile and distinguishes an update that is
 still running, a terminal CloudFormation failure, and remote success followed
 by a local failure. Do not rerun deployment against an active stack. Wait for
 CloudFormation to reach a terminal state before retrying; after a bounded VPC
-cleanup timeout, a later `deploy.sh` run resumes the retained cleanup phase.
+cleanup timeout, a later `wireguard-gateway-setup.sh --disable` run resumes the retained cleanup phase.
 
-After a successful deployment, `deploy.sh` resolves the
+After a successful deployment, the shared runner resolves the
 `OperationsTable` physical resource, waits for the table to exist, and prints a
 concise table summary. It fails unless the table is active, uses on-demand
 billing, has only the `id` string partition key, and has no local or global
 secondary indexes. It then resolves the `OperationsQueue` physical resource and calls
 `GetQueueAttributes` to print a concise SQS summary. This probe verifies that
 the deployed queue can be queried but does not enforce SQS attribute values.
-For an enabled deployment, it also prints the eight conditional, non-secret
-network outputs. The intake and query Function URL checks then run.
+After a successful enablement, the setup script resolves and validates the
+gateway endpoint, gateway public key, workstation address, and deployed Lambda
+subnet CIDR. It then prints the conditional network outputs and a delimited,
+copy-ready peer configuration before the intake and query Function URL checks.
 
 Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run --use-local-libs`
@@ -1326,22 +1340,29 @@ require exporting those values.
 ### Configure the workstation
 
 Install the workstation private key into the platform's protected WireGuard
-configuration using mode `0600` or an equivalent secret-store permission. Use
-this peer shape, replacing the placeholders with the protected private key,
-the gateway public key, conditional Elastic IP output, and supplied Lambda
-subnet CIDR:
+configuration using mode `0600` or an equivalent secret-store permission.
+Successful enablement prints this delimited, copy-ready configuration with all
+public values resolved:
 
-```ini
+```text
+-----BEGIN WIREGUARD PEER CONFIGURATION-----
 [Interface]
 Address = 10.200.0.2/24
-PrivateKey = <workstation-private-key>
+PrivateKey = <wireguard-peer-private-key>
 
 [Peer]
-PublicKey = <gateway-public-key>
-Endpoint = <WireGuardGatewayElasticIp>:51820
-AllowedIPs = <LambdaSubnetCidr>
+PublicKey = <resolved-gateway-public-key>
+Endpoint = <resolved-gateway-elastic-ip>:51820
+AllowedIPs = <resolved-lambda-subnet-cidr>
 PersistentKeepalive = 25
+-----END WIREGUARD PEER CONFIGURATION-----
 ```
+
+Replace the literal `<wireguard-peer-private-key>` with the private key matching
+the `WireGuardWorkstationPublicKey` supplied to setup. The helper never reads,
+generates, prints, or persists that peer private key. It omits the configuration
+on dry runs, disablement, failed deployment, and missing or malformed required
+outputs.
 
 `AllowedIPs` intentionally contains only the Lambda subnet, not the entire
 VPC. This installs the return route for traffic whose source is the Lambda
@@ -1542,7 +1563,7 @@ aws ec2 wait instance-status-ok \
 
 ### Rotate WireGuard keys
 
-`deploy.sh` never rotates either parameter implicitly. To rotate the default
+`wireguard-gateway-setup.sh` never rotates either parameter implicitly. To rotate the default
 gateway pair, generate both values in a new protected directory, update the
 private and public parameters back-to-back, and capture the returned private
 version. Do not deploy the intermediate state where only one value is updated:
@@ -1588,8 +1609,7 @@ printf 'Recorded rotated SSM parameter version: %s\n' \
 
 If the public update fails, retain the protected directory and retry that
 exact public value; do not generate another private key or run a deployment.
-After both updates succeed, rerun the complete enabled SAM or `deploy.sh`
-command with
+After both updates succeed, rerun `wireguard-gateway-setup.sh` with
 `WireGuardPrivateKeyParameterVersion` set to
 `$rotated_parameter_version` and `WireGuardGatewayPublicKey` set to
 `$rotated_gateway_public_key`. Update the workstation peer's `PublicKey` to

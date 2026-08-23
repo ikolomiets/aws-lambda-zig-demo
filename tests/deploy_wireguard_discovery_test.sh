@@ -2,8 +2,8 @@
 set -euo pipefail
 
 REPOSITORY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=../deploy.sh
-source "$REPOSITORY_ROOT/deploy.sh"
+# shellcheck source=../wireguard-gateway-setup.sh
+source "$REPOSITORY_ROOT/wireguard-gateway-setup.sh"
 
 TEST_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/deploy-wireguard-test.XXXXXX")"
 MOCK_CALL_LOG="$TEST_TMP_DIR/aws-calls.log"

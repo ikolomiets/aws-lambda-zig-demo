@@ -2,8 +2,8 @@
 set -euo pipefail
 
 REPOSITORY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=../deploy.sh
-source "$REPOSITORY_ROOT/deploy.sh"
+# shellcheck source=../wireguard-gateway-setup.sh
+source "$REPOSITORY_ROOT/wireguard-gateway-setup.sh"
 
 TEST_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/deploy-cleanup-test.XXXXXX")"
 MOCK_CALL_LOG="$TEST_TMP_DIR/calls.log"
@@ -126,7 +126,8 @@ test_tigerbeetle_configuration() (
     TIGERBEETLE_CLUSTER_ID=340282366920938463463374607431768211455
     TIGERBEETLE_ADDRESSES=127.0.0.1:3000,127.0.0.1:3001
     validate_tigerbeetle_configuration
-    build_sam_parameter_overrides false
+    build_wireguard_parameter_overrides false
+    build_sam_parameter_overrides
     joined_overrides=" ${SAM_PARAMETER_OVERRIDES[*]} "
     assert_contains "$joined_overrides" \
         " TigerBeetleClusterId=340282366920938463463374607431768211455 "
@@ -169,7 +170,8 @@ test_enabled_stack_detach_plan() (
     [ "$LAMBDA_ROUTE_TABLE_ID" = rtb-00000001 ] ||
         fail_test "detach phase did not reuse the enabled stack Lambda route table"
 
-    build_sam_parameter_overrides true
+    build_wireguard_parameter_overrides true
+    build_sam_parameter_overrides
     joined_overrides=" ${SAM_PARAMETER_OVERRIDES[*]} "
     assert_contains "$joined_overrides" " EnableWireGuardGateway=false "
     assert_contains "$joined_overrides" " RetainExecutionVpcCleanupResources=true "
@@ -238,7 +240,13 @@ test_cleanup_readiness() {
 }
 
 deploy_stack_phase() {
-    printf 'deploy:%s\n' "$1" >>"$MOCK_CALL_LOG"
+    local joined_overrides=" ${DEPLOYMENT_PARAMETER_OVERRIDES[*]} "
+
+    case "$joined_overrides" in
+        *" RetainExecutionVpcCleanupResources=true "*) printf 'deploy:true\n' ;;
+        *" RetainExecutionVpcCleanupResources=false "*) printf 'deploy:false\n' ;;
+        *) fail_test "deploy phase omitted the cleanup-retention override" ;;
+    esac >>"$MOCK_CALL_LOG"
 }
 
 test_cleanup_refuses_blocking_eni() {

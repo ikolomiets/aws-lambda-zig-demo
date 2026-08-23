@@ -5,8 +5,9 @@
 This repository is a small Zig 0.16.0 AWS Lambda example. The root build files
 define the intake, query, and execution Lambda bootstrap executables, application code lives in
 `src/`, AWS
-deployment material lives in `template.yaml`, `deploy.sh`, and `docs/`, and the
-vendored `aws_lambda` dependency is under `zig-pkg/`.
+deployment material lives in `template.yaml`, `deploy.sh`,
+`wireguard-gateway-setup.sh`, and `docs/`, while the vendored `aws_lambda`
+dependency is under `zig-pkg/`.
 
 Use these sources in order:
 
@@ -18,7 +19,9 @@ Use these sources in order:
 - `src/lambda_auth.zig` is the shared bearer-token and PASETO verification module.
 - `template.yaml` defines the SAM-managed Lambdas, Function URLs, permissions,
   memory, timeout, runtime, and architecture.
-- `deploy.sh` implements the supported automated AWS SAM deployment flow.
+- `deploy.sh` implements the generic, state-preserving AWS SAM deployment flow.
+- `wireguard-gateway-setup.sh` implements WireGuard gateway enablement,
+  reconfiguration, peer configuration output, and guarded teardown.
 - `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md` documents the supported deployment flow.
 - [`docs/TIGER_STYLE_AGENT.md`](docs/TIGER_STYLE_AGENT.md) is the concise,
   recommended operational style guide for Zig changes.
@@ -58,8 +61,9 @@ Keep the project small. The application has three handlers and one shared authen
 module used by the HTTP handlers; do not add modules, layers, or helper packages until real
 behavior needs that structure.
 
-Before changing deployment behavior, read the SAM template, deployment helper,
-and SAM deployment doc. Public Function URL settings are intentionally demo-oriented;
+Before changing deployment behavior, read the SAM template, both deployment
+helpers, and the SAM deployment doc. Public Function URL settings are
+intentionally demo-oriented;
 do not widen IAM, CORS, runtime, timeout, memory, region, or profile assumptions
 without updating the matching documentation and calling out the operational
 effect.
@@ -81,7 +85,9 @@ Keep changes scoped and update only affected files:
   as appropriate, then run formatting and build validation.
 - SAM resources, permissions, function settings, or outputs: update
   `template.yaml` and `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md`.
-- Deployment helper behavior: update `deploy.sh` and
+- Generic deployment helper behavior: update `deploy.sh` and
+  `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md`.
+- WireGuard lifecycle behavior: update `wireguard-gateway-setup.sh` and
   `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md`.
 - Deployment artifact expectations: update the affected deployment docs.
 - Any Zig code change: review it against
@@ -128,6 +134,8 @@ Use these local checks:
 - `zig build test-deploy`: run only the dependency-free deployment-helper
   regression tests; these use mocked AWS commands and require no credentials or
   network access.
+- `bash -n deploy.sh wireguard-gateway-setup.sh tests/*.sh`: verify deployment
+  helper and shell-test syntax.
 - `zig build test`: run the Zig tests and the deployment-helper regression
   tests.
 - `zig build --release -Darch=arm`: build the stripped, single-threaded,
