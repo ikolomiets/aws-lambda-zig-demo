@@ -81,16 +81,14 @@ AWS VPC
 
 ## 3. Required existing network
 
-The template does not create a VPC, subnet, route table, NAT gateway, or
-DynamoDB VPC endpoint. An enabled deployment supplies:
+The template does not create a VPC, subnet, route table, route-table
+association, or NAT gateway. An enabled deployment supplies:
 
 - one existing VPC;
 - a public gateway subnet with an active `0.0.0.0/0` route to an internet
   gateway;
 - a distinct Lambda subnet in the same VPC and availability zone;
-- the Lambda subnet's effective route table and primary IPv4 CIDR; and
-- DynamoDB access from the Lambda subnet through an active NAT default route
-  or a DynamoDB gateway endpoint associated with its effective route table.
+- the Lambda subnet's effective route table and primary IPv4 CIDR.
 
 Neither subnet may overlap `10.200.0.0/24`. The Lambda route table must not
 already contain a route for `10.200.0.0/24`, except when that route belongs to
@@ -100,9 +98,9 @@ subnet does not give it Internet access through the subnet's internet gateway.
 For a small development VPC, the recommended topology is a dedicated `/28`
 Lambda subnet in the gateway subnet's availability zone, automatic public IPv4
 assignment disabled, an explicitly associated route table containing only the
-VPC-local route, and a DynamoDB gateway endpoint associated only with that
-route table. These supporting resources remain operator-owned outside the SAM
-stack.
+VPC-local route, and the stack-managed DynamoDB gateway endpoint associated
+only with that route table. The VPC, subnets, route table, and association
+remain operator-owned outside the SAM stack.
 
 ## 4. Template parameters and conditions
 
@@ -128,8 +126,9 @@ interface controls the optional managed gateway:
 | `WireGuardInstanceType` | ARM64 EC2 instance type; defaults to `t4g.nano`. |
 
 When `EnableWireGuardGateway=true`, a CloudFormation rule requires every
-gateway input. A second rule requires `VpcId` while cleanup resources are
-retained. Empty defaults are therefore safe when both switches are false.
+gateway input. A second rule requires both `VpcId` and `LambdaRouteTableId`
+while cleanup resources are retained. Empty defaults are therefore safe when
+both switches are false.
 `deploy.sh` performs the stronger live topology and SSM checks described below;
 a direct SAM deployment does not perform those discovery checks.
 
@@ -141,6 +140,7 @@ retained safely during detach. The optional resources are:
 | Logical resource | Type | Creation condition |
 | --- | --- | --- |
 | `ExecutionLambdaSecurityGroup` | `AWS::EC2::SecurityGroup` | Gateway enabled or cleanup resources retained |
+| `ExecutionDynamoDBGatewayEndpoint` | `AWS::EC2::VPCEndpoint` | Gateway enabled or cleanup resources retained |
 | `WireGuardGatewaySecurityGroup` | `AWS::EC2::SecurityGroup` | Gateway enabled |
 | `WireGuardGatewayRole` | `AWS::IAM::Role` | Gateway enabled |
 | `WireGuardGatewayInstanceProfile` | `AWS::IAM::InstanceProfile` | Gateway enabled |
@@ -158,7 +158,12 @@ instance and depends on the Elastic IP association.
 
 The execution function is attached only to `LambdaSubnetId` and the
 stack-managed execution security group while the gateway is enabled. It has no
-VPC attachment in steady disabled state.
+VPC attachment in steady disabled state. The gateway endpoint uses the
+standard same-Region DynamoDB hostname, associates only with
+`LambdaRouteTableId`, and uses the documented default full-access endpoint
+policy. The execution role's table-scoped `dynamodb:UpdateItem` permission is
+still the authorization boundary. Intake and query remain outside the customer
+VPC.
 
 ## 6. Security and IAM boundaries
 
@@ -178,7 +183,7 @@ template opens no IPv6 ingress, SSH, public TCP/3000, or other public ingress.
 The execution security group has no ingress and only:
 
 - TCP/3000 egress to `10.200.0.2/32`; and
-- TCP/443 egress to `0.0.0.0/0` for DynamoDB through the subnet's NAT or VPC
+- TCP/443 egress to `0.0.0.0/0` for DynamoDB through the stack-managed gateway
   endpoint path.
 
 The execution role receives its six Lambda ENI-management actions only while
@@ -239,22 +244,28 @@ For enabled deployments, values resolve in this order:
 
 The helper inspects available IPv4 subnet pairs. A candidate must use distinct
 subnets in one VPC and availability zone, avoid the WireGuard CIDR, provide an
-Internet-gateway default route for the gateway, and provide a NAT or DynamoDB
-gateway-endpoint path for Lambda. Explicit VPC or subnet inputs constrain the
+Internet-gateway default route for the gateway, and have a Lambda route table
+on which the endpoint can be managed. A Lambda subnet with neither NAT nor a
+pre-existing endpoint is eligible. Explicit VPC or subnet inputs constrain the
 candidate set. `LAMBDA_SUBNET_CIDR` and `LAMBDA_ROUTE_TABLE_ID` are assertions
 against the selected subnet's live values.
 
 Discovery proceeds only when exactly one pair matches. Multiple matches are
 printed and require one or both subnet options. With no match, the helper
-prints rejection counts for gateway routing, Lambda DynamoDB access, CIDR
+prints rejection counts for gateway routing, Lambda endpoint management, CIDR
 overlap, subnet identity, VPC, and availability zone. AWS inspection failures
 are reported separately rather than counted as topology rejections.
 
 Before deployment, the helper rechecks the VPC/subnet relationships, same-AZ
-constraint, effective route tables, gateway Internet route, Lambda DynamoDB
-path, CIDRs, and conflicting WireGuard route. An existing WireGuard route is
-accepted only when the current enabled stack owns that route and target
-instance.
+constraint, effective route tables, gateway Internet route, DynamoDB endpoint
+management, CIDRs, and conflicting WireGuard route. A selected route table may
+have no DynamoDB endpoint or the available endpoint owned by this stack. A
+legacy unmanaged endpoint must pass the exclusive-route-table and default-policy
+checks and then be imported manually before normal deployment. Shared,
+unavailable, duplicate-route, custom-policy, or mismatched endpoints are
+rejected. An existing WireGuard route is accepted only when the current enabled
+stack owns that route and target instance. A separate DynamoDB endpoint on
+other VPC route tables is allowed.
 
 With a unique topology and the default SSM paths, first enablement therefore
 needs only the workstation public key in addition to the normal PASETO inputs:
@@ -324,7 +335,7 @@ The helper stops before local work when the stack status ends in
 The helper then runs Zig formatting and tests, builds all three Linux ARM64
 bootstraps, refreshes their zip archives, and runs both SAM validations. An
 enabled deployment uses one SAM update with the resolved gateway parameters.
-After success, the helper prints the seven conditional gateway outputs and
+After success, the helper prints the eight conditional network outputs and
 continues with the DynamoDB, SQS, and optional Function URL checks.
 
 Intake and query are stripped, statically linked executables. Execution is
@@ -338,13 +349,14 @@ enabled gateway with two CloudFormation updates:
 1. Set `EnableWireGuardGateway=false` and
    `RetainExecutionVpcCleanupResources=true`. This removes the execution VPC
    attachment, gateway, Elastic IP, route, launch resources, and gateway
-   security group while retaining the execution security group and the role's
-   ENI-deletion permission.
+   security group while retaining the DynamoDB gateway endpoint, execution
+   security group, and the role's ENI-deletion permission. Both `VpcId` and
+   `LambdaRouteTableId` are propagated to this phase.
 2. Wait up to approximately 20 minutes for the current execution function and
    every published version to have no VPC configuration and for no ENI to use
    the retained security group.
-3. Set `RetainExecutionVpcCleanupResources=false`, removing the retained group
-   and VPC-access policy.
+3. Set `RetainExecutionVpcCleanupResources=false`, removing the endpoint and
+   its prefix-list route, retained group, and VPC-access policy.
 
 If the bounded wait fails, the second update is not attempted. Rerun
 `deploy.sh` after CloudFormation is no longer in progress; it recognizes the
@@ -371,6 +383,7 @@ both detach and cleanup phases with the same Lambda-version and ENI checks.
 An enabled stack emits these non-secret outputs:
 
 ```text
+ExecutionDynamoDBGatewayEndpointId
 WireGuardGatewayInstanceId
 WireGuardGatewayElasticIp
 WireGuardGatewayEndpoint
@@ -437,7 +450,7 @@ Useful failure boundaries are:
 | Handshake but no routed traffic | Workstation `AllowedIPs = <LambdaSubnetCidr>` and gateway peer route `10.200.0.2/32` |
 | EC2 reaches the workstation but not TCP/3000 | Workstation firewall and TigerBeetle bind address |
 | EC2 works but Lambda cannot reach the overlay | VPC route, source/destination check, Lambda VPC attachment, and execution security-group egress |
-| Execution loses DynamoDB access | NAT route or DynamoDB gateway endpoint associated with the Lambda route table |
+| Execution loses DynamoDB access | Stack resource status, endpoint availability and route-table association, and the regional DynamoDB prefix-list route |
 | SSM or bootstrap fails | Gateway Internet route, instance role, cloud-init output, and exact SSM parameter name/version |
 
 Cloud handshake, routing, reboot recovery, rotation, and TigerBeetle checks are
@@ -448,18 +461,22 @@ operator explicitly authorizes and runs them.
 
 The SAM stack owns the execution VPC attachment, both conditional security
 groups, gateway role and instance profile, launch template, EC2 instance,
-Elastic IP and association, and the `10.200.0.0/24` route.
+Elastic IP and association, DynamoDB gateway endpoint and prefix-list route,
+and the `10.200.0.0/24` route.
 
-The operator owns the existing VPC, subnets, Lambda route table, NAT or
-DynamoDB endpoint, and external gateway SSM pair. The workstation owns its
+The operator owns the existing VPC, subnets, Lambda route table and association,
+any NAT or default route, and external gateway SSM pair. The workstation owns its
 WireGuard configuration and private key, local firewall policy, and
 TigerBeetle process and data.
 
 Disabling the gateway removes only the stack-owned optional resources after the
 guarded ENI cleanup. Deleting an enabled stack also removes those stack-owned
-resources. Neither operation deletes the external SSM parameters, supporting
-network, workstation keys, or TigerBeetle data. Delete those separately only
-after confirming they will not be reused.
+resources. Neither operation deletes or changes operator-owned NAT/default
+routes, external SSM parameters, supporting network, workstation keys, or
+TigerBeetle data. Remove a NAT path only after auditing unrelated subnet egress;
+delete other supporting resources only after confirming they will not be
+reused. The one-time legacy endpoint import procedure is documented in
+`docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md`.
 
 ## 14. Non-goals
 

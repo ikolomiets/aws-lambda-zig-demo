@@ -91,6 +91,14 @@ Keep changes scoped and update only affected files:
 Avoid unrelated prose rewrites, hidden behavior changes, broad refactors, and
 new dependencies unless the task explicitly needs them.
 
+## Commit Messages
+
+Write commit messages that are sufficiently detailed for a future maintainer to
+understand the change without reconstructing it from the diff. Use a concise
+imperative subject, followed by a body for non-trivial changes that explains the
+problem or motivation, the material behavior and operational effects, important
+safety or migration decisions.
+
 ## Security and Private AWS Details
 
 Before committing or publishing changes, check tracked and newly added files for

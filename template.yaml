@@ -56,7 +56,7 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
-    Description: Internal deploy-helper switch retaining Lambda ENI cleanup resources during VPC detachment.
+    Description: Internal deploy-helper switch retaining the DynamoDB endpoint and Lambda ENI cleanup resources during VPC detachment.
   VpcId:
     Type: String
     Default: ""
@@ -143,11 +143,13 @@ Rules:
         AssertDescription: WireGuardAmiId is required when the WireGuard gateway is enabled.
       - Assert: !Not [!Equals [!Ref WireGuardInstanceType, ""]]
         AssertDescription: WireGuardInstanceType is required when the gateway is enabled.
-  ExecutionVpcCleanupVpcRequired:
+  ExecutionVpcCleanupInputsRequired:
     RuleCondition: !Equals [!Ref RetainExecutionVpcCleanupResources, "true"]
     Assertions:
       - Assert: !Not [!Equals [!Ref VpcId, ""]]
         AssertDescription: VpcId is required while execution VPC cleanup resources are retained.
+      - Assert: !Not [!Equals [!Ref LambdaRouteTableId, ""]]
+        AssertDescription: LambdaRouteTableId is required while execution VPC cleanup resources are retained.
 
 Conditions:
   WireGuardGatewayEnabled: !Equals [!Ref EnableWireGuardGateway, "true"]
@@ -406,6 +408,24 @@ Resources:
           ToPort: 443
           CidrIp: 0.0.0.0/0
 
+  ExecutionDynamoDBGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ExecutionVpcCleanupResourcesRetained
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      VpcEndpointType: Gateway
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      RouteTableIds:
+        - !Ref LambdaRouteTableId
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "*"
+            Resource: "*"
+
   WireGuardGatewaySecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Condition: WireGuardGatewayEnabled
@@ -636,6 +656,10 @@ Outputs:
   ExecutionFunctionArn:
     Description: Deployed operation execution Lambda function ARN.
     Value: !GetAtt ExecutionFunction.Arn
+  ExecutionDynamoDBGatewayEndpointId:
+    Condition: ExecutionVpcCleanupResourcesRetained
+    Description: DynamoDB gateway endpoint used by the execution Lambda subnet.
+    Value: !Ref ExecutionDynamoDBGatewayEndpoint
   WireGuardGatewayInstanceId:
     Condition: WireGuardGatewayEnabled
     Description: EC2 instance ID of the WireGuard gateway.

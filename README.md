@@ -468,10 +468,10 @@ The fixed initial network configuration is:
 The gateway public subnet and Lambda subnet must be distinct existing subnets
 in one VPC. The gateway subnet needs an active default route to an internet
 gateway. Neither subnet may overlap `10.200.0.0/24`, and the Lambda route table
-must not contain a conflicting route for that CIDR. The Lambda subnet must
-retain DynamoDB access through NAT or a DynamoDB gateway endpoint; attaching a
-Lambda to a public subnet does not provide internet access through that
-subnet's internet gateway.
+must not contain a conflicting route for that CIDR. The stack creates a
+DynamoDB gateway endpoint on the Lambda route table, so the Lambda subnet does
+not need NAT. Attaching a Lambda to a public subnet does not provide internet
+access through that subnet's internet gateway.
 
 The gateway security group exposes IPv4 UDP/51820 from `0.0.0.0/0` because a
 NATed workstation's public address may change. WireGuard authenticates its
@@ -510,25 +510,25 @@ the `WireGuardAmiId` template parameter. The common `PROFILE`, `REGION`, and
 When neither subnet is specified, the helper considers available IPv4 subnet
 pairs. The gateway subnet must have an active `0.0.0.0/0` route to an internet
 gateway. The distinct Lambda subnet must be in the same VPC and availability
-zone and have DynamoDB access through an active NAT default route or a DynamoDB
-gateway endpoint associated with its effective route table. Neither subnet may
-overlap `10.200.0.0/24`. An explicit VPC or one subnet narrows the candidates.
-The helper proceeds only for one pair; otherwise it prints all matching pairs
-and requires `--gateway-public-subnet-id` and/or `--lambda-subnet-id`. With no
-valid pair it reports rejection counts for gateway routing, Lambda DynamoDB
-access, CIDR overlap, subnet identity, VPC, and availability zone. An AWS API
-inspection failure is reported separately and is never treated as ordinary
+zone and have an effective route table on which the endpoint can be managed;
+neither NAT nor a pre-existing endpoint is required. Neither subnet may overlap
+`10.200.0.0/24`. An explicit VPC or one subnet narrows the candidates. The
+helper proceeds only for one pair; otherwise it prints all matching pairs and
+requires `--gateway-public-subnet-id` and/or `--lambda-subnet-id`. With no valid
+pair it reports rejection counts for gateway routing, Lambda endpoint
+management, CIDR overlap, subnet identity, VPC, and availability zone. An AWS
+API inspection failure is reported separately and is never treated as ordinary
 topology rejection. It prints the selected VPC, availability zone, subnets,
 Lambda CIDR, and effective Lambda route table before deployment.
 
 For a small development VPC, the recommended topology is a dedicated `/28`
 Lambda subnet in the gateway subnet's availability zone, automatic public IPv4
 assignment disabled, an explicitly associated route table containing only the
-VPC-local route, and a DynamoDB gateway endpoint associated only with that
-route table. These resources are created manually, tagged for this project,
-and remain operator-owned outside SAM. Disabling or deleting the stack does not
-remove them. See the deployment guide for the provisioning, rollback, and
-cleanup sequence.
+VPC-local route, and the stack-managed DynamoDB gateway endpoint associated
+only with that route table. The subnet, route table, and association remain
+operator-owned outside SAM; the endpoint and its prefix-list route follow the
+stack lifecycle. See the deployment guide for provisioning, legacy endpoint
+import, rollback, and cleanup.
 
 #### Automatic gateway key ownership
 
@@ -595,16 +595,19 @@ default pair, supply the complete pinned pair:
 
 Before a non-dry-run deployment, the helper verifies the VPC, subnet, and
 route-table relationships, confirms the gateway subnet's internet-gateway
-route and Lambda DynamoDB path, and rejects a conflicting Lambda route. It reads
-private-parameter metadata without decryption. The gateway instance retrieves
-the selected private version during bootstrap and verifies that its derived
-public key matches
-`WIREGUARD_GATEWAY_PUBLIC_KEY`.
+route and DynamoDB endpoint manageability, and rejects a conflicting Lambda
+route. An unmanaged endpoint on the selected route table must be imported into
+the stack; shared, unavailable, duplicate-route, custom-policy, or mismatched
+endpoints are rejected without modification. It reads private-parameter
+metadata without decryption. The gateway instance retrieves the selected
+private version during bootstrap and verifies that its derived public key
+matches `WIREGUARD_GATEWAY_PUBLIC_KEY`.
 
 After a successful enabled deployment, `deploy.sh` prints these non-secret
 CloudFormation outputs:
 
 ```text
+ExecutionDynamoDBGatewayEndpointId
 WireGuardGatewayInstanceId
 WireGuardGatewayElasticIp
 WireGuardGatewayEndpoint
@@ -643,15 +646,17 @@ type. A subsequent successful deployment without the enable flag (or with
 `ENABLE_WIREGUARD_GATEWAY=0`) explicitly passes
 `EnableWireGuardGateway=false` to SAM using two CloudFormation updates. The
 first update removes the Lambda VPC attachment, gateway, Elastic IP, route, and
-gateway resources while retaining the execution security group and the role's
-ENI-deletion permission. The helper then waits up to 20 minutes for every
-Lambda version to detach and for the retained security group's ENI count to
-reach zero. Only then does the second update remove the security group and VPC
-access policy. If the bounded wait fails, cleanup stops with those resources
-retained; rerunning `deploy.sh` resumes the guarded cleanup phase. Both external
-SSM parameters and workstation keys remain operator-owned and are not deleted.
-A later re-enable after teardown recovers the current default SSM pair but does
-not reuse values from the disabled stack.
+gateway resources while retaining the DynamoDB gateway endpoint, execution
+security group, and the role's ENI-deletion permission. The helper then waits
+up to 20 minutes for every Lambda version to detach and for the retained
+security group's ENI count to reach zero. Only then does the second update
+remove the endpoint and its prefix-list route, security group, and VPC access
+policy. If the bounded wait fails, cleanup stops with those resources retained;
+rerunning `deploy.sh` resumes the guarded cleanup phase. Operator-owned NAT and
+default routes are not changed. Both external SSM parameters and workstation
+keys remain operator-owned and are not deleted. A later re-enable after teardown
+recovers the current default SSM pair but does not reuse values from the
+disabled stack.
 
 Before any non-dry-run build, the helper clears inherited static AWS credential
 variables, selects the configured SSO-backed profile, and unconditionally runs

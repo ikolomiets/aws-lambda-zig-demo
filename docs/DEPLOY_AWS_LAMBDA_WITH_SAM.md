@@ -8,8 +8,9 @@ their execution roles, public Function URLs for intake and query, the DynamoDB
 operations table shared by all three Lambdas, and the SQS operations queue sent
 by intake and consumed by execution. It can also provision an optional EC2
 WireGuard gateway that routes execution-Lambda traffic to TigerBeetle on a
-development workstation. The gateway is disabled by default; enabling it adds
-EC2 and Elastic IP charges.
+development workstation, plus a DynamoDB gateway endpoint for that Lambda's
+route table. The gateway is disabled by default; enabling it adds EC2 and
+Elastic IP charges.
 
 ## Assumptions
 
@@ -36,19 +37,17 @@ Enabling the WireGuard gateway additionally requires:
 - The effective Lambda-subnet route table, with no route already claiming
   `10.200.0.0/24` unless that route is owned by the existing deployment of this
   stack.
-- DynamoDB reachability from the Lambda subnet through NAT or a DynamoDB
-  gateway endpoint. A public-subnet internet-gateway route alone does not give
-  a VPC-attached Lambda internet access.
 - For the recommended isolated topology, an unused IPv4 `/28` in the VPC and
-  permission to create and tag a subnet, route table, route-table association,
-  and DynamoDB gateway endpoint.
+  permission to create and tag a subnet, route table, and route-table
+  association. The stack creates the DynamoDB gateway endpoint.
 - Local WireGuard tools (`wg` and the platform-specific interface helper) on a
   workstation that can initiate outbound UDP/51820 to the gateway Elastic IP.
 - `wg` must be on `PATH` for `deploy.sh` to generate the default gateway pair
   when both default SSM parameters are absent.
 - Permission for the deployment identity to create the additional EC2
   instance, Elastic IP, security groups, route, IAM role and instance profile,
-  and launch template, as well as the execution-Lambda network interface.
+  launch template, DynamoDB gateway endpoint, and execution-Lambda network
+  interface.
 - `ssm:GetParameter` and `ssm:PutParameter` on
   `/applications/${STACK_NAME}/wireguard/gateway-private-key` and
   `/applications/${STACK_NAME}/wireguard/gateway-public-key`, plus
@@ -229,6 +228,7 @@ Both commands should report that `template.yaml` is valid.
 When `EnableWireGuardGateway=true`, the template also creates:
 
 - `ExecutionLambdaSecurityGroup`: `AWS::EC2::SecurityGroup`
+- `ExecutionDynamoDBGatewayEndpoint`: `AWS::EC2::VPCEndpoint`
 - `WireGuardGatewaySecurityGroup`: `AWS::EC2::SecurityGroup`
 - `WireGuardGatewayRole`: `AWS::IAM::Role`
 - `WireGuardGatewayInstanceProfile`: `AWS::IAM::InstanceProfile`
@@ -239,12 +239,12 @@ When `EnableWireGuardGateway=true`, the template also creates:
 - `WireGuardLambdaRoute`: `AWS::EC2::Route`
 
 Every gateway resource and output is conditional. The internal
-`RetainExecutionVpcCleanupResources` parameter temporarily keeps only
-`ExecutionLambdaSecurityGroup` and the execution role's EC2 network-interface
-policy during a `deploy.sh` disablement transition. In steady disabled state,
-the execution Lambda has no VPC attachment or EC2 network-interface
-permissions, and the empty gateway parameter defaults create no gateway or
-cleanup resources.
+`RetainExecutionVpcCleanupResources` parameter temporarily keeps
+`ExecutionDynamoDBGatewayEndpoint`, `ExecutionLambdaSecurityGroup`, and the
+execution role's EC2 network-interface policy during a `deploy.sh` disablement
+transition. In steady disabled state, the execution Lambda has no VPC
+attachment or EC2 network-interface permissions, and the empty gateway
+parameter defaults create no gateway or cleanup resources.
 
 The gateway security group admits public IPv4 UDP/51820 and private TCP/3000
 from `LambdaSubnetCidr`; it allows IPv4 egress for bootstrap, SSM, and tunnel
@@ -308,7 +308,8 @@ When the gateway is enabled, the role also receives the six EC2
 network-interface actions required by a VPC-attached Lambda. The function is
 attached to the single `LambdaSubnetId` with a stack-managed security group
 that permits only TCP/3000 to `10.200.0.2/32` and TCP/443 for DynamoDB access
-through the subnet's NAT or VPC endpoint path.
+through the stack-managed gateway endpoint. Intake and query remain outside
+the customer VPC and continue using the standard regional DynamoDB hostname.
 
 `TigerBeetleClusterId` and `TigerBeetleAddresses` populate
 `TIGERBEETLE_CLUSTER_ID` and `TIGERBEETLE_ADDRESSES`. Their defaults are `0`
@@ -572,7 +573,7 @@ The optional gateway parameters are:
 | Parameter | Meaning |
 | --- | --- |
 | `EnableWireGuardGateway` | `true` enables the gateway; defaults to `false`. |
-| `RetainExecutionVpcCleanupResources` | Internal `deploy.sh` lifecycle switch; retains only the execution security group and ENI permissions between detach and cleanup phases. Defaults to `false`. |
+| `RetainExecutionVpcCleanupResources` | Internal `deploy.sh` lifecycle switch; retains the DynamoDB endpoint, execution security group, and ENI permissions between detach and cleanup phases. Defaults to `false`. |
 | `VpcId` | Existing VPC containing both supplied subnets. |
 | `GatewayPublicSubnetId` | Existing public subnet for the EC2 gateway. |
 | `LambdaSubnetId` | Distinct existing subnet for the execution Lambda. |
@@ -585,15 +586,15 @@ The optional gateway parameters are:
 | `WireGuardAmiId` | Public SSM parameter resolving to an ARM64 Amazon Linux 2023 AMI. |
 | `WireGuardInstanceType` | ARM64 gateway instance type; defaults to `t4g.nano`. |
 
-### Provision a dedicated Lambda subnet and DynamoDB endpoint
+### Provision a dedicated Lambda subnet and route table
 
 The recommended development topology keeps the existing internet-routed subnet
 for the EC2 gateway and creates a dedicated Lambda subnet in the same
 availability zone. The Lambda subnet has no automatic public IPv4 assignment
-and an explicitly associated route table with only the VPC-local route. A
-DynamoDB gateway endpoint is associated only with that route table. Omitting an
-endpoint policy intentionally selects the AWS default full-access endpoint
-policy; the Lambda role's table-scoped IAM policy remains the authorization
+and an explicitly associated route table with only the VPC-local route. The SAM
+stack associates its DynamoDB gateway endpoint only with that route table and
+uses AWS's documented default full-access endpoint policy. The execution
+role's table-scoped `dynamodb:UpdateItem` policy remains the authorization
 boundary.
 
 Recheck the live VPC, availability zone, CIDR availability, and gateway default
@@ -645,8 +646,8 @@ aws ec2 describe-subnets \
 
 Stop if the selected CIDR is already allocated, the public subnet is not in
 `ca-central-1a`, or its effective route table does not have an active internet
-gateway default route. Once those checks pass, create and tag the manual
-resources:
+gateway default route. Once those checks pass, create and tag the
+operator-owned subnet, route table, and association:
 
 ```sh
 lambda_subnet_id="$(aws ec2 create-subnet \
@@ -680,57 +681,26 @@ lambda_route_table_association_id="$(aws ec2 associate-route-table \
   --output text \
   --profile dev \
   --region ca-central-1)"
-
-dynamodb_endpoint_id="$(aws ec2 create-vpc-endpoint \
-  --vpc-id "$vpc_id" \
-  --vpc-endpoint-type Gateway \
-  --service-name com.amazonaws.ca-central-1.dynamodb \
-  --route-table-ids "$lambda_route_table_id" \
-  --tag-specifications \
-    'ResourceType=vpc-endpoint,Tags=[{Key=Project,Value=aws-lambda-zig-demo},{Key=Purpose,Value=wireguard-execution-lambda},{Key=ManagedBy,Value=manual},{Key=Name,Value=aws-lambda-zig-demo-wireguard-dynamodb}]' \
-  --query VpcEndpoint.VpcEndpointId \
-  --output text \
-  --profile dev \
-  --region ca-central-1)"
-for endpoint_attempt in $(seq 1 30); do
-  endpoint_state="$(aws ec2 describe-vpc-endpoints \
-    --vpc-endpoint-ids "$dynamodb_endpoint_id" \
-    --query 'VpcEndpoints[0].State' \
-    --output text \
-    --profile dev \
-    --region ca-central-1)"
-  [ "$endpoint_state" != available ] || break
-  [ "$endpoint_state" = pending ] || exit 1
-  sleep 2
-done
-[ "$endpoint_state" = available ]
 ```
 
-Record the four returned identifiers only in the operator session. If a step
+Record the three returned identifiers only in the operator session. If a step
 fails before deployment starts, delete only resources created in that attempt,
-in reverse order: endpoint, route-table association, route table, then subnet.
-Once deployment starts, retain the topology for diagnosis or retry.
+in reverse order: route-table association, route table, then subnet. Once
+deployment starts, retain the topology for diagnosis or retry.
 
-These resources are operator-owned outside SAM. Disabling or deleting the
-stack removes the stack-owned `10.200.0.0/24` route and VPC attachment but does
-not remove this subnet, route table, association, or endpoint. For intentional
-final cleanup, first disable or delete the stack, then run:
+The endpoint's AWS-managed prefix-list route takes precedence for same-Region
+DynamoDB traffic. `deploy.sh` and the template do not remove or alter an
+operator-owned NAT or default route, because other subnets or workloads may
+depend on it. Remove an existing NAT path only after auditing every route-table
+association and all unrelated egress requirements.
+
+The subnet, route table, and association remain operator-owned outside SAM.
+Disabling or deleting the stack removes the endpoint, its prefix-list route,
+the stack-owned `10.200.0.0/24` route, and the execution VPC attachment. For
+intentional final cleanup, first disable or delete the stack, verify the
+endpoint output is gone, then run:
 
 ```sh
-aws ec2 delete-vpc-endpoints \
-  --vpc-endpoint-ids "$dynamodb_endpoint_id" \
-  --profile dev \
-  --region ca-central-1
-for endpoint_attempt in $(seq 1 30); do
-  endpoint_state="$(aws ec2 describe-vpc-endpoints \
-    --vpc-endpoint-ids "$dynamodb_endpoint_id" \
-    --query 'VpcEndpoints[0].State' \
-    --output text \
-    --profile dev \
-    --region ca-central-1 2>/dev/null || true)"
-  case "$endpoint_state" in deleted | None | '') break ;; esac
-  sleep 2
-done
 aws ec2 disassociate-route-table \
   --association-id "$lambda_route_table_association_id" \
   --profile dev \
@@ -744,6 +714,138 @@ aws ec2 delete-subnet \
   --profile dev \
   --region ca-central-1
 ```
+
+### Import a legacy unmanaged DynamoDB endpoint
+
+An older deployment may already have an operator-created DynamoDB endpoint on
+`LambdaRouteTableId`. Normal deployment stops with a migration-specific error
+instead of letting CloudFormation create a conflicting route. Import is
+permitted only when the endpoint is `available`, is a `Gateway` endpoint for
+`com.amazonaws.<region>.dynamodb` in `VpcId`, is associated exclusively with
+`LambdaRouteTableId`, and has exactly the documented default full-access
+policy. A shared endpoint or custom policy is rejected and is never changed by
+`deploy.sh`.
+
+Keep the live endpoint ID only in the operator session. First run
+`deploy.sh --enable-wireguard-gateway` through preflight and stop at its import
+error; any other endpoint validation error must be resolved without this
+procedure. CloudFormation import operations cannot add or modify stack outputs,
+and unspecified parameters use the new template's defaults. Create an
+import-only copy that omits the new endpoint output, and explicitly preserve
+every parameter already stored on the stack. The parameter query below returns
+only parameter names and `UsePreviousValue`; it does not read or persist their
+values.
+
+Then package the import-only template and create a manual `IMPORT` change set:
+
+```sh
+stack_name='aws-lambda-zig-demo'
+region='ca-central-1'
+profile='dev'
+dynamodb_endpoint_id='<legacy-vpc-endpoint-id>'
+change_set_name='import-execution-dynamodb-endpoint'
+import_source_template="$(mktemp "${TMPDIR:-/tmp}/endpoint-import-source.XXXXXX")"
+packaged_template="$(mktemp "${TMPDIR:-/tmp}/endpoint-import-packaged.XXXXXX")"
+
+awk '
+  /^  ExecutionDynamoDBGatewayEndpointId:$/ { omit = 1; next }
+  omit && /^  [A-Za-z0-9][A-Za-z0-9_-]*:$/ { omit = 0 }
+  !omit { print }
+' template.yaml >"$import_source_template"
+grep -q '^  ExecutionDynamoDBGatewayEndpoint:$' "$import_source_template" || {
+  printf 'import template is missing ExecutionDynamoDBGatewayEndpoint\n' >&2
+  exit 1
+}
+if grep -q '^  ExecutionDynamoDBGatewayEndpointId:$' "$import_source_template"; then
+  printf 'import template still contains ExecutionDynamoDBGatewayEndpointId\n' >&2
+  exit 1
+fi
+
+stack_parameters="$(
+  aws cloudformation describe-stacks \
+    --stack-name "$stack_name" \
+    --query 'Stacks[0].Parameters[].{ParameterKey:ParameterKey,UsePreviousValue:`true`}' \
+    --output json \
+    --profile "$profile" \
+    --region "$region"
+)"
+
+sam package \
+  --template-file "$import_source_template" \
+  --resolve-s3 \
+  --output-template-file "$packaged_template" \
+  --profile "$profile" \
+  --region "$region"
+aws cloudformation create-change-set \
+  --stack-name "$stack_name" \
+  --change-set-name "$change_set_name" \
+  --change-set-type IMPORT \
+  --template-body "file://$packaged_template" \
+  --resources-to-import \
+    "ResourceType=AWS::EC2::VPCEndpoint,LogicalResourceId=ExecutionDynamoDBGatewayEndpoint,ResourceIdentifier={Id=$dynamodb_endpoint_id}" \
+  --parameters "$stack_parameters" \
+  --capabilities CAPABILITY_IAM \
+  --profile "$profile" \
+  --region "$region"
+aws cloudformation wait change-set-create-complete \
+  --stack-name "$stack_name" \
+  --change-set-name "$change_set_name" \
+  --profile "$profile" \
+  --region "$region"
+aws cloudformation describe-change-set \
+  --stack-name "$stack_name" \
+  --change-set-name "$change_set_name" \
+  --query '[Status,ExecutionStatus,Changes[].[ResourceChange.Action,ResourceChange.LogicalResourceId,ResourceChange.ResourceType]]' \
+  --output json \
+  --profile "$profile" \
+  --region "$region"
+```
+
+Do not execute unless the change set is `CREATE_COMPLETE` and `AVAILABLE` and
+contains exactly one change: `Import`, `ExecutionDynamoDBGatewayEndpoint`,
+`AWS::EC2::VPCEndpoint`. Delete the change set and investigate if anything else
+appears. Once that exact check passes, execute it and verify the stack and
+resource ownership before returning to `deploy.sh`:
+
+```sh
+aws cloudformation execute-change-set \
+  --stack-name "$stack_name" \
+  --change-set-name "$change_set_name" \
+  --profile "$profile" \
+  --region "$region"
+aws cloudformation wait stack-import-complete \
+  --stack-name "$stack_name" \
+  --profile "$profile" \
+  --region "$region"
+aws cloudformation describe-stacks \
+  --stack-name "$stack_name" \
+  --query 'Stacks[0].StackStatus' \
+  --output text \
+  --profile "$profile" \
+  --region "$region"
+aws cloudformation describe-stack-resource \
+  --stack-name "$stack_name" \
+  --logical-resource-id ExecutionDynamoDBGatewayEndpoint \
+  --query 'StackResourceDetail.[ResourceStatus,PhysicalResourceId]' \
+  --output text \
+  --profile "$profile" \
+  --region "$region"
+```
+
+The stack status must be `IMPORT_COMPLETE`, and the resource's physical ID must
+equal the session's legacy endpoint ID. The resource status may subsequently
+become `UPDATE_COMPLETE` when CloudFormation applies stack-level tags to the
+imported endpoint; the successful stack import and physical-ID mapping are the
+decisive checks. Remove both temporary templates only after verification:
+
+```sh
+rm -f -- "$import_source_template" "$packaged_template"
+```
+
+Then rerun `deploy.sh --enable-wireguard-gateway` with the same network inputs.
+That normal deployment adds `ExecutionDynamoDBGatewayEndpointId` to the stack
+outputs; adding it was intentionally deferred because outputs cannot change
+during the import operation.
 
 ### Create the workstation key
 
@@ -949,9 +1051,10 @@ does not perform the required Lambda VPC-detach wait and could remove ENI
 permissions too early. Use `deploy.sh` for disablement, or manually reproduce
 its two phases with `RetainExecutionVpcCleanupResources=true`, a verified wait
 for zero VPC-configured Lambda versions and zero ENIs on the retained security
-group, then `RetainExecutionVpcCleanupResources=false`. Direct SAM commands also
-do not perform `deploy.sh` subnet discovery, SSM generation, or enabled-stack
-reuse.
+group, both `VpcId` and `LambdaRouteTableId` preserved, then
+`RetainExecutionVpcCleanupResources=false`. This keeps the endpoint until the
+final phase. Direct SAM commands also do not perform `deploy.sh` subnet
+discovery, SSM generation, or enabled-stack reuse.
 To enable the gateway in guided mode, supply every opt-in parameter. Use the
 variables populated by the manual key workflow above and replace only the
 network placeholders:
@@ -1048,16 +1151,17 @@ WIREGUARD_WORKSTATION_PUBLIC_KEY="$wireguard_workstation_public_key" \
 ```
 
 The helper considers available IPv4 subnets. A gateway candidate has an active
-internet-gateway default route. A Lambda candidate is distinct, in the same VPC
-and availability zone, and reaches DynamoDB through an active NAT default route
-or a DynamoDB gateway endpoint on its effective route table. Neither subnet may
-overlap `10.200.0.0/24`. An explicit VPC or one subnet narrows the search. Each
-constrained subnet is inspected once. If no pair remains, the helper prints
-rejection counts for gateway routing, Lambda DynamoDB access, CIDR overlap,
-subnet identity, VPC, and availability zone. AWS API or malformed-response
-failures are reported separately instead of being counted as topology
-rejections. If multiple pairs remain, the helper prints every pair and a
-specific ambiguity error. Use the reported IDs to constrain that selection:
+internet-gateway default route. A Lambda candidate is distinct and in the same
+VPC and availability zone; it does not need NAT or a pre-existing endpoint.
+Its effective route table must be eligible for the stack-managed endpoint.
+Neither subnet may overlap `10.200.0.0/24`. An explicit VPC or one subnet
+narrows the search. Each constrained subnet is inspected once. If no pair
+remains, the helper prints rejection counts for gateway routing, Lambda
+endpoint management, CIDR overlap, subnet identity, VPC, and availability
+zone. AWS API or malformed-response failures are reported separately instead
+of being counted as topology rejections. If multiple pairs remain, the helper
+prints every pair and a specific ambiguity error. Use the reported IDs to
+constrain that selection:
 
 ```sh
 ./deploy.sh \
@@ -1093,24 +1197,30 @@ deployment without explicit enablement sends `EnableWireGuardGateway=false`,
 but does so in two phases. The detach phase sets
 `RetainExecutionVpcCleanupResources=true`, removing the gateway, Elastic IP,
 route, related resources, and execution VPC attachment while retaining the
-execution security group and ENI-deletion permission. The helper then polls for
-up to 20 minutes until the current function and every published version have an
-empty VPC configuration and no ENI references the retained security group. The
-cleanup phase sets `RetainExecutionVpcCleanupResources=false` only after those
-checks pass. A timeout stops before cleanup; a later `deploy.sh` run recognizes
-the retained phase and resumes the same guarded wait. Both external SSM
-parameters remain operator-owned. After teardown, a later enablement recovers
-the current default SSM pair but does not reuse gateway inputs from the disabled
-stack.
+stack-managed DynamoDB endpoint, execution security group, and ENI-deletion
+permission. The helper passes both `VpcId` and `LambdaRouteTableId` during this
+phase, then polls for up to 20 minutes until the current function and every
+published version have an empty VPC configuration and no ENI references the
+retained security group. The cleanup phase sets
+`RetainExecutionVpcCleanupResources=false` only after those checks pass,
+removing the endpoint and its prefix-list route before the retained group and
+permission disappear. A timeout stops before cleanup; a later `deploy.sh` run
+recognizes the retained phase and resumes the same guarded wait. Both external
+SSM parameters remain operator-owned. After teardown, a later enablement
+recovers the current default SSM pair but does not reuse gateway inputs from the
+disabled stack.
 
 Before building, `deploy.sh` validates the TigerBeetle cluster ID and address
 list and local gateway syntax. Set `TIGERBEETLE_CLUSTER_ID` and
 `TIGERBEETLE_ADDRESSES`, or pass `--tigerbeetle-cluster-id` and
 `--tigerbeetle-addresses`, to override their defaults. A non-dry-run
-deployment discovers and verifies the topology, including the DynamoDB path,
-checks for a conflicting `10.200.0.0/24` route, and reads SSM parameter metadata
-without decrypting the private value. `--dry-run` performs no AWS discovery or
-key creation and reports that gateway preflight is deferred.
+deployment discovers and verifies the topology, including DynamoDB endpoint
+creation eligibility or stack ownership, checks for a conflicting
+`10.200.0.0/24` route, and reads SSM parameter metadata without decrypting the
+private value. A legacy unmanaged endpoint triggers the import procedure above;
+shared, unavailable, duplicate-route, custom-policy, or mismatched endpoints
+are rejected. `--dry-run` performs no AWS discovery or key creation and reports
+that gateway preflight is deferred.
 
 `deploy.sh` reads the required `PASETO_PUBLIC_KEY` from the host environment and
 passes it as the `PasetoPublicKey` SAM parameter. When post-deploy checks are
@@ -1148,8 +1258,8 @@ billing, has only the `id` string partition key, and has no local or global
 secondary indexes. It then resolves the `OperationsQueue` physical resource and calls
 `GetQueueAttributes` to print a concise SQS summary. This probe verifies that
 the deployed queue can be queried but does not enforce SQS attribute values.
-For an enabled deployment, it also prints the seven conditional, non-secret
-gateway outputs. The intake and query Function URL checks then run.
+For an enabled deployment, it also prints the eight conditional, non-secret
+network outputs. The intake and query Function URL checks then run.
 
 Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run --use-local-libs`
@@ -1174,6 +1284,7 @@ ExecutionFunctionArn
 An enabled deployment also emits these conditional outputs:
 
 ```text
+ExecutionDynamoDBGatewayEndpointId
 WireGuardGatewayInstanceId
 WireGuardGatewayElasticIp
 WireGuardGatewayEndpoint
@@ -1194,13 +1305,13 @@ aws cloudformation describe-stacks \
   --region ca-central-1
 ```
 
-Read all conditional gateway outputs without recording their live values in
+Read all conditional network outputs without recording their live values in
 the repository:
 
 ```sh
 aws cloudformation describe-stacks \
   --stack-name aws-lambda-zig-demo \
-  --query "Stacks[0].Outputs[?OutputKey=='WireGuardGatewayInstanceId' || OutputKey=='WireGuardGatewayElasticIp' || OutputKey=='WireGuardGatewayEndpoint' || OutputKey=='WireGuardGatewayPublicKey' || OutputKey=='WireGuardGatewayAddress' || OutputKey=='WireGuardWorkstationAddress' || OutputKey=='TigerBeetleEndpoint'].[OutputKey,OutputValue]" \
+  --query "Stacks[0].Outputs[?OutputKey=='ExecutionDynamoDBGatewayEndpointId' || OutputKey=='WireGuardGatewayInstanceId' || OutputKey=='WireGuardGatewayElasticIp' || OutputKey=='WireGuardGatewayEndpoint' || OutputKey=='WireGuardGatewayPublicKey' || OutputKey=='WireGuardGatewayAddress' || OutputKey=='WireGuardWorkstationAddress' || OutputKey=='TigerBeetleEndpoint'].[OutputKey,OutputValue]" \
   --output table \
   --profile dev \
   --region ca-central-1
@@ -1240,6 +1351,58 @@ workstation firewall must permit TigerBeetle TCP/3000 from
 socket that includes the WireGuard interface; binding only to loopback or a
 different local interface is insufficient. The gateway performs routing, not
 NAT.
+
+### Check the DynamoDB endpoint and routes
+
+Resolve the endpoint output and verify CloudFormation ownership, endpoint
+state, exclusive route-table association, the AWS-managed DynamoDB prefix-list
+route, and the unchanged WireGuard route:
+
+```sh
+dynamodb_endpoint_id="$(
+  aws cloudformation describe-stacks \
+    --stack-name aws-lambda-zig-demo \
+    --query "Stacks[0].Outputs[?OutputKey=='ExecutionDynamoDBGatewayEndpointId'].OutputValue | [0]" \
+    --output text \
+    --profile dev \
+    --region ca-central-1
+)"
+lambda_route_table_id='<lambda-route-table-id>'
+
+aws cloudformation describe-stack-resource \
+  --stack-name aws-lambda-zig-demo \
+  --logical-resource-id ExecutionDynamoDBGatewayEndpoint \
+  --query 'StackResourceDetail.[ResourceStatus,PhysicalResourceId]' \
+  --output text \
+  --profile dev \
+  --region ca-central-1
+aws ec2 describe-vpc-endpoints \
+  --vpc-endpoint-ids "$dynamodb_endpoint_id" \
+  --query 'VpcEndpoints[0].[State,VpcId,ServiceName,VpcEndpointType,RouteTableIds]' \
+  --output table \
+  --profile dev \
+  --region ca-central-1
+aws ec2 describe-route-tables \
+  --route-table-ids "$lambda_route_table_id" \
+  --query "RouteTables[0].Routes[?VpcEndpointId=='$dynamodb_endpoint_id'].[DestinationPrefixListId,VpcEndpointId,State]" \
+  --output table \
+  --profile dev \
+  --region ca-central-1
+aws ec2 describe-route-tables \
+  --route-table-ids "$lambda_route_table_id" \
+  --query "RouteTables[0].Routes[?DestinationCidrBlock=='10.200.0.0/24'].[DestinationCidrBlock,InstanceId,State]" \
+  --output table \
+  --profile dev \
+  --region ca-central-1
+```
+
+The CloudFormation status must be `CREATE_COMPLETE` or `IMPORT_COMPLETE`; the
+physical ID must match the output. The endpoint must be `available`, use the
+regional DynamoDB service and `Gateway` type, and list only
+`lambda_route_table_id`. Its route must be `active` and target the endpoint.
+The `10.200.0.0/24` route must still target the WireGuard instance. With no NAT
+default route, complete one normal execution operation while TigerBeetle is
+reachable and confirm its DynamoDB update succeeds.
 
 ### Check the instance and tunnel
 
@@ -1374,7 +1537,7 @@ aws ec2 wait instance-status-ok \
 | EC2 reaches neither `10.200.0.2` nor TCP/3000 | Check workstation WireGuard state, local routes, and its firewall before checking AWS. |
 | EC2 reaches `10.200.0.2`, but not TCP/3000 | Permit TCP/3000 from `LambdaSubnetCidr` and make TigerBeetle listen on `10.200.0.2:3000` or an inclusive bind address. |
 | EC2 works, but Lambda cannot reach the overlay | Confirm the `10.200.0.0/24` VPC route, `SourceDestCheck=false`, execution VPC attachment, and TCP/3000 security-group egress. |
-| Execution loses DynamoDB access after VPC attachment | Restore the Lambda subnet's NAT path or DynamoDB gateway endpoint; an internet gateway on the public gateway subnet does not provide Lambda egress. |
+| Execution loses DynamoDB access after VPC attachment | Confirm `ExecutionDynamoDBGatewayEndpoint` is `CREATE_COMPLETE`, `IMPORT_COMPLETE`, or `UPDATE_COMPLETE`, the endpoint is `available`, and its regional DynamoDB prefix-list route targets the endpoint from `LambdaRouteTableId`. |
 | SSM registration or bootstrap fails | Check gateway-subnet internet routing, the instance role, `cloud-init` logs, and the exact SSM parameter name/version. The role can read only that parameter. |
 
 ### Rotate WireGuard keys

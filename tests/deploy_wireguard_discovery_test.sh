@@ -74,17 +74,14 @@ aws() {
                 return 42
             fi
             case "$route_table_id" in
-                rtb-00000001 | rtb-00000004) printf 'igw-00000001\tNone\n' ;;
-                rtb-00000002 | rtb-00000005) printf 'None\tNone\n' ;;
+                rtb-00000001 | rtb-00000004) printf 'igw-00000001\n' ;;
+                rtb-00000002 | rtb-00000005) printf 'None\n' ;;
                 *) fail_test "unexpected route table inspection: $route_table_id" ;;
             esac
             return 0
             ;;
         "ec2 describe-vpc-endpoints "*)
-            case "$arguments" in
-                *rtb-00000002* | *rtb-00000005*) printf '1\n' ;;
-                *) printf '0\n' ;;
-            esac
+            printf 'None\n'
             return 0
             ;;
         *) fail_test "unexpected mocked AWS call: $arguments" ;;
@@ -113,9 +110,9 @@ fi
 assert_contains "$zero_output" "WireGuard subnet candidates:"
 assert_contains "$zero_output" "(none)"
 assert_contains "$zero_output" "gateway routing: 1"
-assert_contains "$zero_output" "Lambda DynamoDB access: 1"
+assert_contains "$zero_output" "Lambda endpoint management: 0"
 assert_contains "$zero_output" "CIDR overlap: 1"
-assert_contains "$zero_output" "subnet identity: 0"
+assert_contains "$zero_output" "subnet identity: 1"
 assert_contains "$zero_output" "VPC: 0"
 assert_contains "$zero_output" "Availability Zone: 1"
 assert_contains "$zero_output" "no WireGuard subnet pair satisfies the required topology"
@@ -132,6 +129,7 @@ unique_output="$(run_discovery unique 2>&1)" ||
     fail_test "unique-candidate discovery failed"
 assert_contains "$unique_output" "Gateway subnet: subnet-00000001"
 assert_contains "$unique_output" "Lambda subnet: subnet-00000002"
+assert_contains "$unique_output" "Lambda route table: rtb-00000002"
 for inspected_id in subnet-00000001 subnet-00000002; do
     inspection_count="$(grep -c "^${inspected_id}$" "$MOCK_CALL_LOG")"
     [ "$inspection_count" -eq 1 ] ||
@@ -148,6 +146,109 @@ case "$inspection_output" in
         fail_test "AWS inspection failure was reported as ordinary topology rejection"
         ;;
 esac
+
+DEFAULT_ENDPOINT_POLICY='{"Version":"2008-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}]}'
+
+run_endpoint_preflight() (
+    local scenario="$1"
+    local mock_endpoint_id=vpce-00000001
+
+    REGION=ca-central-1
+    STACK_NAME=example-stack
+    VPC_ID=vpc-00000001
+    LAMBDA_ROUTE_TABLE_ID=rtb-00000002
+
+    dynamodb_gateway_endpoint_ids_for_route_table() {
+        case "$scenario" in
+            absent | separate_route) printf 'None\n' ;;
+            duplicate) printf 'vpce-00000001\tvpce-00000002\n' ;;
+            *) printf '%s\n' "$mock_endpoint_id" ;;
+        esac
+    }
+    stack_dynamodb_gateway_endpoint_id() {
+        case "$scenario" in
+            stack_owned | stack_mismatched_route) printf '%s\n' "$mock_endpoint_id" ;;
+            *) return 1 ;;
+        esac
+    }
+    dynamodb_gateway_endpoint_details() {
+        local details_vpc=vpc-00000001
+        local details_service=com.amazonaws.ca-central-1.dynamodb
+        local details_type=Gateway
+        local details_state=available
+        local route_table_count=1
+        local has_route_table=True
+
+        case "$scenario" in
+            shared) route_table_count=2 ;;
+            unavailable) details_state=pending ;;
+            mismatched_vpc) details_vpc=vpc-00000009 ;;
+            mismatched_service) details_service=com.amazonaws.ca-central-1.s3 ;;
+            mismatched_type) details_type=Interface ;;
+            stack_mismatched_route) has_route_table=False ;;
+        esac
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$mock_endpoint_id" \
+            "$details_vpc" \
+            "$details_service" \
+            "$details_type" \
+            "$details_state" \
+            "$route_table_count" \
+            "$has_route_table"
+    }
+    dynamodb_gateway_endpoint_policy() {
+        case "$scenario" in
+            custom_policy)
+                printf '%s\n' \
+                    '{"Version":"2008-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"dynamodb:GetItem","Resource":"*"}]}'
+                ;;
+            *) printf '%s\n' "$DEFAULT_ENDPOINT_POLICY" ;;
+        esac
+    }
+
+    preflight_dynamodb_gateway_endpoint
+)
+
+absent_output="$(run_endpoint_preflight absent 2>&1)" ||
+    fail_test "absent endpoint was not eligible for stack creation"
+assert_contains "$absent_output" "eligible for a stack-managed DynamoDB gateway endpoint"
+
+separate_output="$(run_endpoint_preflight separate_route 2>&1)" ||
+    fail_test "endpoint on another route table blocked stack creation"
+assert_contains "$separate_output" "eligible for a stack-managed DynamoDB gateway endpoint"
+
+stack_owned_output="$(run_endpoint_preflight stack_owned 2>&1)" ||
+    fail_test "correct stack-owned endpoint was rejected"
+assert_contains "$stack_owned_output" "Reusing stack-owned DynamoDB gateway endpoint"
+
+if unmanaged_output="$(run_endpoint_preflight unmanaged 2>&1)"; then
+    fail_test "unmanaged importable endpoint was accepted for normal deployment"
+fi
+assert_contains "$unmanaged_output" "must be imported as ExecutionDynamoDBGatewayEndpoint"
+
+for rejected_scenario in \
+    shared \
+    unavailable \
+    duplicate \
+    mismatched_vpc \
+    mismatched_service \
+    mismatched_type \
+    stack_mismatched_route \
+    custom_policy
+do
+    if rejected_output="$(run_endpoint_preflight "$rejected_scenario" 2>&1)"; then
+        fail_test "$rejected_scenario DynamoDB endpoint was accepted"
+    fi
+    case "$rejected_scenario" in
+        shared | stack_mismatched_route) assert_contains "$rejected_output" "associated exclusively" ;;
+        unavailable) assert_contains "$rejected_output" "expected available" ;;
+        duplicate) assert_contains "$rejected_output" "more than one DynamoDB gateway endpoint route" ;;
+        mismatched_vpc) assert_contains "$rejected_output" "does not belong to VPC_ID" ;;
+        mismatched_service) assert_contains "$rejected_output" "mismatched service" ;;
+        mismatched_type) assert_contains "$rejected_output" "is not a Gateway endpoint" ;;
+        custom_policy) assert_contains "$rejected_output" "custom policy" ;;
+    esac
+done
 
 resolve_default_wireguard_keypair() {
     printf '%s\n%s\n' "$1" "$2"

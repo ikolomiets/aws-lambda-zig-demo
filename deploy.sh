@@ -375,30 +375,17 @@ load_prior_wireguard_configuration() {
     printf '==> Reused unspecified WireGuard values from the enabled stack\n'
 }
 
-lambda_subnet_has_dynamodb_access() {
+dynamodb_gateway_endpoint_ids_for_route_table() {
     local route_table_id="$1"
     local vpc_id="$2"
-    local nat_gateway_id endpoint_count
 
-    nat_gateway_id="$(aws ec2 describe-route-tables \
-        --route-table-ids "$route_table_id" \
-        --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0' && State=='active'].NatGatewayId | [0]" \
-        --output text \
-        --region "$REGION")" || return 1
-    case "$nat_gateway_id" in
-        nat-*) return 0 ;;
-    esac
-
-    endpoint_count="$(aws ec2 describe-vpc-endpoints \
+    aws ec2 describe-vpc-endpoints \
         --filters \
         "Name=vpc-id,Values=$vpc_id" \
         "Name=service-name,Values=com.amazonaws.$REGION.dynamodb" \
-        "Name=vpc-endpoint-state,Values=available" \
-        --query "length(VpcEndpoints[?contains(RouteTableIds, '$route_table_id')])" \
+        --query "VpcEndpoints[?contains(RouteTableIds, '$route_table_id')].VpcEndpointId" \
         --output text \
-        --region "$REGION")" || return 1
-    [[ "$endpoint_count" =~ ^[0-9]+$ ]] || return 1
-    [ "$endpoint_count" -gt 0 ]
+        --region "$REGION"
 }
 
 inspect_wireguard_subnet() {
@@ -407,8 +394,8 @@ inspect_wireguard_subnet() {
     local availability_zone="$3"
     local cidr="$4"
     local inspect_dynamodb="$5"
-    local cidr_overlaps=0 route_table_id route_targets
-    local gateway_id=None nat_gateway_id=None dynamodb_access=0 endpoint_count
+    local cidr_overlaps=0 route_table_id gateway_id=None endpoint_ids endpoint_id
+    local endpoint_count=0 endpoint_manageable=0
 
     if ipv4_cidr_overlaps_wireguard "$cidr"; then
         cidr_overlaps=1
@@ -429,43 +416,44 @@ inspect_wireguard_subnet() {
                 "$subnet_id" >&2
             return 1
         }
-        route_targets="$(aws ec2 describe-route-tables \
+        gateway_id="$(aws ec2 describe-route-tables \
             --route-table-ids "$route_table_id" \
-            --query "RouteTables[0].[Routes[?DestinationCidrBlock=='0.0.0.0/0' && State=='active'].GatewayId | [0], Routes[?DestinationCidrBlock=='0.0.0.0/0' && State=='active'].NatGatewayId | [0]]" \
+            --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0' && State=='active'].GatewayId | [0]" \
             --output text \
             --region "$REGION")" || {
             printf 'AWS inspection failed: could not inspect route table %s for subnet %s\n' \
                 "$route_table_id" "$subnet_id" >&2
             return 1
         }
-        read -r gateway_id nat_gateway_id <<<"$route_targets"
         gateway_id="${gateway_id:-None}"
-        nat_gateway_id="${nat_gateway_id:-None}"
 
         if [ "$inspect_dynamodb" -eq 1 ]; then
-            case "$nat_gateway_id" in
-                nat-*) dynamodb_access=1 ;;
+            endpoint_ids="$(dynamodb_gateway_endpoint_ids_for_route_table \
+                "$route_table_id" \
+                "$vpc_id")" || {
+                printf 'AWS inspection failed: could not inspect DynamoDB endpoints for subnet %s\n' \
+                    "$subnet_id" >&2
+                return 1
+            }
+            case "$endpoint_ids" in
+                "" | None) ;;
                 *)
-                    endpoint_count="$(aws ec2 describe-vpc-endpoints \
-                        --filters \
-                        "Name=vpc-id,Values=$vpc_id" \
-                        "Name=service-name,Values=com.amazonaws.$REGION.dynamodb" \
-                        "Name=vpc-endpoint-state,Values=available" \
-                        --query "length(VpcEndpoints[?contains(RouteTableIds, '$route_table_id')])" \
-                        --output text \
-                        --region "$REGION")" || {
-                        printf 'AWS inspection failed: could not inspect DynamoDB access for subnet %s\n' \
-                            "$subnet_id" >&2
-                        return 1
-                    }
-                    if ! [[ "$endpoint_count" =~ ^[0-9]+$ ]]; then
-                        printf 'AWS inspection failed: invalid DynamoDB endpoint count for subnet %s\n' \
-                            "$subnet_id" >&2
-                        return 1
-                    fi
-                    [ "$endpoint_count" -eq 0 ] || dynamodb_access=1
+                    for endpoint_id in $endpoint_ids; do
+                        [[ "$endpoint_id" =~ ^vpce-([0-9a-f]{8}|[0-9a-f]{17})$ ]] || {
+                            printf 'AWS inspection failed: invalid DynamoDB endpoint ID for subnet %s\n' \
+                                "$subnet_id" >&2
+                            return 1
+                        }
+                        endpoint_count=$((endpoint_count + 1))
+                    done
                     ;;
             esac
+            [ "$endpoint_count" -le 1 ] || {
+                printf 'AWS inspection failed: route table %s has more than one DynamoDB gateway endpoint route\n' \
+                    "$route_table_id" >&2
+                return 1
+            }
+            endpoint_manageable=1
         fi
     fi
 
@@ -477,7 +465,7 @@ inspect_wireguard_subnet() {
         "$cidr_overlaps" \
         "${route_table_id:-None}" \
         "$gateway_id" \
-        "$dynamodb_access"
+        "$endpoint_manageable"
 }
 
 print_wireguard_candidates() {
@@ -513,13 +501,13 @@ discover_wireguard_network() {
     local requested_lambda_route_table_id="$LAMBDA_ROUTE_TABLE_ID"
     local subnets candidate inspected_subnet
     local subnet_id subnet_vpc_id subnet_az subnet_cidr subnet_cidr_overlaps
-    local subnet_route_table_id subnet_gateway_id subnet_dynamodb_access
+    local subnet_route_table_id subnet_gateway_id subnet_endpoint_manageable
     local gateway_id gateway_vpc_id gateway_az gateway_cidr gateway_route_table_id
     local lambda_id lambda_vpc_id lambda_az lambda_cidr lambda_route_table_id
     local resolved_gateway_id resolved_lambda_id resolved_vpc_id resolved_az
     local resolved_lambda_cidr resolved_lambda_route_table_id
     local gateway_allowed lambda_allowed
-    local rejection_gateway_routing=0 rejection_lambda_dynamodb=0
+    local rejection_gateway_routing=0 rejection_lambda_endpoint=0
     local rejection_cidr_overlap=0 rejection_subnet_identity=0
     local rejection_vpc=0 rejection_availability_zone=0
     local -a candidates=()
@@ -567,7 +555,7 @@ discover_wireguard_network() {
             subnet_cidr_overlaps \
             subnet_route_table_id \
             subnet_gateway_id \
-            subnet_dynamodb_access <<<"$inspected_subnet"
+            subnet_endpoint_manageable <<<"$inspected_subnet"
 
         if [ "$subnet_cidr_overlaps" -eq 1 ]; then
             rejection_cidr_overlap=$((rejection_cidr_overlap + 1))
@@ -584,12 +572,12 @@ discover_wireguard_network() {
             esac
         fi
         if [ "$lambda_allowed" -eq 1 ]; then
-            if [ "$subnet_dynamodb_access" -eq 1 ]; then
+            if [ "$subnet_endpoint_manageable" -eq 1 ]; then
                 lambda_subnets+=(
                     "$subnet_id|$subnet_vpc_id|$subnet_az|$subnet_cidr|$subnet_route_table_id"
                 )
             else
-                rejection_lambda_dynamodb=$((rejection_lambda_dynamodb + 1))
+                rejection_lambda_endpoint=$((rejection_lambda_endpoint + 1))
             fi
         fi
     done <<<"$subnets"
@@ -625,7 +613,7 @@ discover_wireguard_network() {
             print_wireguard_candidates
             printf 'WireGuard topology rejection counts:\n' >&2
             printf '    gateway routing: %s\n' "$rejection_gateway_routing" >&2
-            printf '    Lambda DynamoDB access: %s\n' "$rejection_lambda_dynamodb" >&2
+            printf '    Lambda endpoint management: %s\n' "$rejection_lambda_endpoint" >&2
             printf '    CIDR overlap: %s\n' "$rejection_cidr_overlap" >&2
             printf '    subnet identity: %s\n' "$rejection_subnet_identity" >&2
             printf '    VPC: %s\n' "$rejection_vpc" >&2
@@ -923,6 +911,150 @@ stack_owns_wireguard_route() {
     [ "$stack_instance_id" = "$route_instance_id" ]
 }
 
+stack_dynamodb_gateway_endpoint_id() {
+    local endpoint_id
+
+    if endpoint_id="$(aws cloudformation describe-stack-resource \
+        --stack-name "$STACK_NAME" \
+        --logical-resource-id ExecutionDynamoDBGatewayEndpoint \
+        --query StackResourceDetail.PhysicalResourceId \
+        --output text \
+        --region "$REGION" 2>&1)"
+    then
+        case "$endpoint_id" in
+            "" | None) return 2 ;;
+        esac
+        printf '%s\n' "$endpoint_id"
+        return 0
+    fi
+
+    case "$endpoint_id" in
+        *"does not exist"* | *"Unable to find details"*) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+dynamodb_gateway_endpoint_details() {
+    local endpoint_id="$1"
+    local route_table_id="$2"
+
+    aws ec2 describe-vpc-endpoints \
+        --vpc-endpoint-ids "$endpoint_id" \
+        --query "VpcEndpoints[0].[VpcEndpointId,VpcId,ServiceName,VpcEndpointType,State,length(RouteTableIds),contains(RouteTableIds, '$route_table_id')]" \
+        --output text \
+        --region "$REGION"
+}
+
+dynamodb_gateway_endpoint_policy() {
+    local endpoint_id="$1"
+
+    aws ec2 describe-vpc-endpoints \
+        --vpc-endpoint-ids "$endpoint_id" \
+        --query 'VpcEndpoints[0].PolicyDocument' \
+        --output text \
+        --region "$REGION"
+}
+
+endpoint_policy_is_default_full_access() {
+    local policy="$1"
+    local compact_policy
+
+    compact_policy="$(printf '%s' "$policy" | tr -d '[:space:]')"
+    [ "$compact_policy" = \
+        '{"Version":"2008-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}]}' ]
+}
+
+validate_dynamodb_gateway_endpoint() {
+    local endpoint_id="$1"
+    local require_default_policy="$2"
+    local endpoint_details actual_endpoint_id endpoint_vpc_id service_name
+    local endpoint_type endpoint_state route_table_count has_route_table policy
+
+    endpoint_details="$(dynamodb_gateway_endpoint_details \
+        "$endpoint_id" \
+        "$LAMBDA_ROUTE_TABLE_ID")" ||
+        fail "could not inspect DynamoDB gateway endpoint $endpoint_id"
+    read -r \
+        actual_endpoint_id \
+        endpoint_vpc_id \
+        service_name \
+        endpoint_type \
+        endpoint_state \
+        route_table_count \
+        has_route_table <<<"$endpoint_details"
+
+    [ "$actual_endpoint_id" = "$endpoint_id" ] ||
+        fail "DynamoDB gateway endpoint $endpoint_id does not exist in $REGION"
+    [ "$endpoint_vpc_id" = "$VPC_ID" ] ||
+        fail "DynamoDB gateway endpoint $endpoint_id does not belong to VPC_ID"
+    [ "$service_name" = "com.amazonaws.$REGION.dynamodb" ] ||
+        fail "DynamoDB gateway endpoint $endpoint_id has a mismatched service"
+    [ "$endpoint_type" = Gateway ] ||
+        fail "DynamoDB gateway endpoint $endpoint_id is not a Gateway endpoint"
+    [ "$endpoint_state" = available ] ||
+        fail "DynamoDB gateway endpoint $endpoint_id is $endpoint_state; expected available"
+    [[ "$route_table_count" =~ ^[0-9]+$ ]] ||
+        fail "DynamoDB gateway endpoint $endpoint_id returned an invalid route-table count"
+    [ "$route_table_count" -eq 1 ] && [ "$has_route_table" = True ] ||
+        fail "DynamoDB gateway endpoint $endpoint_id must be associated exclusively with LAMBDA_ROUTE_TABLE_ID"
+
+    [ "$require_default_policy" = true ] || return 0
+    policy="$(dynamodb_gateway_endpoint_policy "$endpoint_id")" ||
+        fail "could not inspect the policy for DynamoDB gateway endpoint $endpoint_id"
+    endpoint_policy_is_default_full_access "$policy" ||
+        fail "unmanaged DynamoDB gateway endpoint $endpoint_id has a custom policy and cannot be imported safely"
+}
+
+preflight_dynamodb_gateway_endpoint() {
+    local endpoint_ids endpoint_id stack_endpoint_id="" stack_endpoint_status
+    local -a route_endpoint_ids=()
+
+    endpoint_ids="$(dynamodb_gateway_endpoint_ids_for_route_table \
+        "$LAMBDA_ROUTE_TABLE_ID" \
+        "$VPC_ID")" ||
+        fail "could not inspect DynamoDB endpoints for LAMBDA_ROUTE_TABLE_ID"
+    case "$endpoint_ids" in
+        "" | None) ;;
+        *)
+            for endpoint_id in $endpoint_ids; do
+                [[ "$endpoint_id" =~ ^vpce-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
+                    fail "LAMBDA_ROUTE_TABLE_ID returned an invalid DynamoDB endpoint ID"
+                route_endpoint_ids+=("$endpoint_id")
+            done
+            ;;
+    esac
+    [ "${#route_endpoint_ids[@]}" -le 1 ] ||
+        fail "LAMBDA_ROUTE_TABLE_ID has more than one DynamoDB gateway endpoint route"
+
+    if stack_endpoint_id="$(stack_dynamodb_gateway_endpoint_id)"; then
+        stack_endpoint_status=0
+    else
+        stack_endpoint_status=$?
+    fi
+    case "$stack_endpoint_status" in
+        0)
+            [[ "$stack_endpoint_id" =~ ^vpce-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
+                fail "stack resource ExecutionDynamoDBGatewayEndpoint has an invalid physical ID"
+            validate_dynamodb_gateway_endpoint "$stack_endpoint_id" false
+            [ "${#route_endpoint_ids[@]}" -eq 1 ] &&
+                [ "${route_endpoint_ids[0]}" = "$stack_endpoint_id" ] ||
+                fail "stack-owned DynamoDB gateway endpoint does not match LAMBDA_ROUTE_TABLE_ID"
+            printf '==> Reusing stack-owned DynamoDB gateway endpoint %s\n' \
+                "$stack_endpoint_id"
+            ;;
+        1)
+            if [ "${#route_endpoint_ids[@]}" -eq 0 ]; then
+                printf '==> LAMBDA_ROUTE_TABLE_ID is eligible for a stack-managed DynamoDB gateway endpoint\n'
+                return 0
+            fi
+            endpoint_id="${route_endpoint_ids[0]}"
+            validate_dynamodb_gateway_endpoint "$endpoint_id" true
+            fail "unmanaged DynamoDB gateway endpoint $endpoint_id must be imported as ExecutionDynamoDBGatewayEndpoint before deployment; see docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md"
+            ;;
+        *) fail "could not inspect stack ownership of ExecutionDynamoDBGatewayEndpoint" ;;
+    esac
+}
+
 preflight_wireguard_gateway() {
     local actual_vpc_id gateway_subnet lambda_subnet lambda_route_table
     local gateway_subnet_id gateway_vpc_id gateway_az gateway_subnet_cidr
@@ -987,8 +1119,7 @@ preflight_wireguard_gateway() {
     )" || fail "could not resolve the Lambda subnet effective route table"
     [ "$effective_lambda_route_table_id" = "$LAMBDA_ROUTE_TABLE_ID" ] ||
         fail "LAMBDA_ROUTE_TABLE_ID is not the Lambda subnet effective route table"
-    lambda_subnet_has_dynamodb_access "$LAMBDA_ROUTE_TABLE_ID" "$VPC_ID" ||
-        fail "Lambda subnet has no DynamoDB access through NAT or a DynamoDB gateway endpoint"
+    preflight_dynamodb_gateway_endpoint
 
     effective_gateway_route_table_id="$(
         effective_route_table_id "$GATEWAY_PUBLIC_SUBNET_ID" "$VPC_ID"
@@ -1088,7 +1219,7 @@ plan_wireguard_deployment() {
     local prior_parameters parameter_key parameter_value
     local prior_gateway_enabled=false
     local prior_cleanup_retained=false
-    local prior_vpc_id=""
+    local prior_vpc_id="" prior_lambda_route_table_id=""
 
     if [ "$ENABLE_WIREGUARD_GATEWAY" -eq 1 ]; then
         WIREGUARD_DEPLOYMENT_MODE=enabled
@@ -1119,6 +1250,7 @@ plan_wireguard_deployment() {
                 prior_cleanup_retained="$parameter_value"
                 ;;
             VpcId) prior_vpc_id="$parameter_value" ;;
+            LambdaRouteTableId) prior_lambda_route_table_id="$parameter_value" ;;
         esac
     done <<<"$prior_parameters"
 
@@ -1131,7 +1263,10 @@ plan_wireguard_deployment() {
         detach-then-cleanup | resume-cleanup)
             [[ "$prior_vpc_id" =~ ^vpc-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
                 fail "enabled stack has no valid VpcId for retained cleanup resources"
+            [[ "$prior_lambda_route_table_id" =~ ^rtb-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
+                fail "enabled stack has no valid LambdaRouteTableId for retained cleanup resources"
             VPC_ID="$prior_vpc_id"
+            LAMBDA_ROUTE_TABLE_ID="$prior_lambda_route_table_id"
             ;;
     esac
 }
@@ -1267,7 +1402,7 @@ wait_for_execution_vpc_cleanup() {
         fi
     done
 
-    fail "execution Lambda VPC cleanup did not finish within the bounded wait; retained permissions and security group remain"
+    fail "execution Lambda VPC cleanup did not finish within the bounded wait; the retained DynamoDB endpoint, permissions, and security group remain"
 }
 
 build_sam_parameter_overrides() {
@@ -1305,7 +1440,10 @@ build_sam_parameter_overrides() {
     else
         SAM_PARAMETER_OVERRIDES+=("EnableWireGuardGateway=false")
         if [ "$retain_cleanup_resources" = true ]; then
-            SAM_PARAMETER_OVERRIDES+=("VpcId=$VPC_ID")
+            SAM_PARAMETER_OVERRIDES+=(
+                "VpcId=$VPC_ID"
+                "LambdaRouteTableId=$LAMBDA_ROUTE_TABLE_ID"
+            )
         fi
     fi
 }
@@ -1817,7 +1955,7 @@ if [ "$ENABLE_WIREGUARD_GATEWAY" -eq 1 ]; then
     printf '==> WireGuard gateway stack outputs\n'
     aws cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='WireGuardGatewayInstanceId' || OutputKey=='WireGuardGatewayElasticIp' || OutputKey=='WireGuardGatewayEndpoint' || OutputKey=='WireGuardGatewayPublicKey' || OutputKey=='WireGuardGatewayAddress' || OutputKey=='WireGuardWorkstationAddress' || OutputKey=='TigerBeetleEndpoint'].[OutputKey,OutputValue]" \
+        --query "Stacks[0].Outputs[?OutputKey=='ExecutionDynamoDBGatewayEndpointId' || OutputKey=='WireGuardGatewayInstanceId' || OutputKey=='WireGuardGatewayElasticIp' || OutputKey=='WireGuardGatewayEndpoint' || OutputKey=='WireGuardGatewayPublicKey' || OutputKey=='WireGuardGatewayAddress' || OutputKey=='WireGuardWorkstationAddress' || OutputKey=='TigerBeetleEndpoint'].[OutputKey,OutputValue]" \
         --output table \
         --region "$REGION"
 fi

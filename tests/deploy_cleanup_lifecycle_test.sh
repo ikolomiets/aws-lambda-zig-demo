@@ -152,6 +152,7 @@ test_enabled_stack_detach_plan() (
             "cloudformation describe-stacks "*)
                 printf 'EnableWireGuardGateway\ttrue\n'
                 printf 'VpcId\tvpc-00000001\n'
+                printf 'LambdaRouteTableId\trtb-00000001\n'
                 ;;
             *) fail_test "unexpected lifecycle-plan AWS call: $*" ;;
         esac
@@ -165,13 +166,37 @@ test_enabled_stack_detach_plan() (
         fail_test "enabled stack did not plan detach-then-cleanup"
     [ "$VPC_ID" = vpc-00000001 ] ||
         fail_test "detach phase did not reuse the enabled stack VPC"
+    [ "$LAMBDA_ROUTE_TABLE_ID" = rtb-00000001 ] ||
+        fail_test "detach phase did not reuse the enabled stack Lambda route table"
 
     build_sam_parameter_overrides true
     joined_overrides=" ${SAM_PARAMETER_OVERRIDES[*]} "
     assert_contains "$joined_overrides" " EnableWireGuardGateway=false "
     assert_contains "$joined_overrides" " RetainExecutionVpcCleanupResources=true "
     assert_contains "$joined_overrides" " VpcId=vpc-00000001 "
+    assert_contains "$joined_overrides" " LambdaRouteTableId=rtb-00000001 "
 )
+
+test_endpoint_cleanup_condition() {
+    local endpoint_template cleanup_condition
+
+    endpoint_template="$(sed -n \
+        '/^  ExecutionDynamoDBGatewayEndpoint:/,/^  WireGuardGatewaySecurityGroup:/p' \
+        "$REPOSITORY_ROOT/template.yaml")"
+    assert_contains "$endpoint_template" \
+        "Condition: ExecutionVpcCleanupResourcesRetained"
+    assert_contains "$endpoint_template" "DeletionPolicy: Delete"
+    assert_contains "$endpoint_template" "UpdateReplacePolicy: Delete"
+    assert_contains "$endpoint_template" "VpcEndpointType: Gateway"
+    assert_contains "$endpoint_template" "- !Ref LambdaRouteTableId"
+
+    cleanup_condition="$(sed -n \
+        '/^  ExecutionVpcCleanupResourcesRetained:/,/^Resources:/p' \
+        "$REPOSITORY_ROOT/template.yaml")"
+    assert_contains "$cleanup_condition" "!Condition WireGuardGatewayEnabled"
+    assert_contains "$cleanup_condition" \
+        '!Equals [!Ref RetainExecutionVpcCleanupResources, "true"]'
+}
 
 MOCK_CONFIGURED_VERSION_COUNT=0
 MOCK_ENI_COUNT=0
@@ -254,6 +279,7 @@ test_cloudformation_outcome_reporting
 test_phase_selection
 test_tigerbeetle_configuration
 test_enabled_stack_detach_plan
+test_endpoint_cleanup_condition
 test_cleanup_readiness
 test_cleanup_refuses_blocking_eni
 test_detach_precedes_cleanup
