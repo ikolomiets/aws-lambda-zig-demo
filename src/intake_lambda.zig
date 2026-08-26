@@ -272,7 +272,7 @@ fn post_invocation_outcome(
             else => .internal_server_error,
         };
     };
-    if (created.state.? != .new) return operation_success_outcome(allocator, &created);
+    if (created.state.? != .submitted) return operation_success_outcome(allocator, &created);
 
     var queued = created;
     queued.body = parsed.body;
@@ -293,7 +293,7 @@ fn operation_message_body(
     queued: *const operation.Operation,
 ) ![]const u8 {
     std.debug.assert(queued.body != null);
-    std.debug.assert(queued.state == .new);
+    std.debug.assert(queued.state == .submitted);
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -502,7 +502,7 @@ test "AWS SDK debug logging is enabled" {
     try std.testing.expect(std.log.logEnabled(.debug, .aws_sdk));
 }
 
-test "authenticated POST persists and queues NEW then returns without its body" {
+test "authenticated POST persists and queues SUBMITTED then returns without its body" {
     const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
         .seed_byte = 0x42,
         .now = 1_700_000_000,
@@ -518,13 +518,13 @@ test "authenticated POST persists and queues NEW then returns without its body" 
             "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}," ++
-            "\"state\":\"NEW\"}",
+            "\"state\":\"SUBMITTED\"}",
     };
     const expected =
         "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
         "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
         "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
-        "\\\"state\\\":\\\"NEW\\\"," ++
+        "\\\"state\\\":\\\"SUBMITTED\\\"," ++
         "\\\"last_updated\\\":1700000000," ++
         "\\\"expires_at\\\":1700086400," ++
         "\\\"hash\\\":\\\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\\\"}\"}";
@@ -532,7 +532,7 @@ test "authenticated POST persists and queues NEW then returns without its body" 
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"tenant\":\"lambda-test-user\",\"name\":\"echo\"," ++
         "\"body\":{\"message\":\"hello\",\"count\":2}," ++
-        "\"state\":\"NEW\",\"last_updated\":1700000000," ++
+        "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
         "\"expires_at\":1700086400," ++
         "\"hash\":\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\"}";
 
@@ -566,7 +566,7 @@ test "authenticated POST persists and queues NEW then returns without its body" 
             operation.uuidFromString("00112233-4455-6677-8899-aabbccddeeff") catch unreachable,
             fake.last_id,
         );
-        try std.testing.expectEqual(operation.State.new, fake.last_state.?);
+        try std.testing.expectEqual(operation.State.submitted, fake.last_state.?);
         try std.testing.expectEqual(@as(i64, 1_700_000_000), fake.last_updated.?);
         try std.testing.expectEqual(@as(i64, 1_700_086_400), fake.last_expires_at.?);
         try std.testing.expectEqualStrings("lambda-test-user", fake.lastTenant());
@@ -601,32 +601,32 @@ test "POST queues every JSON body variant as exact full Operation JSON" {
     const messages = [_][]const u8{
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":null," ++
-            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"hash\":\"fd177e1082fafe25e8ae2bc301281fc4f4a5a0776ab241d35cf9ed91a46db3b3\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":false," ++
-            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"hash\":\"6e18221b306b6bfd8753e910d58beb8cf007da71923dc7b52011f107fbc51d1c\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":42," ++
-            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"hash\":\"d5ccd414185af1692c3678f3cde5756d3bb12a7cbfd0f39f797610b3fa7bd235\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":\"text\"," ++
-            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"hash\":\"576bfabb751a1c5df078d4d24cd5bd66c00cec5b765e898b7eb3743693a0c2bb\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":[1]," ++
-            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"hash\":\"9a2a3875c2b05917ae674a0d5b6f1bfc71d6dec7b3cb71059f9c21f60709cbc9\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":{\"a\":1}," ++
-            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"hash\":\"72773a3103040a8266d9052ef82f5119ea53608cc1aac4ae8844721705e292dd\"}",
     };
@@ -661,7 +661,7 @@ test "POST queues every JSON body variant as exact full Operation JSON" {
         defer std.testing.allocator.free(response);
 
         try std.testing.expectEqualStrings(expected_message, fake.lastMessage());
-        try expectContains(response, "\\\"state\\\":\\\"NEW\\\"");
+        try expectContains(response, "\\\"state\\\":\\\"SUBMITTED\\\"");
         try expectNotContains(response, "\\\"body\\\":");
         try std.testing.expectEqual(@as(u8, 1), fake.send_count);
     }
@@ -716,7 +716,7 @@ test "POST derives tenant and hash from distinct bounded verified subjects" {
     try std.testing.expect(!std.mem.eql(u8, &hashes[0], &hashes[1]));
 }
 
-test "matching NEW POST requeues and returns the stored snapshot" {
+test "matching SUBMITTED POST requeues and returns the stored snapshot" {
     const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
         .seed_byte = 0x52,
         .now = 1_700_000_500,
@@ -749,7 +749,7 @@ test "matching NEW POST requeues and returns the stored snapshot" {
         ) catch unreachable,
         .tenant = "lambda-test-user",
         .name = "echo",
-        .state = .new,
+        .state = .submitted,
         .last_updated = 1_699_999_000,
         .expires_at = 1_700_085_400,
         .hash = expected_hash,
@@ -766,7 +766,7 @@ test "matching NEW POST requeues and returns the stored snapshot" {
     );
     defer std.testing.allocator.free(response);
 
-    try expectContains(response, "\\\"state\\\":\\\"NEW\\\"");
+    try expectContains(response, "\\\"state\\\":\\\"SUBMITTED\\\"");
     try expectContains(response, "\\\"last_updated\\\":1699999000");
     try expectContains(response, "\\\"expires_at\\\":1700085400");
     try expectContains(fake.lastMessage(), "\"body\":{\"message\":\"hello\",\"count\":2}");
@@ -997,7 +997,7 @@ test "POST persistence failures return only the static internal error" {
     }
 }
 
-test "SQS failure leaves NEW unchanged and a matching POST can requeue" {
+test "SQS failure leaves SUBMITTED unchanged and a matching POST can requeue" {
     const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
         .seed_byte = 0x50,
         .now = 1000,
@@ -1045,7 +1045,7 @@ test "SQS failure leaves NEW unchanged and a matching POST can requeue" {
         1001,
     );
     defer std.testing.allocator.free(retried);
-    try expectContains(retried, "NEW");
+    try expectContains(retried, "SUBMITTED");
     try std.testing.expectEqual(@as(u8, 2), fake.create_count);
     try std.testing.expectEqual(@as(u8, 2), fake.send_count);
 }
@@ -1120,7 +1120,9 @@ test "authenticated POST rejects missing and invalid operation JSON" {
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"spoofed\",\"name\":\"echo\",\"body\":null}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"name\":\"echo\",\"body\":null,\"state\":\"SUBMITTED\"}",
+            "\"name\":\"echo\",\"body\":null,\"state\":\"NEW\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"name\":\"echo\",\"body\":null,\"state\":\"PENDING\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"echo\",\"body\":null,\"state\":\"RUNNING\"}",
     };
@@ -1147,7 +1149,8 @@ test "authenticated POST rejects missing and invalid operation JSON" {
 
         try expectBadRequest(response);
         try expectNotContains(response, "invalid-json-marker");
-        try expectNotContains(response, "SUBMITTED");
+        try expectNotContains(response, "NEW");
+        try expectNotContains(response, "PENDING");
         try expectNotContains(response, "RUNNING");
     }
     try std.testing.expectEqual(@as(u8, 0), fake.create_count);

@@ -123,7 +123,7 @@ pub const Persistence = struct {
         return updated;
     }
 
-    /// Completes a queued NEW Operation if its stored identity still matches.
+    /// Completes a queued SUBMITTED Operation if its stored identity still matches.
     pub fn complete(
         self: *Self,
         arena: Allocator,
@@ -466,17 +466,17 @@ fn validateStored(source: *const operation.Operation) !void {
 
 fn validateCreation(source: *const operation.Operation) !void {
     try validateStored(source);
-    if (source.state != .new) return error.InvalidState;
+    if (source.state != .submitted) return error.InvalidState;
 }
 
 fn validateCompletion(queued: *const operation.Operation) !void {
-    if (queued.state != .new) return error.InvalidState;
+    if (queued.state != .submitted) return error.InvalidState;
     if (queued.body == null) return error.MissingBody;
     if (queued.result != null) return error.UnexpectedResult;
     var persisted = queued.*;
     persisted.body = null;
     try validateStored(&persisted);
-    std.debug.assert(persisted.state == .new);
+    std.debug.assert(persisted.state == .submitted);
     std.debug.assert(persisted.result == null);
 }
 
@@ -676,7 +676,7 @@ fn findUpdateValue(request: *const UpdateRequest, key: []const u8) ?AttributeVal
 test "items round trip every state without persisting body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const states = [_]operation.State{ .new, .succeeded, .failed };
+    const states = [_]operation.State{ .submitted, .succeeded, .failed };
     for (states) |state| {
         var source = testOperation(
             state,
@@ -700,7 +700,7 @@ test "items round trip every state without persisting body" {
 }
 
 test "create request uses the exact item contract and returns a failed condition item" {
-    const source = testOperation(.new, null);
+    const source = testOperation(.submitted, null);
     var request: CreateRequest = undefined;
     try createRequestInit(&request, &source);
     try std.testing.expectEqual(@as(u8, 7), request.item_count);
@@ -741,8 +741,8 @@ test "create request uses the exact item contract and returns a failed condition
     );
 }
 
-test "creation requires a NEW persistent Operation" {
-    try validateCreation(&testOperation(.new, null));
+test "creation requires a SUBMITTED persistent Operation" {
+    try validateCreation(&testOperation(.submitted, null));
     try std.testing.expectError(
         error.InvalidState,
         validateCreation(&testOperation(.succeeded, .{ .bool = true })),
@@ -754,7 +754,7 @@ test "creation requires a NEW persistent Operation" {
 }
 
 test "persistent copy omits the private body without copying arena-owned Values" {
-    var source = testOperation(.new, null);
+    var source = testOperation(.submitted, null);
     source.body = .{ .bool = true };
     const created = persistentCopy(&source);
 
@@ -782,7 +782,7 @@ test "read request is strongly consistent and keyed by canonical UUID" {
 test "decoder rejects legacy and malformed tenant attributes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const source = testOperation(.new, null);
+    const source = testOperation(.submitted, null);
     var request: CreateRequest = undefined;
     try createRequestInit(&request, &source);
     const valid = request.items[0..request.item_count];
@@ -817,7 +817,7 @@ test "decoder rejects legacy and malformed tenant attributes" {
 test "decoder rejects duplicate unknown wrong and malformed attributes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const source = testOperation(.new, null);
+    const source = testOperation(.submitted, null);
     var request: CreateRequest = undefined;
     try createRequestInit(&request, &source);
 
@@ -834,7 +834,7 @@ test "decoder rejects duplicate unknown wrong and malformed attributes" {
         decodeItem(arena.allocator(), malformed[0..7]),
     );
     malformed = request.items;
-    for ([_][]const u8{ "SUBMITTED", "RUNNING", "DONE" }) |state| {
+    for ([_][]const u8{ "NEW", "PENDING", "RUNNING", "DONE" }) |state| {
         malformed[3].value = .{ .s = state };
         try std.testing.expectError(
             error.InvalidItem,
@@ -955,7 +955,7 @@ test "terminal result Values round trip through canonical DynamoDB strings" {
 test "updates snapshot every stored field and return all new attributes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const snapshot = testOperation(.new, null);
+    const snapshot = testOperation(.submitted, null);
     var replacement = snapshot;
     replacement.state = .succeeded;
     replacement.last_updated.? += 1;
@@ -975,7 +975,7 @@ test "updates snapshot every stored field and return all new attributes" {
         request.condition_expression,
         "#tenant = :old_tenant",
     ) != null);
-    try std.testing.expectEqualStrings("NEW", try stringValue(
+    try std.testing.expectEqualStrings("SUBMITTED", try stringValue(
         findUpdateValue(&request, ":old_state").?,
     ));
     try std.testing.expectEqualStrings("SUCCEEDED", try stringValue(
@@ -1001,7 +1001,7 @@ test "updates snapshot every stored field and return all new attributes" {
 }
 
 test "completion condition matches queued identity without timestamp conditions" {
-    var queued = testOperation(.new, null);
+    var queued = testOperation(.submitted, null);
     queued.body = .{ .bool = true };
     var request: CompletionRequest = undefined;
     try completionRequestInit(&request, &queued, 1_800_000_000);
@@ -1031,7 +1031,7 @@ test "completion condition matches queued identity without timestamp conditions"
 }
 
 test "completion persists exact success result and record timestamp without returns" {
-    var queued = testOperation(.new, null);
+    var queued = testOperation(.submitted, null);
     queued.body = .{ .bool = true };
     var request: CompletionRequest = undefined;
     try completionRequestInit(&request, &queued, 1_800_000_123);
@@ -1066,14 +1066,14 @@ test "completion persists exact success result and record timestamp without retu
     try std.testing.expect(input.return_values_on_condition_check_failure == null);
 }
 
-test "completion accepts only queued NEW operations with body and no result" {
-    var queued = testOperation(.new, null);
+test "completion accepts only queued SUBMITTED operations with body and no result" {
+    var queued = testOperation(.submitted, null);
     queued.body = .null;
     try validateCompletion(&queued);
 
     queued.state = .succeeded;
     try std.testing.expectError(error.InvalidState, validateCompletion(&queued));
-    queued = testOperation(.new, null);
+    queued = testOperation(.submitted, null);
     try std.testing.expectError(error.MissingBody, validateCompletion(&queued));
     queued.body = .null;
     queued.result = .null;
@@ -1083,7 +1083,7 @@ test "completion accepts only queued NEW operations with body and no result" {
 test "updates enforce every monotonic state transition" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const states = [_]operation.State{ .new, .succeeded, .failed };
+    const states = [_]operation.State{ .submitted, .succeeded, .failed };
     for (states) |current| {
         for (states) |target| {
             const current_result = if (operation.stateIsTerminal(current))
@@ -1099,7 +1099,7 @@ test "updates enforce every monotonic state transition" {
                 try testResult(arena.allocator(), "{\"new\":true}")
             else
                 null;
-            const allowed = current == .new or current == target;
+            const allowed = current == .submitted or current == target;
             if (allowed) {
                 try validateUpdate(&snapshot, &replacement);
             } else {
@@ -1113,7 +1113,7 @@ test "updates enforce every monotonic state transition" {
 }
 
 test "updates allow same state and reject immutable replacements" {
-    const snapshot = testOperation(.new, null);
+    const snapshot = testOperation(.submitted, null);
     var replacement = snapshot;
     replacement.last_updated.? += 1;
     replacement.expires_at.? += 1;
@@ -1145,7 +1145,7 @@ test "updates allow same state and reject immutable replacements" {
 }
 
 test "update result requires the replacement expiration" {
-    const replacement = testOperation(.new, null);
+    const replacement = testOperation(.submitted, null);
     var updated = replacement;
     try validateUpdateResult(&updated, &replacement);
 
@@ -1165,8 +1165,8 @@ test "update result requires the replacement expiration" {
 test "matching create retry returns the stored Operation in every state" {
     var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer result_arena.deinit();
-    const requested = testOperation(.new, null);
-    const states = [_]operation.State{ .new, .succeeded, .failed };
+    const requested = testOperation(.submitted, null);
+    const states = [_]operation.State{ .submitted, .succeeded, .failed };
     for (states) |state| {
         var existing = testOperation(
             state,
@@ -1203,8 +1203,8 @@ test "matching create retry returns the stored Operation in every state" {
 test "create retry conflicts on a hash mismatch in every state" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const requested = testOperation(.new, null);
-    const states = [_]operation.State{ .new, .succeeded, .failed };
+    const requested = testOperation(.submitted, null);
+    const states = [_]operation.State{ .submitted, .succeeded, .failed };
     for (states) |state| {
         var existing = testOperation(
             state,
@@ -1228,7 +1228,7 @@ test "create retry conflicts on a hash mismatch in every state" {
 test "create retry conflicts when a global UUID belongs to another tenant" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const requested = testOperation(.new, null);
+    const requested = testOperation(.submitted, null);
     var existing = requested;
     existing.tenant = "tenant-b";
     var request: CreateRequest = undefined;
@@ -1248,7 +1248,7 @@ test "create retry conflicts when a global UUID belongs to another tenant" {
 test "create failure requires a valid returned item and preserves AWS failures" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const requested = testOperation(.new, null);
+    const requested = testOperation(.submitted, null);
     var missing = dynamodb.ServiceError{
         .kind = .{ .conditional_check_failed_exception = .{} },
     };

@@ -47,7 +47,7 @@ const usage =
     \\  dynamodb update --id <uuid> --state <state>
     \\
     \\States:
-    \\  NEW | SUCCEEDED | FAILED
+    \\  SUBMITTED | SUCCEEDED | FAILED
     \\
     \\Environment:
     \\  OPERATIONS_TABLE_NAME  DynamoDB table containing Operations
@@ -504,7 +504,7 @@ const FakePersistence = struct {
         .id = operation.uuidFromString(test_id) catch unreachable,
         .tenant = "tenant-a",
         .name = "echo",
-        .state = .new,
+        .state = .submitted,
         .last_updated = 1_700_000_000,
         .expires_at = 1_700_086_400,
         .hash = test_hash,
@@ -702,12 +702,12 @@ test "create parses stdin dispatches once and writes canonical JSON" {
     );
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
     try std.testing.expectEqual(@as(u8, 1), fake.create_count);
-    try std.testing.expectEqual(operation.State.new, fake.last_state.?);
+    try std.testing.expectEqual(operation.State.submitted, fake.last_state.?);
     try std.testing.expectEqualStrings("tenant-a", fake.createTenant());
     try std.testing.expectEqualStrings(
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
-            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"hash\":\"d271e3bd560113d2b82e42dfc46be33" ++
             "fb90b43d7f4b12114f3da4888eae445d4\"}\n",
@@ -800,7 +800,7 @@ test "read validates UUID and writes a canonical strongly modeled item" {
         result.stdout(),
         "\"tenant\":\"tenant-a\"",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout(), "\"state\":\"NEW\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout(), "\"state\":\"SUBMITTED\"") != null);
 
     const invalid = runForTest(
         &.{ "dynamodb", "read", "--id", "not-a-uuid" },
@@ -833,8 +833,8 @@ test "read reports missing and AWS failures with stable exit codes" {
     try std.testing.expectEqualStrings("dynamodb: AWS request failed\n", failed.stderr());
 }
 
-test "update accepts every transition from NEW including same-state refresh" {
-    const targets = [_]operation.State{ .new, .succeeded, .failed };
+test "update accepts every transition from SUBMITTED including same-state refresh" {
+    const targets = [_]operation.State{ .submitted, .succeeded, .failed };
     for (targets) |state| {
         var fake: FakePersistence = .{};
         const input = if (operation.stateIsTerminal(state)) "{ \"new\" : true }" else "";
@@ -896,9 +896,9 @@ test "update refreshes a terminal state and rejects reopening or switching it" {
         target: []const u8,
         input: []const u8,
     }{
-        .{ .current = .succeeded, .target = "NEW", .input = "" },
+        .{ .current = .succeeded, .target = "SUBMITTED", .input = "" },
         .{ .current = .succeeded, .target = "FAILED", .input = "true" },
-        .{ .current = .failed, .target = "NEW", .input = "" },
+        .{ .current = .failed, .target = "SUBMITTED", .input = "" },
         .{ .current = .failed, .target = "SUCCEEDED", .input = "true" },
     };
     for (cases) |case| {
@@ -919,7 +919,7 @@ test "update refreshes a terminal state and rejects reopening or switching it" {
 
 test "update rejects removed lifecycle state arguments" {
     var fake: FakePersistence = .{};
-    for ([_][]const u8{ "SUBMITTED", "RUNNING" }) |state| {
+    for ([_][]const u8{ "NEW", "PENDING", "RUNNING" }) |state| {
         const result = runForTest(
             &.{ "dynamodb", "update", "--id", test_id, "--state", state },
             "",
@@ -932,15 +932,15 @@ test "update rejects removed lifecycle state arguments" {
     try std.testing.expectEqual(@as(u8, 0), fake.update_count);
 }
 
-test "update rejects nonempty pending input and null invalid or oversized terminal results" {
+test "update rejects nonempty SUBMITTED input and null invalid or oversized terminal results" {
     var fake: FakePersistence = .{};
-    const pending = runForTest(
-        &.{ "dynamodb", "update", "--id", test_id, "--state", "NEW" },
+    const submitted = runForTest(
+        &.{ "dynamodb", "update", "--id", test_id, "--state", "SUBMITTED" },
         " ",
         0,
         &fake,
     );
-    try std.testing.expectEqual(@as(u8, 2), pending.exit_code);
+    try std.testing.expectEqual(@as(u8, 2), submitted.exit_code);
     try std.testing.expectEqual(@as(u8, 0), fake.read_count);
 
     const invalid_results = [_][]const u8{ "", "null", "{broken" };

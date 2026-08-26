@@ -325,7 +325,7 @@ when the managed WireGuard gateway is disabled; operators must provide another
 trusted route to the configured TigerBeetle address or accept timeout-driven
 partial-batch retries. For each record, the handler
 retains the debug log containing `message_id` and `body`, parses and validates
-the complete Operation output, and processes only a queued `NEW` Operation with
+the complete Operation output, and processes only a queued `SUBMITTED` Operation with
 a body and no result. Records are handled sequentially within the ten-record
 bound. Invalid records are logged and acknowledged without contacting
 TigerBeetle or DynamoDB.
@@ -382,7 +382,7 @@ record, logs the failure, and requests an SQS retry for only that record.
 
 The second intake inline-policy statement grants that function only `SendMessage`
 access to this stack's operations queue. The handler sends full compact
-`NEW` Operation JSON, but has no receive, delete, purge, or
+`SUBMITTED` Operation JSON, but has no receive, delete, purge, or
 queue-management permissions. Execution receives its separate queue-scoped
 poller policy and table-scoped `UpdateItem`; neither role grants
 queue-management access. The `queue.sh` command uses the local caller's AWS
@@ -408,7 +408,7 @@ The DynamoDB item contract enforced by `src/operation_persistence.zig` is:
 | `id` | `S` | Always present; partition key; canonical lowercase hyphenated Operation UUID. |
 | `tenant` | `S` | Always present; server-owned valid UTF-8; 1 to 64 bytes. |
 | `name` | `S` | Always present. |
-| `state` | `S` | One of `NEW`, `SUCCEEDED`, or `FAILED`. |
+| `state` | `S` | One of `SUBMITTED`, `SUCCEEDED`, or `FAILED`. |
 | `last_updated` | `N` | Unix epoch seconds. |
 | `expires_at` | `N` | Exactly 86,400 seconds after `last_updated`; DynamoDB TTL attribute. |
 | `hash` | `S` | 64-character lowercase BLAKE3-256 hexadecimal value. |
@@ -1671,7 +1671,7 @@ curl -L \
   <IntakeFunctionUrl>
 ```
 
-For a new ID, the handler persists `NEW`, attaches the body only to the queued
+For a new ID, the handler persists `SUBMITTED`, attaches the body only to the queued
 copy sent to SQS, and returns the bodyless persisted Operation output view. It
 uses the invocation timestamp for `last_updated` and the 24-hour
 expiry, the verified subject as tenant, and the stable hash:
@@ -1681,7 +1681,7 @@ expiry, the verified subject as tenant, and the stable hash:
   "id": "00112233-4455-6677-8899-aabbccddeeff",
   "tenant": "example-user",
   "name": "echo",
-  "state": "NEW",
+  "state": "SUBMITTED",
   "last_updated": 1700000000,
   "expires_at": 1700086400,
   "hash": "f4142429f9f7373c34b7b5eeab555ed5b4534a746193c40bfca65bb73f9a3014"
@@ -1698,7 +1698,7 @@ curl -L \
 
 The query performs a strongly consistent read and returns the same compact
 bodyless Operation JSON shown above with `Content-Type: application/json`.
-Terminal Operations also include `result`; pending Operations do not. The path
+Terminal Operations also include `result`; `SUBMITTED` Operations do not. The path
 must contain exactly one UUID segment. Query strings and GET bodies cannot
 supply or alter the ID. Missing and cross-tenant Operations both return the
 same static `404 Not Found` response. DynamoDB request or service failures
@@ -1709,18 +1709,18 @@ readable while it is still stored even after `expires_at`.
 The SQS message is the exact compact full Operation JSON with `id`, `tenant`,
 `name`, `body`, `state`, `last_updated`, `expires_at`, and `hash`, and no
 trailing newline. The DynamoDB item and successful HTTP response omit `body`.
-A matching retry whose stored item is still `NEW` sends the queued copy again.
+A matching retry whose stored item is still `SUBMITTED` sends the queued copy again.
 Matching `SUCCEEDED` or `FAILED` retries return the stored Operation without
 another send.
 
-An SQS failure leaves DynamoDB unchanged as `NEW` and returns only the static
+An SQS failure leaves DynamoDB unchanged as `SUBMITTED` and returns only the static
 `503 Service Unavailable` response. Intake performs no read or update after
 the send. Other DynamoDB, malformed stored-item, and allocation failures remain
 sanitized HTTP 500 responses. Reusing the ID for different work or from a
 different verified subject returns the static `409 Conflict` response.
 
 Delivery is at least once. The standard queue, acknowledgement loss, and
-concurrent `NEW` retries can create duplicate messages. Consumers must use the
+concurrent `SUBMITTED` retries can create duplicate messages. Consumers must use the
 Operation ID and hash idempotently. Execution conditionally completes only a
 matching item with no stored result after the replay-safe TigerBeetle account
 and transfer sequence; it does not predicate completion on stored state. It
@@ -1815,14 +1815,14 @@ Read the persistent output view:
   --id 00112233-4455-6677-8899-aabbccddeeff
 ```
 
-`NEW` requires empty standard input. Terminal states require a
+`SUBMITTED` requires empty standard input. Terminal states require a
 non-null JSON result no larger than 4,096 input bytes whose compact
 serialization is also no larger than 4,096 bytes:
 
 ```sh
 ./persistence.sh update \
   --id 00112233-4455-6677-8899-aabbccddeeff \
-  --state NEW \
+  --state SUBMITTED \
   </dev/null
 
 printf '%s\n' '{"message":"done"}' \
@@ -1834,7 +1834,7 @@ printf '%s\n' '{"message":"done"}' \
 Each successful update refreshes both `last_updated` and `expires_at`, keeping
 the expiry exactly 24 hours after the update timestamp.
 
-Lifecycle ordering is monotonic: same-state refreshes are allowed, and `NEW`
+Lifecycle ordering is monotonic: same-state refreshes are allowed, and `SUBMITTED`
 may transition to `SUCCEEDED` or `FAILED`; terminal states cannot reopen or
 switch. Exit code `1` means the item
 was missing or a create/update conflict occurred. Both conflict paths emit
@@ -1912,8 +1912,8 @@ printf '%s\n' "$operation_json" | ./queue.sh send --tenant 'tenant-a'
 ```
 
 `send` validates the input with `src/operation.zig` and derives `last_updated`
-from the current time. Omitted state defaults to `NEW`, while explicit state
-must be `NEW`. It validates and serializes the resulting full Operation exactly
+from the current time. Omitted state defaults to `SUBMITTED`, while explicit state
+must be `SUBMITTED`. It validates and serializes the resulting full Operation exactly
 once. The SQS message contains the compact canonical JSON with `id`, `tenant`,
 `name`, `body`, `state`, `last_updated`, `expires_at`, and `hash`, with no
 trailing newline. After `SendMessage` succeeds, stdout receives those exact

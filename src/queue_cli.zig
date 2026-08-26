@@ -44,7 +44,7 @@ const usage =
     \\  sqs check
     \\
     \\Commands:
-    \\  send     Read an Operation from stdin and enqueue it as NEW
+    \\  send     Read an Operation from stdin and enqueue it as SUBMITTED
     \\  receive  Long-poll, print, and delete messages until interrupted
     \\  check    Print all queue attributes as JSON
     \\
@@ -445,7 +445,7 @@ fn executeSend(
     defer serialized.deinit();
     try operation.writeOutputJSON(&serialized.writer, &parsed);
     const message = serialized.written();
-    std.debug.assert(parsed.state == .new);
+    std.debug.assert(parsed.state == .submitted);
     std.debug.assert(message.len > 0);
 
     try backend.send(context.allocator, message);
@@ -735,12 +735,12 @@ test "send requires one valid bounded tenant and bounded Operation input" {
     try std.testing.expectEqual(@as(u8, 0), fake.send_count);
 }
 
-test "send queues and prints the same canonical NEW Operation" {
+test "send queues and prints the same canonical SUBMITTED Operation" {
     const expected =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
         "\"body\":{\"message\":\"hello\",\"count\":2}," ++
-        "\"state\":\"NEW\",\"last_updated\":1700000000," ++
+        "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
         "\"expires_at\":1700086400," ++
         "\"hash\":\"d271e3bd560113d2b82e42dfc46be33" ++
         "fb90b43d7f4b12114f3da4888eae445d4\"}";
@@ -748,7 +748,7 @@ test "send queues and prints the same canonical NEW Operation" {
         test_input,
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}," ++
-            "\"state\":\"NEW\"}",
+            "\"state\":\"SUBMITTED\"}",
     };
     var expected_message: ?[]u8 = null;
     defer if (expected_message) |message| std.testing.allocator.free(message);
@@ -786,7 +786,7 @@ test "send validates through Operation and reports AWS failures without output" 
     try std.testing.expectEqualStrings("sqs: invalid operation input\n", invalid.stderr());
     try std.testing.expectEqual(@as(u8, 0), fake.send_count);
 
-    for ([_][]const u8{ "SUBMITTED", "RUNNING" }) |state| {
+    for ([_][]const u8{ "NEW", "PENDING", "RUNNING" }) |state| {
         const input = try std.fmt.allocPrint(
             std.testing.allocator,
             "{{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++

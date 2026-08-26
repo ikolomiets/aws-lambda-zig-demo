@@ -559,7 +559,7 @@ test "AWS SDK debug logging is enabled" {
     try std.testing.expect(std.log.logEnabled(.debug, .aws_sdk));
 }
 
-test "authenticated GET returns exact pending operation JSON and canonicalizes UUID" {
+test "authenticated GET returns exact SUBMITTED operation JSON and canonicalizes UUID" {
     const token = try testToken(0x71);
     defer std.testing.allocator.free(token);
     var environment = try testEnvironment(0x71);
@@ -572,7 +572,7 @@ test "authenticated GET returns exact pending operation JSON and canonicalizes U
         .body = "ffffffff-ffff-ffff-ffff-ffffffffffff",
     });
     defer std.testing.allocator.free(event);
-    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .new) };
+    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .submitted) };
 
     const response = handleInvocationForTest(
         std.testing.allocator,
@@ -587,7 +587,7 @@ test "authenticated GET returns exact pending operation JSON and canonicalizes U
         "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
         "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
         "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
-        "\\\"state\\\":\\\"NEW\\\",\\\"last_updated\\\":1700000123," ++
+        "\\\"state\\\":\\\"SUBMITTED\\\",\\\"last_updated\\\":1700000123," ++
         "\\\"expires_at\\\":1700086523," ++
         "\\\"hash\\\":\\\"" ++ ("ab" ** 32) ++ "\\\"}\"}";
     try std.testing.expectEqualStrings(expected, response);
@@ -637,7 +637,7 @@ test "second lookup before one second uses cached response" {
     defer environment.deinit();
     const event = try testQueryRequestEvent(token);
     defer std.testing.allocator.free(event);
-    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .new) };
+    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .submitted) };
     var cache: OperationCache = undefined;
     OperationCache.init(&cache, std.testing.allocator);
     defer cache.deinit();
@@ -665,7 +665,7 @@ test "second lookup before one second uses cached response" {
     defer std.testing.allocator.free(second);
 
     try std.testing.expectEqualStrings(first, second);
-    try std.testing.expect(std.mem.indexOf(u8, second, "NEW") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "SUBMITTED") != null);
     try std.testing.expectEqual(@as(u8, 1), fake.read_count);
     try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
 }
@@ -677,7 +677,7 @@ test "cache entry expires and is replaced at exactly one second" {
     defer environment.deinit();
     const event = try testQueryRequestEvent(token);
     defer std.testing.allocator.free(event);
-    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .new) };
+    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .submitted) };
     var cache: OperationCache = undefined;
     OperationCache.init(&cache, std.testing.allocator);
     defer cache.deinit();
@@ -704,7 +704,7 @@ test "cache entry expires and is replaced at exactly one second" {
     );
     defer std.testing.allocator.free(second);
 
-    try std.testing.expect(std.mem.indexOf(u8, first, "NEW") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "SUBMITTED") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, "SUCCEEDED") != null);
     try std.testing.expectEqual(@as(u8, 2), fake.read_count);
     try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
@@ -721,7 +721,7 @@ test "foreign request populates ID-only cache for owning tenant" {
     defer std.testing.allocator.free(foreign_event);
     const owner_event = try testQueryRequestEvent(owner_token);
     defer std.testing.allocator.free(owner_event);
-    var fake = FakeQuery{ .response = testOperation("owning-tenant", .new) };
+    var fake = FakeQuery{ .response = testOperation("owning-tenant", .submitted) };
     var cache: OperationCache = undefined;
     OperationCache.init(&cache, std.testing.allocator);
     defer cache.deinit();
@@ -792,12 +792,12 @@ test "full fresh cache serves fetched record without caching it" {
     defer environment.deinit();
     const event = try testQueryRequestEvent(token);
     defer std.testing.allocator.free(event);
-    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .new) };
+    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .submitted) };
     var cache: OperationCache = undefined;
     OperationCache.init(&cache, std.testing.allocator);
     defer cache.deinit();
     try fillTestCache(&cache, 0);
-    const target_id = testOperation("lambda-test-user", .new).id;
+    const target_id = testOperation("lambda-test-user", .submitted).id;
     std.debug.assert(target_id >= cache_entry_count_max);
 
     for (0..2) |_| {
@@ -828,12 +828,12 @@ test "full cache removes all expired entries before admitting fetched record" {
     defer environment.deinit();
     const event = try testQueryRequestEvent(token);
     defer std.testing.allocator.free(event);
-    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .new) };
+    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .submitted) };
     var cache: OperationCache = undefined;
     OperationCache.init(&cache, std.testing.allocator);
     defer cache.deinit();
     try fillTestCache(&cache, 0);
-    const target_id = testOperation("lambda-test-user", .new).id;
+    const target_id = testOperation("lambda-test-user", .submitted).id;
     std.debug.assert(target_id >= cache_entry_count_max);
 
     const first = handleInvocationWithCacheForTest(
@@ -879,7 +879,7 @@ test "cache allocation failures serve fetched response without caching" {
         var cache: OperationCache = undefined;
         OperationCache.init(&cache, failing_allocator.allocator());
         defer cache.deinit();
-        var fake = FakeQuery{ .response = testOperation("lambda-test-user", .new) };
+        var fake = FakeQuery{ .response = testOperation("lambda-test-user", .submitted) };
 
         const response = handleInvocationWithCacheForTest(
             std.testing.allocator,
@@ -950,7 +950,7 @@ test "missing and cross-tenant operations return identical static not found resp
     });
     defer std.testing.allocator.free(event);
     var missing = FakeQuery{ .read_error = error.OperationNotFound };
-    var foreign = FakeQuery{ .response = testOperation("another-tenant", .new) };
+    var foreign = FakeQuery{ .response = testOperation("another-tenant", .submitted) };
 
     const missing_response = handleInvocationForTest(
         std.testing.allocator,
@@ -1071,7 +1071,7 @@ test "malformed stored output and allocation failures remain sanitized" {
         .id = 0,
         .tenant = "lambda-test-user",
         .name = "encoding-failure-marker",
-        .state = .new,
+        .state = .submitted,
         .last_updated = 1000,
         .expires_at = 1001,
         .hash = [_]u8{0} ** 32,

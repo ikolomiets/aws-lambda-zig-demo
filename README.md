@@ -15,7 +15,7 @@ Operation JSON document, derives required tenant metadata from the verified
 token subject, persists the Operation idempotently in DynamoDB, submits new
 work to SQS, and returns the current stored output view without the body.
 The execution Lambda consumes SQS batches, creates a replay-safe TigerBeetle
-account and transfer for each valid queued `NEW` Operation, then conditionally
+account and transfer for each valid queued `SUBMITTED` Operation, then conditionally
 completes DynamoDB with `result: {"success":true}`. Definite rejections are
 acknowledged; TigerBeetle or DynamoDB uncertainty is returned through SQS
 partial-batch failures.
@@ -199,16 +199,16 @@ Read it with a strongly consistent DynamoDB read:
   --id 00112233-4455-6677-8899-aabbccddeeff
 ```
 
-Updates allow same-state refreshes and transitions from `NEW` to `SUCCEEDED`
+Updates allow same-state refreshes and transitions from `SUBMITTED` to `SUCCEEDED`
 or `FAILED`. Terminal Operations cannot be reopened or switched to the other
-terminal state. `NEW` requires empty standard input, while terminal states
+terminal state. `SUBMITTED` requires empty standard input, while terminal states
 require one non-null JSON result of at most 4,096 input bytes whose compact
 serialization is also at most 4,096 bytes:
 
 ```sh
 ./persistence.sh update \
   --id 00112233-4455-6677-8899-aabbccddeeff \
-  --state NEW \
+  --state SUBMITTED \
   </dev/null
 
 printf '%s\n' '{"message":"done"}' \
@@ -262,8 +262,8 @@ printf '%s\n' "$operation_json" | ./queue.sh send --tenant 'tenant-a'
 ```
 
 `send` parses and validates the input through the shared Operation model using
-the current Unix time. Omitted state defaults to `NEW`, while explicit state
-must be `NEW`. It validates the complete output view and serializes it once.
+the current Unix time. Omitted state defaults to `SUBMITTED`, while explicit state
+must be `SUBMITTED`. It validates the complete output view and serializes it once.
 The exact compact JSON bytes sent to SQS contain `id`, `tenant`, `name`,
 `body`, `state`, `last_updated`, `expires_at`, and `hash`. After `SendMessage`
 succeeds, the same bytes are printed followed by a newline; the SQS message
@@ -362,7 +362,7 @@ without `GetItem`. Lambda polls `OperationsQueue` in batches of at most 10
 records with no batching delay.
 
 For every record, the handler retains the debug log containing its message ID
-and body, parses the complete Operation output, and accepts only a queued `NEW`
+and body, parses the complete Operation output, and accepts only a queued `SUBMITTED`
 Operation with a body and no result. It creates account `Operation.id` on
 ledger/code `1`, then transfer `Operation.id` from that account to account `1`
 for amount `100` on ledger/code `1`. Only after both return `created` or
@@ -744,7 +744,7 @@ curl -L \
   <IntakeFunctionUrl>
 ```
 
-For a new ID, the response has `NEW` state, the invocation timestamp, its
+For a new ID, the response has `SUBMITTED` state, the invocation timestamp, its
 24-hour expiry, verified subject as tenant, and the stable BLAKE3-256 operation
 hash. The input body is intentionally omitted:
 
@@ -753,7 +753,7 @@ hash. The input body is intentionally omitted:
   "id": "00112233-4455-6677-8899-aabbccddeeff",
   "tenant": "example-user",
   "name": "echo",
-  "state": "NEW",
+  "state": "SUBMITTED",
   "last_updated": 1700000000,
   "expires_at": 1700086400,
   "hash": "f4142429f9f7373c34b7b5eeab555ed5b4534a746193c40bfca65bb73f9a3014"
@@ -769,24 +769,24 @@ curl -L \
 ```
 
 The query response is the same compact bodyless Operation output JSON shown
-above. Terminal Operations additionally include `result`; pending Operations
+above. Terminal Operations additionally include `result`; `SUBMITTED` Operations
 do not. The ID comes only from the single `rawPath` segment: query strings and
 GET bodies neither provide nor alter it. A different token subject receives the
 same `404 Not Found` response as a missing Operation.
 
-For `NEW`, the handler reattaches the parsed input body only to a queued copy
-of the persisted snapshot and sends that exact compact full `NEW` Operation
+For `SUBMITTED`, the handler reattaches the parsed input body only to a queued copy
+of the persisted snapshot and sends that exact compact full `SUBMITTED` Operation
 JSON to SQS without a trailing newline. It returns the unchanged bodyless
-snapshot. A matching retry whose item is still `NEW` sends it again; matching
+snapshot. A matching retry whose item is still `SUBMITTED` sends it again; matching
 `SUCCEEDED` or `FAILED` items are returned immediately without another SQS
 send.
 
-If `SendMessage` fails, DynamoDB remains `NEW` and the handler returns the
+If `SendMessage` fails, DynamoDB remains `SUBMITTED` and the handler returns the
 static `503 Service Unavailable` response so the caller can retry. Intake
 performs no read or update after the send.
 
 Delivery is at least once. The standard queue, acknowledgement loss, and
-concurrent `NEW` retries can produce duplicate messages, so consumers must
+concurrent `SUBMITTED` retries can produce duplicate messages, so consumers must
 handle the Operation ID and hash idempotently. Reusing the ID for different
 work or from a different verified subject still returns `409 Conflict`. The
 execution consumer conditionally completes only the first matching queued

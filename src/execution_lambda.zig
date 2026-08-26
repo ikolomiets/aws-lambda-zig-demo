@@ -432,7 +432,7 @@ fn accountingTransfer(operation_id: u128) tigerbeetle.Transfer {
 }
 
 fn validateQueuedOperation(queued: *const operation.Operation) !void {
-    if (queued.state != .new) return error.InvalidState;
+    if (queued.state != .submitted) return error.InvalidState;
     if (queued.body == null) return error.MissingBody;
     if (queued.result != null) return error.UnexpectedResult;
     std.debug.assert(queued.hash != null);
@@ -487,7 +487,7 @@ const FakeExecution = struct {
     ) !void {
         _ = arena;
         std.debug.assert(fake.completion_count < record_count_max);
-        std.debug.assert(queued.state == .new);
+        std.debug.assert(queued.state == .submitted);
         std.debug.assert(queued.body != null);
         std.debug.assert(queued.result == null);
         const index = fake.completion_count;
@@ -515,7 +515,7 @@ fn testMessage(allocator: Allocator, id: u128) ![]u8 {
         .tenant = "tenant-a",
         .name = "echo",
         .body = .{ .bool = true },
-        .state = .new,
+        .state = .submitted,
         .last_updated = 1_700_000_000,
         .expires_at = 1_700_086_400,
         .hash = [_]u8{0xAB} ** 32,
@@ -748,7 +748,7 @@ test "malformed terminal bodyless and result-bearing operations are acknowledged
     const records = [_][]const u8{
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
@@ -760,11 +760,11 @@ test "malformed terminal bodyless and result-bearing operations are acknowledged
             "\"expires_at\":1700086400,\"result\":true,\"hash\":\"" ++ hash ++ "\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
-            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
-            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400,\"result\":null,\"hash\":\"" ++ hash ++ "\"}",
     };
     const event = try testEvent(std.testing.allocator, &records);
