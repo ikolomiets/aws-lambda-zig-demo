@@ -135,10 +135,10 @@ const RuntimeResources = struct {
     fn complete(
         resources: *RuntimeResources,
         arena: Allocator,
-        submitted: *const operation.Operation,
+        queued: *const operation.Operation,
         now: operation.UnixSeconds,
     ) !void {
-        return resources.persistence.complete(arena, submitted, now);
+        return resources.persistence.complete(arena, queued, now);
     }
 };
 
@@ -219,11 +219,11 @@ const ExecutionAdapter = struct {
             fn complete(
                 context: *anyopaque,
                 arena: Allocator,
-                submitted: *const operation.Operation,
+                queued: *const operation.Operation,
                 now: operation.UnixSeconds,
             ) anyerror!void {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.complete(arena, submitted, now);
+                return self.complete(arena, queued, now);
             }
         };
         return .{
@@ -251,10 +251,10 @@ const ExecutionAdapter = struct {
     fn complete(
         execution: ExecutionAdapter,
         arena: Allocator,
-        submitted: *const operation.Operation,
+        queued: *const operation.Operation,
         now: operation.UnixSeconds,
     ) !void {
-        return execution.complete_fn(execution.context, arena, submitted, now);
+        return execution.complete_fn(execution.context, arena, queued, now);
     }
 };
 
@@ -340,7 +340,7 @@ fn processRecord(
     execution: ExecutionAdapter,
     clock: Clock,
 ) bool {
-    const submitted = operation.parseOutputJSON(arena, body) catch |err| {
+    const queued = operation.parseOutputJSON(arena, body) catch |err| {
         if (err == error.OutOfMemory) {
             log.debug("message_id={s} stage=parse outcome=retry error={s}", .{
                 message_id,
@@ -354,7 +354,7 @@ fn processRecord(
         });
         return false;
     };
-    validateQueuedOperation(&submitted) catch |err| {
+    validateQueuedOperation(&queued) catch |err| {
         log.debug("message_id={s} outcome=acknowledged_invalid error={s}", .{
             message_id,
             @errorName(err),
@@ -362,7 +362,7 @@ fn processRecord(
         return false;
     };
 
-    const account = accountingAccount(submitted.id);
+    const account = accountingAccount(queued.id);
     const account_outcome = execution.createAccount(&account) catch |err| {
         log.debug("message_id={s} stage=account outcome=retry error={s}", .{
             message_id,
@@ -378,7 +378,7 @@ fn processRecord(
         return false;
     }
 
-    const transfer = accountingTransfer(submitted.id);
+    const transfer = accountingTransfer(queued.id);
     const transfer_outcome = execution.createTransfer(&transfer) catch |err| {
         log.debug("message_id={s} stage=transfer outcome=retry error={s}", .{
             message_id,
@@ -395,7 +395,7 @@ fn processRecord(
     }
 
     const now = clock.now();
-    execution.complete(arena, &submitted, now) catch |err| {
+    execution.complete(arena, &queued, now) catch |err| {
         if (err == error.OperationConflict) {
             log.debug("message_id={s} stage=completion outcome=acknowledged_conflict", .{
                 message_id,
@@ -431,13 +431,13 @@ fn accountingTransfer(operation_id: u128) tigerbeetle.Transfer {
     return transfer;
 }
 
-fn validateQueuedOperation(submitted: *const operation.Operation) !void {
-    if (submitted.state != .submitted) return error.InvalidState;
-    if (submitted.body == null) return error.MissingBody;
-    if (submitted.result != null) return error.UnexpectedResult;
-    std.debug.assert(submitted.hash != null);
-    std.debug.assert(submitted.last_updated != null);
-    std.debug.assert(submitted.expires_at != null);
+fn validateQueuedOperation(queued: *const operation.Operation) !void {
+    if (queued.state != .new) return error.InvalidState;
+    if (queued.body == null) return error.MissingBody;
+    if (queued.result != null) return error.UnexpectedResult;
+    std.debug.assert(queued.hash != null);
+    std.debug.assert(queued.last_updated != null);
+    std.debug.assert(queued.expires_at != null);
 }
 
 const success_outcome: CreateOutcome = .{ .status = 0, .succeeded = true };
@@ -482,14 +482,14 @@ const FakeExecution = struct {
     fn complete(
         fake: *FakeExecution,
         arena: Allocator,
-        submitted: *const operation.Operation,
+        queued: *const operation.Operation,
         now: operation.UnixSeconds,
     ) !void {
         _ = arena;
         std.debug.assert(fake.completion_count < record_count_max);
-        std.debug.assert(submitted.state == .submitted);
-        std.debug.assert(submitted.body != null);
-        std.debug.assert(submitted.result == null);
+        std.debug.assert(queued.state == .new);
+        std.debug.assert(queued.body != null);
+        std.debug.assert(queued.result == null);
         const index = fake.completion_count;
         fake.timestamps[index] = now;
         fake.completion_count += 1;
@@ -510,19 +510,19 @@ const FakeClock = struct {
 };
 
 fn testMessage(allocator: Allocator, id: u128) ![]u8 {
-    const submitted: operation.Operation = .{
+    const queued: operation.Operation = .{
         .id = id,
         .tenant = "tenant-a",
         .name = "echo",
         .body = .{ .bool = true },
-        .state = .submitted,
+        .state = .new,
         .last_updated = 1_700_000_000,
         .expires_at = 1_700_086_400,
         .hash = [_]u8{0xAB} ** 32,
     };
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    try operation.writeOutputJSON(&output.writer, &submitted);
+    try operation.writeOutputJSON(&output.writer, &queued);
     return output.toOwnedSlice();
 }
 
@@ -743,20 +743,28 @@ test "mixed outcomes report exact retryable identifiers and continue processing"
     try std.testing.expectEqual(@as(u128, 9), fake.transfers[5].id);
 }
 
-test "non-submitted bodyless and result-bearing operations are acknowledged" {
+test "malformed terminal bodyless and result-bearing operations are acknowledged" {
     const hash = "ab" ** 32;
     const records = [_][]const u8{
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
+            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
             "\"state\":\"RUNNING\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
+            "\"state\":\"SUCCEEDED\",\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400,\"result\":true,\"hash\":\"" ++ hash ++ "\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400,\"result\":null,\"hash\":\"" ++ hash ++ "\"}",
     };
     const event = try testEvent(std.testing.allocator, &records);

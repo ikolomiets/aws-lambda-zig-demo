@@ -47,7 +47,7 @@ const usage =
     \\  dynamodb update --id <uuid> --state <state>
     \\
     \\States:
-    \\  NEW | SUBMITTED | RUNNING | SUCCEEDED | FAILED
+    \\  NEW | SUCCEEDED | FAILED
     \\
     \\Environment:
     \\  OPERATIONS_TABLE_NAME  DynamoDB table containing Operations
@@ -405,6 +405,7 @@ fn classifyError(err: anyerror) Failure {
         error.InvalidTenant,
         error.InvalidName,
         error.InvalidState,
+        error.InvalidTransition,
         error.BodyTooLarge,
         error.ResultTooLarge,
         error.MissingState,
@@ -471,6 +472,7 @@ fn executeUpdate(
 ) !void {
     const snapshot = try backend.read(context.allocator, options.id);
     try operation.validatePersistent(&snapshot);
+    try operation.validateStateTransition(snapshot.state.?, options.state);
     var replacement = snapshot;
     replacement.state = options.state;
     replacement.last_updated = context.now;
@@ -502,7 +504,7 @@ const FakePersistence = struct {
         .id = operation.uuidFromString(test_id) catch unreachable,
         .tenant = "tenant-a",
         .name = "echo",
-        .state = .running,
+        .state = .new,
         .last_updated = 1_700_000_000,
         .expires_at = 1_700_086_400,
         .hash = test_hash,
@@ -798,7 +800,7 @@ test "read validates UUID and writes a canonical strongly modeled item" {
         result.stdout(),
         "\"tenant\":\"tenant-a\"",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout(), "\"state\":\"RUNNING\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout(), "\"state\":\"NEW\"") != null);
 
     const invalid = runForTest(
         &.{ "dynamodb", "read", "--id", "not-a-uuid" },
@@ -831,12 +833,10 @@ test "read reports missing and AWS failures with stable exit codes" {
     try std.testing.expectEqualStrings("dynamodb: AWS request failed\n", failed.stderr());
 }
 
-test "update accepts every target including jumps same state and terminal removal" {
-    const targets = [_]operation.State{ .new, .submitted, .running, .succeeded, .failed };
+test "update accepts every transition from NEW including same-state refresh" {
+    const targets = [_]operation.State{ .new, .succeeded, .failed };
     for (targets) |state| {
         var fake: FakePersistence = .{};
-        fake.stored.state = .failed;
-        fake.stored.result = .{ .bool = true };
         const input = if (operation.stateIsTerminal(state)) "{ \"new\" : true }" else "";
         const result = runForTest(
             &.{ "dynamodb", "update", "--state", operation.stateToString(state), "--id", test_id },
@@ -878,10 +878,64 @@ test "update accepts every target including jumps same state and terminal remova
     }
 }
 
+test "update refreshes a terminal state and rejects reopening or switching it" {
+    var refresh: FakePersistence = .{};
+    refresh.stored.state = .succeeded;
+    refresh.stored.result = .{ .bool = true };
+    const refreshed = runForTest(
+        &.{ "dynamodb", "update", "--id", test_id, "--state", "SUCCEEDED" },
+        "{\"refreshed\":true}",
+        1_700_000_001,
+        &refresh,
+    );
+    try std.testing.expectEqual(@as(u8, 0), refreshed.exit_code);
+    try std.testing.expectEqual(@as(u8, 1), refresh.update_count);
+
+    const cases = [_]struct {
+        current: operation.State,
+        target: []const u8,
+        input: []const u8,
+    }{
+        .{ .current = .succeeded, .target = "NEW", .input = "" },
+        .{ .current = .succeeded, .target = "FAILED", .input = "true" },
+        .{ .current = .failed, .target = "NEW", .input = "" },
+        .{ .current = .failed, .target = "SUCCEEDED", .input = "true" },
+    };
+    for (cases) |case| {
+        var fake: FakePersistence = .{};
+        fake.stored.state = case.current;
+        fake.stored.result = .{ .bool = true };
+        const result = runForTest(
+            &.{ "dynamodb", "update", "--id", test_id, "--state", case.target },
+            case.input,
+            1_700_000_001,
+            &fake,
+        );
+        try std.testing.expectEqual(@as(u8, 2), result.exit_code);
+        try std.testing.expectEqual(@as(u8, 1), fake.read_count);
+        try std.testing.expectEqual(@as(u8, 0), fake.update_count);
+    }
+}
+
+test "update rejects removed lifecycle state arguments" {
+    var fake: FakePersistence = .{};
+    for ([_][]const u8{ "SUBMITTED", "RUNNING" }) |state| {
+        const result = runForTest(
+            &.{ "dynamodb", "update", "--id", test_id, "--state", state },
+            "",
+            0,
+            &fake,
+        );
+        try std.testing.expectEqual(@as(u8, 2), result.exit_code);
+    }
+    try std.testing.expectEqual(@as(u8, 0), fake.read_count);
+    try std.testing.expectEqual(@as(u8, 0), fake.update_count);
+}
+
 test "update rejects nonempty pending input and null invalid or oversized terminal results" {
     var fake: FakePersistence = .{};
     const pending = runForTest(
-        &.{ "dynamodb", "update", "--id", test_id, "--state", "RUNNING" },
+        &.{ "dynamodb", "update", "--id", test_id, "--state", "NEW" },
         " ",
         0,
         &fake,

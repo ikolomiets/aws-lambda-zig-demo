@@ -59,7 +59,7 @@ pub const Persistence = struct {
         source: *const operation.Operation,
     ) !operation.Operation {
         var persisted = persistentCopy(source);
-        try validateStored(&persisted);
+        try validateCreation(&persisted);
 
         var request: CreateRequest = undefined;
         try createRequestInit(&request, &persisted);
@@ -123,15 +123,15 @@ pub const Persistence = struct {
         return updated;
     }
 
-    /// Completes a queued submitted Operation if its stored identity still matches.
+    /// Completes a queued NEW Operation if its stored identity still matches.
     pub fn complete(
         self: *Self,
         arena: Allocator,
-        submitted: *const operation.Operation,
+        queued: *const operation.Operation,
         now: operation.UnixSeconds,
     ) !void {
         var request: CompletionRequest = undefined;
-        try completionRequestInit(&request, submitted, now);
+        try completionRequestInit(&request, queued, now);
         var diagnostic: dynamodb.ServiceError = undefined;
         _ = self.client.updateItem(arena, .{
             .condition_expression = completion_condition,
@@ -185,7 +185,7 @@ const CompletionRequest = struct {
     expires_at_buffer: [32]u8,
     key: [1]Attribute,
     names: [5]AttributeName,
-    values: [9]Attribute,
+    values: [8]Attribute,
 };
 
 fn createRequestInit(request: *CreateRequest, source: *const operation.Operation) !void {
@@ -283,13 +283,13 @@ fn updateRequestResult(
 
 fn completionRequestInit(
     request: *CompletionRequest,
-    submitted: *const operation.Operation,
+    queued: *const operation.Operation,
     now: operation.UnixSeconds,
 ) !void {
-    try validateCompletion(submitted);
+    try validateCompletion(queued);
     const expires_at = try operation.expires_at_from_last_updated(now);
-    const id = operation.uuidToString(submitted.id, &request.id_buffer);
-    request.hash_buffer = std.fmt.bytesToHex(submitted.hash.?, .lower);
+    const id = operation.uuidToString(queued.id, &request.id_buffer);
+    request.hash_buffer = std.fmt.bytesToHex(queued.hash.?, .lower);
     request.key = .{stringAttribute("id", id)};
     request.names = .{
         .{ .key = "#hash", .value = "hash" },
@@ -300,9 +300,8 @@ fn completionRequestInit(
     };
     request.values = .{
         stringAttribute(":id", id),
-        stringAttribute(":tenant", submitted.tenant),
-        stringAttribute(":name", submitted.name),
-        stringAttribute(":submitted", operation.stateToString(.submitted)),
+        stringAttribute(":tenant", queued.tenant),
+        stringAttribute(":name", queued.name),
         stringAttribute(":hash", &request.hash_buffer),
         stringAttribute(":succeeded", operation.stateToString(.succeeded)),
         numberAttribute(":now", timestampString(now, &request.timestamp_buffer)),
@@ -313,7 +312,7 @@ fn completionRequestInit(
         stringAttribute(":result", completion_result),
     };
     std.debug.assert(request.key.len == 1);
-    std.debug.assert(request.values.len == 9);
+    std.debug.assert(request.values.len == 8);
 }
 
 fn updateValue(request: *UpdateRequest, key: []const u8, value: AttributeValue) void {
@@ -341,7 +340,7 @@ const update_with_result =
     "expires_at = :new_expires_at, #result = :new_result";
 const completion_condition =
     "id = :id AND #tenant = :tenant AND #name = :name AND " ++
-    "#state = :submitted AND #hash = :hash AND attribute_not_exists(#result)";
+    "#hash = :hash AND attribute_not_exists(#result)";
 const completion_update =
     "SET #state = :succeeded, #result = :result, " ++
     "last_updated = :now, expires_at = :expires_at";
@@ -465,14 +464,19 @@ fn validateStored(source: *const operation.Operation) !void {
     }
 }
 
-fn validateCompletion(submitted: *const operation.Operation) !void {
-    if (submitted.state != .submitted) return error.InvalidState;
-    if (submitted.body == null) return error.MissingBody;
-    if (submitted.result != null) return error.UnexpectedResult;
-    var persisted = submitted.*;
+fn validateCreation(source: *const operation.Operation) !void {
+    try validateStored(source);
+    if (source.state != .new) return error.InvalidState;
+}
+
+fn validateCompletion(queued: *const operation.Operation) !void {
+    if (queued.state != .new) return error.InvalidState;
+    if (queued.body == null) return error.MissingBody;
+    if (queued.result != null) return error.UnexpectedResult;
+    var persisted = queued.*;
     persisted.body = null;
     try validateStored(&persisted);
-    std.debug.assert(persisted.state == .submitted);
+    std.debug.assert(persisted.state == .new);
     std.debug.assert(persisted.result == null);
 }
 
@@ -486,6 +490,7 @@ fn validateUpdate(
     if (!std.mem.eql(u8, snapshot.tenant, replacement.tenant)) return error.ImmutableField;
     if (!std.mem.eql(u8, snapshot.name, replacement.name)) return error.ImmutableField;
     if (!std.mem.eql(u8, &snapshot.hash.?, &replacement.hash.?)) return error.ImmutableField;
+    try operation.validateStateTransition(snapshot.state.?, replacement.state.?);
     std.debug.assert(snapshot.body == null);
     std.debug.assert(replacement.body == null);
 }
@@ -508,7 +513,7 @@ fn createError(
     arena: Allocator,
     err: anyerror,
     diagnostic: *dynamodb.ServiceError,
-    submitted: *const operation.Operation,
+    requested: *const operation.Operation,
 ) anyerror!operation.Operation {
     if (err != error.ServiceError) return error.AWSFailure;
     defer diagnostic.deinit();
@@ -518,10 +523,10 @@ fn createError(
     };
     const item = failure.item orelse return error.InvalidItem;
     const existing = try decodeItem(arena, item);
-    if (!std.mem.eql(u8, existing.tenant, submitted.tenant)) {
+    if (!std.mem.eql(u8, existing.tenant, requested.tenant)) {
         return error.OperationConflict;
     }
-    if (!std.mem.eql(u8, &existing.hash.?, &submitted.hash.?)) {
+    if (!std.mem.eql(u8, &existing.hash.?, &requested.hash.?)) {
         return error.OperationConflict;
     }
     return existing;
@@ -671,7 +676,7 @@ fn findUpdateValue(request: *const UpdateRequest, key: []const u8) ?AttributeVal
 test "items round trip every state without persisting body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const states = [_]operation.State{ .new, .submitted, .running, .succeeded, .failed };
+    const states = [_]operation.State{ .new, .succeeded, .failed };
     for (states) |state| {
         var source = testOperation(
             state,
@@ -733,6 +738,18 @@ test "create request uses the exact item contract and returns a failed condition
     try std.testing.expectEqual(
         dynamodb.types.ReturnValuesOnConditionCheckFailure.all_old,
         input.return_values_on_condition_check_failure.?,
+    );
+}
+
+test "creation requires a NEW persistent Operation" {
+    try validateCreation(&testOperation(.new, null));
+    try std.testing.expectError(
+        error.InvalidState,
+        validateCreation(&testOperation(.succeeded, .{ .bool = true })),
+    );
+    try std.testing.expectError(
+        error.InvalidState,
+        validateCreation(&testOperation(.failed, .{ .bool = false })),
     );
 }
 
@@ -817,11 +834,13 @@ test "decoder rejects duplicate unknown wrong and malformed attributes" {
         decodeItem(arena.allocator(), malformed[0..7]),
     );
     malformed = request.items;
-    malformed[3].value = .{ .s = "DONE" };
-    try std.testing.expectError(
-        error.InvalidItem,
-        decodeItem(arena.allocator(), malformed[0..7]),
-    );
+    for ([_][]const u8{ "SUBMITTED", "RUNNING", "DONE" }) |state| {
+        malformed[3].value = .{ .s = state };
+        try std.testing.expectError(
+            error.InvalidItem,
+            decodeItem(arena.allocator(), malformed[0..7]),
+        );
+    }
     malformed = request.items;
     malformed[4].value = .{ .n = "01700000000" };
     try std.testing.expectError(
@@ -936,7 +955,7 @@ test "terminal result Values round trip through canonical DynamoDB strings" {
 test "updates snapshot every stored field and return all new attributes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const snapshot = testOperation(.running, null);
+    const snapshot = testOperation(.new, null);
     var replacement = snapshot;
     replacement.state = .succeeded;
     replacement.last_updated.? += 1;
@@ -956,7 +975,7 @@ test "updates snapshot every stored field and return all new attributes" {
         request.condition_expression,
         "#tenant = :old_tenant",
     ) != null);
-    try std.testing.expectEqualStrings("RUNNING", try stringValue(
+    try std.testing.expectEqualStrings("NEW", try stringValue(
         findUpdateValue(&request, ":old_state").?,
     ));
     try std.testing.expectEqualStrings("SUCCEEDED", try stringValue(
@@ -982,16 +1001,17 @@ test "updates snapshot every stored field and return all new attributes" {
 }
 
 test "completion condition matches queued identity without timestamp conditions" {
-    var submitted = testOperation(.submitted, null);
-    submitted.body = .{ .bool = true };
+    var queued = testOperation(.new, null);
+    queued.body = .{ .bool = true };
     var request: CompletionRequest = undefined;
-    try completionRequestInit(&request, &submitted, 1_800_000_000);
+    try completionRequestInit(&request, &queued, 1_800_000_000);
 
     try std.testing.expectEqualStrings(
         "id = :id AND #tenant = :tenant AND #name = :name AND " ++
-            "#state = :submitted AND #hash = :hash AND attribute_not_exists(#result)",
+            "#hash = :hash AND attribute_not_exists(#result)",
         completion_condition,
     );
+    try std.testing.expect(std.mem.indexOf(u8, completion_condition, "#state") == null);
     try std.testing.expect(std.mem.indexOf(u8, completion_condition, "last_updated") == null);
     try std.testing.expect(std.mem.indexOf(u8, completion_condition, "expires_at") == null);
     try std.testing.expectEqualStrings(test_id, try stringValue(request.key[0].value));
@@ -1004,19 +1024,17 @@ test "completion condition matches queued identity without timestamp conditions"
     try std.testing.expectEqualStrings("echo", try stringValue(
         findAttribute(&request.values, ":name").?,
     ));
-    try std.testing.expectEqualStrings("SUBMITTED", try stringValue(
-        findAttribute(&request.values, ":submitted").?,
-    ));
+    try std.testing.expect(findAttribute(&request.values, ":state") == null);
     try std.testing.expectEqualStrings("ab" ** 32, try stringValue(
         findAttribute(&request.values, ":hash").?,
     ));
 }
 
 test "completion persists exact success result and record timestamp without returns" {
-    var submitted = testOperation(.submitted, null);
-    submitted.body = .{ .bool = true };
+    var queued = testOperation(.new, null);
+    queued.body = .{ .bool = true };
     var request: CompletionRequest = undefined;
-    try completionRequestInit(&request, &submitted, 1_800_000_123);
+    try completionRequestInit(&request, &queued, 1_800_000_123);
 
     try std.testing.expectEqualStrings(
         "SET #state = :succeeded, #result = :result, " ++
@@ -1048,51 +1066,54 @@ test "completion persists exact success result and record timestamp without retu
     try std.testing.expect(input.return_values_on_condition_check_failure == null);
 }
 
-test "completion accepts only submitted operations with body and no result" {
-    var submitted = testOperation(.submitted, null);
-    submitted.body = .null;
-    try validateCompletion(&submitted);
+test "completion accepts only queued NEW operations with body and no result" {
+    var queued = testOperation(.new, null);
+    queued.body = .null;
+    try validateCompletion(&queued);
 
-    submitted.state = .running;
-    try std.testing.expectError(error.InvalidState, validateCompletion(&submitted));
-    submitted = testOperation(.submitted, null);
-    try std.testing.expectError(error.MissingBody, validateCompletion(&submitted));
-    submitted.body = .null;
-    submitted.result = .null;
-    try std.testing.expectError(error.UnexpectedResult, validateCompletion(&submitted));
+    queued.state = .succeeded;
+    try std.testing.expectError(error.InvalidState, validateCompletion(&queued));
+    queued = testOperation(.new, null);
+    try std.testing.expectError(error.MissingBody, validateCompletion(&queued));
+    queued.body = .null;
+    queued.result = .null;
+    try std.testing.expectError(error.UnexpectedResult, validateCompletion(&queued));
 }
 
-test "updates remove replace and preserve result across arbitrary state changes" {
+test "updates enforce every monotonic state transition" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const targets = [_]operation.State{ .new, .submitted, .running, .succeeded, .failed };
-    for (targets) |target| {
-        const snapshot = testOperation(
-            .failed,
-            try testResult(arena.allocator(), "{\"old\":true}"),
-        );
-        var replacement = snapshot;
-        replacement.state = target;
-        replacement.last_updated.? += 1;
-        replacement.expires_at.? += 1;
-        replacement.result = if (operation.stateIsTerminal(target))
-            try testResult(arena.allocator(), "{\"new\":true}")
-        else
-            null;
-        try validateUpdate(&snapshot, &replacement);
-        var request: UpdateRequest = undefined;
-        try updateRequestInit(&request, &snapshot, &replacement);
-        try std.testing.expectEqualStrings(condition_with_result, request.condition_expression);
-        if (operation.stateIsTerminal(target)) {
-            try std.testing.expectEqualStrings(update_with_result, request.update_expression);
-        } else {
-            try std.testing.expectEqualStrings(update_without_result, request.update_expression);
+    const states = [_]operation.State{ .new, .succeeded, .failed };
+    for (states) |current| {
+        for (states) |target| {
+            const current_result = if (operation.stateIsTerminal(current))
+                try testResult(arena.allocator(), "{\"old\":true}")
+            else
+                null;
+            const snapshot = testOperation(current, current_result);
+            var replacement = snapshot;
+            replacement.state = target;
+            replacement.last_updated.? += 1;
+            replacement.expires_at.? += 1;
+            replacement.result = if (operation.stateIsTerminal(target))
+                try testResult(arena.allocator(), "{\"new\":true}")
+            else
+                null;
+            const allowed = current == .new or current == target;
+            if (allowed) {
+                try validateUpdate(&snapshot, &replacement);
+            } else {
+                try std.testing.expectError(
+                    error.InvalidTransition,
+                    validateUpdate(&snapshot, &replacement),
+                );
+            }
         }
     }
 }
 
 test "updates allow same state and reject immutable replacements" {
-    const snapshot = testOperation(.submitted, null);
+    const snapshot = testOperation(.new, null);
     var replacement = snapshot;
     replacement.last_updated.? += 1;
     replacement.expires_at.? += 1;
@@ -1124,7 +1145,7 @@ test "updates allow same state and reject immutable replacements" {
 }
 
 test "update result requires the replacement expiration" {
-    const replacement = testOperation(.running, null);
+    const replacement = testOperation(.new, null);
     var updated = replacement;
     try validateUpdateResult(&updated, &replacement);
 
@@ -1144,8 +1165,8 @@ test "update result requires the replacement expiration" {
 test "matching create retry returns the stored Operation in every state" {
     var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer result_arena.deinit();
-    const submitted = testOperation(.new, null);
-    const states = [_]operation.State{ .new, .submitted, .running, .succeeded, .failed };
+    const requested = testOperation(.new, null);
+    const states = [_]operation.State{ .new, .succeeded, .failed };
     for (states) |state| {
         var existing = testOperation(
             state,
@@ -1168,7 +1189,7 @@ test "matching create retry returns the stored Operation in every state" {
             result_arena.allocator(),
             error.ServiceError,
             &diagnostic,
-            &submitted,
+            &requested,
         );
         try std.testing.expectEqual(existing.state, created.state);
         try std.testing.expectEqual(existing.last_updated, created.last_updated);
@@ -1182,8 +1203,8 @@ test "matching create retry returns the stored Operation in every state" {
 test "create retry conflicts on a hash mismatch in every state" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const submitted = testOperation(.new, null);
-    const states = [_]operation.State{ .new, .submitted, .running, .succeeded, .failed };
+    const requested = testOperation(.new, null);
+    const states = [_]operation.State{ .new, .succeeded, .failed };
     for (states) |state| {
         var existing = testOperation(
             state,
@@ -1199,7 +1220,7 @@ test "create retry conflicts on a hash mismatch in every state" {
             arena.allocator(),
             error.ServiceError,
             &diagnostic,
-            &submitted,
+            &requested,
         ));
     }
 }
@@ -1207,8 +1228,8 @@ test "create retry conflicts on a hash mismatch in every state" {
 test "create retry conflicts when a global UUID belongs to another tenant" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const submitted = testOperation(.new, null);
-    var existing = submitted;
+    const requested = testOperation(.new, null);
+    var existing = requested;
     existing.tenant = "tenant-b";
     var request: CreateRequest = undefined;
     try createRequestInit(&request, &existing);
@@ -1220,14 +1241,14 @@ test "create retry conflicts when a global UUID belongs to another tenant" {
         arena.allocator(),
         error.ServiceError,
         &diagnostic,
-        &submitted,
+        &requested,
     ));
 }
 
 test "create failure requires a valid returned item and preserves AWS failures" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const submitted = testOperation(.new, null);
+    const requested = testOperation(.new, null);
     var missing = dynamodb.ServiceError{
         .kind = .{ .conditional_check_failed_exception = .{} },
     };
@@ -1235,11 +1256,11 @@ test "create failure requires a valid returned item and preserves AWS failures" 
         arena.allocator(),
         error.ServiceError,
         &missing,
-        &submitted,
+        &requested,
     ));
 
     var request: CreateRequest = undefined;
-    try createRequestInit(&request, &submitted);
+    try createRequestInit(&request, &requested);
     var malformed = dynamodb.ServiceError{
         .kind = .{ .conditional_check_failed_exception = .{
             .item = request.items[0..4],
@@ -1249,7 +1270,7 @@ test "create failure requires a valid returned item and preserves AWS failures" 
         arena.allocator(),
         error.ServiceError,
         &malformed,
-        &submitted,
+        &requested,
     ));
 
     var unrelated = dynamodb.ServiceError{
@@ -1259,14 +1280,14 @@ test "create failure requires a valid returned item and preserves AWS failures" 
         arena.allocator(),
         error.ServiceError,
         &unrelated,
-        &submitted,
+        &requested,
     ));
     var unused: dynamodb.ServiceError = undefined;
     try std.testing.expectError(error.AWSFailure, createError(
         arena.allocator(),
         error.ConnectionFailed,
         &unused,
-        &submitted,
+        &requested,
     ));
 }
 

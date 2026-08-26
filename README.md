@@ -15,7 +15,7 @@ Operation JSON document, derives required tenant metadata from the verified
 token subject, persists the Operation idempotently in DynamoDB, submits new
 work to SQS, and returns the current stored output view without the body.
 The execution Lambda consumes SQS batches, creates a replay-safe TigerBeetle
-account and transfer for each valid `SUBMITTED` Operation, then conditionally
+account and transfer for each valid queued `NEW` Operation, then conditionally
 completes DynamoDB with `result: {"success":true}`. Definite rejections are
 acknowledged; TigerBeetle or DynamoDB uncertainty is returned through SQS
 partial-batch failures.
@@ -199,15 +199,16 @@ Read it with a strongly consistent DynamoDB read:
   --id 00112233-4455-6677-8899-aabbccddeeff
 ```
 
-Updates may move to any state, including the current state. Pending states
-require empty standard input, while terminal states require one non-null JSON
-result of at most 4,096 input bytes whose compact serialization is also at most
-4,096 bytes:
+Updates allow same-state refreshes and transitions from `NEW` to `SUCCEEDED`
+or `FAILED`. Terminal Operations cannot be reopened or switched to the other
+terminal state. `NEW` requires empty standard input, while terminal states
+require one non-null JSON result of at most 4,096 input bytes whose compact
+serialization is also at most 4,096 bytes:
 
 ```sh
 ./persistence.sh update \
   --id 00112233-4455-6677-8899-aabbccddeeff \
-  --state RUNNING \
+  --state NEW \
   </dev/null
 
 printf '%s\n' '{"message":"done"}' \
@@ -261,8 +262,8 @@ printf '%s\n' "$operation_json" | ./queue.sh send --tenant 'tenant-a'
 ```
 
 `send` parses and validates the input through the shared Operation model using
-the current Unix time. It then replaces an omitted or explicit `NEW` state
-with `SUBMITTED`, validates the complete output view, and serializes it once.
+the current Unix time. Omitted state defaults to `NEW`, while explicit state
+must be `NEW`. It validates the complete output view and serializes it once.
 The exact compact JSON bytes sent to SQS contain `id`, `tenant`, `name`,
 `body`, `state`, `last_updated`, `expires_at`, and `hash`. After `SendMessage`
 succeeds, the same bytes are printed followed by a newline; the SQS message
@@ -302,9 +303,11 @@ The AWS identity running `queue.sh` needs `sqs:SendMessage` for
 `send`, `sqs:ReceiveMessage` and `sqs:DeleteMessage` for `receive`, and
 `sqs:GetQueueAttributes` for `check`. The command additionally calls
 `cloudformation:DescribeStackResource`. These are caller permissions: the Lambda
-roles remain separate. The intake role is limited to `sqs:SendMessage`, the execution role has
-queue-scoped polling permissions, and the query role has no SQS permissions. Once the event source
-mapping is enabled, `queue.sh receive` competes with the execution Lambda for messages.
+roles remain separate. The intake role is limited to table-scoped
+`dynamodb:PutItem` and queue-scoped `sqs:SendMessage`; the execution role has
+queue-scoped polling permissions, and the query role has no SQS permissions.
+Once the event source mapping is enabled, `queue.sh receive` competes with the
+execution Lambda for messages.
 
 Both Lambda Function URLs require the token in an HTTP authorization header:
 
@@ -359,14 +362,14 @@ without `GetItem`. Lambda polls `OperationsQueue` in batches of at most 10
 records with no batching delay.
 
 For every record, the handler retains the debug log containing its message ID
-and body, parses the complete Operation output, and accepts only a `SUBMITTED`
+and body, parses the complete Operation output, and accepts only a queued `NEW`
 Operation with a body and no result. It creates account `Operation.id` on
 ledger/code `1`, then transfer `Operation.id` from that account to account `1`
 for amount `100` on ledger/code `1`. Only after both return `created` or
 identical `exists` does it sample the real-time clock. The conditional update
-requires the stored canonical ID, tenant, name, `SUBMITTED` state, queued hash,
-and absent result; it does not compare the queued timestamps. A match becomes
-`SUCCEEDED` with the exact compact result `{"success":true}`, a fresh
+requires the stored canonical ID, tenant, name, queued hash, and absent result;
+it deliberately compares neither stored state nor queued timestamps. A match
+becomes `SUCCEEDED` with the exact compact result `{"success":true}`, a fresh
 `last_updated`, and `expires_at` exactly 86,400 seconds later.
 
 Processing continues after every record. Invalid records, definite
@@ -690,8 +693,8 @@ restrictive key-generation workflow, direct SAM parameter overrides, Systems
 Manager checks, failure diagnosis, key rotation, and teardown.
 
 The SAM-managed DynamoDB table and SQS queue, their environment variables, the
-table-scoped `GetItem`, `PutItem`, and `UpdateItem` policy, and the queue-scoped
-`SendMessage` policy are mandatory parts of the intake Lambda. The query Lambda
+table-scoped `PutItem` policy, and the queue-scoped `SendMessage` policy are
+mandatory parts of the intake Lambda. The query Lambda
 receives only `OPERATIONS_TABLE_NAME` and table-scoped `GetItem` in addition to
 the basic logging policy. It initializes a reusable DynamoDB persistence client
 and has no SQS permissions. The execution Lambda receives
@@ -741,7 +744,7 @@ curl -L \
   <IntakeFunctionUrl>
 ```
 
-For a new ID, the response has `SUBMITTED` state, the invocation timestamp, its
+For a new ID, the response has `NEW` state, the invocation timestamp, its
 24-hour expiry, verified subject as tenant, and the stable BLAKE3-256 operation
 hash. The input body is intentionally omitted:
 
@@ -750,7 +753,7 @@ hash. The input body is intentionally omitted:
   "id": "00112233-4455-6677-8899-aabbccddeeff",
   "tenant": "example-user",
   "name": "echo",
-  "state": "SUBMITTED",
+  "state": "NEW",
   "last_updated": 1700000000,
   "expires_at": 1700086400,
   "hash": "f4142429f9f7373c34b7b5eeab555ed5b4534a746193c40bfca65bb73f9a3014"
@@ -771,20 +774,16 @@ do not. The ID comes only from the single `rawPath` segment: query strings and
 GET bodies neither provide nor alter it. A different token subject receives the
 same `404 Not Found` response as a missing Operation.
 
-For `NEW`, the handler combines the persisted identity with the parsed input
-body, refreshes both timestamps from the invocation time, and sends the exact
-compact full `SUBMITTED` Operation JSON to SQS without a trailing newline. It
-then conditionally updates the bodyless DynamoDB item to the same state and
-returns that item. A matching retry whose item is still `NEW` attempts this
-submission again. Matching `SUBMITTED`, `RUNNING`, `SUCCEEDED`, or `FAILED`
-items are returned immediately without another SQS send.
+For `NEW`, the handler reattaches the parsed input body only to a queued copy
+of the persisted snapshot and sends that exact compact full `NEW` Operation
+JSON to SQS without a trailing newline. It returns the unchanged bodyless
+snapshot. A matching retry whose item is still `NEW` sends it again; matching
+`SUCCEEDED` or `FAILED` items are returned immediately without another SQS
+send.
 
 If `SendMessage` fails, DynamoDB remains `NEW` and the handler returns the
-static `503 Service Unavailable` response so the caller can retry. If the
-conditional DynamoDB update fails after a successful send, the handler returns
-the static `500 Internal Server Error`; the message may already be available.
-A concurrent update conflict is reconciled with a strongly consistent read
-when the same Operation has advanced beyond `NEW`.
+static `503 Service Unavailable` response so the caller can retry. Intake
+performs no read or update after the send.
 
 Delivery is at least once. The standard queue, acknowledgement loss, and
 concurrent `NEW` retries can produce duplicate messages, so consumers must

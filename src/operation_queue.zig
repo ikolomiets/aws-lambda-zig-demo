@@ -244,13 +244,13 @@ test "initialization retains valid queue configuration and shared AWS configurat
 }
 
 test "requests use the configured URL and fixed queue contracts" {
-    const send = try send_request(test_queue_url, "submitted-operation");
+    const send = try send_request(test_queue_url, "queued-operation");
     const receive = receive_request(test_queue_url);
     const delete = try delete_request(test_queue_url, "receipt");
     const attributes = get_attributes_request(test_queue_url);
 
     try std.testing.expectEqualStrings(test_queue_url, send.queue_url);
-    try std.testing.expectEqualStrings("submitted-operation", send.message_body);
+    try std.testing.expectEqualStrings("queued-operation", send.message_body);
     try std.testing.expectEqualStrings(test_queue_url, receive.queue_url);
     try std.testing.expectEqual(receive_message_count_max, receive.max_number_of_messages.?);
     try std.testing.expectEqual(receive_wait_time_seconds, receive.wait_time_seconds.?);

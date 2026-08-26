@@ -29,8 +29,8 @@ For each valid queued Operation, execution creates account `Operation.id`
 account `1` for amount `100` (ledger/code `1`), and only then conditionally
 marks DynamoDB `SUCCEEDED`. The two event types require separate requests.
 Stable IDs make duplicate delivery replay-safe: `created` and identical
-`exists` proceed, while a definite rejection is acknowledged and leaves the
-Operation `SUBMITTED`. Client/request uncertainty and DynamoDB service
+`exists` proceed, while a definite rejection is acknowledged without updating
+DynamoDB. Client/request uncertainty and DynamoDB service
 uncertainty are reported as SQS partial-batch failures.
 
 Enabling the gateway incurs EC2 and public IPv4/Elastic IP charges.

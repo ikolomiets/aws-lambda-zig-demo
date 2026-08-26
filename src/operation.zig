@@ -23,8 +23,6 @@ comptime {
 
 pub const State = enum {
     new,
-    submitted,
-    running,
     succeeded,
     failed,
 };
@@ -32,8 +30,6 @@ pub const State = enum {
 /// Parses the uppercase representation shared by JSON and persistent storage.
 pub fn stateFromString(value: []const u8) !State {
     if (std.mem.eql(u8, value, "NEW")) return .new;
-    if (std.mem.eql(u8, value, "SUBMITTED")) return .submitted;
-    if (std.mem.eql(u8, value, "RUNNING")) return .running;
     if (std.mem.eql(u8, value, "SUCCEEDED")) return .succeeded;
     if (std.mem.eql(u8, value, "FAILED")) return .failed;
     return error.InvalidState;
@@ -43,8 +39,6 @@ pub fn stateFromString(value: []const u8) !State {
 pub fn stateToString(state: State) []const u8 {
     return switch (state) {
         .new => "NEW",
-        .submitted => "SUBMITTED",
-        .running => "RUNNING",
         .succeeded => "SUCCEEDED",
         .failed => "FAILED",
     };
@@ -54,8 +48,17 @@ pub fn stateToString(state: State) []const u8 {
 pub fn stateIsTerminal(state: State) bool {
     return switch (state) {
         .succeeded, .failed => true,
-        .new, .submitted, .running => false,
+        .new => false,
     };
+}
+
+/// Validates a monotonic lifecycle transition, including same-state refreshes.
+pub fn validateStateTransition(current: State, replacement: State) !void {
+    switch (current) {
+        .new => {},
+        .succeeded => if (replacement != .succeeded) return error.InvalidTransition,
+        .failed => if (replacement != .failed) return error.InvalidTransition,
+    }
 }
 
 pub const Operation = struct {
@@ -654,27 +657,42 @@ fn expectValueJSON(expected: []const u8, value: *const JSONValue) !void {
 test "persistent state parsing formatting and terminal classification are exhaustive" {
     const states = [_]State{
         .new,
-        .submitted,
-        .running,
         .succeeded,
         .failed,
     };
     const names = [_][]const u8{
         "NEW",
-        "SUBMITTED",
-        "RUNNING",
         "SUCCEEDED",
         "FAILED",
     };
     for (states, names, 0..) |state, name, index| {
         try std.testing.expectEqualStrings(name, stateToString(state));
         try std.testing.expectEqual(state, try stateFromString(name));
-        try std.testing.expectEqual(index >= 3, stateIsTerminal(state));
+        try std.testing.expectEqual(index >= 1, stateIsTerminal(state));
     }
 
     try std.testing.expectError(error.InvalidState, stateFromString("new"));
+    try std.testing.expectError(error.InvalidState, stateFromString("SUBMITTED"));
+    try std.testing.expectError(error.InvalidState, stateFromString("RUNNING"));
     try std.testing.expectError(error.InvalidState, stateFromString("COMPLETED"));
     try std.testing.expectError(error.InvalidState, stateFromString(""));
+}
+
+test "all state transitions enforce the monotonic lifecycle" {
+    const states = [_]State{ .new, .succeeded, .failed };
+    for (states) |current| {
+        for (states) |replacement| {
+            const allowed = current == .new or current == replacement;
+            if (allowed) {
+                try validateStateTransition(current, replacement);
+            } else {
+                try std.testing.expectError(
+                    error.InvalidTransition,
+                    validateStateTransition(current, replacement),
+                );
+            }
+        }
+    }
 }
 
 test "UUID conversion is symmetric and output is lowercase" {
@@ -907,8 +925,6 @@ test "hash includes the operation name and preserves object key order" {
 test "input accepts only omitted state or explicit NEW" {
     const explicit = try testInput(std.testing.allocator, "echo", "null", "NEW");
     defer std.testing.allocator.free(explicit);
-    const later = try testInput(std.testing.allocator, "echo", "null", "SUBMITTED");
-    defer std.testing.allocator.free(later);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -918,10 +934,14 @@ test "input accepts only omitted state or explicit NEW" {
         test_now,
     );
     try std.testing.expectEqual(State.new, operation.state.?);
-    try std.testing.expectError(
-        error.InvalidState,
-        parseTestInput(arena.allocator(), later, test_now),
-    );
+    for ([_][]const u8{ "SUBMITTED", "RUNNING", "SUCCEEDED", "FAILED" }) |state| {
+        const later = try testInput(std.testing.allocator, "echo", "null", state);
+        defer std.testing.allocator.free(later);
+        try std.testing.expectError(
+            error.InvalidState,
+            parseTestInput(arena.allocator(), later, test_now),
+        );
+    }
 }
 
 test "input rejects spoofed output fields duplicates and unknown fields" {
@@ -1065,10 +1085,6 @@ test "persistent validation enforces view and terminal result invariants" {
         .expires_at = test_now + ttl_seconds,
         .hash = hash,
     };
-    try validatePersistent(&operation);
-    operation.state = .submitted;
-    operation.last_updated = test_now + 1;
-    operation.expires_at = test_now + 1 + ttl_seconds;
     try validatePersistent(&operation);
     operation.result = .null;
     try validatePersistent(&operation);
@@ -1280,7 +1296,7 @@ test "output distinguishes object explicit-null and absent bodies" {
         .tenant = test_tenant,
         .name = "echo",
         .body = try parseJSONValue(arena.allocator(), "{\"message\":\"hello\"}"),
-        .state = .submitted,
+        .state = .new,
         .last_updated = test_now + 1,
         .expires_at = test_now + 1 + ttl_seconds,
         .hash = [_]u8{0xAB} ** 32,
@@ -1304,7 +1320,7 @@ test "output distinguishes object explicit-null and absent bodies" {
     try std.testing.expectEqualStrings(
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000001," ++
+            "\"state\":\"NEW\",\"last_updated\":1700000001," ++
             "\"expires_at\":1700086401," ++
             "\"hash\":\"abababababababababababababababab" ++
             "abababababababababababababababab\"}",
@@ -1320,7 +1336,7 @@ test "every valid output shape round trips through the output parser" {
         .null,
         try parseJSONValue(value_arena.allocator(), "{\"message\":\"hello\"}"),
     };
-    const states = [_]State{ .new, .submitted, .running, .succeeded, .failed };
+    const states = [_]State{ .new, .succeeded, .failed };
     for (states) |state| {
         for (bodies) |body| {
             const result: ?JSONValue = if (stateIsTerminal(state))
@@ -1353,7 +1369,7 @@ test "every valid output shape round trips through the output parser" {
         .id = try uuidFromString(test_uuid),
         .tenant = test_tenant,
         .name = "echo",
-        .state = .submitted,
+        .state = .new,
         .last_updated = test_now,
         .expires_at = test_now + ttl_seconds,
         .result = .null,
@@ -1389,20 +1405,20 @@ test "output parser preserves strings and JSON Values in its arena" {
 test "output parser requires all owned fields and rejects extra fields" {
     const hash = "ab" ** 32;
     const missing = [_][]const u8{
-        "{\"tenant\":\"tenant-a\",\"name\":\"echo\",\"state\":\"SUBMITTED\"," ++
+        "{\"tenant\":\"tenant-a\",\"name\":\"echo\",\"state\":\"NEW\"," ++
             "\"last_updated\":1700000000,\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
-        "{\"id\":\"" ++ test_uuid ++ "\",\"name\":\"echo\",\"state\":\"SUBMITTED\"," ++
+        "{\"id\":\"" ++ test_uuid ++ "\",\"name\":\"echo\",\"state\":\"NEW\"," ++
             "\"last_updated\":1700000000,\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
-        "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"state\":\"SUBMITTED\"," ++
-            "\"last_updated\":1700000000,\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
-        "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
+        "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"state\":\"NEW\"," ++
             "\"last_updated\":1700000000,\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
         "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
-            "\"state\":\"SUBMITTED\",\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
+            "\"last_updated\":1700000000,\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
         "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000,\"hash\":\"" ++ hash ++ "\"}",
+            "\"state\":\"NEW\",\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
         "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000,\"expires_at\":1700086400}",
+            "\"state\":\"NEW\",\"last_updated\":1700000000,\"hash\":\"" ++ hash ++ "\"}",
+        "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
+            "\"state\":\"NEW\",\"last_updated\":1700000000,\"expires_at\":1700086400}",
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1412,7 +1428,7 @@ test "output parser requires all owned fields and rejects extra fields" {
 
     const prefix =
         "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
-        "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+        "\"state\":\"NEW\",\"last_updated\":1700000000," ++
         "\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"";
     try std.testing.expectError(
         error.DuplicateField,
@@ -1443,7 +1459,7 @@ test "output parser rejects oversized and invariant-breaking fields" {
             arena.allocator(),
             "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"" ++
                 ("a" ** (tenant_size_max + 1)) ++ "\",\"name\":\"echo\"," ++
-                "\"state\":\"SUBMITTED\"" ++ suffix,
+                "\"state\":\"NEW\"" ++ suffix,
         ),
     );
     try std.testing.expectError(
@@ -1451,7 +1467,7 @@ test "output parser rejects oversized and invariant-breaking fields" {
         parseOutputJSON(
             arena.allocator(),
             "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"" ++
-                ("a" ** (name_size_max + 1)) ++ "\",\"state\":\"SUBMITTED\"" ++ suffix,
+                ("a" ** (name_size_max + 1)) ++ "\",\"state\":\"NEW\"" ++ suffix,
         ),
     );
     try std.testing.expectError(
@@ -1459,7 +1475,7 @@ test "output parser rejects oversized and invariant-breaking fields" {
         parseOutputJSON(
             arena.allocator(),
             prefix ++ "\"body\":\"" ++ ("a" ** (body_size_max - 1)) ++
-                "\",\"state\":\"SUBMITTED\"" ++ suffix,
+                "\",\"state\":\"NEW\"" ++ suffix,
         ),
     );
     try std.testing.expectError(
@@ -1478,7 +1494,7 @@ test "output parser rejects oversized and invariant-breaking fields" {
         error.UnexpectedResult,
         parseOutputJSON(
             arena.allocator(),
-            prefix ++ "\"state\":\"SUBMITTED\",\"result\":true" ++ suffix,
+            prefix ++ "\"state\":\"NEW\",\"result\":true" ++ suffix,
         ),
     );
     try std.testing.expectError(
@@ -1489,7 +1505,7 @@ test "output parser rejects oversized and invariant-breaking fields" {
         error.InvalidExpiresAt,
         parseOutputJSON(
             arena.allocator(),
-            prefix ++ "\"state\":\"SUBMITTED\"" ++
+            prefix ++ "\"state\":\"NEW\"" ++
                 ",\"last_updated\":1700000000,\"expires_at\":1700086401," ++
                 "\"hash\":\"" ++ ("ab" ** 32) ++ "\"}",
         ),
@@ -1498,7 +1514,7 @@ test "output parser rejects oversized and invariant-breaking fields" {
         error.InvalidHash,
         parseOutputJSON(
             arena.allocator(),
-            prefix ++ "\"state\":\"SUBMITTED\"," ++
+            prefix ++ "\"state\":\"NEW\"," ++
                 "\"last_updated\":1700000000,\"expires_at\":1700086400," ++
                 "\"hash\":\"" ++ ("AB" ** 32) ++ "\"}",
         ),

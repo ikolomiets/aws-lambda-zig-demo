@@ -106,23 +106,6 @@ const RuntimeResources = struct {
         return resources.persistence.create(arena, source);
     }
 
-    fn read(
-        resources: *RuntimeResources,
-        arena: Allocator,
-        id: u128,
-    ) !operation.Operation {
-        return resources.persistence.read(arena, id);
-    }
-
-    fn update(
-        resources: *RuntimeResources,
-        arena: Allocator,
-        snapshot: *const operation.Operation,
-        replacement: *const operation.Operation,
-    ) !operation.Operation {
-        return resources.persistence.update(arena, snapshot, replacement);
-    }
-
     fn send(
         resources: *RuntimeResources,
         arena: Allocator,
@@ -138,17 +121,6 @@ const IntakeAdapter = struct {
     create_fn: *const fn (
         *anyopaque,
         Allocator,
-        *const operation.Operation,
-    ) anyerror!operation.Operation,
-    read_fn: *const fn (
-        *anyopaque,
-        Allocator,
-        u128,
-    ) anyerror!operation.Operation,
-    update_fn: *const fn (
-        *anyopaque,
-        Allocator,
-        *const operation.Operation,
         *const operation.Operation,
     ) anyerror!operation.Operation,
     send_fn: *const fn (
@@ -173,25 +145,6 @@ const IntakeAdapter = struct {
                 return self.create(allocator, source);
             }
 
-            fn read(
-                context: *anyopaque,
-                allocator: Allocator,
-                id: u128,
-            ) anyerror!operation.Operation {
-                const self: Pointer = @ptrCast(@alignCast(context));
-                return self.read(allocator, id);
-            }
-
-            fn update(
-                context: *anyopaque,
-                allocator: Allocator,
-                snapshot: *const operation.Operation,
-                replacement: *const operation.Operation,
-            ) anyerror!operation.Operation {
-                const self: Pointer = @ptrCast(@alignCast(context));
-                return self.update(allocator, snapshot, replacement);
-            }
-
             fn send(
                 context: *anyopaque,
                 allocator: Allocator,
@@ -204,8 +157,6 @@ const IntakeAdapter = struct {
         return .{
             .context = pointer,
             .create_fn = Adapter.create,
-            .read_fn = Adapter.read,
-            .update_fn = Adapter.update,
             .send_fn = Adapter.send,
         };
     }
@@ -216,28 +167,6 @@ const IntakeAdapter = struct {
         source: *const operation.Operation,
     ) !operation.Operation {
         return intake.create_fn(intake.context, allocator, source);
-    }
-
-    fn read(
-        intake: IntakeAdapter,
-        allocator: Allocator,
-        id: u128,
-    ) !operation.Operation {
-        return intake.read_fn(intake.context, allocator, id);
-    }
-
-    fn update(
-        intake: IntakeAdapter,
-        allocator: Allocator,
-        snapshot: *const operation.Operation,
-        replacement: *const operation.Operation,
-    ) !operation.Operation {
-        return intake.update_fn(
-            intake.context,
-            allocator,
-            snapshot,
-            replacement,
-        );
     }
 
     fn send(
@@ -345,15 +274,10 @@ fn post_invocation_outcome(
     };
     if (created.state.? != .new) return operation_success_outcome(allocator, &created);
 
-    var submitted = created;
-    submitted.body = parsed.body;
-    submitted.state = .submitted;
-    submitted.last_updated = now;
-    submitted.expires_at = operation.expires_at_from_last_updated(now) catch {
-        return .internal_server_error;
-    };
-    submitted.result = null;
-    const message = operation_message_body(arena, &submitted) catch {
+    var queued = created;
+    queued.body = parsed.body;
+    queued.result = null;
+    const message = operation_message_body(arena, &queued) catch {
         return .internal_server_error;
     };
     intake.send(arena, message) catch |err| {
@@ -361,50 +285,19 @@ fn post_invocation_outcome(
         return .service_unavailable;
     };
 
-    var replacement = submitted;
-    replacement.body = null;
-    const updated = intake.update(arena, &created, &replacement) catch |err| {
-        if (err != error.OperationConflict) return .internal_server_error;
-        return reconcile_update_conflict(allocator, arena, intake, &created);
-    };
-    return operation_success_outcome(allocator, &updated);
-}
-
-fn reconcile_update_conflict(
-    allocator: Allocator,
-    arena: Allocator,
-    intake: IntakeAdapter,
-    submitted_snapshot: *const operation.Operation,
-) InvocationOutcome {
-    const current = intake.read(arena, submitted_snapshot.id) catch {
-        return .internal_server_error;
-    };
-    if (!operation_identity_matches(&current, submitted_snapshot)) return .conflict;
-    if (current.state.? == .new) return .conflict;
-    return operation_success_outcome(allocator, &current);
-}
-
-fn operation_identity_matches(
-    left: *const operation.Operation,
-    right: *const operation.Operation,
-) bool {
-    if (left.id != right.id) return false;
-    if (!std.mem.eql(u8, left.tenant, right.tenant)) return false;
-    if (!std.mem.eql(u8, left.name, right.name)) return false;
-    if (!std.mem.eql(u8, &left.hash.?, &right.hash.?)) return false;
-    return true;
+    return operation_success_outcome(allocator, &created);
 }
 
 fn operation_message_body(
     allocator: Allocator,
-    submitted: *const operation.Operation,
+    queued: *const operation.Operation,
 ) ![]const u8 {
-    std.debug.assert(submitted.body != null);
-    std.debug.assert(submitted.state == .submitted);
+    std.debug.assert(queued.body != null);
+    std.debug.assert(queued.state == .new);
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    try operation.writeOutputJSON(&output.writer, submitted);
+    try operation.writeOutputJSON(&output.writer, queued);
     if (output.written().len > operation_message_size_max) {
         return error.OperationMessageTooLarge;
     }
@@ -495,15 +388,9 @@ fn encodeOutcome(
 
 const FakeIntake = struct {
     response: ?operation.Operation = null,
-    read_response: ?operation.Operation = null,
-    update_response: ?operation.Operation = null,
     create_error: ?anyerror = null,
-    read_error: ?anyerror = null,
-    update_error: ?anyerror = null,
     send_error: ?anyerror = null,
     create_count: u8 = 0,
-    read_count: u8 = 0,
-    update_count: u8 = 0,
     send_count: u8 = 0,
     last_id: u128 = 0,
     last_state: ?operation.State = null,
@@ -518,12 +405,6 @@ const FakeIntake = struct {
     last_body_len: u16 = 0,
     last_message_buffer: [operation_message_size_max]u8 = undefined,
     last_message_len: u16 = 0,
-    last_read_id: u128 = 0,
-    last_snapshot_state: ?operation.State = null,
-    last_update_state: ?operation.State = null,
-    last_update_time: ?operation.UnixSeconds = null,
-    last_update_expires_at: ?operation.UnixSeconds = null,
-    last_update_body_present: bool = false,
 
     fn create(
         fake: *FakeIntake,
@@ -552,36 +433,6 @@ const FakeIntake = struct {
         created.body = null;
         std.debug.assert(created.body == null);
         return created;
-    }
-
-    fn read(
-        fake: *FakeIntake,
-        _: Allocator,
-        id: u128,
-    ) !operation.Operation {
-        std.debug.assert(fake.read_count < 32);
-        fake.read_count += 1;
-        fake.last_read_id = id;
-        if (fake.read_error) |err| return err;
-        return fake.read_response orelse error.OperationNotFound;
-    }
-
-    fn update(
-        fake: *FakeIntake,
-        _: Allocator,
-        snapshot: *const operation.Operation,
-        replacement: *const operation.Operation,
-    ) !operation.Operation {
-        std.debug.assert(fake.update_count < 32);
-        fake.update_count += 1;
-        fake.last_snapshot_state = snapshot.state;
-        fake.last_update_state = replacement.state;
-        fake.last_update_time = replacement.last_updated;
-        fake.last_update_expires_at = replacement.expires_at;
-        fake.last_update_body_present = replacement.body != null;
-        if (fake.update_error) |err| return err;
-        if (fake.update_response) |response| return response;
-        return replacement.*;
     }
 
     fn send(
@@ -651,7 +502,7 @@ test "AWS SDK debug logging is enabled" {
     try std.testing.expect(std.log.logEnabled(.debug, .aws_sdk));
 }
 
-test "authenticated POST submits a new operation and returns it without its body" {
+test "authenticated POST persists and queues NEW then returns without its body" {
     const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
         .seed_byte = 0x42,
         .now = 1_700_000_000,
@@ -673,7 +524,7 @@ test "authenticated POST submits a new operation and returns it without its body
         "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
         "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
         "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
-        "\\\"state\\\":\\\"SUBMITTED\\\"," ++
+        "\\\"state\\\":\\\"NEW\\\"," ++
         "\\\"last_updated\\\":1700000000," ++
         "\\\"expires_at\\\":1700086400," ++
         "\\\"hash\\\":\\\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\\\"}\"}";
@@ -681,7 +532,7 @@ test "authenticated POST submits a new operation and returns it without its body
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"tenant\":\"lambda-test-user\",\"name\":\"echo\"," ++
         "\"body\":{\"message\":\"hello\",\"count\":2}," ++
-        "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+        "\"state\":\"NEW\",\"last_updated\":1700000000," ++
         "\"expires_at\":1700086400," ++
         "\"hash\":\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\"}";
 
@@ -726,12 +577,6 @@ test "authenticated POST submits a new operation and returns it without its body
         );
         try std.testing.expectEqualStrings(expected_message, fake.lastMessage());
         try std.testing.expectEqual(@as(u8, 1), fake.send_count);
-        try std.testing.expectEqual(@as(u8, 1), fake.update_count);
-        try std.testing.expectEqual(operation.State.new, fake.last_snapshot_state.?);
-        try std.testing.expectEqual(operation.State.submitted, fake.last_update_state.?);
-        try std.testing.expectEqual(@as(i64, 1_700_000_000), fake.last_update_time.?);
-        try std.testing.expectEqual(@as(i64, 1_700_086_400), fake.last_update_expires_at.?);
-        try std.testing.expect(!fake.last_update_body_present);
         var expected_hash: [32]u8 = undefined;
         _ = try std.fmt.hexToBytes(
             &expected_hash,
@@ -756,32 +601,32 @@ test "POST queues every JSON body variant as exact full Operation JSON" {
     const messages = [_][]const u8{
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":null," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"hash\":\"fd177e1082fafe25e8ae2bc301281fc4f4a5a0776ab241d35cf9ed91a46db3b3\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":false," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"hash\":\"6e18221b306b6bfd8753e910d58beb8cf007da71923dc7b52011f107fbc51d1c\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":42," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"hash\":\"d5ccd414185af1692c3678f3cde5756d3bb12a7cbfd0f39f797610b3fa7bd235\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":\"text\"," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"hash\":\"576bfabb751a1c5df078d4d24cd5bd66c00cec5b765e898b7eb3743693a0c2bb\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":[1]," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"hash\":\"9a2a3875c2b05917ae674a0d5b6f1bfc71d6dec7b3cb71059f9c21f60709cbc9\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":{\"a\":1}," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
+            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
             "\"hash\":\"72773a3103040a8266d9052ef82f5119ea53608cc1aac4ae8844721705e292dd\"}",
     };
@@ -816,11 +661,9 @@ test "POST queues every JSON body variant as exact full Operation JSON" {
         defer std.testing.allocator.free(response);
 
         try std.testing.expectEqualStrings(expected_message, fake.lastMessage());
-        try expectContains(response, "\\\"state\\\":\\\"SUBMITTED\\\"");
+        try expectContains(response, "\\\"state\\\":\\\"NEW\\\"");
         try expectNotContains(response, "\\\"body\\\":");
         try std.testing.expectEqual(@as(u8, 1), fake.send_count);
-        try std.testing.expectEqual(@as(u8, 1), fake.update_count);
-        try std.testing.expect(!fake.last_update_body_present);
     }
 }
 
@@ -873,7 +716,7 @@ test "POST derives tenant and hash from distinct bounded verified subjects" {
     try std.testing.expect(!std.mem.eql(u8, &hashes[0], &hashes[1]));
 }
 
-test "matching NEW POST retries submission with the invocation timestamp" {
+test "matching NEW POST requeues and returns the stored snapshot" {
     const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
         .seed_byte = 0x52,
         .now = 1_700_000_500,
@@ -923,15 +766,12 @@ test "matching NEW POST retries submission with the invocation timestamp" {
     );
     defer std.testing.allocator.free(response);
 
-    try expectContains(response, "\\\"state\\\":\\\"SUBMITTED\\\"");
-    try expectContains(response, "\\\"last_updated\\\":1700000500");
-    try expectContains(response, "\\\"expires_at\\\":1700086900");
+    try expectContains(response, "\\\"state\\\":\\\"NEW\\\"");
+    try expectContains(response, "\\\"last_updated\\\":1699999000");
+    try expectContains(response, "\\\"expires_at\\\":1700085400");
     try expectContains(fake.lastMessage(), "\"body\":{\"message\":\"hello\",\"count\":2}");
-    try expectContains(fake.lastMessage(), "\"last_updated\":1700000500");
-    try std.testing.expectEqual(operation.State.new, fake.last_snapshot_state.?);
-    try std.testing.expectEqual(operation.State.submitted, fake.last_update_state.?);
+    try expectContains(fake.lastMessage(), "\"last_updated\":1699999000");
     try std.testing.expectEqual(@as(u8, 1), fake.send_count);
-    try std.testing.expectEqual(@as(u8, 1), fake.update_count);
 }
 
 test "matching POST retry returns the latest stored persistent view" {
@@ -1003,7 +843,7 @@ test "matching POST retry returns the latest stored persistent view" {
     try std.testing.expectEqual(@as(u8, 1), fake.create_count);
 }
 
-test "matching POST in every later state returns without another submission" {
+test "matching POST in every terminal state returns without enqueueing" {
     var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer result_arena.deinit();
     const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
@@ -1032,13 +872,13 @@ test "matching POST in every later state returns without another submission" {
         &expected_hash,
         "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
     );
-    const states = [_]operation.State{ .submitted, .running, .succeeded, .failed };
+    const states = [_]operation.State{ .succeeded, .failed };
 
     for (states) |state| {
-        const result = if (operation.stateIsTerminal(state))
-            try operation.parseResultJSON(result_arena.allocator(), "{\"done\":true}")
-        else
-            null;
+        const result = try operation.parseResultJSON(
+            result_arena.allocator(),
+            "{\"done\":true}",
+        );
         var fake = FakeIntake{ .response = .{
             .id = operation.uuidFromString(
                 "00112233-4455-6677-8899-aabbccddeeff",
@@ -1071,8 +911,6 @@ test "matching POST in every later state returns without another submission" {
         try expectContains(response, state_marker);
         try std.testing.expectEqual(@as(u8, 1), fake.create_count);
         try std.testing.expectEqual(@as(u8, 0), fake.send_count);
-        try std.testing.expectEqual(@as(u8, 0), fake.update_count);
-        try std.testing.expectEqual(@as(u8, 0), fake.read_count);
     }
 }
 
@@ -1159,7 +997,7 @@ test "POST persistence failures return only the static internal error" {
     }
 }
 
-test "SQS failure leaves NEW unchanged and a matching POST can retry submission" {
+test "SQS failure leaves NEW unchanged and a matching POST can requeue" {
     const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
         .seed_byte = 0x50,
         .now = 1000,
@@ -1195,7 +1033,6 @@ test "SQS failure leaves NEW unchanged and a matching POST can retry submission"
     try expectNotContains(failed, "queue-failure-marker");
     try expectNotContains(failed, "AWSFailure");
     try std.testing.expectEqual(@as(u8, 1), fake.send_count);
-    try std.testing.expectEqual(@as(u8, 0), fake.update_count);
 
     fake.send_error = null;
     const retried = handleInvocationForTest(
@@ -1208,189 +1045,9 @@ test "SQS failure leaves NEW unchanged and a matching POST can retry submission"
         1001,
     );
     defer std.testing.allocator.free(retried);
-    try expectContains(retried, "SUBMITTED");
+    try expectContains(retried, "NEW");
     try std.testing.expectEqual(@as(u8, 2), fake.create_count);
     try std.testing.expectEqual(@as(u8, 2), fake.send_count);
-    try std.testing.expectEqual(@as(u8, 1), fake.update_count);
-}
-
-test "persistence update failure after send returns only the static internal error" {
-    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
-        .seed_byte = 0x54,
-        .now = 1000,
-        .ttl_seconds = 60,
-    });
-    defer std.testing.allocator.free(token);
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-    try lambda_auth.testing.put_public_key(&environment, 0x54);
-    const event = try test_authorization_request_event(
-        std.testing.allocator,
-        .POST,
-        "Authorization",
-        "Bearer",
-        token,
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"name\":\"update-failure-marker\",\"body\":{\"secret\":\"marker\"}}",
-    );
-    defer std.testing.allocator.free(event);
-    var fake = FakeIntake{ .update_error = error.AWSFailure };
-
-    const response = handleInvocationForTest(
-        std.testing.allocator,
-        event,
-        .{},
-        .{},
-        &environment,
-        &fake,
-        1000,
-    );
-    defer std.testing.allocator.free(response);
-
-    try expectInternalServerError(response);
-    try expectNotContains(response, "update-failure-marker");
-    try expectNotContains(response, "AWSFailure");
-    try std.testing.expectEqual(@as(u8, 1), fake.send_count);
-    try std.testing.expectEqual(@as(u8, 1), fake.update_count);
-    try std.testing.expectEqual(@as(u8, 0), fake.read_count);
-    try expectContains(fake.lastMessage(), "\"state\":\"SUBMITTED\"");
-}
-
-test "concurrent submitted update conflict reconciles with a consistent read" {
-    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
-        .seed_byte = 0x55,
-        .now = 1000,
-        .ttl_seconds = 60,
-    });
-    defer std.testing.allocator.free(token);
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-    try lambda_auth.testing.put_public_key(&environment, 0x55);
-    const event = try test_authorization_request_event(
-        std.testing.allocator,
-        .POST,
-        "Authorization",
-        "Bearer",
-        token,
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}",
-    );
-    defer std.testing.allocator.free(event);
-    var expected_hash: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(
-        &expected_hash,
-        "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
-    );
-    var fake = FakeIntake{
-        .update_error = error.OperationConflict,
-        .read_response = .{
-            .id = operation.uuidFromString(
-                "00112233-4455-6677-8899-aabbccddeeff",
-            ) catch unreachable,
-            .tenant = "lambda-test-user",
-            .name = "echo",
-            .state = .submitted,
-            .last_updated = 1001,
-            .expires_at = 87_401,
-            .hash = expected_hash,
-        },
-    };
-
-    const response = handleInvocationForTest(
-        std.testing.allocator,
-        event,
-        .{},
-        .{},
-        &environment,
-        &fake,
-        1000,
-    );
-    defer std.testing.allocator.free(response);
-
-    try expectContains(response, "\\\"state\\\":\\\"SUBMITTED\\\"");
-    try expectContains(response, "\\\"last_updated\\\":1001");
-    try expectContains(response, "\\\"expires_at\\\":87401");
-    try std.testing.expectEqual(@as(u8, 1), fake.send_count);
-    try std.testing.expectEqual(@as(u8, 1), fake.update_count);
-    try std.testing.expectEqual(@as(u8, 1), fake.read_count);
-    try std.testing.expectEqual(fake.last_id, fake.last_read_id);
-}
-
-test "unreconciled conditional update conflicts remain sanitized" {
-    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
-        .seed_byte = 0x56,
-        .now = 1000,
-        .ttl_seconds = 60,
-    });
-    defer std.testing.allocator.free(token);
-    var environment = std.process.Environ.Map.init(std.testing.allocator);
-    defer environment.deinit();
-    try lambda_auth.testing.put_public_key(&environment, 0x56);
-    const event = try test_authorization_request_event(
-        std.testing.allocator,
-        .POST,
-        "Authorization",
-        "Bearer",
-        token,
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"name\":\"reconcile-marker\",\"body\":true}",
-    );
-    defer std.testing.allocator.free(event);
-    var fake = FakeIntake{
-        .update_error = error.OperationConflict,
-        .read_response = .{
-            .id = operation.uuidFromString(
-                "00112233-4455-6677-8899-aabbccddeeff",
-            ) catch unreachable,
-            .tenant = "lambda-test-user",
-            .name = "reconcile-marker",
-            .state = .new,
-            .last_updated = 1001,
-            .expires_at = 87_401,
-            .hash = [_]u8{0xAB} ** 32,
-        },
-    };
-
-    const conflict = handleInvocationForTest(
-        std.testing.allocator,
-        event,
-        .{},
-        .{},
-        &environment,
-        &fake,
-        1000,
-    );
-    defer std.testing.allocator.free(conflict);
-    try expectConflict(conflict);
-    try expectNotContains(conflict, "reconcile-marker");
-
-    fake.read_response.?.hash = fake.last_hash;
-    const still_new = handleInvocationForTest(
-        std.testing.allocator,
-        event,
-        .{},
-        .{},
-        &environment,
-        &fake,
-        1000,
-    );
-    defer std.testing.allocator.free(still_new);
-    try expectConflict(still_new);
-    try expectNotContains(still_new, "reconcile-marker");
-
-    fake.read_error = error.AWSFailure;
-    const failed_read = handleInvocationForTest(
-        std.testing.allocator,
-        event,
-        .{},
-        .{},
-        &environment,
-        &fake,
-        1000,
-    );
-    defer std.testing.allocator.free(failed_read);
-    try expectInternalServerError(failed_read);
-    try expectNotContains(failed_read, "AWSFailure");
 }
 
 test "warm invocations reuse one adapter without retaining request data" {
@@ -1464,6 +1121,8 @@ test "authenticated POST rejects missing and invalid operation JSON" {
             "\"tenant\":\"spoofed\",\"name\":\"echo\",\"body\":null}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"echo\",\"body\":null,\"state\":\"SUBMITTED\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"name\":\"echo\",\"body\":null,\"state\":\"RUNNING\"}",
     };
     for (invalid_inputs) |input| {
         const event = try test_authorization_request_event(
@@ -1489,6 +1148,7 @@ test "authenticated POST rejects missing and invalid operation JSON" {
         try expectBadRequest(response);
         try expectNotContains(response, "invalid-json-marker");
         try expectNotContains(response, "SUBMITTED");
+        try expectNotContains(response, "RUNNING");
     }
     try std.testing.expectEqual(@as(u8, 0), fake.create_count);
 }

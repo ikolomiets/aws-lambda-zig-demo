@@ -201,9 +201,7 @@ Resources:
           Statement:
             - Effect: Allow
               Action:
-                - dynamodb:GetItem
                 - dynamodb:PutItem
-                - dynamodb:UpdateItem
               Resource: !GetAtt OperationsTable.Arn
             - Effect: Allow
               Action:

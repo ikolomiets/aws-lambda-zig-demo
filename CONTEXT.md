@@ -25,7 +25,7 @@ The JSON value produced when an operation succeeds or fails.
 _Avoid_: Response, output body
 
 **Operation State**:
-The operation's current lifecycle position: new, submitted, running, succeeded, or failed.
+The operation's current lifecycle position: new, succeeded, or failed.
 _Avoid_: Status
 
 **Terminal State**:
