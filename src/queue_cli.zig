@@ -445,7 +445,7 @@ fn executeSend(
     defer serialized.deinit();
     try operation.writeOutputJSON(&serialized.writer, &parsed);
     const message = serialized.written();
-    std.debug.assert(parsed.state == .submitted);
+    std.debug.assert(parsed.status == .submitted);
     std.debug.assert(message.len > 0);
 
     try backend.send(context.allocator, message);

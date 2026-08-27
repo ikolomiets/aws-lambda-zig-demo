@@ -432,9 +432,8 @@ fn accountingTransfer(operation_id: u128) tigerbeetle.Transfer {
 }
 
 fn validateQueuedOperation(queued: *const operation.Operation) !void {
-    if (queued.state != .submitted) return error.InvalidState;
+    if (queued.status != .submitted) return error.InvalidState;
     if (queued.body == null) return error.MissingBody;
-    if (queued.result != null) return error.UnexpectedResult;
     std.debug.assert(queued.hash != null);
     std.debug.assert(queued.last_updated != null);
     std.debug.assert(queued.expires_at != null);
@@ -487,9 +486,8 @@ const FakeExecution = struct {
     ) !void {
         _ = arena;
         std.debug.assert(fake.completion_count < record_count_max);
-        std.debug.assert(queued.state == .submitted);
+        std.debug.assert(queued.status == .submitted);
         std.debug.assert(queued.body != null);
-        std.debug.assert(queued.result == null);
         const index = fake.completion_count;
         fake.timestamps[index] = now;
         fake.completion_count += 1;
@@ -515,7 +513,7 @@ fn testMessage(allocator: Allocator, id: u128) ![]u8 {
         .tenant = "tenant-a",
         .name = "echo",
         .body = .{ .bool = true },
-        .state = .submitted,
+        .status = .submitted,
         .last_updated = 1_700_000_000,
         .expires_at = 1_700_086_400,
         .hash = [_]u8{0xAB} ** 32,
@@ -758,6 +756,10 @@ test "malformed terminal bodyless and result-bearing operations are acknowledged
             "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
             "\"state\":\"SUCCEEDED\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400,\"result\":true,\"hash\":\"" ++ hash ++ "\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
+            "\"state\":\"FAILED\",\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400,\"result\":false,\"hash\":\"" ++ hash ++ "\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
             "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++

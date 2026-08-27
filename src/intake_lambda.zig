@@ -272,11 +272,10 @@ fn post_invocation_outcome(
             else => .internal_server_error,
         };
     };
-    if (created.state.? != .submitted) return operation_success_outcome(allocator, &created);
+    if (created.status != .submitted) return operation_success_outcome(allocator, &created);
 
     var queued = created;
     queued.body = parsed.body;
-    queued.result = null;
     const message = operation_message_body(arena, &queued) catch {
         return .internal_server_error;
     };
@@ -293,7 +292,7 @@ fn operation_message_body(
     queued: *const operation.Operation,
 ) ![]const u8 {
     std.debug.assert(queued.body != null);
-    std.debug.assert(queued.state == .submitted);
+    std.debug.assert(queued.status == .submitted);
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -324,7 +323,6 @@ fn operation_output_body(
     persisted: *const operation.Operation,
 ) ![]const u8 {
     std.debug.assert(persisted.body == null);
-    std.debug.assert(persisted.state != null);
     std.debug.assert(persisted.last_updated != null);
     std.debug.assert(persisted.expires_at != null);
 
@@ -416,7 +414,7 @@ const FakeIntake = struct {
         std.debug.assert(source.name.len <= fake.last_name_buffer.len);
         fake.create_count += 1;
         fake.last_id = source.id;
-        fake.last_state = source.state;
+        fake.last_state = operation.statusToState(&source.status);
         fake.last_updated = source.last_updated;
         fake.last_expires_at = source.expires_at;
         fake.last_hash = source.hash;
@@ -749,7 +747,7 @@ test "matching SUBMITTED POST requeues and returns the stored snapshot" {
         ) catch unreachable,
         .tenant = "lambda-test-user",
         .name = "echo",
-        .state = .submitted,
+        .status = .submitted,
         .last_updated = 1_699_999_000,
         .expires_at = 1_700_085_400,
         .hash = expected_hash,
@@ -798,13 +796,16 @@ test "matching POST retry returns the latest stored persistent view" {
         ) catch unreachable,
         .tenant = "lambda-test-user",
         .name = "echo",
-        .state = .succeeded,
+        .status = .{
+            .completed = .{
+                .success = try operation.parseResultJSON(
+                    result_arena.allocator(),
+                    "{ \"message\" : \"done\" }",
+                ),
+            },
+        },
         .last_updated = 1_700_000_123,
         .expires_at = 1_700_086_523,
-        .result = try operation.parseResultJSON(
-            result_arena.allocator(),
-            "{ \"message\" : \"done\" }",
-        ),
         .hash = expected_hash,
     } };
     const input =
@@ -885,10 +886,9 @@ test "matching POST in every terminal state returns without enqueueing" {
             ) catch unreachable,
             .tenant = "lambda-test-user",
             .name = "echo",
-            .state = state,
+            .status = try operation.statusFromStateResult(state, result),
             .last_updated = 1_700_000_123,
             .expires_at = 1_700_086_523,
-            .result = result,
             .hash = expected_hash,
         } };
         const response = handleInvocationForTest(

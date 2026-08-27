@@ -472,15 +472,16 @@ fn executeUpdate(
 ) !void {
     const snapshot = try backend.read(context.allocator, options.id);
     try operation.validatePersistent(&snapshot);
-    try operation.validateStateTransition(snapshot.state.?, options.state);
-    var replacement = snapshot;
-    replacement.state = options.state;
-    replacement.last_updated = context.now;
-    replacement.expires_at = try operation.expires_at_from_last_updated(context.now);
-    replacement.result = if (operation.stateIsTerminal(options.state))
+    const result = if (operation.stateIsTerminal(options.state))
         try operation.parseResultJSON(context.allocator, context.stdin)
     else
         null;
+    const replacement_status = try operation.statusFromStateResult(options.state, result);
+    try operation.validateStatusTransition(&snapshot.status, &replacement_status);
+    var replacement = snapshot;
+    replacement.status = replacement_status;
+    replacement.last_updated = context.now;
+    replacement.expires_at = try operation.expires_at_from_last_updated(context.now);
     try operation.validatePersistent(&replacement);
     const updated = try backend.update(
         context.allocator,
@@ -504,7 +505,7 @@ const FakePersistence = struct {
         .id = operation.uuidFromString(test_id) catch unreachable,
         .tenant = "tenant-a",
         .name = "echo",
-        .state = .submitted,
+        .status = .submitted,
         .last_updated = 1_700_000_000,
         .expires_at = 1_700_086_400,
         .hash = test_hash,
@@ -528,7 +529,7 @@ const FakePersistence = struct {
     ) !operation.Operation {
         fake.create_count += 1;
         fake.last_id = source.id;
-        fake.last_state = source.state;
+        fake.last_state = operation.statusToState(&source.status);
         fake.create_tenant_len = @intCast(source.tenant.len);
         @memcpy(fake.create_tenant_buffer[0..source.tenant.len], source.tenant);
         if (fake.create_error) |err| return err;
@@ -563,7 +564,7 @@ const FakePersistence = struct {
         replacement: *const operation.Operation,
     ) !operation.Operation {
         fake.update_count += 1;
-        fake.last_state = replacement.state;
+        fake.last_state = operation.statusToState(&replacement.status);
         if (fake.update_error) |err| return err;
         return replacement.*;
     }
@@ -878,42 +879,34 @@ test "update accepts every transition from SUBMITTED including same-state refres
     }
 }
 
-test "update refreshes a terminal state and rejects reopening or switching it" {
-    var refresh: FakePersistence = .{};
-    refresh.stored.state = .succeeded;
-    refresh.stored.result = .{ .bool = true };
-    const refreshed = runForTest(
-        &.{ "dynamodb", "update", "--id", test_id, "--state", "SUCCEEDED" },
-        "{\"refreshed\":true}",
-        1_700_000_001,
-        &refresh,
-    );
-    try std.testing.expectEqual(@as(u8, 0), refreshed.exit_code);
-    try std.testing.expectEqual(@as(u8, 1), refresh.update_count);
-
-    const cases = [_]struct {
-        current: operation.State,
-        target: []const u8,
-        input: []const u8,
-    }{
-        .{ .current = .succeeded, .target = "SUBMITTED", .input = "" },
-        .{ .current = .succeeded, .target = "FAILED", .input = "true" },
-        .{ .current = .failed, .target = "SUBMITTED", .input = "" },
-        .{ .current = .failed, .target = "SUCCEEDED", .input = "true" },
-    };
-    for (cases) |case| {
-        var fake: FakePersistence = .{};
-        fake.stored.state = case.current;
-        fake.stored.result = .{ .bool = true };
-        const result = runForTest(
-            &.{ "dynamodb", "update", "--id", test_id, "--state", case.target },
-            case.input,
-            1_700_000_001,
-            &fake,
-        );
-        try std.testing.expectEqual(@as(u8, 2), result.exit_code);
-        try std.testing.expectEqual(@as(u8, 1), fake.read_count);
-        try std.testing.expectEqual(@as(u8, 0), fake.update_count);
+test "update rejects every target from either completed outcome" {
+    const completed = [_]operation.State{ .succeeded, .failed };
+    const targets = [_]operation.State{ .submitted, .succeeded, .failed };
+    for (completed) |current| {
+        for (targets) |target| {
+            var fake: FakePersistence = .{};
+            fake.stored.status = operation.statusFromStateResult(
+                current,
+                .{ .bool = true },
+            ) catch unreachable;
+            const input = if (operation.stateIsTerminal(target)) "true" else "";
+            const result = runForTest(
+                &.{
+                    "dynamodb",
+                    "update",
+                    "--id",
+                    test_id,
+                    "--state",
+                    operation.stateToString(target),
+                },
+                input,
+                1_700_000_001,
+                &fake,
+            );
+            try std.testing.expectEqual(@as(u8, 2), result.exit_code);
+            try std.testing.expectEqual(@as(u8, 1), fake.read_count);
+            try std.testing.expectEqual(@as(u8, 0), fake.update_count);
+        }
     }
 }
 

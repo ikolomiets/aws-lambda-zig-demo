@@ -63,12 +63,13 @@ pub fn stateIsTerminal(state: State) bool {
     };
 }
 
-/// Validates a monotonic lifecycle transition, including same-state refreshes.
-pub fn validateStateTransition(current: State, replacement: State) !void {
-    switch (current) {
-        .submitted => {},
-        .succeeded => if (replacement != .succeeded) return error.InvalidTransition,
-        .failed => if (replacement != .failed) return error.InvalidTransition,
+/// Validates the only mutable lifecycle: submitted may refresh or complete once.
+pub fn validateStatusTransition(current: *const Status, replacement: *const Status) !void {
+    switch (current.*) {
+        .submitted => switch (replacement.*) {
+            .submitted, .completed => {},
+        },
+        .completed => return error.InvalidTransition,
     }
 }
 
@@ -77,12 +78,11 @@ pub const Operation = struct {
     tenant: []const u8,
     name: []const u8,
     body: ?JSONValue = null,
-    state: ?State = null,
+    status: Status,
     /// Callers must update both timestamps together for every Operation update.
     last_updated: ?UnixSeconds = null,
     /// DynamoDB may delete this Operation after this Unix timestamp.
     expires_at: ?UnixSeconds = null,
-    result: ?JSONValue = null,
     hash: ?[32]u8 = null,
 };
 
@@ -131,10 +131,9 @@ pub fn parseInputJSON(
     const name = try parseJSONString(arena, name_json);
     try validateName(name);
 
-    const state = if (fields.state) |state_json|
-        try parseInputState(arena, state_json)
-    else
-        State.submitted;
+    if (fields.state) |state_json| {
+        _ = try parseInputState(arena, state_json);
+    }
     if (body_json.len > body_size_max) return error.BodyTooLarge;
     const body = try parseJSONValue(arena, body_json);
     const hash = try operationHash(tenant, name, &body);
@@ -145,7 +144,7 @@ pub fn parseInputJSON(
         .tenant = tenant,
         .name = name,
         .body = body,
-        .state = state,
+        .status = .submitted,
         .last_updated = options.now,
         .expires_at = expires_at,
         .hash = hash,
@@ -171,16 +170,24 @@ pub fn parseOutputJSON(arena: Allocator, output_json: []const u8) !Operation {
         if (body_json.len > body_size_max) return error.BodyTooLarge;
         break :body try parseJSONValue(arena, body_json);
     } else null;
-    const result = if (fields.result) |result_json| result: {
-        if (result_json.len > result_size_max) return error.ResultTooLarge;
-        break :result try parseJSONValue(arena, result_json);
-    } else null;
+    const state = try stateFromString(state_text);
+    const status: Status = switch (state) {
+        .submitted => status: {
+            if (fields.result != null) return error.UnexpectedResult;
+            break :status .submitted;
+        },
+        .succeeded, .failed => status: {
+            const result_json = fields.result orelse return error.MissingResult;
+            const result = try parseResultJSON(arena, result_json);
+            break :status try statusFromStateResult(state, result);
+        },
+    };
     const parsed: Operation = .{
         .id = id,
         .tenant = tenant,
         .name = name,
         .body = body,
-        .state = try stateFromString(state_text),
+        .status = status,
         .last_updated = try parseJSONInteger(
             arena,
             fields.last_updated orelse return error.MissingField,
@@ -189,10 +196,9 @@ pub fn parseOutputJSON(arena: Allocator, output_json: []const u8) !Operation {
             arena,
             fields.expires_at orelse return error.MissingField,
         ),
-        .result = result,
         .hash = try hashFromString(hash_text),
     };
-    _ = try validateView(&parsed);
+    try validateView(&parsed);
     return parsed;
 }
 
@@ -266,13 +272,57 @@ pub fn writeResultJSON(buffer: *[result_size_max]u8, result: *const JSONValue) !
     return writer.buffered();
 }
 
-/// Writes the Operation view while preserving body and result Values when present.
+/// Converts a legacy state and raw result into the in-memory status representation.
+pub fn statusFromStateResult(state: State, result: ?JSONValue) !Status {
+    switch (state) {
+        .submitted => {
+            if (result != null) return error.UnexpectedResult;
+            return .submitted;
+        },
+        .succeeded => {
+            const payload = result orelse return error.MissingResult;
+            if (payload == .null) return error.MissingResult;
+            try validateResultSize(&payload);
+            return .{ .completed = .{ .success = payload } };
+        },
+        .failed => {
+            const payload = result orelse return error.MissingResult;
+            if (payload == .null) return error.MissingResult;
+            try validateResultSize(&payload);
+            return .{ .completed = .{ .failure = payload } };
+        },
+    }
+}
+
+/// Returns the legacy state name represented by a status.
+pub fn statusToState(status: *const Status) State {
+    return switch (status.*) {
+        .submitted => .submitted,
+        .completed => |completion| switch (completion) {
+            .success => .succeeded,
+            .failure => .failed,
+        },
+    };
+}
+
+/// Returns the raw completion payload required by the legacy schema.
+pub fn statusResult(status: *const Status) ?*const JSONValue {
+    return switch (status.*) {
+        .submitted => null,
+        .completed => |*completion| switch (completion.*) {
+            .success => |*payload| payload,
+            .failure => |*payload| payload,
+        },
+    };
+}
+
+/// Writes the Operation view while preserving body and completion Values when present.
 pub fn writeOutputJSON(
     writer: *std.Io.Writer,
     operation: *const Operation,
 ) !void {
-    const result_present = try validateView(operation);
-    const state = operation.state.?;
+    try validateView(operation);
+    const state = statusToState(&operation.status);
     const last_updated = operation.last_updated.?;
     const expires_at = operation.expires_at.?;
     const hash = operation.hash.?;
@@ -301,9 +351,9 @@ pub fn writeOutputJSON(
     try json.write(last_updated);
     try json.objectField("expires_at");
     try json.write(expires_at);
-    if (result_present) {
+    if (statusResult(&operation.status)) |result| {
         try json.objectField("result");
-        try json.write(operation.result.?);
+        try json.write(result.*);
     }
     try json.objectField("hash");
     try json.write(&hash_hex);
@@ -313,7 +363,7 @@ pub fn writeOutputJSON(
 /// Checks the invariants required before mapping an operation to a persistent entity.
 pub fn validatePersistent(operation: *const Operation) !void {
     if (operation.body != null) return error.UnexpectedBody;
-    _ = try validateView(operation);
+    try validateView(operation);
 }
 
 /// Converts the canonical hyphenated UUID representation to its numeric representation.
@@ -656,27 +706,19 @@ fn hashFromString(value: []const u8) ![32]u8 {
     return hash;
 }
 
-fn validateView(operation: *const Operation) !bool {
+fn validateView(operation: *const Operation) !void {
     try validateTenant(operation.tenant);
     try validateName(operation.name);
     if (operation.body) |*body| try validateBodySize(body);
-    const state = operation.state orelse return error.MissingState;
     const last_updated = operation.last_updated orelse return error.MissingLastUpdated;
     const expires_at = operation.expires_at orelse return error.MissingExpiresAt;
     const expected_expires_at = try expires_at_from_last_updated(last_updated);
     if (expires_at != expected_expires_at) return error.InvalidExpiresAt;
     if (operation.hash == null) return error.MissingHash;
-    const result_present = operation.result != null;
-    if (stateIsTerminal(state)) {
-        if (!result_present) return error.MissingResult;
-        if (operation.result.? == .null) return error.MissingResult;
-    } else {
-        if (operation.result) |result| {
-            if (result != .null) return error.UnexpectedResult;
-        }
+    if (statusResult(&operation.status)) |result| {
+        if (result.* == .null) return error.MissingResult;
+        try validateResultSize(result);
     }
-    if (operation.result) |*result| try validateResultSize(result);
-    return result_present;
 }
 
 fn validateBodySize(body: *const JSONValue) !void {
@@ -829,21 +871,45 @@ test "persistent state parsing formatting and terminal classification are exhaus
     try std.testing.expectError(error.InvalidState, stateFromString(""));
 }
 
-test "all state transitions enforce the monotonic lifecycle" {
-    const states = [_]State{ .submitted, .succeeded, .failed };
-    for (states) |current| {
-        for (states) |replacement| {
-            const allowed = current == .submitted or current == replacement;
+test "all status transitions enforce immutable completion" {
+    const statuses = [_]Status{
+        .submitted,
+        .{ .completed = .{ .success = .{ .bool = true } } },
+        .{ .completed = .{ .failure = .{ .bool = false } } },
+    };
+    for (&statuses) |*current| {
+        for (&statuses) |*replacement| {
+            const allowed = current.* == .submitted;
             if (allowed) {
-                try validateStateTransition(current, replacement);
+                try validateStatusTransition(current, replacement);
             } else {
                 try std.testing.expectError(
                     error.InvalidTransition,
-                    validateStateTransition(current, replacement),
+                    validateStatusTransition(current, replacement),
                 );
             }
         }
     }
+}
+
+test "legacy states map exhaustively to status variants and raw results" {
+    const states = [_]State{ .submitted, .succeeded, .failed };
+    for (states) |state| {
+        const result: ?JSONValue = if (stateIsTerminal(state)) .{ .bool = true } else null;
+        const status = try statusFromStateResult(state, result);
+        try std.testing.expectEqual(state, statusToState(&status));
+        try std.testing.expectEqual(stateIsTerminal(state), statusResult(&status) != null);
+        if (statusResult(&status)) |payload| {
+            try std.testing.expect(payload.* == .bool);
+            try std.testing.expect(payload.bool);
+        }
+    }
+    try std.testing.expectError(
+        error.UnexpectedResult,
+        statusFromStateResult(.submitted, .{ .bool = true }),
+    );
+    try std.testing.expectError(error.MissingResult, statusFromStateResult(.succeeded, null));
+    try std.testing.expectError(error.MissingResult, statusFromStateResult(.failed, .null));
 }
 
 test "UUID conversion is symmetric and output is lowercase" {
@@ -882,10 +948,9 @@ test "input parses an arena-owned body Value and defaults state" {
     try std.testing.expectEqualStrings(test_tenant, operation.tenant);
     try std.testing.expectEqualStrings("echo", operation.name);
     try expectValueJSON("{\"message\":\"hello\"}", &operation.body.?);
-    try std.testing.expectEqual(State.submitted, operation.state.?);
+    try std.testing.expect(operation.status == .submitted);
     try std.testing.expectEqual(test_now, operation.last_updated.?);
     try std.testing.expectEqual(test_now + ttl_seconds, operation.expires_at.?);
-    try std.testing.expect(operation.result == null);
     try std.testing.expect(operation.hash != null);
 }
 
@@ -1084,7 +1149,7 @@ test "input accepts only omitted state or explicit SUBMITTED" {
         explicit,
         test_now,
     );
-    try std.testing.expectEqual(State.submitted, operation.state.?);
+    try std.testing.expect(operation.status == .submitted);
     for ([_][]const u8{ "NEW", "PENDING", "RUNNING", "SUCCEEDED", "FAILED" }) |state| {
         const later = try testInput(std.testing.allocator, "echo", "null", state);
         defer std.testing.allocator.free(later);
@@ -1225,30 +1290,30 @@ test "input rejects expiration timestamp overflow" {
     );
 }
 
-test "persistent validation enforces view and terminal result invariants" {
+test "persistent validation enforces status completion invariants" {
     const hash = [_]u8{0xAB} ** 32;
     var operation = Operation{
         .id = try uuidFromString(test_uuid),
         .tenant = test_tenant,
         .name = "echo",
-        .state = .submitted,
+        .status = .submitted,
         .last_updated = test_now,
         .expires_at = test_now + ttl_seconds,
         .hash = hash,
     };
     try validatePersistent(&operation);
-    operation.result = .null;
+    operation.status = .{ .completed = .{ .success = .{ .bool = true } } };
     try validatePersistent(&operation);
-    operation.result = .{ .bool = true };
-    try std.testing.expectError(
-        error.UnexpectedResult,
-        validatePersistent(&operation),
-    );
-    operation.state = .succeeded;
+    operation.status = .{ .completed = .{ .failure = .{ .string = "failed" } } };
     operation.last_updated = test_now + 2;
     operation.expires_at = test_now + 2 + ttl_seconds;
     try validatePersistent(&operation);
-    operation.result = .null;
+    operation.status = .{ .completed = .{ .failure = .null } };
+    try std.testing.expectError(
+        error.MissingResult,
+        validatePersistent(&operation),
+    );
+    operation.status = .{ .completed = .{ .success = .null } };
     try std.testing.expectError(
         error.MissingResult,
         validatePersistent(&operation),
@@ -1261,15 +1326,23 @@ test "result accepts exactly 4096 compact bytes" {
         .id = try uuidFromString(test_uuid),
         .tenant = test_tenant,
         .name = "echo",
-        .state = .failed,
+        .status = .{ .completed = .{ .failure = .{ .string = maximum } } },
         .last_updated = test_now,
         .expires_at = test_now + ttl_seconds,
-        .result = .{ .string = maximum },
         .hash = [_]u8{0} ** 32,
     };
     try validatePersistent(&operation);
 
-    operation.result = .{ .string = "a" ** (result_size_max - 1) };
+    operation.status = .{
+        .completed = .{ .failure = .{ .string = "a" ** (result_size_max - 1) } },
+    };
+    try std.testing.expectError(
+        error.ResultTooLarge,
+        validatePersistent(&operation),
+    );
+    operation.status = .{
+        .completed = .{ .success = .{ .string = "a" ** (result_size_max - 1) } },
+    };
     try std.testing.expectError(
         error.ResultTooLarge,
         validatePersistent(&operation),
@@ -1568,13 +1641,13 @@ test "body parses every JSON Value variant and rejects duplicate object keys" {
     );
 }
 
-test "persistent view rejects body and requires state timestamps and hash" {
+test "persistent view rejects body and requires timestamps and hash" {
     var operation = Operation{
         .id = try uuidFromString(test_uuid),
         .tenant = test_tenant,
         .name = "echo",
         .body = .null,
-        .state = .submitted,
+        .status = .submitted,
         .last_updated = test_now,
         .expires_at = test_now + ttl_seconds,
         .hash = [_]u8{0} ** 32,
@@ -1590,12 +1663,6 @@ test "persistent view rejects body and requires state timestamps and hash" {
         validatePersistent(&operation),
     );
     operation.tenant = test_tenant;
-    operation.state = null;
-    try std.testing.expectError(
-        error.MissingState,
-        validatePersistent(&operation),
-    );
-    operation.state = .submitted;
     operation.last_updated = null;
     try std.testing.expectError(
         error.MissingLastUpdated,
@@ -1628,10 +1695,13 @@ test "output preserves scalar body and terminal result as raw JSON" {
         .tenant = test_tenant,
         .name = "echo",
         .body = .{ .bool = true },
-        .state = .succeeded,
+        .status = .{
+            .completed = .{
+                .success = try parseResultJSON(arena.allocator(), "{\"ok\":true}"),
+            },
+        },
         .last_updated = test_now,
         .expires_at = test_now + ttl_seconds,
-        .result = try parseResultJSON(arena.allocator(), "{\"ok\":true}"),
         .hash = [_]u8{0xAB} ** 32,
     };
     var output_buffer: [512]u8 = undefined;
@@ -1650,6 +1720,24 @@ test "output preserves scalar body and terminal result as raw JSON" {
         output.buffered(),
     );
 
+    var failed = operation;
+    failed.status = .{ .completed = .{ .failure = operation.status.completed.success } };
+    var failed_buffer: [512]u8 = undefined;
+    var failed_output: std.Io.Writer = .fixed(&failed_buffer);
+    try writeOutputJSON(&failed_output, &failed);
+    try std.testing.expectEqualStrings(
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
+            "\"body\":true," ++
+            "\"state\":\"FAILED\"," ++
+            "\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400," ++
+            "\"result\":{\"ok\":true}," ++
+            "\"hash\":\"abababababababababababababababab" ++
+            "abababababababababababababababab\"}",
+        failed_output.buffered(),
+    );
+
     var invalid = operation;
     invalid.last_updated = null;
     try std.testing.expectError(error.MissingLastUpdated, writeOutputJSON(&output, &invalid));
@@ -1663,7 +1751,7 @@ test "output distinguishes object explicit-null and absent bodies" {
         .tenant = test_tenant,
         .name = "echo",
         .body = try parseJSONValue(arena.allocator(), "{\"message\":\"hello\"}"),
-        .state = .submitted,
+        .status = .submitted,
         .last_updated = test_now + 1,
         .expires_at = test_now + 1 + ttl_seconds,
         .hash = [_]u8{0xAB} ** 32,
@@ -1703,22 +1791,32 @@ test "every valid output shape round trips through the output parser" {
         .null,
         try parseJSONValue(value_arena.allocator(), "{\"message\":\"hello\"}"),
     };
-    const states = [_]State{ .submitted, .succeeded, .failed };
-    for (states) |state| {
+    const statuses = [_]Status{
+        .submitted,
+        .{ .completed = .{ .success = .{ .bool = true } } },
+        .{ .completed = .{ .failure = .{ .bool = false } } },
+    };
+    for (statuses) |status| {
         for (bodies) |body| {
-            const result: ?JSONValue = if (stateIsTerminal(state))
-                try parseResultJSON(value_arena.allocator(), "{\"success\":true}")
-            else
-                null;
+            var source_status = status;
+            if (source_status == .completed) {
+                const result = try parseResultJSON(
+                    value_arena.allocator(),
+                    "{\"success\":true}",
+                );
+                switch (source_status.completed) {
+                    .success => source_status = .{ .completed = .{ .success = result } },
+                    .failure => source_status = .{ .completed = .{ .failure = result } },
+                }
+            }
             const source: Operation = .{
                 .id = try uuidFromString(test_uuid),
                 .tenant = test_tenant,
                 .name = "echo",
                 .body = body,
-                .state = state,
+                .status = source_status,
                 .last_updated = test_now,
                 .expires_at = test_now + ttl_seconds,
-                .result = result,
                 .hash = [_]u8{0xAB} ** 32,
             };
             const serialized = try testOutput(&source);
@@ -1731,21 +1829,6 @@ test "every valid output shape round trips through the output parser" {
             try std.testing.expectEqualStrings(serialized, round_trip);
         }
     }
-
-    const explicit_null_result = Operation{
-        .id = try uuidFromString(test_uuid),
-        .tenant = test_tenant,
-        .name = "echo",
-        .state = .submitted,
-        .last_updated = test_now,
-        .expires_at = test_now + ttl_seconds,
-        .result = .null,
-        .hash = [_]u8{0xAB} ** 32,
-    };
-    const serialized = try testOutput(&explicit_null_result);
-    defer std.testing.allocator.free(serialized);
-    const parsed = try parseOutputJSON(value_arena.allocator(), serialized);
-    try std.testing.expect(parsed.result.? == .null);
 }
 
 test "output parser preserves strings and JSON Values in its arena" {
@@ -1766,7 +1849,7 @@ test "output parser preserves strings and JSON Values in its arena" {
     try std.testing.expectEqualStrings("tenant-a", parsed.tenant);
     try std.testing.expectEqualStrings("echo", parsed.name);
     try expectValueJSON("{\"message\":\"hello\"}", &parsed.body.?);
-    try expectValueJSON("{\"success\":true}", &parsed.result.?);
+    try expectValueJSON("{\"success\":true}", statusResult(&parsed.status).?);
 }
 
 test "output parser requires all owned fields and rejects extra fields" {
@@ -1865,8 +1948,33 @@ test "output parser rejects oversized and invariant-breaking fields" {
         ),
     );
     try std.testing.expectError(
+        error.UnexpectedResult,
+        parseOutputJSON(
+            arena.allocator(),
+            prefix ++ "\"state\":\"SUBMITTED\",\"result\":null" ++ suffix,
+        ),
+    );
+    try std.testing.expectError(
         error.MissingResult,
         parseOutputJSON(arena.allocator(), prefix ++ "\"state\":\"SUCCEEDED\"" ++ suffix),
+    );
+    try std.testing.expectError(
+        error.MissingResult,
+        parseOutputJSON(arena.allocator(), prefix ++ "\"state\":\"FAILED\"" ++ suffix),
+    );
+    try std.testing.expectError(
+        error.MissingResult,
+        parseOutputJSON(
+            arena.allocator(),
+            prefix ++ "\"state\":\"SUCCEEDED\",\"result\":null" ++ suffix,
+        ),
+    );
+    try std.testing.expectError(
+        error.MissingResult,
+        parseOutputJSON(
+            arena.allocator(),
+            prefix ++ "\"state\":\"FAILED\",\"result\":null" ++ suffix,
+        ),
     );
     try std.testing.expectError(
         error.InvalidExpiresAt,

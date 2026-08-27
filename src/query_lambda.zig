@@ -513,16 +513,19 @@ fn handleInvocationWithCacheForTest(
 }
 
 fn testOperation(tenant: []const u8, state: operation.State) operation.Operation {
+    const result: ?std.json.Value = if (operation.stateIsTerminal(state))
+        .{ .string = "done" }
+    else
+        null;
     return .{
         .id = operation.uuidFromString(
             "00112233-4455-6677-8899-aabbccddeeff",
         ) catch unreachable,
         .tenant = tenant,
         .name = "echo",
-        .state = state,
+        .status = operation.statusFromStateResult(state, result) catch unreachable,
         .last_updated = 1_700_000_123,
         .expires_at = 1_700_086_523,
-        .result = if (operation.stateIsTerminal(state)) .{ .string = "done" } else null,
         .hash = [_]u8{0xab} ** 32,
     };
 }
@@ -628,6 +631,24 @@ test "authenticated GET returns exact terminal operation JSON with result" {
         "\\\"expires_at\\\":1700086523,\\\"result\\\":\\\"done\\\"," ++
         "\\\"hash\\\":\\\"" ++ ("ab" ** 32) ++ "\\\"}\"}";
     try std.testing.expectEqualStrings(expected, response);
+
+    fake.response = testOperation("lambda-test-user", .failed);
+    const failure_response = handleInvocationForTest(
+        std.testing.allocator,
+        event,
+        &environment,
+        &fake,
+        1000,
+    );
+    defer std.testing.allocator.free(failure_response);
+    const expected_failure =
+        "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
+        "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
+        "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
+        "\\\"state\\\":\\\"FAILED\\\",\\\"last_updated\\\":1700000123," ++
+        "\\\"expires_at\\\":1700086523,\\\"result\\\":\\\"done\\\"," ++
+        "\\\"hash\\\":\\\"" ++ ("ab" ** 32) ++ "\\\"}\"}";
+    try std.testing.expectEqualStrings(expected_failure, failure_response);
 }
 
 test "second lookup before one second uses cached response" {
@@ -1071,7 +1092,7 @@ test "malformed stored output and allocation failures remain sanitized" {
         .id = 0,
         .tenant = "lambda-test-user",
         .name = "encoding-failure-marker",
-        .state = .submitted,
+        .status = .submitted,
         .last_updated = 1000,
         .expires_at = 1001,
         .hash = [_]u8{0} ** 32,
