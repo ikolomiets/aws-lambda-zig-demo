@@ -136,9 +136,10 @@ const RuntimeResources = struct {
         resources: *RuntimeResources,
         arena: Allocator,
         queued: *const operation.Operation,
+        completion: *const operation.Completion,
         now: operation.UnixSeconds,
     ) !void {
-        return resources.persistence.complete(arena, queued, now);
+        return resources.persistence.complete(arena, queued, completion, now);
     }
 };
 
@@ -190,6 +191,7 @@ const ExecutionAdapter = struct {
         *anyopaque,
         Allocator,
         *const operation.Operation,
+        *const operation.Completion,
         operation.UnixSeconds,
     ) anyerror!void,
 
@@ -220,10 +222,11 @@ const ExecutionAdapter = struct {
                 context: *anyopaque,
                 arena: Allocator,
                 queued: *const operation.Operation,
+                completion: *const operation.Completion,
                 now: operation.UnixSeconds,
             ) anyerror!void {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.complete(arena, queued, now);
+                return self.complete(arena, queued, completion, now);
             }
         };
         return .{
@@ -252,9 +255,10 @@ const ExecutionAdapter = struct {
         execution: ExecutionAdapter,
         arena: Allocator,
         queued: *const operation.Operation,
+        completion: *const operation.Completion,
         now: operation.UnixSeconds,
     ) !void {
-        return execution.complete_fn(execution.context, arena, queued, now);
+        return execution.complete_fn(execution.context, arena, queued, completion, now);
     }
 };
 
@@ -394,8 +398,15 @@ fn processRecord(
         return false;
     }
 
+    const completion = successCompletion(arena, queued.id) catch |err| {
+        log.debug("message_id={s} stage=completion_payload outcome=retry error={s}", .{
+            message_id,
+            @errorName(err),
+        });
+        return true;
+    };
     const now = clock.now();
-    execution.complete(arena, &queued, now) catch |err| {
+    execution.complete(arena, &queued, &completion, now) catch |err| {
         if (err == error.OperationConflict) {
             log.debug("message_id={s} stage=completion outcome=acknowledged_conflict", .{
                 message_id,
@@ -410,6 +421,15 @@ fn processRecord(
     };
     log.debug("message_id={s} outcome=succeeded", .{message_id});
     return false;
+}
+
+fn successCompletion(arena: Allocator, operation_id: u128) !operation.Completion {
+    var id_buffer: [36]u8 = undefined;
+    const transfer_id = try arena.dupe(u8, operation.uuidToString(operation_id, &id_buffer));
+    var payload = try std.json.ObjectMap.init(arena, &.{}, &.{});
+    try payload.put(arena, "transfer_id", .{ .string = transfer_id });
+    std.debug.assert(payload.count() == 1);
+    return .{ .success = .{ .object = payload } };
 }
 
 fn accountingAccount(operation_id: u128) tigerbeetle.Account {
@@ -444,6 +464,7 @@ const success_outcome: CreateOutcome = .{ .status = 0, .succeeded = true };
 const FakeExecution = struct {
     accounts: [record_count_max]tigerbeetle.Account = undefined,
     transfers: [record_count_max]tigerbeetle.Transfer = undefined,
+    completions: [record_count_max]operation.Completion = undefined,
     timestamps: [record_count_max]operation.UnixSeconds = undefined,
     account_outcomes: [record_count_max]CreateOutcome = .{success_outcome} ** record_count_max,
     transfer_outcomes: [record_count_max]CreateOutcome = .{success_outcome} ** record_count_max,
@@ -482,6 +503,7 @@ const FakeExecution = struct {
         fake: *FakeExecution,
         arena: Allocator,
         queued: *const operation.Operation,
+        completion: *const operation.Completion,
         now: operation.UnixSeconds,
     ) !void {
         _ = arena;
@@ -489,6 +511,7 @@ const FakeExecution = struct {
         std.debug.assert(queued.status == .submitted);
         std.debug.assert(queued.body != null);
         const index = fake.completion_count;
+        fake.completions[index] = completion.*;
         fake.timestamps[index] = now;
         fake.completion_count += 1;
         if (fake.completion_errors[index]) |err| return err;
@@ -561,6 +584,26 @@ test "accounting events use the exact operation contract" {
     expected_transfer.ledger = 1;
     expected_transfer.code = 1;
     try std.testing.expectEqualDeep(expected_transfer, accountingTransfer(id));
+}
+
+test "success completion contains the canonical arena-owned transfer id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const completion = try successCompletion(
+        arena.allocator(),
+        0x00112233445566778899aabbccddeeff,
+    );
+
+    try std.testing.expect(completion == .success);
+    try std.testing.expect(completion.success == .object);
+    try std.testing.expectEqualStrings(
+        "00112233-4455-6677-8899-aabbccddeeff",
+        completion.success.object.get("transfer_id").?.string,
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        successCompletion(std.testing.failing_allocator, 1),
+    );
 }
 
 test "TigerBeetle configuration defaults and validates overrides" {
@@ -646,6 +689,14 @@ test "valid records create accounting events before sampling completion timestam
     try std.testing.expectEqualDeep(accountingTransfer(3), fake.transfers[1]);
     try std.testing.expectEqual(@as(operation.UnixSeconds, 1_800_000_001), fake.timestamps[0]);
     try std.testing.expectEqual(@as(operation.UnixSeconds, 1_800_000_002), fake.timestamps[1]);
+    try std.testing.expectEqualStrings(
+        "00000000-0000-0000-0000-000000000002",
+        fake.completions[0].success.object.get("transfer_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "00000000-0000-0000-0000-000000000003",
+        fake.completions[1].success.object.get("transfer_id").?.string,
+    );
 }
 
 test "rejections are acknowledged before timestamp sampling or completion" {
@@ -741,7 +792,7 @@ test "mixed outcomes report exact retryable identifiers and continue processing"
     try std.testing.expectEqual(@as(u128, 9), fake.transfers[5].id);
 }
 
-test "malformed terminal bodyless and result-bearing operations are acknowledged" {
+test "legacy completed bodyless and result-bearing operations are acknowledged" {
     const hash = "ab" ** 32;
     const records = [_][]const u8{
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
@@ -760,6 +811,21 @@ test "malformed terminal bodyless and result-bearing operations are acknowledged
             "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
             "\"state\":\"FAILED\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400,\"result\":false,\"hash\":\"" ++ hash ++ "\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
+            "\"state\":\"COMPLETED\",\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400,\"result\":{" ++
+            "\"type\":\"SUCCESS\",\"payload\":true},\"hash\":\"" ++ hash ++ "\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
+            "\"state\":\"COMPLETED\",\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400,\"result\":{" ++
+            "\"type\":\"FAILURE\",\"payload\":false},\"hash\":\"" ++ hash ++ "\"}",
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
+            "\"state\":\"COMPLETED\",\"last_updated\":1700000000," ++
+            "\"expires_at\":1700086400,\"result\":{" ++
+            "\"type\":\"success\",\"payload\":true},\"hash\":\"" ++ hash ++ "\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
             "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++

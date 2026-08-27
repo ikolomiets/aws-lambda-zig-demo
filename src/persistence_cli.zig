@@ -47,7 +47,7 @@ const usage =
     \\  dynamodb update --id <uuid> --state <state>
     \\
     \\States:
-    \\  SUBMITTED | SUCCEEDED | FAILED
+    \\  SUBMITTED | COMPLETED
     \\
     \\Environment:
     \\  OPERATIONS_TABLE_NAME  DynamoDB table containing Operations
@@ -405,6 +405,7 @@ fn classifyError(err: anyerror) Failure {
         error.InvalidTenant,
         error.InvalidName,
         error.InvalidState,
+        error.InvalidCompletionType,
         error.InvalidTransition,
         error.BodyTooLarge,
         error.ResultTooLarge,
@@ -472,11 +473,13 @@ fn executeUpdate(
 ) !void {
     const snapshot = try backend.read(context.allocator, options.id);
     try operation.validatePersistent(&snapshot);
-    const result = if (operation.stateIsTerminal(options.state))
-        try operation.parseResultJSON(context.allocator, context.stdin)
-    else
-        null;
-    const replacement_status = try operation.statusFromStateResult(options.state, result);
+    const replacement_status: operation.Status = switch (options.state) {
+        .submitted => .submitted,
+        .completed => .{ .completed = try operation.parseCompletionJSON(
+            context.allocator,
+            context.stdin,
+        ) },
+    };
     try operation.validateStatusTransition(&snapshot.status, &replacement_status);
     var replacement = snapshot;
     replacement.status = replacement_status;
@@ -834,62 +837,82 @@ test "read reports missing and AWS failures with stable exit codes" {
     try std.testing.expectEqualStrings("dynamodb: AWS request failed\n", failed.stderr());
 }
 
-test "update accepts every transition from SUBMITTED including same-state refresh" {
-    const targets = [_]operation.State{ .submitted, .succeeded, .failed };
-    for (targets) |state| {
+test "update accepts submitted refresh and both completed envelopes" {
+    const cases = [_]struct {
+        state: operation.State,
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{
+            .state = .submitted,
+            .input = "",
+            .expected = "{\"id\":\"" ++ test_id ++ "\",\"tenant\":\"tenant-a\"," ++
+                "\"name\":\"echo\",\"state\":\"SUBMITTED\"," ++
+                "\"last_updated\":1700000001,\"expires_at\":1700086401," ++
+                "\"hash\":\"" ++ ("ab" ** 32) ++ "\"}\n",
+        },
+        .{
+            .state = .completed,
+            .input = "{\"type\":\"SUCCESS\",\"payload\":{\"new\":true}}",
+            .expected = "{\"id\":\"" ++ test_id ++ "\",\"tenant\":\"tenant-a\"," ++
+                "\"name\":\"echo\",\"state\":\"COMPLETED\"," ++
+                "\"last_updated\":1700000001,\"expires_at\":1700086401," ++
+                "\"result\":{\"type\":\"SUCCESS\",\"payload\":{\"new\":true}}," ++
+                "\"hash\":\"" ++ ("ab" ** 32) ++ "\"}\n",
+        },
+        .{
+            .state = .completed,
+            .input = "{\"type\":\"FAILURE\",\"payload\":{\"reason\":\"rejected\"}}",
+            .expected = "{\"id\":\"" ++ test_id ++ "\",\"tenant\":\"tenant-a\"," ++
+                "\"name\":\"echo\",\"state\":\"COMPLETED\"," ++
+                "\"last_updated\":1700000001,\"expires_at\":1700086401," ++
+                "\"result\":{\"type\":\"FAILURE\",\"payload\":{" ++
+                "\"reason\":\"rejected\"}},\"hash\":\"" ++ ("ab" ** 32) ++ "\"}\n",
+        },
+    };
+    for (cases) |case| {
         var fake: FakePersistence = .{};
-        const input = if (operation.stateIsTerminal(state)) "{ \"new\" : true }" else "";
         const result = runForTest(
-            &.{ "dynamodb", "update", "--state", operation.stateToString(state), "--id", test_id },
-            input,
+            &.{
+                "dynamodb",
+                "update",
+                "--state",
+                operation.stateToString(case.state),
+                "--id",
+                test_id,
+            },
+            case.input,
             1_700_000_001,
             &fake,
         );
         try std.testing.expectEqual(@as(u8, 0), result.exit_code);
         try std.testing.expectEqual(@as(u8, 1), fake.read_count);
         try std.testing.expectEqual(@as(u8, 1), fake.update_count);
-        try std.testing.expectEqual(state, fake.last_state.?);
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            result.stdout(),
-            "\"tenant\":\"tenant-a\"",
-        ) != null);
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            result.stdout(),
-            "\"expires_at\":1700086401",
-        ) != null);
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            result.stdout(),
-            operation.stateToString(state),
-        ) != null);
-        try std.testing.expectEqual(operation.stateIsTerminal(state), std.mem.indexOf(
-            u8,
-            result.stdout(),
-            "\"result\"",
-        ) != null);
-        if (operation.stateIsTerminal(state)) {
-            try std.testing.expect(std.mem.indexOf(
-                u8,
-                result.stdout(),
-                "\"result\":{\"new\":true}",
-            ) != null);
-        }
+        try std.testing.expectEqual(case.state, fake.last_state.?);
+        try std.testing.expectEqualStrings(case.expected, result.stdout());
     }
 }
 
 test "update rejects every target from either completed outcome" {
-    const completed = [_]operation.State{ .succeeded, .failed };
-    const targets = [_]operation.State{ .submitted, .succeeded, .failed };
+    const completed = [_]operation.Status{
+        .{ .completed = .{ .success = .{ .bool = true } } },
+        .{ .completed = .{ .failure = .{ .bool = false } } },
+    };
+    const targets = [_]struct { state: operation.State, input: []const u8 }{
+        .{ .state = .submitted, .input = "" },
+        .{
+            .state = .completed,
+            .input = "{\"type\":\"SUCCESS\",\"payload\":true}",
+        },
+        .{
+            .state = .completed,
+            .input = "{\"type\":\"FAILURE\",\"payload\":false}",
+        },
+    };
     for (completed) |current| {
         for (targets) |target| {
             var fake: FakePersistence = .{};
-            fake.stored.status = operation.statusFromStateResult(
-                current,
-                .{ .bool = true },
-            ) catch unreachable;
-            const input = if (operation.stateIsTerminal(target)) "true" else "";
+            fake.stored.status = current;
             const result = runForTest(
                 &.{
                     "dynamodb",
@@ -897,9 +920,9 @@ test "update rejects every target from either completed outcome" {
                     "--id",
                     test_id,
                     "--state",
-                    operation.stateToString(target),
+                    operation.stateToString(target.state),
                 },
-                input,
+                target.input,
                 1_700_000_001,
                 &fake,
             );
@@ -912,7 +935,15 @@ test "update rejects every target from either completed outcome" {
 
 test "update rejects removed lifecycle state arguments" {
     var fake: FakePersistence = .{};
-    for ([_][]const u8{ "NEW", "PENDING", "RUNNING" }) |state| {
+    for ([_][]const u8{
+        "NEW",
+        "PENDING",
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "submitted",
+        "completed",
+    }) |state| {
         const result = runForTest(
             &.{ "dynamodb", "update", "--id", test_id, "--state", state },
             "",
@@ -925,7 +956,7 @@ test "update rejects removed lifecycle state arguments" {
     try std.testing.expectEqual(@as(u8, 0), fake.update_count);
 }
 
-test "update rejects nonempty SUBMITTED input and null invalid or oversized terminal results" {
+test "update rejects submitted input and malformed completion envelopes" {
     var fake: FakePersistence = .{};
     const submitted = runForTest(
         &.{ "dynamodb", "update", "--id", test_id, "--state", "SUBMITTED" },
@@ -936,19 +967,28 @@ test "update rejects nonempty SUBMITTED input and null invalid or oversized term
     try std.testing.expectEqual(@as(u8, 2), submitted.exit_code);
     try std.testing.expectEqual(@as(u8, 0), fake.read_count);
 
-    const invalid_results = [_][]const u8{ "", "null", "{broken" };
+    const invalid_results = [_][]const u8{
+        "",
+        "null",
+        "true",
+        "{broken",
+        "{\"type\":\"SUCCESS\",\"payload\":null}",
+        "{\"type\":\"success\",\"payload\":true}",
+        "{\"type\":\"SUCCESS\",\"payload\":true,\"extra\":1}",
+    };
     for (invalid_results) |input| {
         const result = runForTest(
-            &.{ "dynamodb", "update", "--id", test_id, "--state", "SUCCEEDED" },
+            &.{ "dynamodb", "update", "--id", test_id, "--state", "COMPLETED" },
             input,
             0,
             &fake,
         );
         try std.testing.expectEqual(@as(u8, 2), result.exit_code);
     }
-    const oversized = "\"" ++ ("a" ** (operation.result_size_max - 1)) ++ "\"";
+    const oversized = "{\"type\":\"FAILURE\",\"payload\":\"" ++
+        ("a" ** (operation.result_size_max - 30)) ++ "\"}";
     const large = runForTest(
-        &.{ "dynamodb", "update", "--id", test_id, "--state", "FAILED" },
+        &.{ "dynamodb", "update", "--id", test_id, "--state", "COMPLETED" },
         oversized,
         0,
         &fake,
@@ -957,12 +997,13 @@ test "update rejects nonempty SUBMITTED input and null invalid or oversized term
     try std.testing.expectEqual(@as(u8, 0), fake.update_count);
 }
 
-test "update accepts a terminal result at the exact serialized size bound" {
+test "update accepts a full completion envelope at the exact size bound" {
     var fake: FakePersistence = .{};
-    const maximum = "\"" ++ ("a" ** (operation.result_size_max - 2)) ++ "\"";
+    const maximum = "{\"type\":\"SUCCESS\",\"payload\":\"" ++
+        ("a" ** (operation.result_size_max - 31)) ++ "\"}";
     comptime std.debug.assert(maximum.len == operation.result_size_max);
     const result = runForTest(
-        &.{ "dynamodb", "update", "--id", test_id, "--state", "FAILED" },
+        &.{ "dynamodb", "update", "--id", test_id, "--state", "COMPLETED" },
         maximum,
         1_700_000_001,
         &fake,
@@ -976,8 +1017,8 @@ test "update conflict is generic and diagnostics do not echo input" {
     var fake: FakePersistence = .{ .update_error = error.OperationConflict };
     const result_marker = "result-private-marker";
     const result = runForTest(
-        &.{ "dynamodb", "update", "--id", test_id, "--state", "FAILED" },
-        "\"result-private-marker\"",
+        &.{ "dynamodb", "update", "--id", test_id, "--state", "COMPLETED" },
+        "{\"type\":\"FAILURE\",\"payload\":\"result-private-marker\"}",
         0,
         &fake,
     );

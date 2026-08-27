@@ -513,17 +513,16 @@ fn handleInvocationWithCacheForTest(
 }
 
 fn testOperation(tenant: []const u8, state: operation.State) operation.Operation {
-    const result: ?std.json.Value = if (operation.stateIsTerminal(state))
-        .{ .string = "done" }
-    else
-        null;
     return .{
         .id = operation.uuidFromString(
             "00112233-4455-6677-8899-aabbccddeeff",
         ) catch unreachable,
         .tenant = tenant,
         .name = "echo",
-        .status = operation.statusFromStateResult(state, result) catch unreachable,
+        .status = switch (state) {
+            .submitted => .submitted,
+            .completed => .{ .completed = .{ .success = .{ .string = "done" } } },
+        },
         .last_updated = 1_700_000_123,
         .expires_at = 1_700_086_523,
         .hash = [_]u8{0xab} ** 32,
@@ -601,7 +600,7 @@ test "authenticated GET returns exact SUBMITTED operation JSON and canonicalizes
     try std.testing.expectEqual(@as(u8, 1), fake.read_count);
 }
 
-test "authenticated GET returns exact terminal operation JSON with result" {
+test "authenticated GET returns exact completed success and failure envelopes" {
     const token = try testToken(0x72);
     defer std.testing.allocator.free(token);
     var environment = try testEnvironment(0x72);
@@ -612,7 +611,7 @@ test "authenticated GET returns exact terminal operation JSON with result" {
         .raw_path = "/00112233-4455-6677-8899-aabbccddeeff",
     });
     defer std.testing.allocator.free(event);
-    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .succeeded) };
+    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .completed) };
 
     const response = handleInvocationForTest(
         std.testing.allocator,
@@ -627,12 +626,15 @@ test "authenticated GET returns exact terminal operation JSON with result" {
         "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
         "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
         "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
-        "\\\"state\\\":\\\"SUCCEEDED\\\",\\\"last_updated\\\":1700000123," ++
-        "\\\"expires_at\\\":1700086523,\\\"result\\\":\\\"done\\\"," ++
+        "\\\"state\\\":\\\"COMPLETED\\\",\\\"last_updated\\\":1700000123," ++
+        "\\\"expires_at\\\":1700086523,\\\"result\\\":{" ++
+        "\\\"type\\\":\\\"SUCCESS\\\",\\\"payload\\\":\\\"done\\\"}," ++
         "\\\"hash\\\":\\\"" ++ ("ab" ** 32) ++ "\\\"}\"}";
     try std.testing.expectEqualStrings(expected, response);
 
-    fake.response = testOperation("lambda-test-user", .failed);
+    var failure = testOperation("lambda-test-user", .completed);
+    failure.status = .{ .completed = .{ .failure = .{ .string = "done" } } };
+    fake.response = failure;
     const failure_response = handleInvocationForTest(
         std.testing.allocator,
         event,
@@ -645,8 +647,9 @@ test "authenticated GET returns exact terminal operation JSON with result" {
         "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
         "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
         "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
-        "\\\"state\\\":\\\"FAILED\\\",\\\"last_updated\\\":1700000123," ++
-        "\\\"expires_at\\\":1700086523,\\\"result\\\":\\\"done\\\"," ++
+        "\\\"state\\\":\\\"COMPLETED\\\",\\\"last_updated\\\":1700000123," ++
+        "\\\"expires_at\\\":1700086523,\\\"result\\\":{" ++
+        "\\\"type\\\":\\\"FAILURE\\\",\\\"payload\\\":\\\"done\\\"}," ++
         "\\\"hash\\\":\\\"" ++ ("ab" ** 32) ++ "\\\"}\"}";
     try std.testing.expectEqualStrings(expected_failure, failure_response);
 }
@@ -673,7 +676,7 @@ test "second lookup before one second uses cached response" {
         10,
     );
     defer std.testing.allocator.free(first);
-    fake.response = testOperation("lambda-test-user", .succeeded);
+    fake.response = testOperation("lambda-test-user", .completed);
     const second = handleInvocationWithCacheForTest(
         std.testing.allocator,
         event,
@@ -713,7 +716,7 @@ test "cache entry expires and is replaced at exactly one second" {
         0,
     );
     defer std.testing.allocator.free(first);
-    fake.response = testOperation("lambda-test-user", .succeeded);
+    fake.response = testOperation("lambda-test-user", .completed);
     const second = handleInvocationWithCacheForTest(
         std.testing.allocator,
         event,
@@ -726,7 +729,7 @@ test "cache entry expires and is replaced at exactly one second" {
     defer std.testing.allocator.free(second);
 
     try std.testing.expect(std.mem.indexOf(u8, first, "SUBMITTED") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second, "SUCCEEDED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "COMPLETED") != null);
     try std.testing.expectEqual(@as(u8, 2), fake.read_count);
     try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
 }

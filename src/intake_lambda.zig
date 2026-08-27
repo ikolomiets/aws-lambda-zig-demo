@@ -422,7 +422,9 @@ const FakeIntake = struct {
         @memcpy(fake.last_tenant_buffer[0..source.tenant.len], source.tenant);
         fake.last_name_len = @intCast(source.name.len);
         @memcpy(fake.last_name_buffer[0..source.name.len], source.name);
-        const body = try operation.writeResultJSON(&fake.last_body_buffer, &source.body.?);
+        var body_writer: std.Io.Writer = .fixed(&fake.last_body_buffer);
+        try std.json.Stringify.value(source.body.?, .{}, &body_writer);
+        const body = body_writer.buffered();
         fake.last_body_len = @intCast(body.len);
 
         if (fake.create_error) |err| return err;
@@ -798,10 +800,11 @@ test "matching POST retry returns the latest stored persistent view" {
         .name = "echo",
         .status = .{
             .completed = .{
-                .success = try operation.parseResultJSON(
+                .success = (try operation.parseCompletionJSON(
                     result_arena.allocator(),
-                    "{ \"message\" : \"done\" }",
-                ),
+                    "{\"type\":\"SUCCESS\",\"payload\":{" ++
+                        "\"message\":\"done\"}}",
+                )).success,
             },
         },
         .last_updated = 1_700_000_123,
@@ -835,18 +838,17 @@ test "matching POST retry returns the latest stored persistent view" {
         "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
         "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
         "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
-        "\\\"state\\\":\\\"SUCCEEDED\\\"," ++
+        "\\\"state\\\":\\\"COMPLETED\\\"," ++
         "\\\"last_updated\\\":1700000123," ++
         "\\\"expires_at\\\":1700086523," ++
-        "\\\"result\\\":{\\\"message\\\":\\\"done\\\"}," ++
+        "\\\"result\\\":{\\\"type\\\":\\\"SUCCESS\\\"," ++
+        "\\\"payload\\\":{\\\"message\\\":\\\"done\\\"}}," ++
         "\\\"hash\\\":\\\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\\\"}\"}";
     try std.testing.expectEqualStrings(expected, response);
     try std.testing.expectEqual(@as(u8, 1), fake.create_count);
 }
 
 test "matching POST in every terminal state returns without enqueueing" {
-    var result_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer result_arena.deinit();
     const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
         .seed_byte = 0x53,
         .now = 1_700_000_000,
@@ -873,20 +875,19 @@ test "matching POST in every terminal state returns without enqueueing" {
         &expected_hash,
         "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
     );
-    const states = [_]operation.State{ .succeeded, .failed };
+    const completions = [_]operation.Completion{
+        .{ .success = .{ .bool = true } },
+        .{ .failure = .{ .bool = false } },
+    };
 
-    for (states) |state| {
-        const result = try operation.parseResultJSON(
-            result_arena.allocator(),
-            "{\"done\":true}",
-        );
+    for (completions) |completion| {
         var fake = FakeIntake{ .response = .{
             .id = operation.uuidFromString(
                 "00112233-4455-6677-8899-aabbccddeeff",
             ) catch unreachable,
             .tenant = "lambda-test-user",
             .name = "echo",
-            .status = try operation.statusFromStateResult(state, result),
+            .status = .{ .completed = completion },
             .last_updated = 1_700_000_123,
             .expires_at = 1_700_086_523,
             .hash = expected_hash,
@@ -901,14 +902,11 @@ test "matching POST in every terminal state returns without enqueueing" {
             1_700_000_000,
         );
         defer std.testing.allocator.free(response);
-        const state_marker = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "\\\"state\\\":\\\"{s}\\\"",
-            .{operation.stateToString(state)},
-        );
-        defer std.testing.allocator.free(state_marker);
-
-        try expectContains(response, state_marker);
+        try expectContains(response, "\\\"state\\\":\\\"COMPLETED\\\"");
+        try expectContains(response, switch (completion) {
+            .success => "\\\"type\\\":\\\"SUCCESS\\\"",
+            .failure => "\\\"type\\\":\\\"FAILURE\\\"",
+        });
         try std.testing.expectEqual(@as(u8, 1), fake.create_count);
         try std.testing.expectEqual(@as(u8, 0), fake.send_count);
     }

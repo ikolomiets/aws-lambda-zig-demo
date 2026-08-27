@@ -24,13 +24,27 @@ comptime {
 
 pub const State = enum {
     submitted,
-    succeeded,
-    failed,
+    completed,
 };
 
 pub const Completion = union(enum) {
     success: std.json.Value,
     failure: std.json.Value,
+
+    pub fn jsonStringify(completion: Completion, json: anytype) !void {
+        try json.beginObject();
+        try json.objectField("type");
+        switch (completion) {
+            .success => try json.write("SUCCESS"),
+            .failure => try json.write("FAILURE"),
+        }
+        try json.objectField("payload");
+        switch (completion) {
+            .success => |payload| try json.write(payload),
+            .failure => |payload| try json.write(payload),
+        }
+        try json.endObject();
+    }
 };
 
 pub const Status = union(enum) {
@@ -41,8 +55,7 @@ pub const Status = union(enum) {
 /// Parses the uppercase representation shared by JSON and persistent storage.
 pub fn stateFromString(value: []const u8) !State {
     if (std.mem.eql(u8, value, "SUBMITTED")) return .submitted;
-    if (std.mem.eql(u8, value, "SUCCEEDED")) return .succeeded;
-    if (std.mem.eql(u8, value, "FAILED")) return .failed;
+    if (std.mem.eql(u8, value, "COMPLETED")) return .completed;
     return error.InvalidState;
 }
 
@@ -50,15 +63,14 @@ pub fn stateFromString(value: []const u8) !State {
 pub fn stateToString(state: State) []const u8 {
     return switch (state) {
         .submitted => "SUBMITTED",
-        .succeeded => "SUCCEEDED",
-        .failed => "FAILED",
+        .completed => "COMPLETED",
     };
 }
 
 /// Reports whether the state requires a non-null result.
 pub fn stateIsTerminal(state: State) bool {
     return switch (state) {
-        .succeeded, .failed => true,
+        .completed => true,
         .submitted => false,
     };
 }
@@ -176,10 +188,9 @@ pub fn parseOutputJSON(arena: Allocator, output_json: []const u8) !Operation {
             if (fields.result != null) return error.UnexpectedResult;
             break :status .submitted;
         },
-        .succeeded, .failed => status: {
+        .completed => status: {
             const result_json = fields.result orelse return error.MissingResult;
-            const result = try parseResultJSON(arena, result_json);
-            break :status try statusFromStateResult(state, result);
+            break :status .{ .completed = try parseCompletionJSON(arena, result_json) };
         },
     };
     const parsed: Operation = .{
@@ -255,64 +266,19 @@ pub fn writeCompletionJSON(
     return writer.buffered();
 }
 
-/// Parses a bounded, non-null terminal result into the lifetime arena.
-pub fn parseResultJSON(arena: Allocator, input_json: []const u8) !JSONValue {
-    if (input_json.len > result_size_max) return error.ResultTooLarge;
-    const result = try parseJSONValue(arena, input_json);
-    if (result == .null) return error.MissingResult;
-    try validateResultSize(&result);
-    return result;
-}
-
-/// Serializes a result compactly into the fixed persistence request buffer.
-pub fn writeResultJSON(buffer: *[result_size_max]u8, result: *const JSONValue) ![]const u8 {
-    var writer: std.Io.Writer = .fixed(buffer);
-    std.json.Stringify.value(result.*, .{}, &writer) catch return error.ResultTooLarge;
-    std.debug.assert(writer.buffered().len <= result_size_max);
-    return writer.buffered();
-}
-
-/// Converts a legacy state and raw result into the in-memory status representation.
-pub fn statusFromStateResult(state: State, result: ?JSONValue) !Status {
-    switch (state) {
-        .submitted => {
-            if (result != null) return error.UnexpectedResult;
-            return .submitted;
-        },
-        .succeeded => {
-            const payload = result orelse return error.MissingResult;
-            if (payload == .null) return error.MissingResult;
-            try validateResultSize(&payload);
-            return .{ .completed = .{ .success = payload } };
-        },
-        .failed => {
-            const payload = result orelse return error.MissingResult;
-            if (payload == .null) return error.MissingResult;
-            try validateResultSize(&payload);
-            return .{ .completed = .{ .failure = payload } };
-        },
-    }
-}
-
-/// Returns the legacy state name represented by a status.
+/// Returns the persistent state name represented by a status.
 pub fn statusToState(status: *const Status) State {
     return switch (status.*) {
         .submitted => .submitted,
-        .completed => |completion| switch (completion) {
-            .success => .succeeded,
-            .failure => .failed,
-        },
+        .completed => .completed,
     };
 }
 
-/// Returns the raw completion payload required by the legacy schema.
-pub fn statusResult(status: *const Status) ?*const JSONValue {
+/// Returns the tagged completion envelope when the operation is complete.
+pub fn statusCompletion(status: *const Status) ?*const Completion {
     return switch (status.*) {
         .submitted => null,
-        .completed => |*completion| switch (completion.*) {
-            .success => |*payload| payload,
-            .failure => |*payload| payload,
-        },
+        .completed => |*completion| completion,
     };
 }
 
@@ -351,9 +317,9 @@ pub fn writeOutputJSON(
     try json.write(last_updated);
     try json.objectField("expires_at");
     try json.write(expires_at);
-    if (statusResult(&operation.status)) |result| {
+    if (statusCompletion(&operation.status)) |completion| {
         try json.objectField("result");
-        try json.write(result.*);
+        try json.write(completion.*);
     }
     try json.objectField("hash");
     try json.write(&hash_hex);
@@ -671,18 +637,7 @@ fn writeCompletionJSONToWriter(
         .writer = writer,
         .options = .{},
     };
-    try json.beginObject();
-    try json.objectField("type");
-    switch (completion.*) {
-        .success => try json.write("SUCCESS"),
-        .failure => try json.write("FAILURE"),
-    }
-    try json.objectField("payload");
-    switch (completion.*) {
-        .success => |payload| try json.write(payload),
-        .failure => |payload| try json.write(payload),
-    }
-    try json.endObject();
+    try json.write(completion.*);
 }
 
 fn parseJSONValue(arena: Allocator, json: []const u8) !JSONValue {
@@ -715,9 +670,9 @@ fn validateView(operation: *const Operation) !void {
     const expected_expires_at = try expires_at_from_last_updated(last_updated);
     if (expires_at != expected_expires_at) return error.InvalidExpiresAt;
     if (operation.hash == null) return error.MissingHash;
-    if (statusResult(&operation.status)) |result| {
-        if (result.* == .null) return error.MissingResult;
-        try validateResultSize(result);
+    if (statusCompletion(&operation.status)) |completion| {
+        var completion_buffer: [result_size_max]u8 = undefined;
+        _ = try writeCompletionJSON(&completion_buffer, completion);
     }
 }
 
@@ -735,13 +690,6 @@ pub fn validateTenant(tenant: []const u8) !void {
     if (!std.unicode.utf8ValidateSlice(tenant)) return error.InvalidTenant;
     std.debug.assert(tenant.len > 0);
     std.debug.assert(tenant.len <= tenant_size_max);
-}
-
-fn validateResultSize(result: *const JSONValue) !void {
-    var count_buffer: [256]u8 = undefined;
-    var counter: std.Io.Writer.Discarding = .init(&count_buffer);
-    try std.json.Stringify.value(result.*, .{}, &counter.writer);
-    if (counter.fullCount() > result_size_max) return error.ResultTooLarge;
 }
 
 fn validateName(name: []const u8) !void {
@@ -819,7 +767,9 @@ fn testOutput(operation: *const Operation) ![]u8 {
 
 fn expectValueJSON(expected: []const u8, value: *const JSONValue) !void {
     var buffer: [result_size_max]u8 = undefined;
-    try std.testing.expectEqualStrings(expected, try writeResultJSON(&buffer, value));
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try std.json.Stringify.value(value.*, .{}, &writer);
+    try std.testing.expectEqualStrings(expected, writer.buffered());
 }
 
 fn testCompletionInput(
@@ -849,25 +799,25 @@ fn expectCompletionJSON(expected: []const u8, completion: *const Completion) !vo
 test "persistent state parsing formatting and terminal classification are exhaustive" {
     const states = [_]State{
         .submitted,
-        .succeeded,
-        .failed,
+        .completed,
     };
     const names = [_][]const u8{
         "SUBMITTED",
-        "SUCCEEDED",
-        "FAILED",
+        "COMPLETED",
     };
     for (states, names, 0..) |state, name, index| {
         try std.testing.expectEqualStrings(name, stateToString(state));
         try std.testing.expectEqual(state, try stateFromString(name));
-        try std.testing.expectEqual(index >= 1, stateIsTerminal(state));
+        try std.testing.expectEqual(index == 1, stateIsTerminal(state));
     }
 
     try std.testing.expectError(error.InvalidState, stateFromString("submitted"));
+    try std.testing.expectError(error.InvalidState, stateFromString("completed"));
     try std.testing.expectError(error.InvalidState, stateFromString("NEW"));
     try std.testing.expectError(error.InvalidState, stateFromString("PENDING"));
     try std.testing.expectError(error.InvalidState, stateFromString("RUNNING"));
-    try std.testing.expectError(error.InvalidState, stateFromString("COMPLETED"));
+    try std.testing.expectError(error.InvalidState, stateFromString("SUCCEEDED"));
+    try std.testing.expectError(error.InvalidState, stateFromString("FAILED"));
     try std.testing.expectError(error.InvalidState, stateFromString(""));
 }
 
@@ -892,24 +842,17 @@ test "all status transitions enforce immutable completion" {
     }
 }
 
-test "legacy states map exhaustively to status variants and raw results" {
-    const states = [_]State{ .submitted, .succeeded, .failed };
-    for (states) |state| {
-        const result: ?JSONValue = if (stateIsTerminal(state)) .{ .bool = true } else null;
-        const status = try statusFromStateResult(state, result);
-        try std.testing.expectEqual(state, statusToState(&status));
-        try std.testing.expectEqual(stateIsTerminal(state), statusResult(&status) != null);
-        if (statusResult(&status)) |payload| {
-            try std.testing.expect(payload.* == .bool);
-            try std.testing.expect(payload.bool);
-        }
+test "statuses map exhaustively to states and optional completions" {
+    const statuses = [_]Status{
+        .submitted,
+        .{ .completed = .{ .success = .{ .bool = true } } },
+        .{ .completed = .{ .failure = .{ .bool = false } } },
+    };
+    for (&statuses, 0..) |*status, index| {
+        const expected_state: State = if (index == 0) .submitted else .completed;
+        try std.testing.expectEqual(expected_state, statusToState(status));
+        try std.testing.expectEqual(index != 0, statusCompletion(status) != null);
     }
-    try std.testing.expectError(
-        error.UnexpectedResult,
-        statusFromStateResult(.submitted, .{ .bool = true }),
-    );
-    try std.testing.expectError(error.MissingResult, statusFromStateResult(.succeeded, null));
-    try std.testing.expectError(error.MissingResult, statusFromStateResult(.failed, .null));
 }
 
 test "UUID conversion is symmetric and output is lowercase" {
@@ -1150,7 +1093,14 @@ test "input accepts only omitted state or explicit SUBMITTED" {
         test_now,
     );
     try std.testing.expect(operation.status == .submitted);
-    for ([_][]const u8{ "NEW", "PENDING", "RUNNING", "SUCCEEDED", "FAILED" }) |state| {
+    for ([_][]const u8{
+        "NEW",
+        "PENDING",
+        "RUNNING",
+        "COMPLETED",
+        "SUCCEEDED",
+        "FAILED",
+    }) |state| {
         const later = try testInput(std.testing.allocator, "echo", "null", state);
         defer std.testing.allocator.free(later);
         try std.testing.expectError(
@@ -1317,87 +1267,6 @@ test "persistent validation enforces status completion invariants" {
     try std.testing.expectError(
         error.MissingResult,
         validatePersistent(&operation),
-    );
-}
-
-test "result accepts exactly 4096 compact bytes" {
-    const maximum = "a" ** (result_size_max - 2);
-    var operation = Operation{
-        .id = try uuidFromString(test_uuid),
-        .tenant = test_tenant,
-        .name = "echo",
-        .status = .{ .completed = .{ .failure = .{ .string = maximum } } },
-        .last_updated = test_now,
-        .expires_at = test_now + ttl_seconds,
-        .hash = [_]u8{0} ** 32,
-    };
-    try validatePersistent(&operation);
-
-    operation.status = .{
-        .completed = .{ .failure = .{ .string = "a" ** (result_size_max - 1) } },
-    };
-    try std.testing.expectError(
-        error.ResultTooLarge,
-        validatePersistent(&operation),
-    );
-    operation.status = .{
-        .completed = .{ .success = .{ .string = "a" ** (result_size_max - 1) } },
-    };
-    try std.testing.expectError(
-        error.ResultTooLarge,
-        validatePersistent(&operation),
-    );
-}
-
-test "terminal result ingress accepts exactly 4096 bytes and rejects more" {
-    const maximum = "\"" ++ ("a" ** (result_size_max - 2)) ++ "\"";
-    const oversized = "\"" ++ ("a" ** (result_size_max - 1)) ++ "\"";
-    comptime std.debug.assert(maximum.len == result_size_max);
-    comptime std.debug.assert(oversized.len == result_size_max + 1);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const result = try parseResultJSON(arena.allocator(), maximum);
-    try std.testing.expect(result == .string);
-    try std.testing.expectEqual(@as(usize, result_size_max - 2), result.string.len);
-    try std.testing.expectError(
-        error.ResultTooLarge,
-        parseResultJSON(arena.allocator(), oversized),
-    );
-}
-
-test "terminal result parsing owns and normalizes every JSON Value variant" {
-    const inputs = [_][]const u8{
-        "true",
-        "42",
-        "\"hello\"",
-        "[true, 42]",
-        "{\"first\":1,\"second\":2}",
-    };
-    const expected = [_][]const u8{
-        "true",
-        "42",
-        "\"hello\"",
-        "[true,42]",
-        "{\"first\":1,\"second\":2}",
-    };
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    for (inputs, expected) |input, canonical| {
-        const result = try parseResultJSON(arena.allocator(), input);
-        try expectValueJSON(canonical, &result);
-    }
-    try std.testing.expectError(
-        error.MissingResult,
-        parseResultJSON(arena.allocator(), "null"),
-    );
-    try std.testing.expectError(
-        error.InvalidJSON,
-        parseResultJSON(arena.allocator(), "{\"key\":1,\"key\":2}"),
-    );
-    try std.testing.expectError(
-        error.InvalidJSON,
-        parseResultJSON(arena.allocator(), "{broken"),
     );
 }
 
@@ -1687,7 +1556,7 @@ test "persistent view rejects body and requires timestamps and hash" {
     );
 }
 
-test "output preserves scalar body and terminal result as raw JSON" {
+test "output writes exact completed success and failure envelopes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const operation = Operation{
@@ -1697,7 +1566,7 @@ test "output preserves scalar body and terminal result as raw JSON" {
         .body = .{ .bool = true },
         .status = .{
             .completed = .{
-                .success = try parseResultJSON(arena.allocator(), "{\"ok\":true}"),
+                .success = try parseJSONValue(arena.allocator(), "{\"ok\":true}"),
             },
         },
         .last_updated = test_now,
@@ -1711,10 +1580,10 @@ test "output preserves scalar body and terminal result as raw JSON" {
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
             "\"body\":true," ++
-            "\"state\":\"SUCCEEDED\"," ++
+            "\"state\":\"COMPLETED\"," ++
             "\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
-            "\"result\":{\"ok\":true}," ++
+            "\"result\":{\"type\":\"SUCCESS\",\"payload\":{\"ok\":true}}," ++
             "\"hash\":\"abababababababababababababababab" ++
             "abababababababababababababababab\"}",
         output.buffered(),
@@ -1729,10 +1598,10 @@ test "output preserves scalar body and terminal result as raw JSON" {
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
             "\"body\":true," ++
-            "\"state\":\"FAILED\"," ++
+            "\"state\":\"COMPLETED\"," ++
             "\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400," ++
-            "\"result\":{\"ok\":true}," ++
+            "\"result\":{\"type\":\"FAILURE\",\"payload\":{\"ok\":true}}," ++
             "\"hash\":\"abababababababababababababababab" ++
             "abababababababababababababababab\"}",
         failed_output.buffered(),
@@ -1798,23 +1667,12 @@ test "every valid output shape round trips through the output parser" {
     };
     for (statuses) |status| {
         for (bodies) |body| {
-            var source_status = status;
-            if (source_status == .completed) {
-                const result = try parseResultJSON(
-                    value_arena.allocator(),
-                    "{\"success\":true}",
-                );
-                switch (source_status.completed) {
-                    .success => source_status = .{ .completed = .{ .success = result } },
-                    .failure => source_status = .{ .completed = .{ .failure = result } },
-                }
-            }
             const source: Operation = .{
                 .id = try uuidFromString(test_uuid),
                 .tenant = test_tenant,
                 .name = "echo",
                 .body = body,
-                .status = source_status,
+                .status = status,
                 .last_updated = test_now,
                 .expires_at = test_now + ttl_seconds,
                 .hash = [_]u8{0xAB} ** 32,
@@ -1836,9 +1694,10 @@ test "output parser preserves strings and JSON Values in its arena" {
         u8,
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
-            "\"body\":{\"message\":\"hello\"},\"state\":\"SUCCEEDED\"," ++
+            "\"body\":{\"message\":\"hello\"},\"state\":\"COMPLETED\"," ++
             "\"last_updated\":1700000000,\"expires_at\":1700086400," ++
-            "\"result\":{\"success\":true},\"hash\":\"" ++ ("ab" ** 32) ++ "\"}",
+            "\"result\":{\"type\":\"SUCCESS\",\"payload\":{\"success\":true}}," ++
+            "\"hash\":\"" ++ ("ab" ** 32) ++ "\"}",
     );
     defer std.testing.allocator.free(serialized);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1849,7 +1708,9 @@ test "output parser preserves strings and JSON Values in its arena" {
     try std.testing.expectEqualStrings("tenant-a", parsed.tenant);
     try std.testing.expectEqualStrings("echo", parsed.name);
     try expectValueJSON("{\"message\":\"hello\"}", &parsed.body.?);
-    try expectValueJSON("{\"success\":true}", statusResult(&parsed.status).?);
+    try std.testing.expect(parsed.status == .completed);
+    try std.testing.expect(parsed.status.completed == .success);
+    try expectValueJSON("{\"success\":true}", &parsed.status.completed.success);
 }
 
 test "output parser requires all owned fields and rejects extra fields" {
@@ -1932,8 +1793,9 @@ test "output parser rejects oversized and invariant-breaking fields" {
         error.ResultTooLarge,
         parseOutputJSON(
             arena.allocator(),
-            prefix ++ "\"state\":\"SUCCEEDED\",\"result\":\"" ++
-                ("a" ** (result_size_max - 1)) ++ "\"" ++ suffix,
+            prefix ++ "\"state\":\"COMPLETED\",\"result\":" ++
+                "{\"type\":\"SUCCESS\",\"payload\":\"" ++
+                ("a" ** (result_size_max - 1)) ++ "\"}" ++ suffix,
         ),
     );
     try std.testing.expectError(
@@ -1956,24 +1818,31 @@ test "output parser rejects oversized and invariant-breaking fields" {
     );
     try std.testing.expectError(
         error.MissingResult,
+        parseOutputJSON(arena.allocator(), prefix ++ "\"state\":\"COMPLETED\"" ++ suffix),
+    );
+    try std.testing.expectError(
+        error.InvalidState,
         parseOutputJSON(arena.allocator(), prefix ++ "\"state\":\"SUCCEEDED\"" ++ suffix),
     );
     try std.testing.expectError(
-        error.MissingResult,
-        parseOutputJSON(arena.allocator(), prefix ++ "\"state\":\"FAILED\"" ++ suffix),
-    );
-    try std.testing.expectError(
-        error.MissingResult,
-        parseOutputJSON(
-            arena.allocator(),
-            prefix ++ "\"state\":\"SUCCEEDED\",\"result\":null" ++ suffix,
-        ),
-    );
-    try std.testing.expectError(
-        error.MissingResult,
+        error.InvalidState,
         parseOutputJSON(
             arena.allocator(),
             prefix ++ "\"state\":\"FAILED\",\"result\":null" ++ suffix,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidJSON,
+        parseOutputJSON(
+            arena.allocator(),
+            prefix ++ "\"state\":\"COMPLETED\",\"result\":null" ++ suffix,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidJSON,
+        parseOutputJSON(
+            arena.allocator(),
+            prefix ++ "\"state\":\"COMPLETED\",\"result\":true" ++ suffix,
         ),
     );
     try std.testing.expectError(
