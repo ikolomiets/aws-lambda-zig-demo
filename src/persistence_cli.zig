@@ -933,16 +933,13 @@ test "update rejects every target from either completed outcome" {
     }
 }
 
-test "update rejects removed lifecycle state arguments" {
+test "update rejects invalid lifecycle state arguments" {
     var fake: FakePersistence = .{};
     for ([_][]const u8{
-        "NEW",
-        "PENDING",
-        "RUNNING",
-        "SUCCEEDED",
-        "FAILED",
+        "UNKNOWN",
         "submitted",
         "completed",
+        "",
     }) |state| {
         const result = runForTest(
             &.{ "dynamodb", "update", "--id", test_id, "--state", state },

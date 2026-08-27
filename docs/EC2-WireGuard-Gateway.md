@@ -26,12 +26,33 @@ Execution Lambda
 
 For each valid queued Operation, execution creates account `Operation.id`
 (ledger/code `1`), then creates transfer `Operation.id` from that account to
-account `1` for amount `100` (ledger/code `1`), and only then conditionally
-marks DynamoDB `SUCCEEDED`. The two event types require separate requests.
+account `1` for amount `100` (ledger/code `1`). The two event types require
+separate requests. After both succeed, execution conditionally transitions a
+matching `SUBMITTED` row with no result to `COMPLETED` and stores exactly:
+
+```json
+{"type":"SUCCESS","payload":{"transfer_id":"00112233-4455-6677-8899-aabbccddeeff"}}
+```
+
 Stable IDs make duplicate delivery replay-safe: `created` and identical
-`exists` proceed, while a definite rejection is acknowledged without updating
-DynamoDB. Client/request uncertainty and DynamoDB service
-uncertainty are reported as SQS partial-batch failures.
+`exists` proceed. Definitive rejections are also persisted as `COMPLETED`,
+using the applicable exact result envelope:
+
+```json
+{"type":"FAILURE","payload":{"stage":"ACCOUNT","status":19}}
+```
+
+```json
+{"type":"FAILURE","payload":{"stage":"TRANSFER","status":22}}
+```
+
+Client/request uncertainty and DynamoDB service uncertainty leave the Operation
+`SUBMITTED` without a result and are reported as SQS partial-batch failures.
+Conditional conflicts are acknowledged without changing the stored row;
+completed Operations are immutable, including same-outcome refreshes.
+`SUBMITTED` and `COMPLETED` are the only lifecycle states. A completed `result`
+contains exactly uppercase `type` and non-null `payload`, and the entire compact
+envelope is limited to 4,096 bytes.
 
 Enabling the gateway incurs EC2 and public IPv4/Elastic IP charges.
 
@@ -454,8 +475,9 @@ After an explicitly authorized cloud deployment, validate in this order:
    with receiving credits. Submit a unique valid Operation and verify that
    execution creates account `Operation.id`, posts transfer `Operation.id` for
    amount `100` from that account to account `1`, then marks DynamoDB
-   `SUCCEEDED`. A duplicate delivery must replay both IDs as identical
-   `exists` without changing balances a second time.
+   `COMPLETED` with the exact `SUCCESS` envelope above. A duplicate delivery
+   must replay both IDs as identical `exists` without changing balances a
+   second time or mutating the completed row.
 6. Reboot the gateway and repeat the interface, forwarding, handshake, and
    routed-connectivity checks to verify bootstrap persistence.
 

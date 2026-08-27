@@ -980,25 +980,13 @@ test "mixed outcomes report exact retryable identifiers and continue processing"
     try std.testing.expectEqual(@as(u128, 9), fake.transfers[5].id);
 }
 
-test "legacy completed bodyless and result-bearing operations are acknowledged" {
+test "unsupported queued operation schemas are acknowledged" {
     const hash = "ab" ** 32;
     const records = [_][]const u8{
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
-            "\"state\":\"NEW\",\"last_updated\":1700000000," ++
+            "\"state\":\"UNKNOWN\",\"last_updated\":1700000000," ++
             "\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
-            "\"state\":\"RUNNING\",\"last_updated\":1700000000," ++
-            "\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
-            "\"state\":\"SUCCEEDED\",\"last_updated\":1700000000," ++
-            "\"expires_at\":1700086400,\"result\":true,\"hash\":\"" ++ hash ++ "\"}",
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
-            "\"state\":\"FAILED\",\"last_updated\":1700000000," ++
-            "\"expires_at\":1700086400,\"result\":false,\"hash\":\"" ++ hash ++ "\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"tenant-a\",\"name\":\"echo\",\"body\":true," ++
             "\"state\":\"COMPLETED\",\"last_updated\":1700000000," ++

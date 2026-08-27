@@ -99,6 +99,9 @@ new dependencies unless the task explicitly needs them.
 
 ## Commit Messages
 
+Leave agent-made changes uncommitted for code review. Do not create a commit at
+the end of a session unless the user explicitly requests one.
+
 Write commit messages that are sufficiently detailed for a future maintainer to
 understand the change without reconstructing it from the diff. Use a concise
 imperative subject, followed by a body for non-trivial changes that explains the

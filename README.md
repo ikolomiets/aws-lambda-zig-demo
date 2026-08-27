@@ -16,9 +16,10 @@ token subject, persists the Operation idempotently in DynamoDB, submits new
 work to SQS, and returns the current stored output view without the body.
 The execution Lambda consumes SQS batches, creates a replay-safe TigerBeetle
 account and transfer for each valid queued `SUBMITTED` Operation, then conditionally
-completes DynamoDB with `result: {"success":true}`. Definite rejections are
-acknowledged; TigerBeetle or DynamoDB uncertainty is returned through SQS
-partial-batch failures.
+transitions DynamoDB to `COMPLETED` with a tagged success or failure `result`.
+Definitive account or transfer rejections are persisted as completed failures;
+TigerBeetle client/request or DynamoDB uncertainty is returned through SQS
+partial-batch failures and leaves the Operation retryable.
 
 ## Requirements
 
@@ -182,12 +183,14 @@ JSON document is rejected to prevent spoofing.
 Each persistence command and Lambda POST owns its Operation tenant, strings,
 body, and result through one short-lived arena. Optional absence means a field
 is omitted from that Operation view; an explicit JSON `null` remains a
-distinct `std.json.Value`. Terminal results must be present and non-null.
+distinct `std.json.Value`. A completed result must be present and contain
+exactly uppercase `type` and non-null `payload` fields. A submitted Operation
+has no result.
 
 A create is safe to retry with the original UUID, tenant, name, and body. If that UUID
 already identifies an Operation with the same Operation hash, the retry
 succeeds and returns the current stored Operation, including its state,
-`last_updated`, `expires_at`, and terminal result when present. Reusing the UUID
+`last_updated`, `expires_at`, and completed result when present. Reusing the UUID
 for different content returns `dynamodb: operation conflict` with exit code
 `1`. UUIDs are globally scoped, so reusing an ID under another tenant also
 changes the hash and returns a conflict.
@@ -199,11 +202,12 @@ Read it with a strongly consistent DynamoDB read:
   --id 00112233-4455-6677-8899-aabbccddeeff
 ```
 
-Updates allow same-state refreshes and transitions from `SUBMITTED` to `SUCCEEDED`
-or `FAILED`. Terminal Operations cannot be reopened or switched to the other
-terminal state. `SUBMITTED` requires empty standard input, while terminal states
-require one non-null JSON result of at most 4,096 input bytes whose compact
-serialization is also at most 4,096 bytes:
+The lifecycle is `SUBMITTED -> COMPLETED`. Submitted Operations may be
+refreshed as submitted or completed once. Completed Operations are immutable:
+they cannot be reopened, changed, or refreshed with the same outcome. A
+`SUBMITTED` update requires empty standard input. A `COMPLETED` update requires
+the complete tagged result envelope on standard input; both its input and
+compact serialization must fit the 4,096-byte full-envelope limit:
 
 ```sh
 ./persistence.sh update \
@@ -211,10 +215,11 @@ serialization is also at most 4,096 bytes:
   --state SUBMITTED \
   </dev/null
 
-printf '%s\n' '{"message":"done"}' \
+printf '%s\n' \
+  '{"type":"SUCCESS","payload":{"transfer_id":"00112233-4455-6677-8899-aabbccddeeff"}}' \
   | ./persistence.sh update \
       --id 00112233-4455-6677-8899-aabbccddeeff \
-      --state SUCCEEDED
+      --state COMPLETED
 ```
 
 A newly created item and every successful update set `expires_at` to exactly
@@ -228,23 +233,20 @@ failure, or an internal failure. Create and update conflicts both emit
 `dynamodb: operation conflict`.
 
 The persistent item contains exactly `id`, `tenant`, `name`, `state`,
-`last_updated`, `expires_at`, `hash`, and an optional terminal `result`; it never
+`last_updated`, `expires_at`, `hash`, and an optional completed `result`; it never
 contains `body`. Tenant is a required DynamoDB `S` attribute. Creates use
 `attribute_not_exists(id)` and request the existing item on
 a failed condition so matching retries need no separate read. Updates first
 perform a strongly consistent read and then condition on the complete snapshot,
 including `expires_at`, so a concurrent change is reported instead of
-overwritten. Updates preserve `id`, `tenant`, `name`, and `hash`. DynamoDB keeps `result`
-as an `S` attribute containing the compact `std.json.Value` serialization.
-Reads reject malformed, oversized, duplicate-key, explicit-null, or
-noncanonical stored result strings.
+overwritten. Updates preserve `id`, `tenant`, `name`, and `hash`. DynamoDB keeps
+`result` as an `S` attribute containing the complete compact tagged envelope.
+Reads reject malformed, oversized, duplicate-key, explicit-null,
+noncanonical, or incorrectly tagged stored result strings.
 
 The SAM table enables native DynamoDB TTL on `expires_at`. Expiration is
 best-effort: an Operation becomes eligible for deletion after 24 hours but may
-remain readable until DynamoDB removes it asynchronously. The item contract is
-strict: legacy records without `tenant` are rejected and must be deleted and
-recreated before this version reads them. There is no fallback decoder or
-migration path in the application.
+remain readable until DynamoDB removes it asynchronously.
 
 ## Queue commands
 
@@ -366,17 +368,36 @@ and body, parses the complete Operation output, and accepts only a queued `SUBMI
 Operation with a body and no result. It creates account `Operation.id` on
 ledger/code `1`, then transfer `Operation.id` from that account to account `1`
 for amount `100` on ledger/code `1`. Only after both return `created` or
-identical `exists` does it sample the real-time clock. The conditional update
-requires the stored canonical ID, tenant, name, queued hash, and absent result;
-it deliberately compares neither stored state nor queued timestamps. A match
-becomes `SUCCEEDED` with the exact compact result `{"success":true}`, a fresh
-`last_updated`, and `expires_at` exactly 86,400 seconds later.
+identical `exists` does the successful path sample the real-time clock. The
+conditional update
+requires the stored canonical ID, tenant, name, queued hash, `SUBMITTED` state,
+and absent result; it deliberately compares no timestamps. A match
+becomes `COMPLETED` with a fresh `last_updated` and `expires_at` exactly 86,400
+seconds later. The exact success envelope is:
 
-Processing continues after every record. Invalid records, definite
-TigerBeetle rejections, and DynamoDB conflicts are acknowledged. TigerBeetle
+```json
+{"type":"SUCCESS","payload":{"transfer_id":"00112233-4455-6677-8899-aabbccddeeff"}}
+```
+
+A definitive account or transfer rejection instead completes the Operation
+with its exact stage and raw TigerBeetle status, sampling the completion time
+after the rejecting request:
+
+```json
+{"type":"FAILURE","payload":{"stage":"ACCOUNT","status":19}}
+```
+
+```json
+{"type":"FAILURE","payload":{"stage":"TRANSFER","status":22}}
+```
+
+Processing continues after every record. Invalid records and DynamoDB
+conditional conflicts are acknowledged; a conflict leaves the stored Operation
+unchanged, including when another delivery already completed it. TigerBeetle
 client/request errors and DynamoDB service uncertainty add the exact message ID
-to `batchItemFailures`. Account `1` must be pre-provisioned on ledger `1`; the
-executor never creates it.
+to `batchItemFailures`, leave the Operation `SUBMITTED` without a result, and
+permit infrastructure retry. Account `1` must be pre-provisioned on ledger `1`;
+the executor never creates it.
 
 ## Lambda logs
 
@@ -769,7 +790,7 @@ curl -L \
 ```
 
 The query response is the same compact bodyless Operation output JSON shown
-above. Terminal Operations additionally include `result`; `SUBMITTED` Operations
+above. `COMPLETED` Operations additionally include `result`; `SUBMITTED` Operations
 do not. The ID comes only from the single `rawPath` segment: query strings and
 GET bodies neither provide nor alter it. A different token subject receives the
 same `404 Not Found` response as a missing Operation.
@@ -778,7 +799,7 @@ For `SUBMITTED`, the handler reattaches the parsed input body only to a queued c
 of the persisted snapshot and sends that exact compact full `SUBMITTED` Operation
 JSON to SQS without a trailing newline. It returns the unchanged bodyless
 snapshot. A matching retry whose item is still `SUBMITTED` sends it again; matching
-`SUCCEEDED` or `FAILED` items are returned immediately without another SQS
+`COMPLETED` items are returned immediately without another SQS
 send.
 
 If `SendMessage` fails, DynamoDB remains `SUBMITTED` and the handler returns the
@@ -790,10 +811,10 @@ concurrent `SUBMITTED` retries can produce duplicate messages, so consumers must
 handle the Operation ID and hash idempotently. Reusing the ID for different
 work or from a different verified subject still returns `409 Conflict`. The
 execution consumer conditionally completes only the first matching queued
-snapshot after replay-safe TigerBeetle accounting. It acknowledges invalid
-records, definite TigerBeetle rejections, and update conflicts. TigerBeetle
-client/request errors and DynamoDB service uncertainty request a per-record
-retry.
+`SUBMITTED` snapshot with no result after replay-safe TigerBeetle accounting.
+It acknowledges invalid records, persisted definitive TigerBeetle rejections,
+and update conflicts. TigerBeetle client/request errors and DynamoDB service
+uncertainty request a per-record retry and leave the Operation submitted.
 
 The template intentionally creates publicly reachable intake POST and query
 GET Function URLs for demo testing, while both Function URL handlers enforce PASETO bearer

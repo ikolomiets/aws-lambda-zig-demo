@@ -795,14 +795,14 @@ test "read request is strongly consistent and keyed by canonical UUID" {
     try std.testing.expectEqualStrings(test_id, try stringValue(input.key[0].value));
 }
 
-test "decoder rejects legacy and malformed tenant attributes" {
+test "decoder rejects missing and malformed tenant attributes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source = testOperation(.submitted, null);
     var request: CreateRequest = undefined;
     try createRequestInit(&request, &source);
     const valid = request.items[0..request.item_count];
-    const legacy_without_tenant = [_]Attribute{
+    const missing_tenant = [_]Attribute{
         valid[0],
         valid[2],
         valid[3],
@@ -812,7 +812,7 @@ test "decoder rejects legacy and malformed tenant attributes" {
     };
     try std.testing.expectError(
         error.InvalidItem,
-        decodeItem(arena.allocator(), &legacy_without_tenant),
+        decodeItem(arena.allocator(), &missing_tenant),
     );
     const invalid_values = [_]AttributeValue{
         .{ .n = "1" },
@@ -851,12 +851,7 @@ test "decoder rejects duplicate unknown wrong and malformed attributes" {
     );
     malformed = request.items;
     for ([_][]const u8{
-        "NEW",
-        "PENDING",
-        "RUNNING",
-        "DONE",
-        "SUCCEEDED",
-        "FAILED",
+        "UNKNOWN",
         "submitted",
         "completed",
     }) |state| {
@@ -909,7 +904,7 @@ test "decoder enforces completion presence type canonical envelope and size" {
     try createRequestInit(&request, &source);
     _ = try decodeItem(arena.allocator(), &request.items);
 
-    const legacy = [_]Attribute{
+    const missing_tenant = [_]Attribute{
         request.items[0],
         request.items[2],
         request.items[3],
@@ -918,7 +913,7 @@ test "decoder enforces completion presence type canonical envelope and size" {
         request.items[6],
         request.items[7],
     };
-    try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &legacy));
+    try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &missing_tenant));
     try std.testing.expectError(
         error.InvalidItem,
         decodeItem(arena.allocator(), request.items[0..7]),
@@ -1072,49 +1067,51 @@ test "completion condition matches queued identity without timestamp conditions"
     ));
 }
 
-test "completion persists exact success result and record timestamp without returns" {
+test "completion persists exact result envelopes and record timestamps without returns" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var queued = testOperation(.submitted, null);
     queued.body = .{ .bool = true };
-    const completion = try testCompletion(
-        arena.allocator(),
+    const envelopes = [_][]const u8{
         "{\"type\":\"SUCCESS\",\"payload\":{" ++
             "\"transfer_id\":\"00112233-4455-6677-8899-aabbccddeeff\"}}",
-    );
-    var request: CompletionRequest = undefined;
-    try completionRequestInit(&request, &queued, &completion, 1_800_000_123);
-
-    try std.testing.expectEqualStrings(
-        "SET #state = :completed, #result = :result, " ++
-            "last_updated = :now, expires_at = :expires_at",
-        completion_update,
-    );
-    try std.testing.expectEqualStrings("COMPLETED", try stringValue(
-        findAttribute(&request.values, ":completed").?,
-    ));
-    try std.testing.expectEqualStrings(
-        "{\"type\":\"SUCCESS\",\"payload\":{" ++
-            "\"transfer_id\":\"00112233-4455-6677-8899-aabbccddeeff\"}}",
-        try stringValue(findAttribute(&request.values, ":result").?),
-    );
-    try std.testing.expectEqualStrings("1800000123", try numberValue(
-        findAttribute(&request.values, ":now").?,
-    ));
-    try std.testing.expectEqualStrings("1800086523", try numberValue(
-        findAttribute(&request.values, ":expires_at").?,
-    ));
-
-    const input = dynamodb.UpdateItemInput{
-        .condition_expression = completion_condition,
-        .expression_attribute_names = &request.names,
-        .expression_attribute_values = &request.values,
-        .key = &request.key,
-        .table_name = "operations",
-        .update_expression = completion_update,
+        "{\"type\":\"FAILURE\",\"payload\":{\"stage\":\"ACCOUNT\",\"status\":19}}",
+        "{\"type\":\"FAILURE\",\"payload\":{\"stage\":\"TRANSFER\",\"status\":22}}",
     };
-    try std.testing.expect(input.return_values == null);
-    try std.testing.expect(input.return_values_on_condition_check_failure == null);
+    for (envelopes) |envelope| {
+        const completion = try testCompletion(arena.allocator(), envelope);
+        var request: CompletionRequest = undefined;
+        try completionRequestInit(&request, &queued, &completion, 1_800_000_123);
+
+        try std.testing.expectEqualStrings("SUBMITTED", try stringValue(
+            findAttribute(&request.values, ":submitted").?,
+        ));
+        try std.testing.expectEqualStrings("COMPLETED", try stringValue(
+            findAttribute(&request.values, ":completed").?,
+        ));
+        try std.testing.expectEqualStrings(envelope, try stringValue(
+            findAttribute(&request.values, ":result").?,
+        ));
+        try std.testing.expectEqualStrings("1800000123", try numberValue(
+            findAttribute(&request.values, ":now").?,
+        ));
+        try std.testing.expectEqualStrings("1800086523", try numberValue(
+            findAttribute(&request.values, ":expires_at").?,
+        ));
+
+        const input = dynamodb.UpdateItemInput{
+            .condition_expression = completion_condition,
+            .expression_attribute_names = &request.names,
+            .expression_attribute_values = &request.values,
+            .key = &request.key,
+            .table_name = "operations",
+            .update_expression = completion_update,
+        };
+        try std.testing.expectEqualStrings(completion_condition, input.condition_expression.?);
+        try std.testing.expectEqualStrings(completion_update, input.update_expression.?);
+        try std.testing.expect(input.return_values == null);
+        try std.testing.expect(input.return_values_on_condition_check_failure == null);
+    }
 }
 
 test "completion request enforces the full 4096 byte envelope boundary" {

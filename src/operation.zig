@@ -813,11 +813,7 @@ test "persistent state parsing formatting and terminal classification are exhaus
 
     try std.testing.expectError(error.InvalidState, stateFromString("submitted"));
     try std.testing.expectError(error.InvalidState, stateFromString("completed"));
-    try std.testing.expectError(error.InvalidState, stateFromString("NEW"));
-    try std.testing.expectError(error.InvalidState, stateFromString("PENDING"));
-    try std.testing.expectError(error.InvalidState, stateFromString("RUNNING"));
-    try std.testing.expectError(error.InvalidState, stateFromString("SUCCEEDED"));
-    try std.testing.expectError(error.InvalidState, stateFromString("FAILED"));
+    try std.testing.expectError(error.InvalidState, stateFromString("UNKNOWN"));
     try std.testing.expectError(error.InvalidState, stateFromString(""));
 }
 
@@ -1094,12 +1090,10 @@ test "input accepts only omitted state or explicit SUBMITTED" {
     );
     try std.testing.expect(operation.status == .submitted);
     for ([_][]const u8{
-        "NEW",
-        "PENDING",
-        "RUNNING",
         "COMPLETED",
-        "SUCCEEDED",
-        "FAILED",
+        "UNKNOWN",
+        "submitted",
+        "completed",
     }) |state| {
         const later = try testInput(std.testing.allocator, "echo", "null", state);
         defer std.testing.allocator.free(later);
@@ -1353,7 +1347,7 @@ test "completion codec requires exactly type and payload" {
 }
 
 test "completion codec accepts only uppercase known string types" {
-    const invalid_types = [_][]const u8{ "success", "Success", "SUCCEEDED", "UNKNOWN" };
+    const invalid_types = [_][]const u8{ "success", "Success", "UNKNOWN" };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1822,14 +1816,7 @@ test "output parser rejects oversized and invariant-breaking fields" {
     );
     try std.testing.expectError(
         error.InvalidState,
-        parseOutputJSON(arena.allocator(), prefix ++ "\"state\":\"SUCCEEDED\"" ++ suffix),
-    );
-    try std.testing.expectError(
-        error.InvalidState,
-        parseOutputJSON(
-            arena.allocator(),
-            prefix ++ "\"state\":\"FAILED\",\"result\":null" ++ suffix,
-        ),
+        parseOutputJSON(arena.allocator(), prefix ++ "\"state\":\"UNKNOWN\"" ++ suffix),
     );
     try std.testing.expectError(
         error.InvalidJSON,

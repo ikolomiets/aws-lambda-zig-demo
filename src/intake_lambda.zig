@@ -1118,11 +1118,11 @@ test "authenticated POST rejects missing and invalid operation JSON" {
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"tenant\":\"spoofed\",\"name\":\"echo\",\"body\":null}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"name\":\"echo\",\"body\":null,\"state\":\"NEW\"}",
+            "\"name\":\"echo\",\"body\":null,\"state\":\"UNKNOWN\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"name\":\"echo\",\"body\":null,\"state\":\"PENDING\"}",
+            "\"name\":\"echo\",\"body\":null,\"state\":\"submitted\"}",
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"name\":\"echo\",\"body\":null,\"state\":\"RUNNING\"}",
+            "\"name\":\"echo\",\"body\":null,\"state\":\"COMPLETED\"}",
     };
     for (invalid_inputs) |input| {
         const event = try test_authorization_request_event(
@@ -1147,9 +1147,7 @@ test "authenticated POST rejects missing and invalid operation JSON" {
 
         try expectBadRequest(response);
         try expectNotContains(response, "invalid-json-marker");
-        try expectNotContains(response, "NEW");
-        try expectNotContains(response, "PENDING");
-        try expectNotContains(response, "RUNNING");
+        try expectNotContains(response, "UNKNOWN");
     }
     try std.testing.expectEqual(@as(u8, 0), fake.create_count);
 }

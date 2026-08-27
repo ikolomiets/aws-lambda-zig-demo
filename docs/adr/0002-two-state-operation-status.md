@@ -29,9 +29,3 @@ itself be null. The entire compact envelope is limited to 4,096 bytes.
 Completion is immutable. `SUBMITTED -> SUBMITTED` remains valid while an operation is pending, and a
 submitted operation may transition once to either completed outcome. Every transition from
 `COMPLETED`, including a same-outcome refresh, is rejected.
-
-The eventual wire and persistence rollout is intentionally a one-step breaking cutover. After that
-cutover, readers accept only `SUBMITTED` or `COMPLETED` with the tagged envelope. They do not decode
-legacy `SUCCEEDED` or `FAILED` terminal rows and do not accept raw terminal result JSON. This avoids
-maintaining two terminal schemas and makes an invalid lifecycle/result combination impossible in the
-domain model.

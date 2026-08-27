@@ -786,7 +786,7 @@ test "send validates through Operation and reports AWS failures without output" 
     try std.testing.expectEqualStrings("sqs: invalid operation input\n", invalid.stderr());
     try std.testing.expectEqual(@as(u8, 0), fake.send_count);
 
-    for ([_][]const u8{ "NEW", "PENDING", "RUNNING" }) |state| {
+    for ([_][]const u8{ "UNKNOWN", "submitted", "completed", "COMPLETED" }) |state| {
         const input = try std.fmt.allocPrint(
             std.testing.allocator,
             "{{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
@@ -794,13 +794,13 @@ test "send validates through Operation and reports AWS failures without output" 
             .{state},
         );
         defer std.testing.allocator.free(input);
-        const removed = runForTest(
+        const invalid_state = runForTest(
             &.{ "sqs", "send", "--tenant", "tenant-a" },
             input,
             0,
             &fake,
         );
-        try std.testing.expectEqual(@as(u8, 2), removed.exit_code);
+        try std.testing.expectEqual(@as(u8, 2), invalid_state.exit_code);
     }
     try std.testing.expectEqual(@as(u8, 0), fake.send_count);
 
