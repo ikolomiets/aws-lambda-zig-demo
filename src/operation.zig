@@ -15,6 +15,7 @@ const hash_string_size = 64;
 
 comptime {
     std.debug.assert(body_size_max == result_size_max);
+    std.debug.assert(result_size_max == 4096);
     std.debug.assert(output_size_max > body_size_max + result_size_max);
     std.debug.assert(ttl_seconds == 86_400);
     std.debug.assert(uuid_string_size == 36);
@@ -25,6 +26,16 @@ pub const State = enum {
     submitted,
     succeeded,
     failed,
+};
+
+pub const Completion = union(enum) {
+    success: std.json.Value,
+    failure: std.json.Value,
+};
+
+pub const Status = union(enum) {
+    submitted,
+    completed: Completion,
 };
 
 /// Parses the uppercase representation shared by JSON and persistent storage.
@@ -92,6 +103,11 @@ const OutputFields = struct {
     expires_at: ?[]const u8 = null,
     result: ?[]const u8 = null,
     hash: ?[]const u8 = null,
+};
+
+const CompletionFields = struct {
+    type: ?[]const u8 = null,
+    payload: ?[]const u8 = null,
 };
 
 /// Parses the input view into values owned by the lifetime arena.
@@ -191,6 +207,46 @@ pub fn expires_at_from_last_updated(last_updated: UnixSeconds) !UnixSeconds {
     std.debug.assert(expires_at > last_updated);
     std.debug.assert(expires_at - last_updated == ttl_seconds);
     return expires_at;
+}
+
+/// Parses a bounded completion envelope into values owned by the lifetime arena.
+pub fn parseCompletionJSON(arena: Allocator, input_json: []const u8) !Completion {
+    if (input_json.len > result_size_max) return error.ResultTooLarge;
+    const fields = try scanCompletionFields(arena, input_json);
+    const type_json = fields.type orelse return error.MissingField;
+    const payload_json = fields.payload orelse return error.MissingField;
+    const type_name = try parseJSONString(arena, type_json);
+    const payload = try parseJSONValue(arena, payload_json);
+    if (payload == .null) return error.MissingResult;
+
+    const completion: Completion = completion: {
+        if (std.mem.eql(u8, type_name, "SUCCESS")) {
+            break :completion .{ .success = payload };
+        }
+        if (std.mem.eql(u8, type_name, "FAILURE")) {
+            break :completion .{ .failure = payload };
+        }
+        return error.InvalidCompletionType;
+    };
+    var buffer: [result_size_max]u8 = undefined;
+    _ = try writeCompletionJSON(&buffer, &completion);
+    return completion;
+}
+
+/// Serializes a completion into a compact, canonical, bounded envelope.
+pub fn writeCompletionJSON(
+    buffer: *[result_size_max]u8,
+    completion: *const Completion,
+) ![]const u8 {
+    switch (completion.*) {
+        .success => |payload| if (payload == .null) return error.MissingResult,
+        .failure => |payload| if (payload == .null) return error.MissingResult,
+    }
+    var writer: std.Io.Writer = .fixed(buffer);
+    writeCompletionJSONToWriter(&writer, completion) catch return error.ResultTooLarge;
+    std.debug.assert(writer.buffered().len > 0);
+    std.debug.assert(writer.buffered().len <= result_size_max);
+    return writer.buffered();
 }
 
 /// Parses a bounded, non-null terminal result into the lifetime arena.
@@ -333,6 +389,38 @@ fn scanInputFields(arena: Allocator, input_json: []const u8) !InputFields {
     return fields;
 }
 
+fn scanCompletionFields(arena: Allocator, input_json: []const u8) !CompletionFields {
+    var scanner = std.json.Scanner.initCompleteInput(arena, input_json);
+    defer scanner.deinit();
+
+    const first = scanner.next() catch |err| return jsonError(err);
+    if (first != .object_begin) return error.InvalidJSON;
+
+    var fields: CompletionFields = .{};
+    var field_count: u8 = 0;
+    while (true) {
+        const token = scanner.nextAllocMax(
+            arena,
+            .alloc_always,
+            input_json.len,
+        ) catch |err| return jsonError(err);
+        if (token == .object_end) break;
+        const field_name = switch (token) {
+            .allocated_string => |value| value,
+            else => return error.InvalidJSON,
+        };
+        const value_start = try jsonValueStart(input_json, scanner.cursor);
+        try scannerSkipValue(&scanner);
+        const value_json = input_json[value_start..scanner.cursor];
+        try setCompletionField(&fields, field_name, value_json);
+        field_count += 1;
+        std.debug.assert(field_count <= 2);
+    }
+    const last = scanner.next() catch |err| return jsonError(err);
+    if (last != .end_of_document) return error.InvalidJSON;
+    return fields;
+}
+
 fn scanOutputFields(arena: Allocator, output_json: []const u8) !OutputFields {
     var scanner = std.json.Scanner.initCompleteInput(arena, output_json);
     defer scanner.deinit();
@@ -434,6 +522,22 @@ fn setInputField(
     }
 }
 
+fn setCompletionField(
+    fields: *CompletionFields,
+    field_name: []const u8,
+    value_json: []const u8,
+) !void {
+    if (std.mem.eql(u8, field_name, "type")) {
+        if (fields.type != null) return error.DuplicateField;
+        fields.type = value_json;
+    } else if (std.mem.eql(u8, field_name, "payload")) {
+        if (fields.payload != null) return error.DuplicateField;
+        fields.payload = value_json;
+    } else {
+        return error.UnknownField;
+    }
+}
+
 fn jsonValueStart(input_json: []const u8, cursor_after_key: usize) !usize {
     // Inspect without advancing the scanner so that the original value bytes remain addressable.
     var cursor = cursor_after_key;
@@ -506,6 +610,28 @@ fn hashEnvelopeWrite(
     try json.write(name);
     try json.objectField("body");
     try json.write(body.*);
+    try json.endObject();
+}
+
+fn writeCompletionJSONToWriter(
+    writer: *std.Io.Writer,
+    completion: *const Completion,
+) !void {
+    var json: std.json.Stringify = .{
+        .writer = writer,
+        .options = .{},
+    };
+    try json.beginObject();
+    try json.objectField("type");
+    switch (completion.*) {
+        .success => try json.write("SUCCESS"),
+        .failure => try json.write("FAILURE"),
+    }
+    try json.objectField("payload");
+    switch (completion.*) {
+        .success => |payload| try json.write(payload),
+        .failure => |payload| try json.write(payload),
+    }
     try json.endObject();
 }
 
@@ -652,6 +778,30 @@ fn testOutput(operation: *const Operation) ![]u8 {
 fn expectValueJSON(expected: []const u8, value: *const JSONValue) !void {
     var buffer: [result_size_max]u8 = undefined;
     try std.testing.expectEqualStrings(expected, try writeResultJSON(&buffer, value));
+}
+
+fn testCompletionInput(
+    allocator: Allocator,
+    type_name: []const u8,
+    payload_json: []const u8,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeAll("{\"type\":");
+    try std.json.Stringify.value(type_name, .{}, &output.writer);
+    try output.writer.writeAll(",\"payload\":");
+    try output.writer.writeAll(payload_json);
+    try output.writer.writeByte('}');
+    std.debug.assert(output.written().len > payload_json.len);
+    return output.toOwnedSlice();
+}
+
+fn expectCompletionJSON(expected: []const u8, completion: *const Completion) !void {
+    var buffer: [result_size_max]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        expected,
+        try writeCompletionJSON(&buffer, completion),
+    );
 }
 
 test "persistent state parsing formatting and terminal classification are exhaustive" {
@@ -1175,6 +1325,222 @@ test "terminal result parsing owns and normalizes every JSON Value variant" {
     try std.testing.expectError(
         error.InvalidJSON,
         parseResultJSON(arena.allocator(), "{broken"),
+    );
+}
+
+test "completion codec round trips every non-null JSON Value variant" {
+    const payloads = [_][]const u8{
+        "false",
+        "42",
+        "1.5",
+        "9223372036854775808",
+        "\"hello\"",
+        "[null,true,42]",
+        "{\"nested\":null,\"value\":\"text\"}",
+    };
+    const payload_tags = [_]std.meta.Tag(JSONValue){
+        .bool,
+        .integer,
+        .float,
+        .number_string,
+        .string,
+        .array,
+        .object,
+    };
+    const type_names = [_][]const u8{ "SUCCESS", "FAILURE" };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    for (type_names) |type_name| {
+        for (payloads, payload_tags) |payload_json, payload_tag| {
+            const input = try testCompletionInput(
+                std.testing.allocator,
+                type_name,
+                payload_json,
+            );
+            defer std.testing.allocator.free(input);
+            const completion = try parseCompletionJSON(arena.allocator(), input);
+            const payload = switch (completion) {
+                .success => |value| value,
+                .failure => |value| value,
+            };
+            try std.testing.expectEqual(payload_tag, std.meta.activeTag(payload));
+            try std.testing.expectEqualStrings(type_name, switch (completion) {
+                .success => "SUCCESS",
+                .failure => "FAILURE",
+            });
+            try expectCompletionJSON(input, &completion);
+        }
+    }
+}
+
+test "completion codec requires exactly type and payload" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectError(error.MissingField, parseCompletionJSON(arena.allocator(), "{}"));
+    try std.testing.expectError(
+        error.MissingField,
+        parseCompletionJSON(arena.allocator(), "{\"payload\":true}"),
+    );
+    try std.testing.expectError(
+        error.MissingField,
+        parseCompletionJSON(arena.allocator(), "{\"type\":\"SUCCESS\"}"),
+    );
+    try std.testing.expectError(
+        error.DuplicateField,
+        parseCompletionJSON(
+            arena.allocator(),
+            "{\"type\":\"SUCCESS\",\"payload\":true,\"type\":\"FAILURE\"}",
+        ),
+    );
+    try std.testing.expectError(
+        error.DuplicateField,
+        parseCompletionJSON(
+            arena.allocator(),
+            "{\"type\":\"SUCCESS\",\"payload\":true,\"payload\":false}",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnknownField,
+        parseCompletionJSON(
+            arena.allocator(),
+            "{\"type\":\"SUCCESS\",\"payload\":true,\"extra\":false}",
+        ),
+    );
+}
+
+test "completion codec accepts only uppercase known string types" {
+    const invalid_types = [_][]const u8{ "success", "Success", "SUCCEEDED", "UNKNOWN" };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    for (invalid_types) |type_name| {
+        const input = try testCompletionInput(std.testing.allocator, type_name, "true");
+        defer std.testing.allocator.free(input);
+        try std.testing.expectError(
+            error.InvalidCompletionType,
+            parseCompletionJSON(arena.allocator(), input),
+        );
+    }
+    try std.testing.expectError(
+        error.InvalidJSON,
+        parseCompletionJSON(arena.allocator(), "{\"type\":true,\"payload\":false}"),
+    );
+
+    const reversed = "{\"payload\":{\"ok\":true},\"type\":\"SUCCESS\"}";
+    const completion = try parseCompletionJSON(arena.allocator(), reversed);
+    try expectCompletionJSON(
+        "{\"type\":\"SUCCESS\",\"payload\":{\"ok\":true}}",
+        &completion,
+    );
+}
+
+test "completion codec rejects null and malformed payloads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectError(
+        error.MissingResult,
+        parseCompletionJSON(arena.allocator(), "{\"type\":\"SUCCESS\",\"payload\":null}"),
+    );
+    try std.testing.expectError(
+        error.InvalidJSON,
+        parseCompletionJSON(arena.allocator(), "{\"type\":\"SUCCESS\",\"payload\":[}"),
+    );
+    try std.testing.expectError(
+        error.InvalidJSON,
+        parseCompletionJSON(
+            arena.allocator(),
+            "{\"type\":\"SUCCESS\",\"payload\":{\"key\":1,\"key\":2}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidJSON,
+        parseCompletionJSON(arena.allocator(), "[\"SUCCESS\",true]"),
+    );
+
+    var buffer: [result_size_max]u8 = undefined;
+    const success: Completion = .{ .success = .null };
+    const failure: Completion = .{ .failure = .null };
+    try std.testing.expectError(error.MissingResult, writeCompletionJSON(&buffer, &success));
+    try std.testing.expectError(error.MissingResult, writeCompletionJSON(&buffer, &failure));
+}
+
+test "completion envelope enforces input and compact output bounds" {
+    const maximum = "{\"type\":\"SUCCESS\",\"payload\":\"" ++
+        ("a" ** (result_size_max - 31)) ++ "\"}";
+    const oversized = "{\"type\":\"SUCCESS\",\"payload\":\"" ++
+        ("a" ** (result_size_max - 30)) ++ "\"}";
+    comptime std.debug.assert(maximum.len == result_size_max);
+    comptime std.debug.assert(oversized.len == result_size_max + 1);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const completion = try parseCompletionJSON(arena.allocator(), maximum);
+    try expectCompletionJSON(maximum, &completion);
+    try std.testing.expectError(
+        error.ResultTooLarge,
+        parseCompletionJSON(arena.allocator(), oversized),
+    );
+
+    const large_completion: Completion = .{
+        .success = .{ .string = "a" ** (result_size_max - 30) },
+    };
+    var buffer: [result_size_max]u8 = undefined;
+    try std.testing.expectError(
+        error.ResultTooLarge,
+        writeCompletionJSON(&buffer, &large_completion),
+    );
+}
+
+test "completion parser bounds compact normalization independently of input" {
+    const expanding = "{\"type\":\"SUCCESS\",\"payload\":[" ++
+        ("1e20," ** 800) ++ "1e20]}";
+    comptime std.debug.assert(expanding.len <= result_size_max);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectError(
+        error.ResultTooLarge,
+        parseCompletionJSON(arena.allocator(), expanding),
+    );
+}
+
+test "completion parser owns strings and nested values in its arena" {
+    const source =
+        "{\"payload\":{\"key\":[\"value\",9223372036854775808]}," ++
+        "\"type\":\"FAILURE\"}";
+    const input = try std.testing.allocator.dupe(u8, source);
+    defer std.testing.allocator.free(input);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const completion = try parseCompletionJSON(arena.allocator(), input);
+    @memset(input, 'x');
+    try expectCompletionJSON(
+        "{\"type\":\"FAILURE\",\"payload\":{" ++
+            "\"key\":[\"value\",9223372036854775808]}}",
+        &completion,
+    );
+}
+
+fn testCompletionParseAllocationFailures(allocator: Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const completion = try parseCompletionJSON(
+        arena.allocator(),
+        "{\"type\":\"SUCCESS\",\"payload\":{\"key\":[\"value\",42]}}",
+    );
+    std.debug.assert(completion == .success);
+    std.debug.assert(completion.success == .object);
+}
+
+test "completion parsing cleans up every allocation failure path" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        testCompletionParseAllocationFailures,
+        .{},
     );
 }
 
