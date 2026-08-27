@@ -112,10 +112,9 @@ const RuntimeResources = struct {
         defer resources.tigerbeetle_client.allocator.free(results);
         if (results.len != 1) return error.MalformedResult;
 
-        return .{
-            .status = results[0].status,
-            .succeeded = tigerbeetle.create_account_succeeded(results[0].status),
-        };
+        const status = results[0].status;
+        if (tigerbeetle.create_account_succeeded(status)) return .accepted;
+        return .{ .rejected = status };
     }
 
     fn createTransfer(
@@ -126,10 +125,9 @@ const RuntimeResources = struct {
         defer resources.tigerbeetle_client.allocator.free(results);
         if (results.len != 1) return error.MalformedResult;
 
-        return .{
-            .status = results[0].status,
-            .succeeded = tigerbeetle.create_transfer_succeeded(results[0].status),
-        };
+        const status = results[0].status;
+        if (tigerbeetle.create_transfer_succeeded(status)) return .accepted;
+        return .{ .rejected = status };
     }
 
     fn complete(
@@ -172,9 +170,14 @@ fn tigerbeetleConfiguration(
     return .{ .cluster_id = cluster_id, .addresses = addresses };
 }
 
-const CreateOutcome = struct {
-    status: u32,
-    succeeded: bool,
+const CreateOutcome = union(enum) {
+    accepted,
+    rejected: u32,
+};
+
+const FailureStage = enum {
+    account,
+    transfer,
 };
 
 const ExecutionAdapter = struct {
@@ -374,12 +377,17 @@ fn processRecord(
         });
         return true;
     };
-    if (!account_outcome.succeeded) {
-        log.debug("message_id={s} stage=account outcome=rejected status={d}", .{
+    switch (account_outcome) {
+        .accepted => {},
+        .rejected => |status| return processRecordRejection(
+            arena,
             message_id,
-            account_outcome.status,
-        });
-        return false;
+            &queued,
+            .account,
+            status,
+            execution,
+            clock,
+        ),
     }
 
     const transfer = accountingTransfer(queued.id);
@@ -390,12 +398,17 @@ fn processRecord(
         });
         return true;
     };
-    if (!transfer_outcome.succeeded) {
-        log.debug("message_id={s} stage=transfer outcome=rejected status={d}", .{
+    switch (transfer_outcome) {
+        .accepted => {},
+        .rejected => |status| return processRecordRejection(
+            arena,
             message_id,
-            transfer_outcome.status,
-        });
-        return false;
+            &queued,
+            .transfer,
+            status,
+            execution,
+            clock,
+        ),
     }
 
     const completion = successCompletion(arena, queued.id) catch |err| {
@@ -405,8 +418,43 @@ fn processRecord(
         });
         return true;
     };
+    return processRecordCompletion(arena, message_id, &queued, &completion, execution, clock);
+}
+
+fn processRecordRejection(
+    arena: Allocator,
+    message_id: []const u8,
+    queued: *const operation.Operation,
+    stage: FailureStage,
+    status: u32,
+    execution: ExecutionAdapter,
+    clock: Clock,
+) bool {
+    log.debug("message_id={s} stage={s} outcome=rejected status={d}", .{
+        message_id,
+        @tagName(stage),
+        status,
+    });
+    const completion = failureCompletion(arena, stage, status) catch |err| {
+        log.debug("message_id={s} stage=completion_payload outcome=retry error={s}", .{
+            message_id,
+            @errorName(err),
+        });
+        return true;
+    };
+    return processRecordCompletion(arena, message_id, queued, &completion, execution, clock);
+}
+
+fn processRecordCompletion(
+    arena: Allocator,
+    message_id: []const u8,
+    queued: *const operation.Operation,
+    completion: *const operation.Completion,
+    execution: ExecutionAdapter,
+    clock: Clock,
+) bool {
     const now = clock.now();
-    execution.complete(arena, &queued, &completion, now) catch |err| {
+    execution.complete(arena, queued, completion, now) catch |err| {
         if (err == error.OperationConflict) {
             log.debug("message_id={s} stage=completion outcome=acknowledged_conflict", .{
                 message_id,
@@ -419,7 +467,11 @@ fn processRecord(
         });
         return true;
     };
-    log.debug("message_id={s} outcome=succeeded", .{message_id});
+    const outcome = switch (completion.*) {
+        .success => "succeeded",
+        .failure => "failed",
+    };
+    log.debug("message_id={s} outcome={s}", .{ message_id, outcome });
     return false;
 }
 
@@ -430,6 +482,28 @@ fn successCompletion(arena: Allocator, operation_id: u128) !operation.Completion
     try payload.put(arena, "transfer_id", .{ .string = transfer_id });
     std.debug.assert(payload.count() == 1);
     return .{ .success = .{ .object = payload } };
+}
+
+fn failureCompletion(
+    arena: Allocator,
+    stage: FailureStage,
+    status: u32,
+) !operation.Completion {
+    const stage_name: []const u8 = switch (stage) {
+        .account => "ACCOUNT",
+        .transfer => "TRANSFER",
+    };
+    switch (stage) {
+        .account => std.debug.assert(!tigerbeetle.create_account_succeeded(status)),
+        .transfer => std.debug.assert(!tigerbeetle.create_transfer_succeeded(status)),
+    }
+
+    const stage_owned = try arena.dupe(u8, stage_name);
+    var payload = try std.json.ObjectMap.init(arena, &.{}, &.{});
+    try payload.put(arena, "stage", .{ .string = stage_owned });
+    try payload.put(arena, "status", .{ .integer = @intCast(status) });
+    std.debug.assert(payload.count() == 2);
+    return .{ .failure = .{ .object = payload } };
 }
 
 fn accountingAccount(operation_id: u128) tigerbeetle.Account {
@@ -459,7 +533,7 @@ fn validateQueuedOperation(queued: *const operation.Operation) !void {
     std.debug.assert(queued.expires_at != null);
 }
 
-const success_outcome: CreateOutcome = .{ .status = 0, .succeeded = true };
+const success_outcome: CreateOutcome = .accepted;
 
 const FakeExecution = struct {
     accounts: [record_count_max]tigerbeetle.Account = undefined,
@@ -606,6 +680,39 @@ test "success completion contains the canonical arena-owned transfer id" {
     );
 }
 
+test "failure completions contain exact arena-owned stages and raw statuses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = [_]struct {
+        stage: FailureStage,
+        status: u32,
+        expected: []const u8,
+    }{
+        .{
+            .stage = .account,
+            .status = 19,
+            .expected = "{\"type\":\"FAILURE\",\"payload\":{\"stage\":\"ACCOUNT\",\"status\":19}}",
+        },
+        .{
+            .stage = .transfer,
+            .status = 22,
+            .expected = "{\"type\":\"FAILURE\",\"payload\":{\"stage\":\"TRANSFER\",\"status\":22}}",
+        },
+    };
+    for (cases) |case| {
+        const completion = try failureCompletion(arena.allocator(), case.stage, case.status);
+        var buffer: [operation.result_size_max]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            case.expected,
+            try operation.writeCompletionJSON(&buffer, &completion),
+        );
+    }
+    try std.testing.expectError(
+        error.OutOfMemory,
+        failureCompletion(std.testing.failing_allocator, .account, 19),
+    );
+}
+
 test "TigerBeetle configuration defaults and validates overrides" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
@@ -699,7 +806,7 @@ test "valid records create accounting events before sampling completion timestam
     );
 }
 
-test "rejections are acknowledged before timestamp sampling or completion" {
+test "rejections persist exact failure completions before acknowledgement" {
     const message = try testMessage(std.testing.allocator, 2);
     defer std.testing.allocator.free(message);
     const event = try testEvent(std.testing.allocator, &.{message});
@@ -708,8 +815,9 @@ test "rejections are acknowledged before timestamp sampling or completion" {
     defer arena.deinit();
 
     var account_rejection: FakeExecution = .{};
-    account_rejection.account_outcomes[0] = .{ .status = 19, .succeeded = false };
+    account_rejection.account_outcomes[0] = .{ .rejected = 19 };
     var account_clock: FakeClock = .{};
+    account_clock.values[0] = 1_800_000_001;
     const account_response = try handleInvocation(
         arena.allocator(),
         event,
@@ -719,12 +827,25 @@ test "rejections are acknowledged before timestamp sampling or completion" {
     try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", account_response);
     try std.testing.expectEqual(@as(u8, 1), account_rejection.account_count);
     try std.testing.expectEqual(@as(u8, 0), account_rejection.transfer_count);
-    try std.testing.expectEqual(@as(u8, 0), account_rejection.completion_count);
-    try std.testing.expectEqual(@as(u8, 0), account_clock.count);
+    try std.testing.expectEqual(@as(u8, 1), account_rejection.completion_count);
+    try std.testing.expectEqual(@as(u8, 1), account_clock.count);
+    try std.testing.expectEqual(
+        @as(operation.UnixSeconds, 1_800_000_001),
+        account_rejection.timestamps[0],
+    );
+    var account_buffer: [operation.result_size_max]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"FAILURE\",\"payload\":{\"stage\":\"ACCOUNT\",\"status\":19}}",
+        try operation.writeCompletionJSON(
+            &account_buffer,
+            &account_rejection.completions[0],
+        ),
+    );
 
     var transfer_rejection: FakeExecution = .{};
-    transfer_rejection.transfer_outcomes[0] = .{ .status = 22, .succeeded = false };
+    transfer_rejection.transfer_outcomes[0] = .{ .rejected = 22 };
     var transfer_clock: FakeClock = .{};
+    transfer_clock.values[0] = 1_800_000_002;
     const transfer_response = try handleInvocation(
         arena.allocator(),
         event,
@@ -734,7 +855,62 @@ test "rejections are acknowledged before timestamp sampling or completion" {
     try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", transfer_response);
     try std.testing.expectEqual(@as(u8, 1), transfer_rejection.account_count);
     try std.testing.expectEqual(@as(u8, 1), transfer_rejection.transfer_count);
-    try std.testing.expectEqual(@as(u8, 0), transfer_rejection.completion_count);
+    try std.testing.expectEqual(@as(u8, 1), transfer_rejection.completion_count);
+    try std.testing.expectEqual(@as(u8, 1), transfer_clock.count);
+    try std.testing.expectEqual(
+        @as(operation.UnixSeconds, 1_800_000_002),
+        transfer_rejection.timestamps[0],
+    );
+    var transfer_buffer: [operation.result_size_max]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"FAILURE\",\"payload\":{\"stage\":\"TRANSFER\",\"status\":22}}",
+        try operation.writeCompletionJSON(
+            &transfer_buffer,
+            &transfer_rejection.completions[0],
+        ),
+    );
+}
+
+test "TigerBeetle request errors retry without sampling completion timestamps" {
+    const message = try testMessage(std.testing.allocator, 2);
+    defer std.testing.allocator.free(message);
+    const event = try testEvent(std.testing.allocator, &.{message});
+    defer std.testing.allocator.free(event);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var account_error: FakeExecution = .{};
+    account_error.account_errors[0] = error.ClientClosed;
+    var account_clock: FakeClock = .{};
+    const account_response = try handleInvocation(
+        arena.allocator(),
+        event,
+        ExecutionAdapter.init(&account_error),
+        Clock.init(&account_clock),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}",
+        account_response,
+    );
+    try std.testing.expectEqual(@as(u8, 0), account_error.transfer_count);
+    try std.testing.expectEqual(@as(u8, 0), account_error.completion_count);
+    try std.testing.expectEqual(@as(u8, 0), account_clock.count);
+
+    var transfer_error: FakeExecution = .{};
+    transfer_error.transfer_errors[0] = error.TooMuchData;
+    var transfer_clock: FakeClock = .{};
+    const transfer_response = try handleInvocation(
+        arena.allocator(),
+        event,
+        ExecutionAdapter.init(&transfer_error),
+        Clock.init(&transfer_clock),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}",
+        transfer_response,
+    );
+    try std.testing.expectEqual(@as(u8, 1), transfer_error.transfer_count);
+    try std.testing.expectEqual(@as(u8, 0), transfer_error.completion_count);
     try std.testing.expectEqual(@as(u8, 0), transfer_clock.count);
 }
 
@@ -758,9 +934,9 @@ test "mixed outcomes report exact retryable identifiers and continue processing"
     const event = try testEvent(std.testing.allocator, &bodies);
     defer std.testing.allocator.free(event);
     var fake: FakeExecution = .{};
-    fake.account_outcomes[1] = .{ .status = 19, .succeeded = false };
+    fake.account_outcomes[1] = .{ .rejected = 19 };
     fake.account_errors[2] = error.ClientClosed;
-    fake.transfer_outcomes[1] = .{ .status = 22, .succeeded = false };
+    fake.transfer_outcomes[1] = .{ .rejected = 22 };
     fake.transfer_errors[2] = error.TooMuchData;
     fake.completion_errors[1] = error.OperationConflict;
     fake.completion_errors[2] = error.AWSFailure;
@@ -769,6 +945,8 @@ test "mixed outcomes report exact retryable identifiers and continue processing"
     clock.values[1] = 1_800_000_002;
     clock.values[2] = 1_800_000_003;
     clock.values[3] = 1_800_000_004;
+    clock.values[4] = 1_800_000_005;
+    clock.values[5] = 1_800_000_006;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -780,14 +958,24 @@ test "mixed outcomes report exact retryable identifiers and continue processing"
     );
     try std.testing.expectEqualStrings(
         "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-3\"}," ++
-            "{\"itemIdentifier\":\"message-5\"}," ++
-            "{\"itemIdentifier\":\"message-7\"}]}",
+            "{\"itemIdentifier\":\"message-4\"}," ++
+            "{\"itemIdentifier\":\"message-5\"}]}",
         response,
     );
     try std.testing.expectEqual(@as(u8, 8), fake.account_count);
     try std.testing.expectEqual(@as(u8, 6), fake.transfer_count);
-    try std.testing.expectEqual(@as(u8, 4), fake.completion_count);
-    try std.testing.expectEqual(@as(u8, 4), clock.count);
+    try std.testing.expectEqual(@as(u8, 6), fake.completion_count);
+    try std.testing.expectEqual(@as(u8, 6), clock.count);
+    try std.testing.expect(fake.completions[1] == .failure);
+    try std.testing.expect(fake.completions[2] == .failure);
+    try std.testing.expectEqual(
+        @as(operation.UnixSeconds, 1_800_000_002),
+        fake.timestamps[1],
+    );
+    try std.testing.expectEqual(
+        @as(operation.UnixSeconds, 1_800_000_003),
+        fake.timestamps[2],
+    );
     try std.testing.expectEqual(@as(u128, 9), fake.accounts[7].id);
     try std.testing.expectEqual(@as(u128, 9), fake.transfers[5].id);
 }
