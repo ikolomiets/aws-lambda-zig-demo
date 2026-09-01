@@ -47,6 +47,176 @@ test_source_guards() {
         fail_test "sourcing deployment helpers produced output: $source_output"
 }
 
+test_completion_function_name_options() (
+    local default_name invalid_name_output usage_output
+
+    default_name="$(env -u COMPLETION_FUNCTION_NAME bash -c \
+        'source "$1/deploy.sh"; printf "%s\n" "$COMPLETION_FUNCTION_NAME"' \
+        bash "$REPOSITORY_ROOT")" ||
+        fail_test "default completion function name could not be resolved"
+    [ "$default_name" = completion-lambda ] ||
+        fail_test "default completion function name did not match the SAM parameter"
+
+    COMPLETION_FUNCTION_NAME=completion-lambda
+    parse_deployment_options --completion-function-name completion-custom
+    validate_completion_function_name
+    [ "$COMPLETION_FUNCTION_NAME" = completion-custom ] ||
+        fail_test "separate completion function-name option was not applied"
+
+    parse_deployment_options --completion-function-name=completion_equal
+    validate_completion_function_name
+    [ "$COMPLETION_FUNCTION_NAME" = completion_equal ] ||
+        fail_test "equals completion function-name option was not applied"
+
+    if invalid_name_output="$({
+        parse_deployment_options --completion-function-name ''
+        validate_completion_function_name
+    } 2>&1)"; then
+        fail_test "empty completion function-name argument was accepted"
+    fi
+    assert_contains "$invalid_name_output" "empty value for --completion-function-name"
+
+    if invalid_name_output="$({
+        parse_deployment_options --completion-function-name completion/name
+        validate_completion_function_name
+    } 2>&1)"; then
+        fail_test "invalid completion function-name argument was accepted"
+    fi
+    assert_contains "$invalid_name_output" "must contain only letters"
+
+    if invalid_name_output="$({
+        parse_deployment_options \
+            --completion-function-name \
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        validate_completion_function_name
+    } 2>&1)"; then
+        fail_test "oversized completion function-name argument was accepted"
+    fi
+    assert_contains "$invalid_name_output" "must be at most 64 characters"
+
+    usage_output="$(usage)"
+    assert_contains "$usage_output" "--completion-function-name NAME"
+    assert_contains "$usage_output" "COMPLETION_FUNCTION_NAME"
+)
+
+test_completion_parameter_preserves_stack_state() (
+    local overrides
+
+    INTAKE_FUNCTION_NAME=intake-existing
+    QUERY_FUNCTION_NAME=query-existing
+    EXECUTION_FUNCTION_NAME=execution-existing
+    COMPLETION_FUNCTION_NAME=completion-explicit
+    DEPLOYMENT_PARAMETER_OVERRIDES=(
+        "EnableWireGuardGateway=true"
+        "VpcId=vpc-00000001"
+    )
+
+    build_sam_parameter_overrides
+    overrides=" ${SAM_PARAMETER_OVERRIDES[*]} "
+    assert_contains "$overrides" " IntakeFunctionName=intake-existing "
+    assert_contains "$overrides" " QueryFunctionName=query-existing "
+    assert_contains "$overrides" " ExecutionFunctionName=execution-existing "
+    assert_contains "$overrides" " CompletionFunctionName=completion-explicit "
+    assert_contains "$overrides" " EnableWireGuardGateway=true "
+    assert_contains "$overrides" " VpcId=vpc-00000001 "
+    [ "${#SAM_PARAMETER_OVERRIDES[@]}" -eq 10 ] ||
+        fail_test "completion parameter propagation changed preserved stack state"
+)
+
+test_deployed_function_name_outputs() (
+    local output
+
+    INTAKE_FUNCTION_NAME=intake-existing
+    QUERY_FUNCTION_NAME=query-existing
+    EXECUTION_FUNCTION_NAME=execution-existing
+    COMPLETION_FUNCTION_NAME=completion-existing
+    aws() {
+        printf 'IntakeFunctionName|intake-existing\t'
+        printf 'QueryFunctionName|query-existing\t'
+        printf 'ExecutionFunctionName|execution-existing\t'
+        printf 'CompletionFunctionName|%s\n' "$MOCK_COMPLETION_OUTPUT"
+    }
+
+    MOCK_COMPLETION_OUTPUT=completion-existing
+    output="$(validate_deployed_function_names)" ||
+        fail_test "matching deployed function-name outputs were rejected"
+    assert_contains "$output" "match requested values"
+
+    MOCK_COMPLETION_OUTPUT=completion-mismatch
+    if output="$(validate_deployed_function_names 2>&1)"; then
+        fail_test "mismatched completion function-name output was accepted"
+    fi
+    assert_contains "$output" "CompletionFunctionName does not match"
+)
+
+test_four_lambda_artifacts() (
+    local artifact_tmp artifact_output expected_file_calls expected_zip_calls
+
+    artifact_tmp="$(mktemp -d "${TMPDIR:-/tmp}/deploy-artifact-test.XXXXXX")"
+    trap 'rm -rf -- "$artifact_tmp"' EXIT
+    cd "$artifact_tmp"
+    MOCK_FILE_CALLS="$artifact_tmp/file-calls.log"
+    MOCK_ZIP_CALLS="$artifact_tmp/zip-calls.log"
+    : >"$MOCK_FILE_CALLS"
+    : >"$MOCK_ZIP_CALLS"
+    for archive in \
+        intake-lambda.zip \
+        query-lambda.zip \
+        execution-lambda.zip \
+        completion-lambda.zip
+    do
+        printf 'stale archive\n' >"$archive"
+    done
+
+    file() {
+        printf '%s\n' "$1" >>"$MOCK_FILE_CALLS"
+        case "$1" in
+            zig-out/bin/execution/bootstrap)
+                printf '%s\n' \
+                    "$1: ELF 64-bit LSB executable, ARM aarch64, dynamically linked, stripped"
+                ;;
+            zig-out/bin/intake/bootstrap | \
+                zig-out/bin/query/bootstrap | \
+                zig-out/bin/completion/bootstrap)
+                printf '%s\n' \
+                    "$1: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped"
+                ;;
+            *) fail_test "unexpected artifact validation path: $1" ;;
+        esac
+    }
+    zip() {
+        [ "$#" -eq 3 ] && [ "$1" = -qj ] ||
+            fail_test "unexpected mocked zip invocation: $*"
+        [ ! -e "$2" ] || fail_test "stale archive was not removed: $2"
+        printf '%s|%s\n' "$2" "$3" >>"$MOCK_ZIP_CALLS"
+        printf 'mock archive\n' >"$2"
+    }
+    unzip() {
+        [ "$#" -eq 2 ] && [ "$1" = -Z1 ] ||
+            fail_test "unexpected mocked unzip invocation: $*"
+        [ -s "$2" ] || fail_test "archive validation received an empty file: $2"
+        printf 'bootstrap\n'
+    }
+
+    artifact_output="$(validate_lambda_bootstraps)" ||
+        fail_test "four-bootstrap artifact validation failed"
+    assert_contains "$artifact_output" "zig-out/bin/completion/bootstrap"
+    package_lambda_archives
+
+    expected_file_calls='zig-out/bin/intake/bootstrap
+zig-out/bin/query/bootstrap
+zig-out/bin/completion/bootstrap
+zig-out/bin/execution/bootstrap'
+    [ "$(<"$MOCK_FILE_CALLS")" = "$expected_file_calls" ] ||
+        fail_test "bootstrap validation did not retain the four expected paths"
+    expected_zip_calls='intake-lambda.zip|zig-out/bin/intake/bootstrap
+query-lambda.zip|zig-out/bin/query/bootstrap
+execution-lambda.zip|zig-out/bin/execution/bootstrap
+completion-lambda.zip|zig-out/bin/completion/bootstrap'
+    [ "$(<"$MOCK_ZIP_CALLS")" = "$expected_zip_calls" ] ||
+        fail_test "packaging did not retain the four expected archive mappings"
+)
+
 test_setup_action_parsing() (
     WIREGUARD_INSTANCE_TYPE=t4g.nano
     WIREGUARD_ACTION=enable
@@ -104,6 +274,78 @@ test_enabled_stack_fills_only_unspecified_values() (
         fail_test "enabled-stack reuse overrode a supplied gateway subnet"
     [ "$LAMBDA_SUBNET_ID" = subnet-00000002 ] ||
         fail_test "enabled-stack reuse did not fill an unspecified Lambda subnet"
+)
+
+test_ipv6_egress_ownership_state() (
+    aws() {
+        case "$MOCK_STACK_STATE" in
+            enabled)
+                printf 'EnableWireGuardGateway\ttrue\n'
+                printf 'RetainExecutionVpcCleanupResources\tfalse\n'
+                ;;
+            retained)
+                printf 'EnableWireGuardGateway\tfalse\n'
+                printf 'RetainExecutionVpcCleanupResources\ttrue\n'
+                ;;
+            disabled)
+                printf 'EnableWireGuardGateway\tfalse\n'
+                printf 'RetainExecutionVpcCleanupResources\tfalse\n'
+                ;;
+            *) fail_test "unknown mocked stack state: $MOCK_STACK_STATE" ;;
+        esac
+        printf 'VpcId\tvpc-00000001\n'
+        printf 'LambdaRouteTableId\trtb-00000002\n'
+    }
+
+    ENABLE_WIREGUARD_GATEWAY=1
+    MOCK_STACK_STATE=enabled
+    plan_wireguard_deployment
+    [ "$WIREGUARD_EGRESS_RESOURCES_EXPECTED" -eq 1 ] ||
+        fail_test "enabled stack did not require stack-owned IPv6 egress"
+    [ "$WIREGUARD_STACK_VPC_ID" = vpc-00000001 ] ||
+        fail_test "enabled stack VPC ownership was not recorded"
+    [ "$WIREGUARD_STACK_ROUTE_TABLE_ID" = rtb-00000002 ] ||
+        fail_test "enabled stack route-table ownership was not recorded"
+
+    ENABLE_WIREGUARD_GATEWAY=0
+    MOCK_STACK_STATE=retained
+    plan_wireguard_deployment
+    [ "$WIREGUARD_DEPLOYMENT_MODE" = resume-cleanup ] ||
+        fail_test "retained stack did not select resumed cleanup"
+    [ "$WIREGUARD_EGRESS_RESOURCES_EXPECTED" -eq 1 ] ||
+        fail_test "retained cleanup did not require stack-owned IPv6 egress"
+
+    ENABLE_WIREGUARD_GATEWAY=1
+    MOCK_STACK_STATE=disabled
+    plan_wireguard_deployment
+    [ "$WIREGUARD_EGRESS_RESOURCES_EXPECTED" -eq 0 ] ||
+        fail_test "disabled stack did not select conflict-free first enablement"
+    [ -z "$WIREGUARD_STACK_VPC_ID" ] && [ -z "$WIREGUARD_STACK_ROUTE_TABLE_ID" ] ||
+        fail_test "disabled stack retained stale IPv6 egress ownership state"
+)
+
+test_ipv6_egress_interface_guards() (
+    local helper_source overrides
+
+    ENABLE_WIREGUARD_GATEWAY=1
+    VPC_ID=vpc-00000001
+    GATEWAY_PUBLIC_SUBNET_ID=subnet-00000001
+    LAMBDA_SUBNET_ID=subnet-00000002
+    LAMBDA_ROUTE_TABLE_ID=rtb-00000002
+    LAMBDA_SUBNET_CIDR=172.31.1.0/24
+    WIREGUARD_PRIVATE_KEY_PARAMETER_NAME=/applications/example/wireguard/gateway-private-key
+    WIREGUARD_PRIVATE_KEY_PARAMETER_VERSION=1
+    WIREGUARD_GATEWAY_PUBLIC_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+    WIREGUARD_WORKSTATION_PUBLIC_KEY=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+    WIREGUARD_INSTANCE_TYPE=t4g.nano
+    build_wireguard_parameter_overrides false
+    overrides="$(joined_overrides)"
+    assert_not_contains "$overrides" "EgressOnlyInternetGatewayId="
+
+    helper_source="$(<"$REPOSITORY_ROOT/wireguard-gateway-setup.sh")"
+    assert_not_contains "$helper_source" "create-egress-only-internet-gateway"
+    assert_not_contains "$helper_source" "delete-egress-only-internet-gateway"
+    assert_not_contains "$helper_source" "EgressOnlyInternetGatewayId="
 )
 
 mock_preserved_stack() {
@@ -300,8 +542,14 @@ test_failed_deployment_omits_peer_configuration() (
 )
 
 test_source_guards
+test_completion_function_name_options
+test_completion_parameter_preserves_stack_state
+test_deployed_function_name_outputs
+test_four_lambda_artifacts
 test_setup_action_parsing
 test_enabled_stack_fills_only_unspecified_values
+test_ipv6_egress_ownership_state
+test_ipv6_egress_interface_guards
 test_ordinary_deployment_preserves_gateway_state
 test_new_stack_defaults_disabled
 test_ordinary_deployment_rejects_transition

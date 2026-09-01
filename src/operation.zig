@@ -10,7 +10,7 @@ pub const name_size_max = 64;
 pub const tenant_size_max = 64;
 pub const output_size_max = body_size_max + result_size_max + 2048;
 pub const ttl_seconds: UnixSeconds = 24 * 60 * 60;
-const uuid_string_size = 36;
+pub const uuid_string_size = 36;
 const hash_string_size = 64;
 
 comptime {

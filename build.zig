@@ -135,6 +135,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/operation.zig"),
     });
+    const lambda_completion_batch = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/completion_batch.zig"),
+        .imports = &.{
+            .{ .name = "operation", .module = lambda_operation },
+        },
+    });
     const lambda_operation_persistence = b.createModule(.{
         .target = lambda_target,
         .optimize = optimize,
@@ -145,10 +153,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation", .module = lambda_operation },
         },
     });
-    const lambda_operation_queue = b.createModule(.{
+    const lambda_sqs_queue = b.createModule(.{
         .target = lambda_target,
         .optimize = optimize,
-        .root_source_file = b.path("src/operation_queue.zig"),
+        .root_source_file = b.path("src/sqs_queue.zig"),
         .imports = &.{
             .{ .name = "aws", .module = lambda_aws },
             .{ .name = "sqs", .module = lambda_sqs },
@@ -159,7 +167,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const execution_aws = execution_aws_sdk.module("aws");
-    const execution_dynamodb = execution_aws_sdk.module("dynamodb");
+    const execution_sqs = execution_aws_sdk.module("sqs");
     const execution_runtime = b.dependency("aws_lambda", .{
         .target = execution_target,
     }).module("lambda");
@@ -168,14 +176,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/operation.zig"),
     });
-    const execution_operation_persistence = b.createModule(.{
+    const execution_completion_batch = b.createModule(.{
         .target = execution_target,
         .optimize = optimize,
-        .root_source_file = b.path("src/operation_persistence.zig"),
+        .root_source_file = b.path("src/completion_batch.zig"),
+        .imports = &.{
+            .{ .name = "operation", .module = execution_operation },
+        },
+    });
+    const execution_sqs_queue = b.createModule(.{
+        .target = execution_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/sqs_queue.zig"),
         .imports = &.{
             .{ .name = "aws", .module = execution_aws },
-            .{ .name = "dynamodb", .module = execution_dynamodb },
-            .{ .name = "operation", .module = execution_operation },
+            .{ .name = "sqs", .module = execution_sqs },
         },
     });
     const tigerbeetle_c_lambda = add_tigerbeetle_c_module(
@@ -203,7 +218,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lambda_auth", .module = lambda_auth },
             .{ .name = "operation", .module = lambda_operation },
             .{ .name = "operation_persistence", .module = lambda_operation_persistence },
-            .{ .name = "operation_queue", .module = lambda_operation_queue },
+            .{ .name = "sqs_queue", .module = lambda_sqs_queue },
         },
     });
 
@@ -241,6 +256,30 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&install_query_lambda.step);
 
+    const completion_lambda_mod = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/completion_lambda.zig"),
+        .strip = true,
+        .single_threaded = true,
+        .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
+            .{ .name = "aws-lambda", .module = lambda_runtime },
+            .{ .name = "completion_batch", .module = lambda_completion_batch },
+            .{ .name = "operation", .module = lambda_operation },
+            .{ .name = "operation_persistence", .module = lambda_operation_persistence },
+        },
+    });
+    const completion_lambda_exe = b.addExecutable(.{
+        .name = "completion-bootstrap",
+        .root_module = completion_lambda_mod,
+    });
+    const install_completion_lambda = b.addInstallArtifact(completion_lambda_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "bin/completion" } },
+        .dest_sub_path = "bootstrap",
+    });
+    b.getInstallStep().dependOn(&install_completion_lambda.step);
+
     const execution_lambda_mod = b.createModule(.{
         .target = execution_target,
         .optimize = optimize,
@@ -251,14 +290,17 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "aws", .module = execution_aws },
             .{ .name = "aws-lambda", .module = execution_runtime },
+            .{ .name = "completion_batch", .module = execution_completion_batch },
             .{ .name = "operation", .module = execution_operation },
-            .{ .name = "operation_persistence", .module = execution_operation_persistence },
+            .{ .name = "sqs_queue", .module = execution_sqs_queue },
             .{ .name = tigerbeetle_import_name, .module = tigerbeetle_lambda },
         },
     });
     const execution_lambda_exe = b.addExecutable(.{
         .name = "execution-bootstrap",
         .root_module = execution_lambda_mod,
+        // Temporary workaround for the Zig stdlib hostname-connect stall.
+        .zig_lib_dir = .{ .cwd_relative = "../zig/lib" },
     });
     const install_execution_lambda = b.addInstallArtifact(execution_lambda_exe, .{
         .dest_dir = .{ .override = .{ .custom = "bin/execution" } },
@@ -290,6 +332,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/operation.zig"),
     });
+    const host_completion_batch = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/completion_batch.zig"),
+        .imports = &.{
+            .{ .name = "operation", .module = host_operation },
+        },
+    });
     const host_operation_persistence = b.createModule(.{
         .target = b.graph.host,
         .optimize = optimize,
@@ -300,10 +350,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation", .module = host_operation },
         },
     });
-    const host_operation_queue = b.createModule(.{
+    const host_sqs_queue = b.createModule(.{
         .target = b.graph.host,
         .optimize = optimize,
-        .root_source_file = b.path("src/operation_queue.zig"),
+        .root_source_file = b.path("src/sqs_queue.zig"),
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
             .{ .name = "sqs", .module = host_sqs },
@@ -371,7 +421,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
             .{ .name = "operation", .module = host_operation },
-            .{ .name = "operation_queue", .module = host_operation_queue },
+            .{ .name = "sqs_queue", .module = host_sqs_queue },
         },
     });
     const queue_cli_exe = b.addExecutable(.{
@@ -391,7 +441,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lambda_auth", .module = host_lambda_auth },
             .{ .name = "operation", .module = host_operation },
             .{ .name = "operation_persistence", .module = host_operation_persistence },
-            .{ .name = "operation_queue", .module = host_operation_queue },
+            .{ .name = "sqs_queue", .module = host_sqs_queue },
         },
     });
     const lambda_tests = b.addTest(.{
@@ -424,8 +474,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
             .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "completion_batch", .module = host_completion_batch },
             .{ .name = "operation", .module = host_operation },
-            .{ .name = "operation_persistence", .module = host_operation_persistence },
+            .{ .name = "sqs_queue", .module = host_sqs_queue },
             .{ .name = tigerbeetle_import_name, .module = tigerbeetle_host },
         },
     });
@@ -433,6 +484,24 @@ pub fn build(b: *std.Build) void {
         .root_module = execution_test_mod,
     });
     const run_execution_tests = b.addRunArtifact(execution_tests);
+
+    const completion_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+        .root_source_file = b.path("src/completion_lambda.zig"),
+        .single_threaded = true,
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "completion_batch", .module = host_completion_batch },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "operation_persistence", .module = host_operation_persistence },
+        },
+    });
+    const completion_tests = b.addTest(.{
+        .root_module = completion_test_mod,
+    });
+    const run_completion_tests = b.addRunArtifact(completion_tests);
 
     const lambda_auth_tests = b.addTest(.{
         .root_module = host_lambda_auth,
@@ -444,15 +513,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_operation_tests = b.addRunArtifact(operation_tests);
 
+    const completion_batch_tests = b.addTest(.{
+        .root_module = host_completion_batch,
+    });
+    const run_completion_batch_tests = b.addRunArtifact(completion_batch_tests);
+
     const operation_persistence_tests = b.addTest(.{
         .root_module = host_operation_persistence,
     });
     const run_operation_persistence_tests = b.addRunArtifact(operation_persistence_tests);
 
-    const operation_queue_tests = b.addTest(.{
-        .root_module = host_operation_queue,
+    const sqs_queue_tests = b.addTest(.{
+        .root_module = host_sqs_queue,
     });
-    const run_operation_queue_tests = b.addRunArtifact(operation_queue_tests);
+    const run_sqs_queue_tests = b.addRunArtifact(sqs_queue_tests);
 
     const paseto_test_mod = b.createModule(.{
         .target = b.graph.host,
@@ -627,10 +701,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lambda_auth_tests.step);
     test_step.dependOn(&run_query_tests.step);
     test_step.dependOn(&run_execution_tests.step);
+    test_step.dependOn(&run_completion_tests.step);
     test_step.dependOn(&run_lambda_tests.step);
+    test_step.dependOn(&run_completion_batch_tests.step);
     test_step.dependOn(&run_operation_tests.step);
     test_step.dependOn(&run_operation_persistence_tests.step);
-    test_step.dependOn(&run_operation_queue_tests.step);
+    test_step.dependOn(&run_sqs_queue_tests.step);
     test_step.dependOn(&run_paseto_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_persistence_cli_tests.step);

@@ -1,8 +1,9 @@
 const std = @import("std");
 const aws = @import("aws");
 const lambda = @import("aws-lambda");
+const completion_batch = @import("completion_batch");
 const operation = @import("operation");
-const operation_persistence = @import("operation_persistence");
+const sqs_queue = @import("sqs_queue");
 const tigerbeetle = @import("tigerbeetle");
 
 pub const std_options: std.Options = .{
@@ -36,11 +37,16 @@ comptime {
     std.debug.assert(accounting_transfer_amount > 0);
     std.debug.assert(record_count_max > 0);
     std.debug.assert(record_count_max <= 10);
+    std.debug.assert(
+        record_count_max * (operation.result_size_max + operation.uuid_string_size + 64) <
+            completion_batch.encoded_message_size_max,
+    );
     std.debug.assert(tigerbeetle_addresses_default.len > 0);
     std.debug.assert(tigerbeetle_addresses_default.len <= tigerbeetle_addresses_size_max);
 }
 
 var runtime_execution_adapter: ?ExecutionAdapter = null;
+var runtime_completion_publisher: ?CompletionPublisher = null;
 
 pub fn main(init: std.process.Init) void {
     var resources: RuntimeResources = undefined;
@@ -50,8 +56,11 @@ pub fn main(init: std.process.Init) void {
     };
     defer resources.deinit();
 
-    installRuntimeExecutionAdapter(ExecutionAdapter.init(&resources));
-    defer uninstallRuntimeExecutionAdapter();
+    installRuntimeAdapters(
+        ExecutionAdapter.init(&resources),
+        CompletionPublisher.init(&resources),
+    );
+    defer uninstallRuntimeAdapters();
     lambda.handle(init, handler, .{});
 }
 
@@ -59,13 +68,15 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
     const execution = runtime_execution_adapter orelse {
         return error.ExecutionNotInitialized;
     };
-    var clock: RealClock = .{ .io = ctx.io };
-    return handleInvocation(ctx.arena, event, execution, Clock.init(&clock));
+    const publisher = runtime_completion_publisher orelse {
+        return error.CompletionPublisherNotInitialized;
+    };
+    return handleInvocation(ctx.arena, event, execution, publisher);
 }
 
 const RuntimeResources = struct {
     config: aws.Config,
-    persistence: operation_persistence.Persistence,
+    completion_queue: sqs_queue.Queue,
     tigerbeetle_client: *tigerbeetle.Client,
 
     fn init(resources: *RuntimeResources, process_init: std.process.Init) !void {
@@ -81,13 +92,14 @@ const RuntimeResources = struct {
         ) catch return error.AWSConfigurationFailure;
         errdefer resources.config.deinit();
 
-        operation_persistence.Persistence.init(
-            &resources.persistence,
+        sqs_queue.Queue.init(
+            &resources.completion_queue,
             process_init.gpa,
             &resources.config,
             process_init.environ_map,
-        ) catch return error.PersistenceConfigurationFailure;
-        errdefer resources.persistence.deinit();
+            "COMPLETION_QUEUE_URL",
+        ) catch return error.CompletionQueueConfigurationFailure;
+        errdefer resources.completion_queue.deinit();
 
         resources.tigerbeetle_client = tigerbeetle.Client.create(
             process_init.gpa,
@@ -99,7 +111,7 @@ const RuntimeResources = struct {
 
     fn deinit(resources: *RuntimeResources) void {
         resources.tigerbeetle_client.destroy();
-        resources.persistence.deinit();
+        resources.completion_queue.deinit();
         resources.config.deinit();
         resources.* = undefined;
     }
@@ -130,14 +142,12 @@ const RuntimeResources = struct {
         return .{ .rejected = status };
     }
 
-    fn complete(
+    fn sendCompletion(
         resources: *RuntimeResources,
         arena: Allocator,
-        queued: *const operation.Operation,
-        completion: *const operation.Completion,
-        now: operation.UnixSeconds,
+        body: []const u8,
     ) !void {
-        return resources.persistence.complete(arena, queued, completion, now);
+        return resources.completion_queue.send(arena, body);
     }
 };
 
@@ -190,13 +200,6 @@ const ExecutionAdapter = struct {
         *anyopaque,
         *const tigerbeetle.Transfer,
     ) anyerror!CreateOutcome,
-    complete_fn: *const fn (
-        *anyopaque,
-        Allocator,
-        *const operation.Operation,
-        *const operation.Completion,
-        operation.UnixSeconds,
-    ) anyerror!void,
 
     fn init(pointer: anytype) ExecutionAdapter {
         const Pointer = @TypeOf(pointer);
@@ -220,23 +223,11 @@ const ExecutionAdapter = struct {
                 const self: Pointer = @ptrCast(@alignCast(context));
                 return self.createTransfer(transfer);
             }
-
-            fn complete(
-                context: *anyopaque,
-                arena: Allocator,
-                queued: *const operation.Operation,
-                completion: *const operation.Completion,
-                now: operation.UnixSeconds,
-            ) anyerror!void {
-                const self: Pointer = @ptrCast(@alignCast(context));
-                return self.complete(arena, queued, completion, now);
-            }
         };
         return .{
             .context = pointer,
             .create_account_fn = Adapter.createAccount,
             .create_transfer_fn = Adapter.createTransfer,
-            .complete_fn = Adapter.complete,
         };
     }
 
@@ -253,121 +244,199 @@ const ExecutionAdapter = struct {
     ) !CreateOutcome {
         return execution.create_transfer_fn(execution.context, transfer);
     }
-
-    fn complete(
-        execution: ExecutionAdapter,
-        arena: Allocator,
-        queued: *const operation.Operation,
-        completion: *const operation.Completion,
-        now: operation.UnixSeconds,
-    ) !void {
-        return execution.complete_fn(execution.context, arena, queued, completion, now);
-    }
 };
 
-const Clock = struct {
+const CompletionPublisher = struct {
     context: *anyopaque,
-    now_fn: *const fn (*anyopaque) operation.UnixSeconds,
+    send_fn: *const fn (*anyopaque, Allocator, []const u8) anyerror!void,
 
-    fn init(pointer: anytype) Clock {
+    fn init(pointer: anytype) CompletionPublisher {
         const Pointer = @TypeOf(pointer);
         const pointer_info = @typeInfo(Pointer);
         comptime std.debug.assert(pointer_info == .pointer);
         comptime std.debug.assert(pointer_info.pointer.size == .one);
 
         const Adapter = struct {
-            fn now(context: *anyopaque) operation.UnixSeconds {
+            fn send(
+                context: *anyopaque,
+                arena: Allocator,
+                body: []const u8,
+            ) anyerror!void {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.now();
+                return self.sendCompletion(arena, body);
             }
         };
         return .{
             .context = pointer,
-            .now_fn = Adapter.now,
+            .send_fn = Adapter.send,
         };
     }
 
-    fn now(clock: Clock) operation.UnixSeconds {
-        return clock.now_fn(clock.context);
+    fn send(publisher: CompletionPublisher, arena: Allocator, body: []const u8) !void {
+        return publisher.send_fn(publisher.context, arena, body);
     }
 };
 
-const RealClock = struct {
-    io: std.Io,
-
-    fn now(clock: *RealClock) operation.UnixSeconds {
-        return std.Io.Clock.real.now(clock.io).toSeconds();
-    }
-};
-
-fn installRuntimeExecutionAdapter(execution: ExecutionAdapter) void {
+fn installRuntimeAdapters(
+    execution: ExecutionAdapter,
+    publisher: CompletionPublisher,
+) void {
     std.debug.assert(runtime_execution_adapter == null);
+    std.debug.assert(runtime_completion_publisher == null);
     runtime_execution_adapter = execution;
+    runtime_completion_publisher = publisher;
     std.debug.assert(runtime_execution_adapter != null);
+    std.debug.assert(runtime_completion_publisher != null);
 }
 
-fn uninstallRuntimeExecutionAdapter() void {
+fn uninstallRuntimeAdapters() void {
     std.debug.assert(runtime_execution_adapter != null);
+    std.debug.assert(runtime_completion_publisher != null);
     runtime_execution_adapter = null;
+    runtime_completion_publisher = null;
     std.debug.assert(runtime_execution_adapter == null);
+    std.debug.assert(runtime_completion_publisher == null);
 }
+
+const RecordParseOutcome = union(enum) {
+    acknowledged,
+    retry,
+    valid: operation.Operation,
+};
+
+const ExecutionOutcome = union(enum) {
+    retry,
+    terminal: completion_batch.Entry,
+};
 
 fn handleInvocation(
     allocator: Allocator,
     event: []const u8,
     execution: ExecutionAdapter,
-    clock: Clock,
+    publisher: CompletionPublisher,
 ) ![]const u8 {
     const sqs_event = try lambda.sqs.parseEvent(allocator, event);
     defer sqs_event.deinit(allocator);
     if (sqs_event.records.len > record_count_max) return error.TooManyRecords;
 
-    var failures: [record_count_max]lambda.sqs.BatchItemFailure = undefined;
-    var failure_count: u8 = 0;
-    for (sqs_event.records) |record| {
+    var queued_operations: [record_count_max]operation.Operation = undefined;
+    var queued_record_indexes: [record_count_max]usize = undefined;
+    var entries: [record_count_max]completion_batch.Entry = undefined;
+    var represented_record_indexes: [record_count_max]usize = undefined;
+    var retry_records = [_]bool{false} ** record_count_max;
+    var queued_count: usize = 0;
+    var entry_count: usize = 0;
+    for (sqs_event.records, 0..) |record, record_index| {
         log.debug("message_id={s} body={s}", .{ record.message_id, record.body });
-        if (processRecord(allocator, record.message_id, record.body, execution, clock)) {
-            std.debug.assert(failure_count < record_count_max);
+        switch (parseRecord(allocator, record.message_id, record.body)) {
+            .acknowledged => {},
+            .retry => retry_records[record_index] = true,
+            .valid => |queued| {
+                std.debug.assert(queued_count < record_count_max);
+                queued_operations[queued_count] = queued;
+                queued_record_indexes[queued_count] = record_index;
+                queued_count += 1;
+            },
+        }
+    }
+    for (queued_operations[0..queued_count], queued_record_indexes[0..queued_count]) |
+        *queued,
+        record_index,
+    | {
+        const message_id = sqs_event.records[record_index].message_id;
+        switch (executeOperation(allocator, message_id, queued, execution)) {
+            .retry => retry_records[record_index] = true,
+            .terminal => |entry| {
+                std.debug.assert(entry_count < queued_count);
+                entries[entry_count] = entry;
+                represented_record_indexes[entry_count] = record_index;
+                entry_count += 1;
+            },
+        }
+    }
+    std.debug.assert(queued_count <= sqs_event.records.len);
+    std.debug.assert(entry_count <= queued_count);
+    std.debug.assert(entry_count <= sqs_event.records.len);
+
+    publishCompletions(allocator, entries[0..entry_count], publisher) catch |err| {
+        log.debug("stage=completion_publish outcome=retry error={s}", .{@errorName(err)});
+        for (represented_record_indexes[0..entry_count]) |record_index| {
+            std.debug.assert(record_index < sqs_event.records.len);
+            retry_records[record_index] = true;
+        }
+    };
+
+    return encodeFailureResponse(allocator, sqs_event.records, &retry_records);
+}
+
+fn publishCompletions(
+    arena: Allocator,
+    entries: []const completion_batch.Entry,
+    publisher: CompletionPublisher,
+) !void {
+    if (entries.len == 0) return;
+    std.debug.assert(entries.len <= record_count_max);
+    const message = try completion_batch.encode(arena, &.{ .results = entries });
+    try publisher.send(arena, message);
+}
+
+fn encodeFailureResponse(
+    allocator: Allocator,
+    records: []const lambda.sqs.Record,
+    retry_records: *const [record_count_max]bool,
+) ![]const u8 {
+    std.debug.assert(records.len <= record_count_max);
+    var failures: [record_count_max]lambda.sqs.BatchItemFailure = undefined;
+    var failure_count: usize = 0;
+    for (records, 0..) |record, record_index| {
+        if (retry_records[record_index]) {
             failures[failure_count] = .{ .item_identifier = record.message_id };
             failure_count += 1;
         }
     }
-    std.debug.assert(failure_count <= sqs_event.records.len);
-
+    std.debug.assert(failure_count <= records.len);
     return lambda.sqs.encodeResponse(allocator, .{
         .batch_item_failures = failures[0..failure_count],
     });
 }
 
-/// Returns true only when SQS must retry this record.
-fn processRecord(
+fn parseRecord(
     arena: Allocator,
     message_id: []const u8,
     body: []const u8,
-    execution: ExecutionAdapter,
-    clock: Clock,
-) bool {
+) RecordParseOutcome {
     const queued = operation.parseOutputJSON(arena, body) catch |err| {
         if (err == error.OutOfMemory) {
             log.debug("message_id={s} stage=parse outcome=retry error={s}", .{
                 message_id,
                 @errorName(err),
             });
-            return true;
+            return .retry;
         }
         log.debug("message_id={s} outcome=acknowledged_invalid error={s}", .{
             message_id,
             @errorName(err),
         });
-        return false;
+        return .acknowledged;
     };
     validateQueuedOperation(&queued) catch |err| {
         log.debug("message_id={s} outcome=acknowledged_invalid error={s}", .{
             message_id,
             @errorName(err),
         });
-        return false;
+        return .acknowledged;
     };
+    return .{ .valid = queued };
+}
+
+fn executeOperation(
+    arena: Allocator,
+    message_id: []const u8,
+    queued: *const operation.Operation,
+    execution: ExecutionAdapter,
+) ExecutionOutcome {
+    std.debug.assert(queued.status == .submitted);
+    std.debug.assert(queued.body != null);
 
     const account = accountingAccount(queued.id);
     const account_outcome = execution.createAccount(&account) catch |err| {
@@ -375,18 +444,16 @@ fn processRecord(
             message_id,
             @errorName(err),
         });
-        return true;
+        return .retry;
     };
     switch (account_outcome) {
         .accepted => {},
         .rejected => |status| return processRecordRejection(
             arena,
             message_id,
-            &queued,
+            queued.id,
             .account,
             status,
-            execution,
-            clock,
         ),
     }
 
@@ -396,18 +463,16 @@ fn processRecord(
             message_id,
             @errorName(err),
         });
-        return true;
+        return .retry;
     };
     switch (transfer_outcome) {
         .accepted => {},
         .rejected => |status| return processRecordRejection(
             arena,
             message_id,
-            &queued,
+            queued.id,
             .transfer,
             status,
-            execution,
-            clock,
         ),
     }
 
@@ -416,20 +481,19 @@ fn processRecord(
             message_id,
             @errorName(err),
         });
-        return true;
+        return .retry;
     };
-    return processRecordCompletion(arena, message_id, &queued, &completion, execution, clock);
+    log.debug("message_id={s} outcome=succeeded", .{message_id});
+    return .{ .terminal = .{ .operation_id = queued.id, .result = completion } };
 }
 
 fn processRecordRejection(
     arena: Allocator,
     message_id: []const u8,
-    queued: *const operation.Operation,
+    operation_id: u128,
     stage: FailureStage,
     status: u32,
-    execution: ExecutionAdapter,
-    clock: Clock,
-) bool {
+) ExecutionOutcome {
     log.debug("message_id={s} stage={s} outcome=rejected status={d}", .{
         message_id,
         @tagName(stage),
@@ -440,39 +504,9 @@ fn processRecordRejection(
             message_id,
             @errorName(err),
         });
-        return true;
+        return .retry;
     };
-    return processRecordCompletion(arena, message_id, queued, &completion, execution, clock);
-}
-
-fn processRecordCompletion(
-    arena: Allocator,
-    message_id: []const u8,
-    queued: *const operation.Operation,
-    completion: *const operation.Completion,
-    execution: ExecutionAdapter,
-    clock: Clock,
-) bool {
-    const now = clock.now();
-    execution.complete(arena, queued, completion, now) catch |err| {
-        if (err == error.OperationConflict) {
-            log.debug("message_id={s} stage=completion outcome=acknowledged_conflict", .{
-                message_id,
-            });
-            return false;
-        }
-        log.debug("message_id={s} stage=completion outcome=retry error={s}", .{
-            message_id,
-            @errorName(err),
-        });
-        return true;
-    };
-    const outcome = switch (completion.*) {
-        .success => "succeeded",
-        .failure => "failed",
-    };
-    log.debug("message_id={s} outcome={s}", .{ message_id, outcome });
-    return false;
+    return .{ .terminal = .{ .operation_id = operation_id, .result = completion } };
 }
 
 fn successCompletion(arena: Allocator, operation_id: u128) !operation.Completion {
@@ -538,16 +572,12 @@ const success_outcome: CreateOutcome = .accepted;
 const FakeExecution = struct {
     accounts: [record_count_max]tigerbeetle.Account = undefined,
     transfers: [record_count_max]tigerbeetle.Transfer = undefined,
-    completions: [record_count_max]operation.Completion = undefined,
-    timestamps: [record_count_max]operation.UnixSeconds = undefined,
     account_outcomes: [record_count_max]CreateOutcome = .{success_outcome} ** record_count_max,
     transfer_outcomes: [record_count_max]CreateOutcome = .{success_outcome} ** record_count_max,
     account_errors: [record_count_max]?anyerror = .{null} ** record_count_max,
     transfer_errors: [record_count_max]?anyerror = .{null} ** record_count_max,
-    completion_errors: [record_count_max]?anyerror = .{null} ** record_count_max,
     account_count: u8 = 0,
     transfer_count: u8 = 0,
-    completion_count: u8 = 0,
 
     fn createAccount(
         fake: *FakeExecution,
@@ -572,35 +602,31 @@ const FakeExecution = struct {
         if (fake.transfer_errors[index]) |err| return err;
         return fake.transfer_outcomes[index];
     }
-
-    fn complete(
-        fake: *FakeExecution,
-        arena: Allocator,
-        queued: *const operation.Operation,
-        completion: *const operation.Completion,
-        now: operation.UnixSeconds,
-    ) !void {
-        _ = arena;
-        std.debug.assert(fake.completion_count < record_count_max);
-        std.debug.assert(queued.status == .submitted);
-        std.debug.assert(queued.body != null);
-        const index = fake.completion_count;
-        fake.completions[index] = completion.*;
-        fake.timestamps[index] = now;
-        fake.completion_count += 1;
-        if (fake.completion_errors[index]) |err| return err;
-    }
 };
 
-const FakeClock = struct {
-    values: [record_count_max]operation.UnixSeconds = undefined,
-    count: u8 = 0,
+const FakePublisher = struct {
+    message: []const u8 = undefined,
+    execution: ?*const FakeExecution = null,
+    send_error: ?anyerror = null,
+    account_count_at_send: u8 = 0,
+    transfer_count_at_send: u8 = 0,
+    send_count: u8 = 0,
 
-    fn now(clock: *FakeClock) operation.UnixSeconds {
-        std.debug.assert(clock.count < record_count_max);
-        const value = clock.values[clock.count];
-        clock.count += 1;
-        return value;
+    fn sendCompletion(
+        fake: *FakePublisher,
+        arena: Allocator,
+        body: []const u8,
+    ) !void {
+        _ = arena;
+        std.debug.assert(fake.send_count == 0);
+        std.debug.assert(body.len > 0);
+        fake.message = body;
+        if (fake.execution) |execution| {
+            fake.account_count_at_send = execution.account_count;
+            fake.transfer_count_at_send = execution.transfer_count;
+        }
+        fake.send_count += 1;
+        if (fake.send_error) |err| return err;
     }
 };
 
@@ -765,157 +791,8 @@ test "TigerBeetle configuration defaults and validates overrides" {
     );
 }
 
-test "valid records create accounting events before sampling completion timestamps" {
-    const first = try testMessage(std.testing.allocator, 2);
-    defer std.testing.allocator.free(first);
-    const second = try testMessage(std.testing.allocator, 3);
-    defer std.testing.allocator.free(second);
-    const event = try testEvent(std.testing.allocator, &.{ first, second });
-    defer std.testing.allocator.free(event);
-    var fake: FakeExecution = .{};
-    var clock: FakeClock = .{};
-    clock.values[0] = 1_800_000_001;
-    clock.values[1] = 1_800_000_002;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const response = try handleInvocation(
-        arena.allocator(),
-        event,
-        ExecutionAdapter.init(&fake),
-        Clock.init(&clock),
-    );
-    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
-    try std.testing.expectEqual(@as(u8, 2), fake.account_count);
-    try std.testing.expectEqual(@as(u8, 2), fake.transfer_count);
-    try std.testing.expectEqual(@as(u8, 2), fake.completion_count);
-    try std.testing.expectEqual(@as(u8, 2), clock.count);
-    try std.testing.expectEqualDeep(accountingAccount(2), fake.accounts[0]);
-    try std.testing.expectEqualDeep(accountingTransfer(2), fake.transfers[0]);
-    try std.testing.expectEqualDeep(accountingAccount(3), fake.accounts[1]);
-    try std.testing.expectEqualDeep(accountingTransfer(3), fake.transfers[1]);
-    try std.testing.expectEqual(@as(operation.UnixSeconds, 1_800_000_001), fake.timestamps[0]);
-    try std.testing.expectEqual(@as(operation.UnixSeconds, 1_800_000_002), fake.timestamps[1]);
-    try std.testing.expectEqualStrings(
-        "00000000-0000-0000-0000-000000000002",
-        fake.completions[0].success.object.get("transfer_id").?.string,
-    );
-    try std.testing.expectEqualStrings(
-        "00000000-0000-0000-0000-000000000003",
-        fake.completions[1].success.object.get("transfer_id").?.string,
-    );
-}
-
-test "rejections persist exact failure completions before acknowledgement" {
-    const message = try testMessage(std.testing.allocator, 2);
-    defer std.testing.allocator.free(message);
-    const event = try testEvent(std.testing.allocator, &.{message});
-    defer std.testing.allocator.free(event);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var account_rejection: FakeExecution = .{};
-    account_rejection.account_outcomes[0] = .{ .rejected = 19 };
-    var account_clock: FakeClock = .{};
-    account_clock.values[0] = 1_800_000_001;
-    const account_response = try handleInvocation(
-        arena.allocator(),
-        event,
-        ExecutionAdapter.init(&account_rejection),
-        Clock.init(&account_clock),
-    );
-    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", account_response);
-    try std.testing.expectEqual(@as(u8, 1), account_rejection.account_count);
-    try std.testing.expectEqual(@as(u8, 0), account_rejection.transfer_count);
-    try std.testing.expectEqual(@as(u8, 1), account_rejection.completion_count);
-    try std.testing.expectEqual(@as(u8, 1), account_clock.count);
-    try std.testing.expectEqual(
-        @as(operation.UnixSeconds, 1_800_000_001),
-        account_rejection.timestamps[0],
-    );
-    var account_buffer: [operation.result_size_max]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "{\"type\":\"FAILURE\",\"payload\":{\"stage\":\"ACCOUNT\",\"status\":19}}",
-        try operation.writeCompletionJSON(
-            &account_buffer,
-            &account_rejection.completions[0],
-        ),
-    );
-
-    var transfer_rejection: FakeExecution = .{};
-    transfer_rejection.transfer_outcomes[0] = .{ .rejected = 22 };
-    var transfer_clock: FakeClock = .{};
-    transfer_clock.values[0] = 1_800_000_002;
-    const transfer_response = try handleInvocation(
-        arena.allocator(),
-        event,
-        ExecutionAdapter.init(&transfer_rejection),
-        Clock.init(&transfer_clock),
-    );
-    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", transfer_response);
-    try std.testing.expectEqual(@as(u8, 1), transfer_rejection.account_count);
-    try std.testing.expectEqual(@as(u8, 1), transfer_rejection.transfer_count);
-    try std.testing.expectEqual(@as(u8, 1), transfer_rejection.completion_count);
-    try std.testing.expectEqual(@as(u8, 1), transfer_clock.count);
-    try std.testing.expectEqual(
-        @as(operation.UnixSeconds, 1_800_000_002),
-        transfer_rejection.timestamps[0],
-    );
-    var transfer_buffer: [operation.result_size_max]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "{\"type\":\"FAILURE\",\"payload\":{\"stage\":\"TRANSFER\",\"status\":22}}",
-        try operation.writeCompletionJSON(
-            &transfer_buffer,
-            &transfer_rejection.completions[0],
-        ),
-    );
-}
-
-test "TigerBeetle request errors retry without sampling completion timestamps" {
-    const message = try testMessage(std.testing.allocator, 2);
-    defer std.testing.allocator.free(message);
-    const event = try testEvent(std.testing.allocator, &.{message});
-    defer std.testing.allocator.free(event);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var account_error: FakeExecution = .{};
-    account_error.account_errors[0] = error.ClientClosed;
-    var account_clock: FakeClock = .{};
-    const account_response = try handleInvocation(
-        arena.allocator(),
-        event,
-        ExecutionAdapter.init(&account_error),
-        Clock.init(&account_clock),
-    );
-    try std.testing.expectEqualStrings(
-        "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}",
-        account_response,
-    );
-    try std.testing.expectEqual(@as(u8, 0), account_error.transfer_count);
-    try std.testing.expectEqual(@as(u8, 0), account_error.completion_count);
-    try std.testing.expectEqual(@as(u8, 0), account_clock.count);
-
-    var transfer_error: FakeExecution = .{};
-    transfer_error.transfer_errors[0] = error.TooMuchData;
-    var transfer_clock: FakeClock = .{};
-    const transfer_response = try handleInvocation(
-        arena.allocator(),
-        event,
-        ExecutionAdapter.init(&transfer_error),
-        Clock.init(&transfer_clock),
-    );
-    try std.testing.expectEqualStrings(
-        "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}",
-        transfer_response,
-    );
-    try std.testing.expectEqual(@as(u8, 1), transfer_error.transfer_count);
-    try std.testing.expectEqual(@as(u8, 0), transfer_error.completion_count);
-    try std.testing.expectEqual(@as(u8, 0), transfer_clock.count);
-}
-
-test "mixed outcomes report exact retryable identifiers and continue processing" {
-    var messages: [8][]u8 = undefined;
+test "mixed source outcomes publish one exact aggregate after all execution" {
+    var messages: [6][]u8 = undefined;
     for (&messages, 0..) |*message, index| {
         message.* = try testMessage(std.testing.allocator, index + 2);
     }
@@ -928,8 +805,6 @@ test "mixed outcomes report exact retryable identifiers and continue processing"
         messages[3],
         messages[4],
         messages[5],
-        messages[6],
-        messages[7],
     };
     const event = try testEvent(std.testing.allocator, &bodies);
     defer std.testing.allocator.free(event);
@@ -938,15 +813,7 @@ test "mixed outcomes report exact retryable identifiers and continue processing"
     fake.account_errors[2] = error.ClientClosed;
     fake.transfer_outcomes[1] = .{ .rejected = 22 };
     fake.transfer_errors[2] = error.TooMuchData;
-    fake.completion_errors[1] = error.OperationConflict;
-    fake.completion_errors[2] = error.AWSFailure;
-    var clock: FakeClock = .{};
-    clock.values[0] = 1_800_000_001;
-    clock.values[1] = 1_800_000_002;
-    clock.values[2] = 1_800_000_003;
-    clock.values[3] = 1_800_000_004;
-    clock.values[4] = 1_800_000_005;
-    clock.values[5] = 1_800_000_006;
+    var publisher: FakePublisher = .{ .execution = &fake };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -954,30 +821,130 @@ test "mixed outcomes report exact retryable identifiers and continue processing"
         arena.allocator(),
         event,
         ExecutionAdapter.init(&fake),
-        Clock.init(&clock),
+        CompletionPublisher.init(&publisher),
     );
     try std.testing.expectEqualStrings(
         "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-3\"}," ++
-            "{\"itemIdentifier\":\"message-4\"}," ++
             "{\"itemIdentifier\":\"message-5\"}]}",
         response,
     );
-    try std.testing.expectEqual(@as(u8, 8), fake.account_count);
-    try std.testing.expectEqual(@as(u8, 6), fake.transfer_count);
-    try std.testing.expectEqual(@as(u8, 6), fake.completion_count);
-    try std.testing.expectEqual(@as(u8, 6), clock.count);
-    try std.testing.expect(fake.completions[1] == .failure);
-    try std.testing.expect(fake.completions[2] == .failure);
-    try std.testing.expectEqual(
-        @as(operation.UnixSeconds, 1_800_000_002),
-        fake.timestamps[1],
+    try std.testing.expectEqual(@as(u8, 6), fake.account_count);
+    try std.testing.expectEqual(@as(u8, 4), fake.transfer_count);
+    try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
+    try std.testing.expectEqual(fake.account_count, publisher.account_count_at_send);
+    try std.testing.expectEqual(fake.transfer_count, publisher.transfer_count_at_send);
+    try std.testing.expectEqualStrings(
+        "{\"results\":[" ++
+            "{\"operation_id\":\"00000000-0000-0000-0000-000000000002\"," ++
+            "\"result\":{\"type\":\"SUCCESS\",\"payload\":{" ++
+            "\"transfer_id\":\"00000000-0000-0000-0000-000000000002\"}}}," ++
+            "{\"operation_id\":\"00000000-0000-0000-0000-000000000003\"," ++
+            "\"result\":{\"type\":\"FAILURE\",\"payload\":{" ++
+            "\"stage\":\"ACCOUNT\",\"status\":19}}}," ++
+            "{\"operation_id\":\"00000000-0000-0000-0000-000000000005\"," ++
+            "\"result\":{\"type\":\"FAILURE\",\"payload\":{" ++
+            "\"stage\":\"TRANSFER\",\"status\":22}}}," ++
+            "{\"operation_id\":\"00000000-0000-0000-0000-000000000007\"," ++
+            "\"result\":{\"type\":\"SUCCESS\",\"payload\":{" ++
+            "\"transfer_id\":\"00000000-0000-0000-0000-000000000007\"}}}]}",
+        publisher.message,
     );
-    try std.testing.expectEqual(
-        @as(operation.UnixSeconds, 1_800_000_003),
-        fake.timestamps[2],
+    try std.testing.expect(std.mem.indexOf(u8, publisher.message, "tenant") == null);
+    try std.testing.expect(std.mem.indexOf(u8, publisher.message, "state") == null);
+    try std.testing.expect(std.mem.indexOf(u8, publisher.message, "hash") == null);
+}
+
+test "no terminal results produce no aggregate send" {
+    const message = try testMessage(std.testing.allocator, 2);
+    defer std.testing.allocator.free(message);
+    const event = try testEvent(std.testing.allocator, &.{ "{invalid", message });
+    defer std.testing.allocator.free(event);
+    var fake: FakeExecution = .{};
+    fake.account_errors[0] = error.ClientClosed;
+    var publisher: FakePublisher = .{};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try handleInvocation(
+        arena.allocator(),
+        event,
+        ExecutionAdapter.init(&fake),
+        CompletionPublisher.init(&publisher),
     );
-    try std.testing.expectEqual(@as(u128, 9), fake.accounts[7].id);
-    try std.testing.expectEqual(@as(u128, 9), fake.transfers[5].id);
+    try std.testing.expectEqualStrings(
+        "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-1\"}]}",
+        response,
+    );
+    try std.testing.expectEqual(@as(u8, 1), fake.account_count);
+    try std.testing.expectEqual(@as(u8, 0), fake.transfer_count);
+    try std.testing.expectEqual(@as(u8, 0), publisher.send_count);
+}
+
+test "aggregate send failure retries represented records in source order" {
+    var messages: [3][]u8 = undefined;
+    for (&messages, 0..) |*message, index| {
+        message.* = try testMessage(std.testing.allocator, index + 2);
+    }
+    defer for (messages) |message| std.testing.allocator.free(message);
+    const event = try testEvent(
+        std.testing.allocator,
+        &.{ messages[0], messages[1], "{invalid", messages[2] },
+    );
+    defer std.testing.allocator.free(event);
+    var fake: FakeExecution = .{};
+    fake.account_errors[1] = error.ClientClosed;
+    fake.account_outcomes[2] = .{ .rejected = 19 };
+    var publisher: FakePublisher = .{ .send_error = error.AWSFailure };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try handleInvocation(
+        arena.allocator(),
+        event,
+        ExecutionAdapter.init(&fake),
+        CompletionPublisher.init(&publisher),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}," ++
+            "{\"itemIdentifier\":\"message-1\"}," ++
+            "{\"itemIdentifier\":\"message-3\"}]}",
+        response,
+    );
+    try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
+    const decoded = try completion_batch.decode(arena.allocator(), publisher.message);
+    try std.testing.expectEqual(@as(usize, 2), decoded.results.len);
+    try std.testing.expect(decoded.results[0] == .valid);
+    try std.testing.expectEqual(@as(u128, 2), decoded.results[0].valid.operation_id);
+    try std.testing.expect(decoded.results[1] == .valid);
+    try std.testing.expectEqual(@as(u128, 4), decoded.results[1].valid.operation_id);
+}
+
+test "duplicate operations remain terminal and share one aggregate send" {
+    const message = try testMessage(std.testing.allocator, 2);
+    defer std.testing.allocator.free(message);
+    const event = try testEvent(std.testing.allocator, &.{ message, message });
+    defer std.testing.allocator.free(event);
+    var fake: FakeExecution = .{};
+    var publisher: FakePublisher = .{};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const response = try handleInvocation(
+        arena.allocator(),
+        event,
+        ExecutionAdapter.init(&fake),
+        CompletionPublisher.init(&publisher),
+    );
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+    try std.testing.expectEqual(@as(u8, 2), fake.account_count);
+    try std.testing.expectEqual(@as(u8, 2), fake.transfer_count);
+    try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
+    const decoded = try completion_batch.decode(arena.allocator(), publisher.message);
+    try std.testing.expectEqual(@as(usize, 2), decoded.results.len);
+    for (decoded.results) |result| {
+        try std.testing.expect(result == .valid);
+        try std.testing.expectEqual(@as(u128, 2), result.valid.operation_id);
+    }
 }
 
 test "unsupported queued operation schemas are acknowledged" {
@@ -1014,7 +981,7 @@ test "unsupported queued operation schemas are acknowledged" {
     const event = try testEvent(std.testing.allocator, &records);
     defer std.testing.allocator.free(event);
     var fake: FakeExecution = .{};
-    var clock: FakeClock = .{};
+    var publisher: FakePublisher = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1022,37 +989,47 @@ test "unsupported queued operation schemas are acknowledged" {
         arena.allocator(),
         event,
         ExecutionAdapter.init(&fake),
-        Clock.init(&clock),
+        CompletionPublisher.init(&publisher),
     );
     try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
     try std.testing.expectEqual(@as(u8, 0), fake.account_count);
     try std.testing.expectEqual(@as(u8, 0), fake.transfer_count);
-    try std.testing.expectEqual(@as(u8, 0), fake.completion_count);
-    try std.testing.expectEqual(@as(u8, 0), clock.count);
+    try std.testing.expectEqual(@as(u8, 0), publisher.send_count);
 }
 
 test "record parsing allocation failure is retryable" {
     const message = try testMessage(std.testing.allocator, 2);
     defer std.testing.allocator.free(message);
-    var fake: FakeExecution = .{};
-    var clock: FakeClock = .{};
 
-    try std.testing.expect(processRecord(
+    const outcome = parseRecord(
         std.testing.failing_allocator,
         "message-0",
         message,
-        ExecutionAdapter.init(&fake),
-        Clock.init(&clock),
-    ));
-    try std.testing.expectEqual(@as(u8, 0), fake.account_count);
-    try std.testing.expectEqual(@as(u8, 0), fake.transfer_count);
-    try std.testing.expectEqual(@as(u8, 0), fake.completion_count);
-    try std.testing.expectEqual(@as(u8, 0), clock.count);
+    );
+    try std.testing.expect(outcome == .retry);
+}
+
+test "aggregate encoding allocation failure occurs before send" {
+    const entries = [_]completion_batch.Entry{.{
+        .operation_id = 2,
+        .result = .{ .success = .{ .bool = true } },
+    }};
+    var publisher: FakePublisher = .{};
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        publishCompletions(
+            std.testing.failing_allocator,
+            &entries,
+            CompletionPublisher.init(&publisher),
+        ),
+    );
+    try std.testing.expectEqual(@as(u8, 0), publisher.send_count);
 }
 
 test "malformed non-SQS and oversized batch events are rejected" {
     var fake: FakeExecution = .{};
-    var clock: FakeClock = .{};
+    var publisher: FakePublisher = .{};
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(
@@ -1061,7 +1038,7 @@ test "malformed non-SQS and oversized batch events are rejected" {
             arena.allocator(),
             "{}",
             ExecutionAdapter.init(&fake),
-            Clock.init(&clock),
+            CompletionPublisher.init(&publisher),
         ),
     );
 
@@ -1076,7 +1053,7 @@ test "malformed non-SQS and oversized batch events are rejected" {
             arena.allocator(),
             event,
             ExecutionAdapter.init(&fake),
-            Clock.init(&clock),
+            CompletionPublisher.init(&publisher),
         ),
     );
 
@@ -1089,7 +1066,7 @@ test "malformed non-SQS and oversized batch events are rejected" {
             arena.allocator(),
             oversized,
             ExecutionAdapter.init(&fake),
-            Clock.init(&clock),
+            CompletionPublisher.init(&publisher),
         ),
     );
 }

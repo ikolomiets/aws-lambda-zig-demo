@@ -3,8 +3,8 @@
 ## Repository and Sources of Truth
 
 This repository is a small Zig 0.16.0 AWS Lambda example. The root build files
-define the intake, query, and execution Lambda bootstrap executables, application code lives in
-`src/`, AWS
+define the intake, query, execution, and completion Lambda bootstrap executables,
+application code lives in `src/`, AWS
 deployment material lives in `template.yaml`, `deploy.sh`,
 `wireguard-gateway-setup.sh`, and `docs/`, while the vendored `aws_lambda`
 dependency is under `zig-pkg/`.
@@ -16,6 +16,8 @@ Use these sources in order:
 - `src/intake_lambda.zig` is the authenticated POST intake entrypoint and handler.
 - `src/query_lambda.zig` is the authenticated GET environment-query entrypoint and handler.
 - `src/execution_lambda.zig` is the SQS-driven execution entrypoint and handler.
+- `src/completion_lambda.zig` is the SQS-driven completion entrypoint and handler.
+- `src/completion_batch.zig` is the bounded ID-and-result Completion message contract.
 - `src/lambda_auth.zig` is the shared bearer-token and PASETO verification module.
 - `template.yaml` defines the SAM-managed Lambdas, Function URLs, permissions,
   memory, timeout, runtime, and architecture.
@@ -57,9 +59,9 @@ the affected change.
 
 ## Architecture and Change Scope
 
-Keep the project small. The application has three handlers and one shared authentication
-module used by the HTTP handlers; do not add modules, layers, or helper packages until real
-behavior needs that structure.
+Keep the project small. The application has four handlers, one shared authentication module
+used by the HTTP handlers, and one shared Completion message module used by the SQS handlers;
+do not add modules, layers, or helper packages until real behavior needs that structure.
 
 Before changing deployment behavior, read the SAM template, both deployment
 helpers, and the SAM deployment doc. Public Function URL settings are
@@ -70,10 +72,11 @@ effect.
 
 Treat generated build artifacts as artifacts:
 
-- `zig-out/bin/intake/bootstrap`, `zig-out/bin/query/bootstrap`, and
-  `zig-out/bin/execution/bootstrap` are produced by `zig build`.
-- `intake-lambda.zip`, `query-lambda.zip`, and `execution-lambda.zip` package their matching
-  bootstraps for Lambda/SAM.
+- `zig-out/bin/intake/bootstrap`, `zig-out/bin/query/bootstrap`,
+  `zig-out/bin/execution/bootstrap`, and `zig-out/bin/completion/bootstrap` are produced by
+  `zig build`.
+- `intake-lambda.zip`, `query-lambda.zip`, `execution-lambda.zip`, and
+  `completion-lambda.zip` package their matching bootstraps for Lambda/SAM.
 
 Only refresh artifacts when the task requires a deployable package.
 
@@ -132,7 +135,7 @@ the AWS CLI query that retrieves it instead of recording the value itself.
 
 Use these local checks:
 
-- `zig fmt --check build.zig src/execution_lambda.zig src/intake_lambda.zig src/lambda_auth.zig src/query_lambda.zig`:
+- `zig fmt --check build.zig src/completion_batch.zig src/completion_lambda.zig src/execution_lambda.zig src/intake_lambda.zig src/lambda_auth.zig src/query_lambda.zig`:
   verify Zig formatting.
 - `zig build test-deploy`: run only the dependency-free deployment-helper
   regression tests; these use mocked AWS commands and require no credentials or
@@ -141,12 +144,14 @@ Use these local checks:
   helper and shell-test syntax.
 - `zig build test`: run the Zig tests and the deployment-helper regression
   tests.
-- `zig build --release -Darch=arm`: build the stripped, single-threaded,
-  ReleaseSafe Linux ARM64 intake, query, and execution Lambda bootstraps.
+- `zig build --release -Darch=arm`: build the stripped ReleaseSafe Linux ARM64 intake,
+  query, execution, and completion Lambda bootstraps. Execution remains multithread-capable
+  for the TigerBeetle callback thread; the other three are single-threaded.
 - `zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap` and
   `zip -qj query-lambda.zip zig-out/bin/query/bootstrap` and
-  `zip -qj execution-lambda.zip zig-out/bin/execution/bootstrap`: refresh deployable packages
-  when required.
+  `zip -qj execution-lambda.zip zig-out/bin/execution/bootstrap` and
+  `zip -qj completion-lambda.zip zig-out/bin/completion/bootstrap`: refresh deployable
+  packages when required.
 - `sam validate --template-file template.yaml --region ca-central-1`: validate
   the SAM template when `template.yaml` changes.
 - `sam validate --lint --template-file template.yaml --region ca-central-1`:

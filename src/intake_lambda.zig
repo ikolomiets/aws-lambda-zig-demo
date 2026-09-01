@@ -4,7 +4,7 @@ const lambda = @import("aws-lambda");
 const lambda_auth = @import("lambda_auth");
 const operation = @import("operation");
 const operation_persistence = @import("operation_persistence");
-const operation_queue = @import("operation_queue");
+const sqs_queue = @import("sqs_queue");
 
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{.{
@@ -65,7 +65,7 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
 const RuntimeResources = struct {
     config: aws.Config,
     persistence: operation_persistence.Persistence,
-    queue: operation_queue.Queue,
+    queue: sqs_queue.Queue,
 
     fn init(resources: *RuntimeResources, process_init: std.process.Init) !void {
         resources.config = aws.Config.load(
@@ -76,11 +76,12 @@ const RuntimeResources = struct {
         ) catch return error.AWSConfigurationFailure;
         errdefer resources.config.deinit();
 
-        operation_queue.Queue.init(
+        sqs_queue.Queue.init(
             &resources.queue,
             process_init.gpa,
             &resources.config,
             process_init.environ_map,
+            "OPERATIONS_QUEUE_URL",
         ) catch return error.InvalidQueueConfiguration;
         errdefer resources.queue.deinit();
         operation_persistence.Persistence.init(

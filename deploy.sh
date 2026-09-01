@@ -7,6 +7,7 @@ STACK_NAME="${STACK_NAME:-aws-lambda-zig-demo}"
 INTAKE_FUNCTION_NAME="${INTAKE_FUNCTION_NAME:-intake-lambda}"
 QUERY_FUNCTION_NAME="${QUERY_FUNCTION_NAME:-query-lambda}"
 EXECUTION_FUNCTION_NAME="${EXECUTION_FUNCTION_NAME:-execution-lambda}"
+COMPLETION_FUNCTION_NAME="${COMPLETION_FUNCTION_NAME:-completion-lambda}"
 TIGERBEETLE_CLUSTER_ID="${TIGERBEETLE_CLUSTER_ID:-0}"
 TIGERBEETLE_ADDRESSES="${TIGERBEETLE_ADDRESSES:-10.200.0.2:3000}"
 LAMBDA_PRINCIPAL="${LAMBDA_PRINCIPAL:-*}"
@@ -40,6 +41,8 @@ Options:
                          Query Lambda name. Defaults to query-lambda.
   --execution-function-name NAME
                          Execution Lambda name. Defaults to execution-lambda.
+  --completion-function-name NAME
+                         Completion Lambda name. Defaults to completion-lambda.
   --tigerbeetle-cluster-id ID
                          Unsigned decimal cluster ID. Defaults to 0.
   --tigerbeetle-addresses ADDRESSES
@@ -55,9 +58,9 @@ Options:
 
 Environment overrides:
   PROFILE, REGION, STACK_NAME, INTAKE_FUNCTION_NAME, QUERY_FUNCTION_NAME,
-  EXECUTION_FUNCTION_NAME, TIGERBEETLE_CLUSTER_ID, TIGERBEETLE_ADDRESSES,
-  LAMBDA_PRINCIPAL, PASETO_PRIVATE_KEY, PASETO_PUBLIC_KEY,
-  LOCAL_AWS_LAMBDA_ROOT
+  EXECUTION_FUNCTION_NAME, COMPLETION_FUNCTION_NAME, TIGERBEETLE_CLUSTER_ID,
+  TIGERBEETLE_ADDRESSES, LAMBDA_PRINCIPAL, PASETO_PRIVATE_KEY,
+  PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT
 
 Authentication:
   Non-dry-run deployments require an SSO-backed AWS CLI profile. The script
@@ -89,6 +92,15 @@ need_value() {
 
 need_command() {
     command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
+}
+
+validate_completion_function_name() {
+    [ -n "$COMPLETION_FUNCTION_NAME" ] ||
+        fail "COMPLETION_FUNCTION_NAME must not be empty"
+    [ "${#COMPLETION_FUNCTION_NAME}" -le 64 ] ||
+        fail "COMPLETION_FUNCTION_NAME must be at most 64 characters"
+    [[ "$COMPLETION_FUNCTION_NAME" =~ ^[A-Za-z0-9_-]+$ ]] ||
+        fail "COMPLETION_FUNCTION_NAME must contain only letters, digits, hyphens, and underscores"
 }
 
 validate_tigerbeetle_configuration() {
@@ -311,6 +323,7 @@ build_sam_parameter_overrides() {
         "IntakeFunctionName=$INTAKE_FUNCTION_NAME"
         "QueryFunctionName=$QUERY_FUNCTION_NAME"
         "ExecutionFunctionName=$EXECUTION_FUNCTION_NAME"
+        "CompletionFunctionName=$COMPLETION_FUNCTION_NAME"
         "TigerBeetleClusterId=$TIGERBEETLE_CLUSTER_ID"
         "TigerBeetleAddresses=$TIGERBEETLE_ADDRESSES"
         "LambdaPrincipal=$LAMBDA_PRINCIPAL"
@@ -411,7 +424,45 @@ deploy_stack_and_resolve_controller_outputs() {
         --output text \
         --region "$REGION"
 
+    validate_deployed_function_names
     invoke_deployment_controller outputs
+}
+
+validate_deployed_function_names() {
+    local stack_outputs line output_key output_value
+    local deployed_intake_name="" deployed_query_name=""
+    local deployed_execution_name="" deployed_completion_name=""
+
+    stack_outputs="$(aws cloudformation describe-stacks \
+        --stack-name "$STACK_NAME" \
+        --query "Stacks[0].Outputs[?OutputKey=='IntakeFunctionName' || OutputKey=='QueryFunctionName' || OutputKey=='ExecutionFunctionName' || OutputKey=='CompletionFunctionName'].join('|', [OutputKey,OutputValue])" \
+        --output text \
+        --profile "$PROFILE" \
+        --region "$REGION")" ||
+        fail "could not resolve deployed Lambda function-name outputs"
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        output_key="${line%%|*}"
+        output_value="${line#*|}"
+        case "$output_key" in
+            IntakeFunctionName) deployed_intake_name="$output_value" ;;
+            QueryFunctionName) deployed_query_name="$output_value" ;;
+            ExecutionFunctionName) deployed_execution_name="$output_value" ;;
+            CompletionFunctionName) deployed_completion_name="$output_value" ;;
+            *) fail "stack returned an unexpected Lambda function-name output" ;;
+        esac
+    done <<<"${stack_outputs//$'\t'/$'\n'}"
+
+    [ "$deployed_intake_name" = "$INTAKE_FUNCTION_NAME" ] ||
+        fail "stack output IntakeFunctionName does not match the requested name"
+    [ "$deployed_query_name" = "$QUERY_FUNCTION_NAME" ] ||
+        fail "stack output QueryFunctionName does not match the requested name"
+    [ "$deployed_execution_name" = "$EXECUTION_FUNCTION_NAME" ] ||
+        fail "stack output ExecutionFunctionName does not match the requested name"
+    [ "$deployed_completion_name" = "$COMPLETION_FUNCTION_NAME" ] ||
+        fail "stack output CompletionFunctionName does not match the requested name"
+    printf '==> Deployed Lambda function names match requested values\n'
 }
 
 parse_deployment_options() {
@@ -478,6 +529,17 @@ parse_deployment_options() {
                 EXECUTION_FUNCTION_NAME="${1#*=}"
                 [ -n "$EXECUTION_FUNCTION_NAME" ] ||
                     fail "empty value for --execution-function-name"
+                shift
+                ;;
+            --completion-function-name)
+                need_value "$1" "${2:-}"
+                COMPLETION_FUNCTION_NAME="$2"
+                shift 2
+                ;;
+            --completion-function-name=*)
+                COMPLETION_FUNCTION_NAME="${1#*=}"
+                [ -n "$COMPLETION_FUNCTION_NAME" ] ||
+                    fail "empty value for --completion-function-name"
                 shift
                 ;;
             --tigerbeetle-cluster-id)
@@ -553,8 +615,59 @@ parse_deployment_options() {
     done
 }
 
+validate_lambda_bootstraps() {
+    local bootstrap artifact_type execution_artifact_type
+
+    for bootstrap in \
+        zig-out/bin/intake/bootstrap \
+        zig-out/bin/query/bootstrap \
+        zig-out/bin/completion/bootstrap
+    do
+        artifact_type="$(file "$bootstrap")"
+        case "$artifact_type" in
+            *"ELF 64-bit LSB executable"*aarch64*"statically linked"*"stripped"*) ;;
+            *) fail "unexpected bootstrap artifact type: $artifact_type" ;;
+        esac
+        printf '%s\n' "$artifact_type"
+    done
+
+    execution_artifact_type="$(file zig-out/bin/execution/bootstrap)"
+    case "$execution_artifact_type" in
+        *"ELF 64-bit LSB executable"*aarch64*"dynamically linked"*"stripped"*) ;;
+        *) fail "unexpected execution bootstrap artifact type: $execution_artifact_type" ;;
+    esac
+    printf '%s\n' "$execution_artifact_type"
+}
+
+package_lambda_archives() {
+    local archive archive_contents
+
+    rm -f \
+        intake-lambda.zip \
+        query-lambda.zip \
+        execution-lambda.zip \
+        completion-lambda.zip
+    zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
+    zip -qj query-lambda.zip zig-out/bin/query/bootstrap
+    zip -qj execution-lambda.zip zig-out/bin/execution/bootstrap
+    zip -qj completion-lambda.zip zig-out/bin/completion/bootstrap
+
+    for archive in \
+        intake-lambda.zip \
+        query-lambda.zip \
+        execution-lambda.zip \
+        completion-lambda.zip
+    do
+        [ -s "$archive" ] || fail "$archive was not created or is empty"
+        archive_contents="$(unzip -Z1 "$archive")"
+        [ "$archive_contents" = bootstrap ] ||
+            fail "$archive must contain only a root-level bootstrap"
+    done
+}
+
 run_deployment() {
     parse_deployment_options "$@"
+    validate_completion_function_name
 
     cd "$(dirname "${BASH_SOURCE[0]}")"
     CACHE_DIR=".zig-cache-deploy"
@@ -611,6 +724,8 @@ run_deployment() {
     printf '==> Checking Zig formatting\n'
     zig fmt --check \
         build.zig \
+        src/completion_batch.zig \
+        src/completion_lambda.zig \
         src/execution_lambda.zig \
         src/intake_lambda.zig \
         src/lambda_auth.zig \
@@ -639,35 +754,11 @@ run_deployment() {
     printf '==> Building Linux ARM64 Lambda bootstraps\n'
     zig build "${ZIG_BUILD_ARGS[@]}" --release -Darch=arm
 
-    for bootstrap in \
-        zig-out/bin/intake/bootstrap \
-        zig-out/bin/query/bootstrap
-    do
-        artifact_type="$(file "$bootstrap")"
-        case "$artifact_type" in
-            *"ELF 64-bit LSB executable"*aarch64*"statically linked"*"stripped"*) ;;
-            *) fail "unexpected bootstrap artifact type: $artifact_type" ;;
-        esac
-        printf '%s\n' "$artifact_type"
-    done
-    execution_artifact_type="$(file zig-out/bin/execution/bootstrap)"
-    case "$execution_artifact_type" in
-        *"ELF 64-bit LSB executable"*aarch64*"dynamically linked"*"stripped"*) ;;
-        *) fail "unexpected execution bootstrap artifact type: $execution_artifact_type" ;;
-    esac
-    printf '%s\n' "$execution_artifact_type"
+    validate_lambda_bootstraps
     [ ! -e zig-out/bin/bootstrap ] || fail "obsolete zig-out/bin/bootstrap was recreated"
 
     printf '==> Refreshing Lambda zip archives\n'
-    rm -f intake-lambda.zip query-lambda.zip execution-lambda.zip
-    zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
-    zip -qj query-lambda.zip zig-out/bin/query/bootstrap
-    zip -qj execution-lambda.zip zig-out/bin/execution/bootstrap
-    for archive in intake-lambda.zip query-lambda.zip execution-lambda.zip; do
-        archive_contents="$(unzip -Z1 "$archive")"
-        [ "$archive_contents" = bootstrap ] ||
-            fail "$archive must contain only a root-level bootstrap"
-    done
+    package_lambda_archives
 
     printf '==> Validating SAM template\n'
     sam validate --template-file template.yaml --region "$REGION"

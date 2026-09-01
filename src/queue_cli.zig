@@ -1,7 +1,7 @@
 const std = @import("std");
 const aws = @import("aws");
 const operation = @import("operation");
-const operation_queue = @import("operation_queue");
+const sqs_queue = @import("sqs_queue");
 
 const Allocator = std.mem.Allocator;
 
@@ -87,8 +87,14 @@ pub fn main(init: std.process.Init) u8 {
         return finish(context.stdout, context.stderr, 2, .configuration);
     };
     defer config.deinit();
-    var queue: operation_queue.Queue = undefined;
-    operation_queue.Queue.init(&queue, init.gpa, &config, init.environ_map) catch {
+    var queue: sqs_queue.Queue = undefined;
+    sqs_queue.Queue.init(
+        &queue,
+        init.gpa,
+        &config,
+        init.environ_map,
+        "OPERATIONS_QUEUE_URL",
+    ) catch {
         return finish(context.stdout, context.stderr, 2, .configuration);
     };
     defer queue.deinit();
@@ -252,7 +258,7 @@ const QueueInterface = struct {
         receive: *const fn (
             *anyopaque,
             Allocator,
-        ) anyerror!?operation_queue.Message,
+        ) anyerror!?sqs_queue.Message,
         delete: *const fn (
             *anyopaque,
             Allocator,
@@ -261,7 +267,7 @@ const QueueInterface = struct {
         get_attributes: *const fn (
             *anyopaque,
             Allocator,
-        ) anyerror![]const operation_queue.Attribute,
+        ) anyerror![]const sqs_queue.Attribute,
     };
 
     fn init(pointer: anytype) QueueInterface {
@@ -283,7 +289,7 @@ const QueueInterface = struct {
             fn receive(
                 context: *anyopaque,
                 allocator: Allocator,
-            ) anyerror!?operation_queue.Message {
+            ) anyerror!?sqs_queue.Message {
                 const self: Pointer = @ptrCast(@alignCast(context));
                 return self.receive(allocator);
             }
@@ -300,7 +306,7 @@ const QueueInterface = struct {
             fn get_attributes(
                 context: *anyopaque,
                 allocator: Allocator,
-            ) anyerror![]const operation_queue.Attribute {
+            ) anyerror![]const sqs_queue.Attribute {
                 const self: Pointer = @ptrCast(@alignCast(context));
                 return self.get_attributes(allocator);
             }
@@ -327,7 +333,7 @@ const QueueInterface = struct {
     fn receive(
         self: QueueInterface,
         allocator: Allocator,
-    ) !?operation_queue.Message {
+    ) !?sqs_queue.Message {
         return self.vtable.receive(self.context, allocator);
     }
 
@@ -342,7 +348,7 @@ const QueueInterface = struct {
     fn get_attributes(
         self: QueueInterface,
         allocator: Allocator,
-    ) ![]const operation_queue.Attribute {
+    ) ![]const sqs_queue.Attribute {
         return self.vtable.get_attributes(self.context, allocator);
     }
 };
@@ -483,7 +489,7 @@ fn executeReceivePoll(
 fn processReceiveResponse(
     context: Context,
     backend: QueueInterface,
-    message_optional: ?operation_queue.Message,
+    message_optional: ?sqs_queue.Message,
 ) !void {
     const message = message_optional orelse return;
 
@@ -516,9 +522,9 @@ const test_input =
     "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
 
 const FakeQueue = struct {
-    message: ?operation_queue.Message = null,
-    receive_batches: []const ?operation_queue.Message = &.{},
-    attributes: []const operation_queue.Attribute = &.{},
+    message: ?sqs_queue.Message = null,
+    receive_batches: []const ?sqs_queue.Message = &.{},
+    attributes: []const sqs_queue.Attribute = &.{},
     send_error: ?anyerror = null,
     receive_error: ?anyerror = null,
     receive_error_after: ?u8 = null,
@@ -552,7 +558,7 @@ const FakeQueue = struct {
     fn receive(
         fake: *FakeQueue,
         allocator: Allocator,
-    ) !?operation_queue.Message {
+    ) !?sqs_queue.Message {
         fake.receive_count += 1;
         if (fake.allocation_bytes_in_use) |bytes_in_use| {
             if (bytes_in_use.* != 0) fake.allocation_released_before_poll = false;
@@ -588,7 +594,7 @@ const FakeQueue = struct {
     fn get_attributes(
         fake: *FakeQueue,
         _: Allocator,
-    ) ![]const operation_queue.Attribute {
+    ) ![]const sqs_queue.Attribute {
         fake.check_count += 1;
         if (fake.check_error) |err| return err;
         return fake.attributes;
@@ -817,15 +823,15 @@ test "send validates through Operation and reports AWS failures without output" 
 }
 
 test "receive continues through empty polls and prints and deletes messages in order" {
-    const first: operation_queue.Message = .{
+    const first: sqs_queue.Message = .{
         .body = "first",
         .receipt_handle = "receipt-1",
     };
-    const second: operation_queue.Message = .{
+    const second: sqs_queue.Message = .{
         .body = "second\nline",
         .receipt_handle = "receipt-2",
     };
-    const batches = [_]?operation_queue.Message{ null, first, null, second };
+    const batches = [_]?sqs_queue.Message{ null, first, null, second };
     var fake: FakeQueue = .{
         .receive_batches = &batches,
         .receive_error_after = batches.len + 1,
@@ -872,7 +878,7 @@ test "receive releases every poll arena before polling again" {
 
 test "receive writes arbitrary bytes and deletes with the receipt handle" {
     const body = [_]u8{ 'n', 'o', 't', ' ', 'J', 'S', 'O', 'N', '\n', 0x00, 0xFF };
-    const message: operation_queue.Message = .{
+    const message: sqs_queue.Message = .{
         .body = &body,
         .receipt_handle = "receipt-1",
     };
@@ -930,7 +936,7 @@ const TrackingWriter = struct {
 };
 
 test "receive flushes output before delete and does not delete after output failure" {
-    const message: operation_queue.Message = .{
+    const message: sqs_queue.Message = .{
         .body = "raw-body",
         .receipt_handle = "receipt-2",
     };
@@ -989,7 +995,7 @@ test "receive reports invalid service, AWS, and delete failures" {
     try std.testing.expectEqualStrings("sqs: AWS request failed\n", receive_failed.stderr());
     try std.testing.expectEqual(@as(u8, 1), receive_fake.receive_count);
 
-    const message: operation_queue.Message = .{
+    const message: sqs_queue.Message = .{
         .body = "already-output",
         .receipt_handle = "receipt",
     };
@@ -1011,7 +1017,7 @@ test "receive reports invalid service, AWS, and delete failures" {
 }
 
 test "check writes every known and unknown attribute as escaped JSON" {
-    const attributes = [_]operation_queue.Attribute{
+    const attributes = [_]sqs_queue.Attribute{
         .{ .key = "ApproximateNumberOfMessages", .value = "3" },
         .{ .key = "Future\"Attribute", .value = "line\nvalue\\suffix" },
     };
@@ -1033,7 +1039,7 @@ test "check writes every known and unknown attribute as escaped JSON" {
 
 test "AWS and internal diagnostics do not echo message data" {
     const body_marker = "private-message-marker";
-    const message: operation_queue.Message = .{
+    const message: sqs_queue.Message = .{
         .body = body_marker,
         .receipt_handle = "private-receipt-marker",
     };

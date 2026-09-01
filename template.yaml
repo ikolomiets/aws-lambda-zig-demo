@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Deploy intake, query, and execution Lambdas with an optional WireGuard gateway.
+Description: Deploy intake, query, execution, and completion Lambdas with an optional WireGuard gateway.
 
 # Opt-in network parameters intentionally default to empty and are guarded by a Rule.
 Metadata:
@@ -22,6 +22,10 @@ Parameters:
     Type: String
     Default: execution-lambda
     Description: Name of the operation execution Lambda function.
+  CompletionFunctionName:
+    Type: String
+    Default: completion-lambda
+    Description: Name of the operation completion Lambda function.
   TigerBeetleClusterId:
     Type: String
     Default: "0"
@@ -56,13 +60,13 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
-    Description: Internal deploy-helper switch retaining the DynamoDB endpoint and Lambda ENI cleanup resources during VPC detachment.
+    Description: Internal deploy-helper switch retaining the stack-owned EIGW, IPv6 route, execution security group, and Lambda ENI cleanup resources during VPC detachment.
   VpcId:
     Type: String
     Default: ""
     AllowedPattern: '^$|^vpc-([0-9a-f]{8}|[0-9a-f]{17})$'
     ConstraintDescription: Must be an EC2 VPC ID.
-    Description: ID of the existing VPC for the optional WireGuard gateway.
+    Description: ID of the existing VPC; its IPv6 CIDR association remains externally managed.
   GatewayPublicSubnetId:
     Type: String
     Default: ""
@@ -74,13 +78,13 @@ Parameters:
     Default: ""
     AllowedPattern: '^$|^subnet-([0-9a-f]{8}|[0-9a-f]{17})$'
     ConstraintDescription: Must be an EC2 subnet ID.
-    Description: ID of the existing private subnet reserved for the execution Lambda.
+    Description: ID of the existing private execution subnet; its IPv6 CIDR association remains externally managed.
   LambdaRouteTableId:
     Type: String
     Default: ""
     AllowedPattern: '^$|^rtb-([0-9a-f]{8}|[0-9a-f]{17})$'
     ConstraintDescription: Must be an EC2 route-table ID.
-    Description: ID of the route table associated with the Lambda subnet.
+    Description: ID of the external route table where SAM manages execution-specific routes.
   LambdaSubnetCidr:
     Type: String
     Default: ""
@@ -177,6 +181,13 @@ Resources:
         Enabled: true
 
   OperationsQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      VisibilityTimeout: 90
+
+  CompletionQueue:
     Type: AWS::SQS::Queue
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
@@ -319,14 +330,14 @@ Resources:
                   - sqs:GetQueueAttributes
                   - sqs:ReceiveMessage
                 Resource: !GetAtt OperationsQueue.Arn
-        - PolicyName: ExecutionFunctionOperationUpdate
+        - PolicyName: ExecutionFunctionCompletionPublisher
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
-                  - dynamodb:UpdateItem
-                Resource: !GetAtt OperationsTable.Arn
+                  - sqs:SendMessage
+                Resource: !GetAtt CompletionQueue.Arn
         - !If
           - ExecutionVpcCleanupResourcesRetained
           - PolicyName: ExecutionFunctionVpcAccess
@@ -359,12 +370,17 @@ Resources:
       Role: !GetAtt ExecutionFunctionRole.Arn
       Environment:
         Variables:
-          OPERATIONS_TABLE_NAME: !Ref OperationsTable
+          AWS_USE_DUALSTACK_ENDPOINT: !If
+            - WireGuardGatewayEnabled
+            - "true"
+            - "false"
+          COMPLETION_QUEUE_URL: !Ref CompletionQueue
           TIGERBEETLE_ADDRESSES: !Ref TigerBeetleAddresses
           TIGERBEETLE_CLUSTER_ID: !Ref TigerBeetleClusterId
       VpcConfig: !If
         - WireGuardGatewayEnabled
-        - SecurityGroupIds:
+        - Ipv6AllowedForDualStack: true
+          SecurityGroupIds:
             - !Ref ExecutionLambdaSecurityGroup
           SubnetIds:
             - !Ref LambdaSubnetId
@@ -381,6 +397,70 @@ Resources:
       FunctionResponseTypes:
         - ReportBatchItemFailures
 
+  CompletionFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub lambda.${AWS::URLSuffix}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CompletionFunctionSqsPoller
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ChangeMessageVisibility
+                  - sqs:ChangeMessageVisibilityBatch
+                  - sqs:DeleteMessage
+                  - sqs:DeleteMessageBatch
+                  - sqs:GetQueueAttributes
+                  - sqs:ReceiveMessage
+                Resource: !GetAtt CompletionQueue.Arn
+        - PolicyName: CompletionFunctionOperationUpdate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt OperationsTable.Arn
+
+  CompletionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref CompletionFunctionName
+      Description: SQS-driven operation completion function built with aws-lambda-zig.
+      CodeUri: completion-lambda.zip
+      Runtime: provided.al2023
+      Handler: bootstrap
+      Architectures:
+        - arm64
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt CompletionFunctionRole.Arn
+      Environment:
+        Variables:
+          OPERATIONS_TABLE_NAME: !Ref OperationsTable
+
+  CompletionFunctionCompletionQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref CompletionFunction
+      EventSourceArn: !GetAtt CompletionQueue.Arn
+      Enabled: true
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 0
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
   ExecutionLambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Condition: ExecutionVpcCleanupResourcesRetained
@@ -391,7 +471,7 @@ Resources:
           ignore_checks:
             - W1030
     Properties:
-      GroupDescription: Execution Lambda egress to TigerBeetle and AWS APIs.
+      GroupDescription: Stack-owned execution Lambda egress to TigerBeetle and AWS APIs.
       VpcId: !Ref VpcId
       SecurityGroupIngress: []
       SecurityGroupEgress:
@@ -400,29 +480,31 @@ Resources:
           FromPort: 3000
           ToPort: 3000
           CidrIp: 10.200.0.2/32
-        - Description: HTTPS access through the subnet NAT or VPC endpoints.
+        - Description: HTTPS to AWS dual-stack service endpoints through the EIGW.
           IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: 0.0.0.0/0
+          CidrIpv6: "::/0"
 
-  ExecutionDynamoDBGatewayEndpoint:
-    Type: AWS::EC2::VPCEndpoint
+  # SAM owns the EIGW and execution route. The supplied VPC and subnet IPv6
+  # CIDR associations are prerequisites and remain externally managed.
+  ExecutionEgressOnlyInternetGateway:
+    Type: AWS::EC2::EgressOnlyInternetGateway
     Condition: ExecutionVpcCleanupResourcesRetained
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      VpcEndpointType: Gateway
       VpcId: !Ref VpcId
-      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
-      RouteTableIds:
-        - !Ref LambdaRouteTableId
-      PolicyDocument:
-        Statement:
-          - Effect: Allow
-            Principal: "*"
-            Action: "*"
-            Resource: "*"
+
+  ExecutionSqsIpv6Route:
+    Type: AWS::EC2::Route
+    Condition: ExecutionVpcCleanupResourcesRetained
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RouteTableId: !Ref LambdaRouteTableId
+      DestinationIpv6CidrBlock: "::/0"
+      EgressOnlyInternetGatewayId: !Ref ExecutionEgressOnlyInternetGateway
 
   WireGuardGatewaySecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -654,10 +736,12 @@ Outputs:
   ExecutionFunctionArn:
     Description: Deployed operation execution Lambda function ARN.
     Value: !GetAtt ExecutionFunction.Arn
-  ExecutionDynamoDBGatewayEndpointId:
-    Condition: ExecutionVpcCleanupResourcesRetained
-    Description: DynamoDB gateway endpoint used by the execution Lambda subnet.
-    Value: !Ref ExecutionDynamoDBGatewayEndpoint
+  CompletionFunctionName:
+    Description: Deployed operation completion Lambda function name.
+    Value: !Ref CompletionFunction
+  CompletionFunctionArn:
+    Description: Deployed operation completion Lambda function ARN.
+    Value: !GetAtt CompletionFunction.Arn
   WireGuardGatewayInstanceId:
     Condition: WireGuardGatewayEnabled
     Description: EC2 instance ID of the WireGuard gateway.

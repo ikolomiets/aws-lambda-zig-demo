@@ -143,6 +143,29 @@ pub const Persistence = struct {
             return writeError(err, &diagnostic, error.OperationConflict);
         };
     }
+
+    /// Completes the item selected by ID if its stored state is still SUBMITTED.
+    pub fn completeById(
+        self: *Self,
+        arena: Allocator,
+        id: u128,
+        completion: *const operation.Completion,
+        now: operation.UnixSeconds,
+    ) !void {
+        var request: CompletionByIdRequest = undefined;
+        try completionByIdRequestInit(&request, id, completion, now);
+        var diagnostic: dynamodb.ServiceError = undefined;
+        _ = self.client.updateItem(arena, .{
+            .condition_expression = completion_by_id_condition,
+            .expression_attribute_names = &request.names,
+            .expression_attribute_values = &request.values,
+            .key = &request.key,
+            .table_name = self.table_name,
+            .update_expression = completion_update,
+        }, .{ .diagnostic = &diagnostic }) catch |err| {
+            return writeError(err, &diagnostic, error.OperationConflict);
+        };
+    }
 };
 
 const CreateRequest = struct {
@@ -186,6 +209,16 @@ const CompletionRequest = struct {
     key: [1]Attribute,
     names: [5]AttributeName,
     values: [9]Attribute,
+};
+
+const CompletionByIdRequest = struct {
+    id_buffer: [id_size]u8,
+    timestamp_buffer: [32]u8,
+    expires_at_buffer: [32]u8,
+    result_buffer: [operation.result_size_max]u8,
+    key: [1]Attribute,
+    names: [2]AttributeName,
+    values: [5]Attribute,
 };
 
 fn createRequestInit(request: *CreateRequest, source: *const operation.Operation) !void {
@@ -328,6 +361,36 @@ fn completionRequestInit(
     std.debug.assert(request.values.len == 9);
 }
 
+fn completionByIdRequestInit(
+    request: *CompletionByIdRequest,
+    id: u128,
+    completion: *const operation.Completion,
+    now: operation.UnixSeconds,
+) !void {
+    const expires_at = try operation.expires_at_from_last_updated(now);
+    const result = try operation.writeCompletionJSON(&request.result_buffer, completion);
+    const id_string = operation.uuidToString(id, &request.id_buffer);
+    request.key = .{stringAttribute("id", id_string)};
+    request.names = .{
+        .{ .key = "#result", .value = "result" },
+        .{ .key = "#state", .value = "state" },
+    };
+    request.values = .{
+        stringAttribute(":submitted", operation.stateToString(.submitted)),
+        stringAttribute(":completed", operation.stateToString(.completed)),
+        numberAttribute(":now", timestampString(now, &request.timestamp_buffer)),
+        numberAttribute(":expires_at", timestampString(
+            expires_at,
+            &request.expires_at_buffer,
+        )),
+        stringAttribute(":result", result),
+    };
+    std.debug.assert(request.key.len == 1);
+    std.debug.assert(request.key[0].value.s.?.len == id_size);
+    std.debug.assert(request.names.len == 2);
+    std.debug.assert(request.values.len == 5);
+}
+
 fn updateValue(request: *UpdateRequest, key: []const u8, value: AttributeValue) void {
     std.debug.assert(request.value_count < request.values.len);
     request.values[request.value_count] = .{ .key = key, .value = value };
@@ -354,6 +417,7 @@ const update_with_result =
 const completion_condition =
     "id = :id AND #tenant = :tenant AND #name = :name AND " ++
     "#hash = :hash AND #state = :submitted AND attribute_not_exists(#result)";
+const completion_by_id_condition = "#state = :submitted";
 const completion_update =
     "SET #state = :completed, #result = :result, " ++
     "last_updated = :now, expires_at = :expires_at";
@@ -1136,6 +1200,102 @@ test "completion request enforces the full 4096 byte envelope boundary" {
     );
 }
 
+test "ID-only completion selects the canonical key and conditions only on state" {
+    const id = operation.uuidFromString(test_id) catch unreachable;
+    const completion: operation.Completion = .{ .success = .{ .bool = true } };
+    var request: CompletionByIdRequest = undefined;
+    try completionByIdRequestInit(&request, id, &completion, 1_800_000_000);
+
+    try std.testing.expectEqualStrings(test_id, try stringValue(request.key[0].value));
+    try std.testing.expectEqualStrings("#state = :submitted", completion_by_id_condition);
+    for ([_][]const u8{
+        "id",
+        "tenant",
+        "name",
+        "hash",
+        "last_updated",
+        "expires_at",
+        "result",
+        "attribute_",
+    }) |excluded_condition| {
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            completion_by_id_condition,
+            excluded_condition,
+        ) == null);
+    }
+    try std.testing.expect(findAttribute(&request.values, ":id") == null);
+    try std.testing.expect(findAttribute(&request.values, ":tenant") == null);
+    try std.testing.expect(findAttribute(&request.values, ":name") == null);
+    try std.testing.expect(findAttribute(&request.values, ":hash") == null);
+
+    const input = dynamodb.UpdateItemInput{
+        .condition_expression = completion_by_id_condition,
+        .expression_attribute_names = &request.names,
+        .expression_attribute_values = &request.values,
+        .key = &request.key,
+        .table_name = "operations",
+        .update_expression = completion_update,
+    };
+    try std.testing.expectEqualStrings(completion_by_id_condition, input.condition_expression.?);
+    try std.testing.expectEqualStrings(completion_update, input.update_expression.?);
+    try std.testing.expect(input.return_values == null);
+    try std.testing.expect(input.return_values_on_condition_check_failure == null);
+}
+
+test "ID-only completion persists exact envelopes and caller timestamps" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const id = operation.uuidFromString(test_id) catch unreachable;
+    const envelopes = [_][]const u8{
+        "{\"type\":\"SUCCESS\",\"payload\":{" ++
+            "\"transfer_id\":\"00112233-4455-6677-8899-aabbccddeeff\"}}",
+        "{\"type\":\"FAILURE\",\"payload\":{\"stage\":\"TRANSFER\",\"status\":22}}",
+    };
+    for (envelopes) |envelope| {
+        const completion = try testCompletion(arena.allocator(), envelope);
+        var request: CompletionByIdRequest = undefined;
+        try completionByIdRequestInit(&request, id, &completion, 1_800_000_123);
+
+        try std.testing.expectEqualStrings("SUBMITTED", try stringValue(
+            findAttribute(&request.values, ":submitted").?,
+        ));
+        try std.testing.expectEqualStrings("COMPLETED", try stringValue(
+            findAttribute(&request.values, ":completed").?,
+        ));
+        try std.testing.expectEqualStrings(envelope, try stringValue(
+            findAttribute(&request.values, ":result").?,
+        ));
+        try std.testing.expectEqualStrings("1800000123", try numberValue(
+            findAttribute(&request.values, ":now").?,
+        ));
+        try std.testing.expectEqualStrings("1800086523", try numberValue(
+            findAttribute(&request.values, ":expires_at").?,
+        ));
+    }
+}
+
+test "ID-only completion enforces the full 4096 byte envelope boundary" {
+    const id = operation.uuidFromString(test_id) catch unreachable;
+    const maximum: operation.Completion = .{
+        .success = .{ .string = "a" ** (operation.result_size_max - 31) },
+    };
+    var request: CompletionByIdRequest = undefined;
+    try completionByIdRequestInit(&request, id, &maximum, 1_800_000_123);
+    try std.testing.expectEqual(
+        @as(usize, operation.result_size_max),
+        (try stringValue(findAttribute(&request.values, ":result").?)).len,
+    );
+
+    const oversized: operation.Completion = .{
+        .failure = .{ .string = "a" ** (operation.result_size_max - 30) },
+    };
+    try std.testing.expectError(
+        error.ResultTooLarge,
+        completionByIdRequestInit(&request, id, &oversized, 1_800_000_123),
+    );
+}
+
 test "completion accepts only queued SUBMITTED operations with body" {
     var queued = testOperation(.submitted, null);
     queued.body = .null;
@@ -1394,6 +1554,36 @@ test "conditional update failures map to concurrent outcomes" {
     try std.testing.expectEqual(
         error.AWSFailure,
         writeError(error.ServiceError, &aws_diagnostic, error.OperationConflict),
+    );
+}
+
+test "ID-only completion maps every failed state condition to conflict" {
+    const failed_state_conditions = [_][]const u8{
+        "missing item",
+        "already completed item",
+        "other stored state",
+    };
+    for (failed_state_conditions) |_| {
+        var diagnostic = dynamodb.ServiceError{
+            .kind = .{ .conditional_check_failed_exception = .{} },
+        };
+        try std.testing.expectEqual(
+            error.OperationConflict,
+            writeError(error.ServiceError, &diagnostic, error.OperationConflict),
+        );
+    }
+
+    var transient_diagnostic = dynamodb.ServiceError{
+        .kind = .{ .unknown = .{ .http_status = 503 } },
+    };
+    try std.testing.expectEqual(
+        error.AWSFailure,
+        writeError(error.ServiceError, &transient_diagnostic, error.OperationConflict),
+    );
+    var unused: dynamodb.ServiceError = undefined;
+    try std.testing.expectEqual(
+        error.AWSFailure,
+        writeError(error.ConnectionFailed, &unused, error.OperationConflict),
     );
 }
 

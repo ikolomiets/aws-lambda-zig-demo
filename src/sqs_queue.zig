@@ -4,6 +4,7 @@ const sqs = @import("sqs");
 
 const Allocator = std.mem.Allocator;
 
+const environment_variable_name_size_max = 256;
 const queue_url_size_max = 2048;
 const message_size_max = 1024 * 1024;
 const receipt_handle_size_max = 64 * 1024;
@@ -15,6 +16,7 @@ const receive_wait_time_seconds: i32 = 20;
 const attribute_names_all = [_]sqs.types.QueueAttributeName{.all};
 
 comptime {
+    std.debug.assert(environment_variable_name_size_max < queue_url_size_max);
     std.debug.assert(queue_url_size_max < message_size_max);
     std.debug.assert(receipt_handle_size_max < message_size_max);
     std.debug.assert(attribute_count_max > 1);
@@ -34,7 +36,7 @@ pub const Attribute = struct {
     value: []const u8,
 };
 
-/// Owns SQS configuration, requests, responses, and validation for the operations queue.
+/// Owns SQS configuration, requests, responses, and validation for one queue.
 pub const Queue = struct {
     client: sqs.Client,
     queue_url: []const u8,
@@ -46,8 +48,12 @@ pub const Queue = struct {
         allocator: Allocator,
         aws_config: *aws.Config,
         environment: *const std.process.Environ.Map,
+        queue_url_environment_variable: []const u8,
     ) !void {
-        const queue_url = configured_queue_url(environment) catch {
+        const queue_url = configured_queue_url(
+            environment,
+            queue_url_environment_variable,
+        ) catch {
             return error.InvalidConfiguration;
         };
         target.* = .{
@@ -189,8 +195,12 @@ fn validate_attributes(attributes: []const aws.map.StringMapEntry) !void {
     std.debug.assert(attributes.len <= attribute_count_max);
 }
 
-fn configured_queue_url(environment: *const std.process.Environ.Map) ![]const u8 {
-    const queue_url = environment.get("OPERATIONS_QUEUE_URL") orelse {
+fn configured_queue_url(
+    environment: *const std.process.Environ.Map,
+    queue_url_environment_variable: []const u8,
+) ![]const u8 {
+    try validate_environment_variable_name(queue_url_environment_variable);
+    const queue_url = environment.get(queue_url_environment_variable) orelse {
         return error.InvalidConfiguration;
     };
     if (queue_url.len == 0) return error.InvalidConfiguration;
@@ -200,47 +210,103 @@ fn configured_queue_url(environment: *const std.process.Environ.Map) ![]const u8
     return queue_url;
 }
 
+fn validate_environment_variable_name(name: []const u8) !void {
+    if (name.len == 0) return error.InvalidConfiguration;
+    if (name.len > environment_variable_name_size_max) return error.InvalidConfiguration;
+    if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidConfiguration;
+    if (std.mem.indexOfScalar(u8, name, '=') != null) return error.InvalidConfiguration;
+    std.debug.assert(name.len > 0);
+    std.debug.assert(name.len <= environment_variable_name_size_max);
+    std.debug.assert(std.mem.indexOfScalar(u8, name, 0) == null);
+    std.debug.assert(std.mem.indexOfScalar(u8, name, '=') == null);
+}
+
 fn map_aws_error(err: anyerror) error{ OutOfMemory, AWSFailure } {
     if (err == error.OutOfMemory) return error.OutOfMemory;
     return error.AWSFailure;
 }
 
 const test_queue_url = "https://sqs.example.invalid/operations";
+const test_completion_queue_url = "https://sqs.example.invalid/completions";
+const operations_queue_url_environment_variable = "OPERATIONS_QUEUE_URL";
+const completion_queue_url_environment_variable = "COMPLETION_QUEUE_URL";
 
-test "initialization requires a nonempty bounded queue URL" {
+test "initialization requires a nonempty bounded URL for either requested setting" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     var config: aws.Config = undefined;
     var queue: Queue = undefined;
 
-    try std.testing.expectError(
-        error.InvalidConfiguration,
-        Queue.init(&queue, std.testing.allocator, &config, &environment),
-    );
-    const invalid_urls = [_][]const u8{
-        "",
-        "a" ** (queue_url_size_max + 1),
+    const settings = [_][]const u8{
+        operations_queue_url_environment_variable,
+        completion_queue_url_environment_variable,
     };
-    for (invalid_urls) |queue_url| {
-        try environment.put("OPERATIONS_QUEUE_URL", queue_url);
+    for (settings) |setting| {
         try std.testing.expectError(
             error.InvalidConfiguration,
-            Queue.init(&queue, std.testing.allocator, &config, &environment),
+            Queue.init(&queue, std.testing.allocator, &config, &environment, setting),
         );
+        const invalid_urls = [_][]const u8{
+            "",
+            "a" ** (queue_url_size_max + 1),
+        };
+        for (invalid_urls) |queue_url| {
+            try environment.put(setting, queue_url);
+            try std.testing.expectError(
+                error.InvalidConfiguration,
+                Queue.init(&queue, std.testing.allocator, &config, &environment, setting),
+            );
+        }
+        _ = environment.swapRemove(setting);
     }
 }
 
-test "initialization retains valid queue configuration and shared AWS configuration" {
+test "initialization supports operations and completion queue URL settings" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try environment.put("OPERATIONS_QUEUE_URL", test_queue_url);
+    try environment.put(operations_queue_url_environment_variable, test_queue_url);
+    try environment.put(completion_queue_url_environment_variable, test_completion_queue_url);
+    var config: aws.Config = undefined;
+    const settings = [_]struct { name: []const u8, queue_url: []const u8 }{
+        .{ .name = operations_queue_url_environment_variable, .queue_url = test_queue_url },
+        .{
+            .name = completion_queue_url_environment_variable,
+            .queue_url = test_completion_queue_url,
+        },
+    };
+    for (settings) |setting| {
+        var queue: Queue = undefined;
+        try Queue.init(
+            &queue,
+            std.testing.allocator,
+            &config,
+            &environment,
+            setting.name,
+        );
+        defer queue.deinit();
+
+        try std.testing.expect(queue.client.config == &config);
+        try std.testing.expectEqualStrings(setting.queue_url, queue.queue_url);
+    }
+}
+
+test "initialization rejects invalid environment variable names" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
     var config: aws.Config = undefined;
     var queue: Queue = undefined;
-    try Queue.init(&queue, std.testing.allocator, &config, &environment);
-    defer queue.deinit();
-
-    try std.testing.expect(queue.client.config == &config);
-    try std.testing.expectEqualStrings(test_queue_url, queue.queue_url);
+    const invalid_names = [_][]const u8{
+        "",
+        "a" ** (environment_variable_name_size_max + 1),
+        "QUEUE=URL",
+        "QUEUE\x00URL",
+    };
+    for (invalid_names) |name| {
+        try std.testing.expectError(
+            error.InvalidConfiguration,
+            Queue.init(&queue, std.testing.allocator, &config, &environment, name),
+        );
+    }
 }
 
 test "requests use the configured URL and fixed queue contracts" {

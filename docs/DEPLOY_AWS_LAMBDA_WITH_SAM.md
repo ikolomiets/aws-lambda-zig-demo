@@ -1,16 +1,23 @@
-# Deploy the intake, query, and execution Lambdas with SAM
+# Deploy the intake, query, execution, and completion Lambdas with SAM
 
-This guide documents how to deploy the three Zig Lambda packages in this repository
+This guide documents how to deploy the four Zig Lambda packages in this repository
 using AWS SAM and `template.yaml`.
 
-SAM deploys all three Lambda functions as one CloudFormation-managed stack. It creates
+SAM deploys all four Lambda functions as one CloudFormation-managed stack. It creates
 their execution roles, public Function URLs for intake and query, the DynamoDB
-operations table shared by all three Lambdas, and the SQS operations queue sent
-by intake and consumed by execution. It can also provision an optional EC2
-WireGuard gateway that routes execution-Lambda traffic to TigerBeetle on a
-development workstation, plus a DynamoDB gateway endpoint for that Lambda's
-route table. The gateway is disabled by default; enabling it adds EC2 and
-Elastic IP charges.
+operations table, the Operations queue sent by intake and consumed by execution,
+and the Completion queue sent by execution and consumed by completion. The complete
+data flow is:
+
+```text
+intake -> Operations queue -> execution/TigerBeetle -> Completion queue -> completion -> DynamoDB
+```
+
+The template can also provision an optional EC2 WireGuard gateway that routes
+execution-Lambda traffic to TigerBeetle on a development workstation. While
+execution is VPC-attached, SAM supplies outbound IPv6 access to the regional SQS
+dual-stack endpoint through a stack-owned egress-only internet gateway (EIGW).
+The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 
 ## Assumptions
 
@@ -20,8 +27,9 @@ Elastic IP charges.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
-- `intake-lambda.zip`, `query-lambda.zip`, and `execution-lambda.zip` each contain one Linux ARM64
-  executable named `bootstrap`.
+- `intake-lambda.zip`, `query-lambda.zip`, `execution-lambda.zip`, and
+  `completion-lambda.zip` each contain one Linux ARM64 executable named
+  `bootstrap`.
 - Both Lambda Function URLs are intentionally public for authenticated demo testing.
 - `LAMBDA_PRINCIPAL` defaults to `'*'` unless you override the
   `LambdaPrincipal` template parameter.
@@ -34,20 +42,32 @@ Enabling the WireGuard gateway additionally requires:
 - An existing VPC with distinct public gateway and Lambda subnets.
 - An internet gateway and an active `0.0.0.0/0` route from the gateway public
   subnet to that internet gateway.
-- The effective Lambda-subnet route table, with no route already claiming
-  `10.200.0.0/24` unless that route is owned by the existing deployment of this
-  stack.
+- An active IPv6 CIDR association on the VPC and exactly one active IPv6 `/64`
+  association on the Lambda subnet contained by that VPC allocation. These
+  associations remain externally managed.
+- VPC DNS support and DNS hostnames enabled so the AWS SDK can resolve regional
+  dual-stack service names.
+- The Lambda subnet's effective route table, with no unmanaged `::/0` route and
+  no route already claiming `10.200.0.0/24` unless that route is owned by the
+  existing deployment of this stack.
+- A Lambda-subnet network ACL that permits outbound IPv6 TCP/443 and returning
+  inbound TCP/1024-65535. Nontrivial ordered policies require operator review.
+- No unmanaged EIGW attached to the VPC. A VPC can have only one EIGW; the stack
+  must be able to create and own it for this deployment.
 - For the recommended isolated topology, an unused IPv4 `/28` in the VPC and
   permission to create and tag a subnet, route table, and route-table
-  association. The stack creates the DynamoDB gateway endpoint.
+  association. Assign the IPv6 `/64` outside this template and helper.
 - Local WireGuard tools (`wg` and the platform-specific interface helper) on a
   workstation that can initiate outbound UDP/51820 to the gateway Elastic IP.
 - `wg` must be on `PATH` for `wireguard-gateway-setup.sh` to generate the default gateway pair
   when both default SSM parameters are absent.
-- Permission for the deployment identity to create the additional EC2
-  instance, Elastic IP, security groups, route, IAM role and instance profile,
-  launch template, DynamoDB gateway endpoint, and execution-Lambda network
-  interface.
+- Permission for the deployment identity to create, inspect, and delete the
+  additional EC2 instance, Elastic IP, security groups, IPv4 and IPv6 routes,
+  EIGW, IAM role and instance profile, launch template, and execution-Lambda
+  network interfaces. Preflight also describes VPCs, subnets, route tables,
+  EIGWs, network ACLs, VPC DNS attributes, Lambda versions, and network
+  interfaces, and probes regional SQS dual-stack availability with
+  `sqs:ListQueues`.
 - `ssm:GetParameter` and `ssm:PutParameter` on
   `/applications/${STACK_NAME}/wireguard/gateway-private-key` and
   `/applications/${STACK_NAME}/wireguard/gateway-public-key`, plus
@@ -85,6 +105,15 @@ profiles are unsupported. Dry runs make no AWS authentication calls.
 
 ## 2. Build and package the Zig Lambdas
 
+Check Zig and shell formatting/syntax before the test graph:
+
+```sh
+zig fmt --check build.zig src/completion_batch.zig src/completion_lambda.zig \
+  src/execution_lambda.zig src/intake_lambda.zig src/lambda_auth.zig \
+  src/query_lambda.zig
+bash -n deploy.sh wireguard-gateway-setup.sh tests/*.sh
+```
+
 Run the full local test graph before packaging. This includes the Zig tests and
 the dependency-free deployment-helper regression tests:
 
@@ -114,12 +143,13 @@ The build also installs the host-native `paseto` utility and the local command
 implementations invoked by `persistence.sh` and `queue.sh`. Each Lambda zip
 contains only its handler's root-level `bootstrap`.
 
-Verify that all three built artifacts are Linux ARM64 executables.
+Verify that all four built artifacts are Linux ARM64 executables.
 
 ```sh
 file zig-out/bin/intake/bootstrap \
   zig-out/bin/query/bootstrap \
-  zig-out/bin/execution/bootstrap
+  zig-out/bin/execution/bootstrap \
+  zig-out/bin/completion/bootstrap
 ```
 
 Inspect the execution bootstrap before creating or updating any AWS resource. It must be the
@@ -148,7 +178,8 @@ The package-level check is independent of the Lambda executable: `strings` on
 `lib/aarch64-linux-gnu.2.27/libtb_client.a` must show epoll, eventfd, and timerfd markers and no
 `io_uring` marker. The macOS archive remains the Darwin/kqueue build.
 
-Intake and query remain single-threaded, statically linked executables:
+Intake, query, and completion remain single-threaded, statically linked
+executables:
 
 ```text
 ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
@@ -160,12 +191,13 @@ and `file` reports it as dynamically linked. Amazon Linux 2023 supplies the
 glibc loader and libraries; do not expect the execution bootstrap to be
 static.
 
-Create or refresh all three packages.
+Create or refresh all four packages.
 
 ```sh
 zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
 zip -qj query-lambda.zip zig-out/bin/query/bootstrap
 zip -qj execution-lambda.zip zig-out/bin/execution/bootstrap
+zip -qj completion-lambda.zip zig-out/bin/completion/bootstrap
 ```
 
 SAM reads the packages from the matching `CodeUri` properties in `template.yaml`.
@@ -211,6 +243,7 @@ Both commands should report that `template.yaml` is valid.
 
 - `OperationsTable`: `AWS::DynamoDB::Table`
 - `OperationsQueue`: `AWS::SQS::Queue`
+- `CompletionQueue`: `AWS::SQS::Queue`
 - `IntakeFunction`: `AWS::Serverless::Function`
 - `IntakeFunctionUrl`: `AWS::Lambda::Url`
 - `FunctionUrlInvokeFunctionUrlPermission`: allows `lambda:InvokeFunctionUrl`
@@ -224,11 +257,15 @@ Both commands should report that `template.yaml` is valid.
 - `ExecutionFunction`: `AWS::Serverless::Function`
 - `ExecutionFunctionRole`: `AWS::IAM::Role`
 - `ExecutionFunctionOperationsQueueMapping`: `AWS::Lambda::EventSourceMapping`
+- `CompletionFunction`: `AWS::Serverless::Function`
+- `CompletionFunctionRole`: `AWS::IAM::Role`
+- `CompletionFunctionCompletionQueueMapping`: `AWS::Lambda::EventSourceMapping`
 
 When `EnableWireGuardGateway=true`, the template also creates:
 
 - `ExecutionLambdaSecurityGroup`: `AWS::EC2::SecurityGroup`
-- `ExecutionDynamoDBGatewayEndpoint`: `AWS::EC2::VPCEndpoint`
+- `ExecutionEgressOnlyInternetGateway`: `AWS::EC2::EgressOnlyInternetGateway`
+- `ExecutionSqsIpv6Route`: `AWS::EC2::Route`
 - `WireGuardGatewaySecurityGroup`: `AWS::EC2::SecurityGroup`
 - `WireGuardGatewayRole`: `AWS::IAM::Role`
 - `WireGuardGatewayInstanceProfile`: `AWS::IAM::InstanceProfile`
@@ -240,11 +277,13 @@ When `EnableWireGuardGateway=true`, the template also creates:
 
 Every gateway resource and output is conditional. The internal
 `RetainExecutionVpcCleanupResources` parameter temporarily keeps
-`ExecutionDynamoDBGatewayEndpoint`, `ExecutionLambdaSecurityGroup`, and the
-execution role's EC2 network-interface policy during a setup-script disablement
-transition. In steady disabled state, the execution Lambda has no VPC
-attachment or EC2 network-interface permissions, and the empty gateway
-parameter defaults create no gateway or cleanup resources.
+`ExecutionEgressOnlyInternetGateway`, `ExecutionSqsIpv6Route`,
+`ExecutionLambdaSecurityGroup`, the required `VpcId` and `LambdaRouteTableId`
+values, and the execution role's EC2 network-interface policy during a
+setup-script detach or reconfiguration transition. In steady disabled state,
+the execution Lambda has no VPC attachment or EC2 network-interface
+permissions, and the empty gateway parameter defaults create no gateway or
+cleanup resources.
 
 The gateway security group admits public IPv4 UDP/51820 and private TCP/3000
 from `LambdaSubnetCidr`; it allows IPv4 egress for bootstrap, SSM, and tunnel
@@ -254,8 +293,9 @@ at `10.200.0.1/24`. The instance has source/destination checking disabled. Its
 Elastic IP and the Lambda-subnet route to `10.200.0.0/24` follow the
 stack-managed instance lifecycle.
 
-The intake and query functions share the runtime, architecture, memory, timeout, basic logging
-policy, PASETO configuration, and operations-table environment value:
+The intake and query functions share the runtime, architecture, memory,
+three-second timeout, basic logging policy, PASETO configuration, and
+operations-table environment value:
 
 ```yaml
 Runtime: provided.al2023
@@ -300,14 +340,35 @@ The query function receives its own inline policy containing only
 The execution function uses the same `provided.al2023` ARM64 runtime, 128 MB
 memory, a 15-second timeout, and basic logging policy. It has no Function URL
 or authentication configuration. Its explicit role grants queue-scoped
-polling permissions for `OperationsQueue` and only `dynamodb:UpdateItem` on
-this stack's operations table; execution does not receive `dynamodb:GetItem`.
-When the gateway is enabled, the role also receives the six EC2
-network-interface actions required by a VPC-attached Lambda. The function is
-attached to the single `LambdaSubnetId` with a stack-managed security group
-that permits only TCP/3000 to `10.200.0.2/32` and TCP/443 for DynamoDB access
-through the stack-managed gateway endpoint. Intake and query remain outside
-the customer VPC and continue using the standard regional DynamoDB hostname.
+polling permissions for `OperationsQueue` and `sqs:SendMessage` only for
+`CompletionQueue`. It has no DynamoDB permission. When the gateway is enabled,
+the role also receives the six EC2 network-interface actions required by a
+VPC-attached Lambda. The function receives `COMPLETION_QUEUE_URL` plus the
+TigerBeetle settings.
+
+Only execution is attached to `LambdaSubnetId`. Its VPC configuration sets
+`Ipv6AllowedForDualStack: true`, its stack-managed security group allows IPv4
+TCP/3000 only to `10.200.0.2/32` and IPv6 TCP/443 to `::/0`, and
+`AWS_USE_DUALSTACK_ENDPOINT=true` makes the AWS SDK select the regional public
+SQS dual-stack endpoint. SAM creates the VPC's EIGW and an execution-specific
+`::/0` route in `LambdaRouteTableId`. The externally supplied VPC, subnets,
+route table, IPv6 associations, DNS settings, and network ACL remain outside
+the stack.
+
+The completion function uses `provided.al2023`, ARM64, 128 MB, and a 15-second
+timeout. It has no Function URL, authentication configuration, or VPC
+attachment. Its explicit role can poll only `CompletionQueue` and can call
+only `dynamodb:UpdateItem` on `OperationsTable`. Its only application
+environment value is `OPERATIONS_TABLE_NAME`.
+
+The least-privilege boundary is deliberate: intake creates an Operation and
+sends it to `OperationsQueue`; query reads the table; execution polls
+`OperationsQueue` and publishes terminal results to `CompletionQueue`; and
+completion polls `CompletionQueue` and updates the table. Lambda's managed
+event-source pollers consume both source queues outside the function execution
+environment. Therefore only execution's AWS SDK `SendMessage` call needs the
+VPC SQS egress path. Completion remains outside the VPC and reaches DynamoDB
+normally.
 
 `TigerBeetleClusterId` and `TigerBeetleAddresses` populate
 `TIGERBEETLE_CLUSTER_ID` and `TIGERBEETLE_ADDRESSES`. Their defaults are `0`
@@ -318,7 +379,7 @@ address-syntax validation during cold start. `deploy.sh` exposes matching
 `--tigerbeetle-cluster-id` and `--tigerbeetle-addresses` options plus matching
 environment overrides.
 
-The explicit event source mapping is enabled with `BatchSize: 10`,
+The execution event source mapping is enabled with `BatchSize: 10`,
 `MaximumBatchingWindowInSeconds: 0`, and `ReportBatchItemFailures`. Lambda polls
 the queue and invokes execution with SQS events. The mapping remains enabled
 when the managed WireGuard gateway is disabled; operators must provide another
@@ -328,7 +389,7 @@ retains the debug log containing `message_id` and `body`, parses and validates
 the complete Operation output, and processes only a queued `SUBMITTED` Operation with
 a body and no result. Records are handled sequentially within the ten-record
 bound. Invalid records are logged and acknowledged without contacting
-TigerBeetle or DynamoDB.
+TigerBeetle.
 
 For each valid Operation, execution first creates a TigerBeetle account with
 `id = Operation.id`, ledger `1`, and code `1`. It then creates a posted transfer
@@ -339,22 +400,16 @@ TigerBeetle event types. Account `1` is an operator-provisioned prerequisite;
 execution never creates it, and it must use ledger `1` with flags compatible
 with receiving this credit.
 
-Completion is one conditional `UpdateItem`. The condition checks canonical
-`id`, stored `tenant` and `name`, the queued hash, `state = SUBMITTED`, and an
-absent stored `result`; timestamps are intentionally not conditions.
-The successful path samples the real-time clock only after both accounting
-requests return `created` or the identical-event `exists` replay result. Its
-update sets `state = COMPLETED`, stores the compact tagged success envelope as
-`result`, sets `last_updated` to that sample, and sets `expires_at` to exactly
-86,400 seconds later. The success result is exactly:
+After both accounting requests return `created` or the replay-safe identical
+`exists`, execution creates a terminal success entry. The success result is
+exactly:
 
 ```json
 {"type":"SUCCESS","payload":{"transfer_id":"00112233-4455-6677-8899-aabbccddeeff"}}
 ```
 
-A definitive account or transfer rejection uses the same completion update
-with its stage and raw TigerBeetle status, sampling the completion time after
-the rejecting request. The failure results are exactly:
+A definitive account or transfer rejection creates a terminal failure entry
+with its stage and raw TigerBeetle status. The failure results are exactly:
 
 ```json
 {"type":"FAILURE","payload":{"stage":"ACCOUNT","status":19}}
@@ -364,31 +419,70 @@ the rejecting request. The failure results are exactly:
 {"type":"FAILURE","payload":{"stage":"TRANSFER","status":22}}
 ```
 
-The update requests neither success attributes nor the conflicting item on
-conditional failure.
+Processing always advances to the next Operations record. A definite
+TigerBeetle rejection is logged and represented as a terminal Completion
+entry. TigerBeetle client/request or result-construction uncertainty adds only
+that Operations message ID to `batchItemFailures`. After processing the
+invocation, execution encodes all terminal entries into at most one aggregate
+Completion message and sends it once. The stable account and transfer IDs make
+Operations retries replay-safe: `created` and identical `exists` proceed,
+while every `exists_with_different_*` result is a definitive terminal failure.
 
-Processing always advances to the next record. A definite TigerBeetle rejection
-is logged with its stage and numeric status, persisted as a completed failure,
-and acknowledged. TigerBeetle client/request errors and DynamoDB service
-uncertainty add only that message ID to `batchItemFailures`; the Operation
-remains `SUBMITTED` without a result so infrastructure retry can continue. A
-DynamoDB `OperationConflict` is acknowledged and leaves the stored Operation
-unchanged. This includes duplicate delivery after completion and any queued
-identity mismatch. The stable account and transfer IDs make retries
-replay-safe: `created` and identical `exists` proceed, while every
-`exists_with_different_*` result is a definitive completed rejection.
+The aggregate JSON contract is `{"results":[...]}`. Each entry contains only
+the canonical `operation_id` and a validated tagged `result`; it does not copy
+the queued Operation snapshot, tenant, name, hash, or timestamps. The codec
+rejects an empty aggregate and bounds the complete encoded message to 1 MiB.
+That byte limit, rather than a promised fixed number of result entries, is the
+message contract. If publication fails, every Operations record represented
+in that aggregate is returned for retry. If publication succeeds, those source
+records are acknowledged; execution never acknowledges a terminal result
+before its Completion message is published.
+
+The completion event source mapping uses `BatchSize: 1`,
+`MaximumBatchingWindowInSeconds: 0`, and `ReportBatchItemFailures`. One Lambda
+invocation therefore receives one aggregate Completion queue message and
+updates only that message's entries, sequentially. The 15-second function
+timeout and the queue's 90-second visibility timeout are paired with this
+one-message boundary. Do not infer that every aggregate up to the byte limit
+will necessarily finish in 15 seconds: use measured cold-start and worst-case
+sequential DynamoDB latency when changing the encoded-message bound, function
+timeout, or queue visibility timeout, and size all three together.
+
+For each valid entry, completion performs one ID-only `UpdateItem`: the
+canonical ID selects the item and the condition is only stored
+`state = SUBMITTED`. There is no read-before-write and no comparison against
+tenant, name, hash, `last_updated`, `expires_at`, a queued snapshot, or an
+absent result. A successful write sets `state = COMPLETED`, stores the
+canonical result envelope, samples `last_updated` immediately before that
+entry's write, and derives `expires_at` as exactly 86,400 seconds later. The
+request asks for neither success attributes nor the conflicting item.
+
+A missing item or an item no longer in `SUBMITTED` state is an acknowledged
+`OperationConflict`. This makes duplicate or stale at-least-once Completion
+delivery unable to overwrite the first terminal result. An invalid entry that
+still contains one trustworthy canonical ID is converted to an identifiable,
+deterministic failure result and persisted. An entry with a missing,
+noncanonical, duplicate, or otherwise untrustworthy ID is acknowledged without
+a write because there is no safe item to select. A malformed outer aggregate
+is also acknowledged unless decoding failed for allocation.
+
+A transient allocation or DynamoDB failure stops processing that aggregate and
+returns its single SQS message ID in `batchItemFailures`. The entire message is
+then replayed. Earlier successful entries become acknowledged conflicts on
+replay, allowing processing to reach the failed entry and any later entries;
+each newly successful write gets its actual replay-time timestamp and TTL.
+Completion acknowledges the SQS message only after every entry has either
+succeeded or reached an acknowledged deterministic/conflict outcome.
 
 `OPERATIONS_TABLE_NAME` contains the CloudFormation-generated physical table
-name. Before each of the three invocation loops starts, its bootstrap loads an
-AWS configuration and initializes the Operation persistence module with the
-validated table name. The query and execution bootstraps reuse that
-configuration, persistence client, HTTP pool, and adapter across warm
-invocations. Execution also retains one TigerBeetle client across warm
-invocations. The intake bootstrap validates `OPERATIONS_QUEUE_URL`,
-initializes the queue module, and reuses both clients with its shared AWS
-configuration. Missing or invalid configuration prevents the affected Lambda
-from handling invocations. The local persistence and queue command
-implementations use the same modules and contracts.
+name. Intake, query, and completion initialize the Operation persistence
+module around an AWS configuration and reuse their clients and HTTP pools
+across warm invocations. Intake additionally validates
+`OPERATIONS_QUEUE_URL`; execution validates `COMPLETION_QUEUE_URL`, initializes
+the SQS module, and retains one TigerBeetle client across warm invocations.
+Missing or invalid configuration prevents the affected Lambda from handling
+invocations. The local persistence and queue command implementations use the
+same modules and contracts.
 
 Startup validation makes no DynamoDB or SQS request. A missing table or
 insufficient DynamoDB permission is discovered by a POST persistence request
@@ -396,24 +490,32 @@ and returned by intake as a sanitized HTTP 500. A query DynamoDB request or
 service failure returns a sanitized HTTP 503, while a malformed stored item or
 unexpected failure returns HTTP 500. A missing queue, insufficient
 `SendMessage` permission, or another SQS send failure is returned as a
-sanitized HTTP 503. Execution discovers a missing table, insufficient
-`UpdateItem` permission, or another DynamoDB service failure while processing a
-record, logs the failure, and requests an SQS retry for only that record.
+sanitized HTTP 503. Execution discovers a missing Completion queue, insufficient
+`SendMessage` permission, or another Completion queue send failure while
+publishing the aggregate and retries every represented Operations record.
+Completion discovers a missing table, insufficient `UpdateItem` permission,
+or another DynamoDB service failure while processing an entry and retries the
+single Completion message.
 
-The second intake inline-policy statement grants that function only `SendMessage`
-access to this stack's operations queue. The handler sends full compact
-`SUBMITTED` Operation JSON, but has no receive, delete, purge, or
-queue-management permissions. Execution receives its separate queue-scoped
-poller policy and table-scoped `UpdateItem`; neither role grants
-queue-management access. The `queue.sh` command uses the local caller's AWS
-identity and does not expand either Lambda role. Its `receive` command competes
-with the enabled execution event source mapping for messages.
+The second intake inline-policy statement grants that function only
+`SendMessage` access to this stack's Operations queue. The handler sends full
+compact `SUBMITTED` Operation JSON, but has no receive, delete, purge, or
+queue-management permissions. Execution receives its separate Operations
+queue-scoped poller policy and Completion queue-scoped `SendMessage` policy.
+Completion receives its separate Completion queue-scoped poller policy and
+table-scoped `UpdateItem`; neither role grants queue-management access. The
+`queue.sh` command uses the local caller's AWS identity and does not expand any
+Lambda role. Its `receive` command competes with the enabled execution event
+source mapping for Operations messages.
 
-`OperationsQueue` is a standard queue with a CloudFormation-generated name and
-a 90-second visibility timeout, six times the execution timeout. The template
-does not configure FIFO behavior or a dead-letter queue. `DeletionPolicy: Delete`
-and `UpdateReplacePolicy: Delete` mean deleting the stack or replacing the queue
-permanently deletes queued messages.
+`OperationsQueue` and `CompletionQueue` are standard queues with
+CloudFormation-generated names and 90-second visibility timeouts, six times
+their consumer functions' 15-second timeouts. The template does not configure
+FIFO behavior or a dead-letter queue for either queue. No additional
+retention or replay path is introduced. `DeletionPolicy: Delete` and
+`UpdateReplacePolicy: Delete` mean deleting the stack or replacing either
+queue permanently deletes its queued messages; retries do not outlive the
+queue's configured retention period.
 
 The operations table uses on-demand `PAY_PER_REQUEST` billing and has one
 string partition key named `id`. It has no sort key, secondary indexes,
@@ -472,7 +574,9 @@ transition once to `COMPLETED`; every completed Operation is immutable,
 including a same-outcome refresh. New items and every successful update set
 `expires_at` to `last_updated + 86,400`.
 Result-size validation remains in the application rather than a DynamoDB
-condition expression.
+condition expression. The completion Lambda uses the separate relaxed
+ID-only update described above; the strict snapshot-based update interface
+remains available to local persistence callers.
 
 Tenant is server-owned metadata, part of idempotency identity, and the query
 authorization boundary. UUIDs and the `id` partition key remain globally
@@ -515,10 +619,11 @@ The template defaults to:
 intake-lambda
 query-lambda
 execution-lambda
+completion-lambda
 ```
 
-They are controlled by `IntakeFunctionName`, `QueryFunctionName`, and
-`ExecutionFunctionName`. Before
+They are controlled by `IntakeFunctionName`, `QueryFunctionName`,
+`ExecutionFunctionName`, and `CompletionFunctionName`. Before
 updating an existing stack, resolve the current intake physical name and reuse
 it exactly:
 
@@ -549,8 +654,9 @@ before using the direct SAM commands below.
 
 Remove obsolete `FunctionName=...` entries from `samconfig.toml`, then add
 `IntakeFunctionName=<existing-physical-name>` and
-`QueryFunctionName=query-lambda` and `ExecutionFunctionName=execution-lambda` if parameter
-overrides are saved there. The
+`QueryFunctionName=query-lambda`, `ExecutionFunctionName=execution-lambda`, and
+`CompletionFunctionName=completion-lambda` if parameter overrides are saved
+there. The
 removed `FunctionName` parameter and generic function outputs were template
 interfaces, not physical resources, so they require no cleanup.
 
@@ -592,11 +698,11 @@ The optional gateway parameters are:
 | Parameter | Meaning |
 | --- | --- |
 | `EnableWireGuardGateway` | `true` enables the gateway; defaults to `false`. |
-| `RetainExecutionVpcCleanupResources` | Internal `wireguard-gateway-setup.sh` lifecycle switch; retains the DynamoDB endpoint, execution security group, and ENI permissions between detach and cleanup phases. Defaults to `false`. |
-| `VpcId` | Existing VPC containing both supplied subnets. |
+| `RetainExecutionVpcCleanupResources` | Internal `wireguard-gateway-setup.sh` lifecycle switch; retains the stack-owned EIGW, IPv6 route, execution security group, required VPC/route-table values, and ENI permissions between detach and cleanup phases. Defaults to `false`. |
+| `VpcId` | Existing VPC containing both supplied subnets; its IPv6 CIDR association remains externally managed. |
 | `GatewayPublicSubnetId` | Existing public subnet for the EC2 gateway. |
-| `LambdaSubnetId` | Distinct existing subnet for the execution Lambda. |
-| `LambdaRouteTableId` | Effective route table for `LambdaSubnetId`. |
+| `LambdaSubnetId` | Distinct existing subnet for the execution Lambda; its IPv6 `/64` association remains externally managed. |
+| `LambdaRouteTableId` | Effective external route table for `LambdaSubnetId`; SAM adds its execution-specific routes. |
 | `LambdaSubnetCidr` | Primary IPv4 CIDR of `LambdaSubnetId`; it must not overlap `10.200.0.0/24`. |
 | `WireGuardPrivateKeyParameterName` | Absolute path of the external gateway-private-key SSM `SecureString`. |
 | `WireGuardPrivateKeyParameterVersion` | Exact positive version to retrieve; defaults to `1`. |
@@ -605,266 +711,150 @@ The optional gateway parameters are:
 | `WireGuardAmiId` | Public SSM parameter resolving to an ARM64 Amazon Linux 2023 AMI. |
 | `WireGuardInstanceType` | ARM64 gateway instance type; defaults to `t4g.nano`. |
 
-### Provision a dedicated Lambda subnet and route table
+### Provision and validate the external dual-stack topology
 
-The recommended development topology keeps the existing internet-routed subnet
-for the EC2 gateway and creates a dedicated Lambda subnet in the same
-availability zone. The Lambda subnet has no automatic public IPv4 assignment
-and an explicitly associated route table with only the VPC-local route. The SAM
-stack associates its DynamoDB gateway endpoint only with that route table and
-uses AWS's documented default full-access endpoint policy. The execution
-role's table-scoped `dynamodb:UpdateItem` policy remains the authorization
-boundary.
+The recommended development topology keeps an existing internet-routed subnet
+for the EC2 gateway and uses a distinct private subnet in the same availability
+zone for execution. The Lambda subnet has no automatic public IPv4 assignment
+and uses an explicitly associated route table. The VPC, subnets, route table,
+route-table association, IPv6 CIDR associations, DNS attributes, and network
+ACL are operator-owned prerequisites. Neither the SAM template nor
+`wireguard-gateway-setup.sh` creates, changes, or deletes them.
 
-Recheck the live VPC, availability zone, CIDR availability, and gateway default
-route immediately before creation. The following example uses the selected
-`172.31.48.0/28` default but keeps live identifiers out of the repository:
+Before enablement, the topology must satisfy all of these constraints:
+
+- The gateway subnet and Lambda subnet are distinct, in the same VPC and
+  availability zone, and neither IPv4 CIDR overlaps `10.200.0.0/24`.
+- The gateway subnet's effective route table has an active `0.0.0.0/0` route
+  to an internet gateway.
+- The VPC has an active IPv6 CIDR association. The Lambda subnet has exactly
+  one active IPv6 `/64`, contained by exactly one active VPC IPv6 allocation.
+- `enableDnsSupport` and `enableDnsHostnames` are both enabled on the VPC.
+- `LambdaRouteTableId` is the Lambda subnet's effective route table. Before
+  first enablement it has no `::/0` route and the VPC has no attached EIGW.
+  During reconfiguration, any such route and EIGW must be the current stack's
+  `ExecutionSqsIpv6Route` and `ExecutionEgressOnlyInternetGateway`.
+- The Lambda subnet's effective network ACL allows outbound IPv6 TCP/443 and
+  the corresponding inbound TCP/1024-65535 response traffic. A clearly denying
+  policy is rejected; a valid but nontrivial ordered policy produces a warning
+  and requires operator verification.
+- The route table has no conflicting `10.200.0.0/24` route. The current
+  stack-owned WireGuard route is accepted during an in-place reconfiguration.
+
+Use live queries immediately before enablement and keep the returned values in
+the operator session rather than documentation:
 
 ```sh
-gateway_subnet_id='<existing-public-gateway-subnet-id>'
-lambda_subnet_cidr='172.31.48.0/28'
-vpc_id="$(aws ec2 describe-subnets \
-  --subnet-ids "$gateway_subnet_id" \
-  --query 'Subnets[0].VpcId' \
-  --output text \
-  --profile dev \
-  --region ca-central-1)"
-availability_zone="$(aws ec2 describe-subnets \
-  --subnet-ids "$gateway_subnet_id" \
-  --query 'Subnets[0].AvailabilityZone' \
-  --output text \
-  --profile dev \
-  --region ca-central-1)"
-gateway_route_table_id="$(aws ec2 describe-route-tables \
-  --filters "Name=association.subnet-id,Values=$gateway_subnet_id" \
-  --query 'RouteTables[0].RouteTableId' \
-  --output text \
-  --profile dev \
-  --region ca-central-1)"
-if [ "$gateway_route_table_id" = None ]; then
-  gateway_route_table_id="$(aws ec2 describe-route-tables \
-    --filters "Name=vpc-id,Values=$vpc_id" \
-      'Name=association.main,Values=true' \
-    --query 'RouteTables[0].RouteTableId' \
-    --output text \
-    --profile dev \
-    --region ca-central-1)"
-fi
-aws ec2 describe-route-tables \
-  --route-table-ids "$gateway_route_table_id" \
-  --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0' && State=='active'].GatewayId" \
+vpc_id='<vpc-id>'
+gateway_subnet_id='<gateway-public-subnet-id>'
+lambda_subnet_id='<lambda-subnet-id>'
+lambda_route_table_id='<lambda-route-table-id>'
+
+aws ec2 describe-vpcs \
+  --vpc-ids "$vpc_id" \
+  --query 'Vpcs[0].[VpcId,Ipv6CidrBlockAssociationSet]' \
+  --output json \
   --profile dev \
   --region ca-central-1
 aws ec2 describe-subnets \
-  --filters "Name=vpc-id,Values=$vpc_id" \
-  --query 'Subnets[].[SubnetId,CidrBlock,AvailabilityZone]' \
-  --output table \
-  --profile dev \
-  --region ca-central-1
-```
-
-Stop if the selected CIDR is already allocated, the public subnet is not in
-`ca-central-1a`, or its effective route table does not have an active internet
-gateway default route. Once those checks pass, create and tag the
-operator-owned subnet, route table, and association:
-
-```sh
-lambda_subnet_id="$(aws ec2 create-subnet \
-  --vpc-id "$vpc_id" \
-  --availability-zone "$availability_zone" \
-  --cidr-block "$lambda_subnet_cidr" \
-  --tag-specifications \
-    'ResourceType=subnet,Tags=[{Key=Project,Value=aws-lambda-zig-demo},{Key=Purpose,Value=wireguard-execution-lambda},{Key=ManagedBy,Value=manual},{Key=Name,Value=aws-lambda-zig-demo-wireguard-lambda}]' \
-  --query Subnet.SubnetId \
-  --output text \
-  --profile dev \
-  --region ca-central-1)"
-aws ec2 modify-subnet-attribute \
-  --subnet-id "$lambda_subnet_id" \
-  --no-map-public-ip-on-launch \
-  --profile dev \
-  --region ca-central-1
-
-lambda_route_table_id="$(aws ec2 create-route-table \
-  --vpc-id "$vpc_id" \
-  --tag-specifications \
-    'ResourceType=route-table,Tags=[{Key=Project,Value=aws-lambda-zig-demo},{Key=Purpose,Value=wireguard-execution-lambda},{Key=ManagedBy,Value=manual},{Key=Name,Value=aws-lambda-zig-demo-wireguard-lambda-route-table}]' \
-  --query RouteTable.RouteTableId \
-  --output text \
-  --profile dev \
-  --region ca-central-1)"
-lambda_route_table_association_id="$(aws ec2 associate-route-table \
-  --subnet-id "$lambda_subnet_id" \
-  --route-table-id "$lambda_route_table_id" \
-  --query AssociationId \
-  --output text \
-  --profile dev \
-  --region ca-central-1)"
-```
-
-Record the three returned identifiers only in the operator session. If a step
-fails before deployment starts, delete only resources created in that attempt,
-in reverse order: route-table association, route table, then subnet. Once
-deployment starts, retain the topology for diagnosis or retry.
-
-The endpoint's AWS-managed prefix-list route takes precedence for same-Region
-DynamoDB traffic. `deploy.sh` and the template do not remove or alter an
-operator-owned NAT or default route, because other subnets or workloads may
-depend on it. Remove an existing NAT path only after auditing every route-table
-association and all unrelated egress requirements.
-
-The subnet, route table, and association remain operator-owned outside SAM.
-Disabling or deleting the stack removes the endpoint, its prefix-list route,
-the stack-owned `10.200.0.0/24` route, and the execution VPC attachment. For
-intentional final cleanup, first disable or delete the stack, verify the
-endpoint output is gone, then run:
-
-```sh
-aws ec2 disassociate-route-table \
-  --association-id "$lambda_route_table_association_id" \
-  --profile dev \
-  --region ca-central-1
-aws ec2 delete-route-table \
-  --route-table-id "$lambda_route_table_id" \
-  --profile dev \
-  --region ca-central-1
-aws ec2 delete-subnet \
-  --subnet-id "$lambda_subnet_id" \
-  --profile dev \
-  --region ca-central-1
-```
-
-### Import a legacy unmanaged DynamoDB endpoint
-
-An older deployment may already have an operator-created DynamoDB endpoint on
-`LambdaRouteTableId`. Normal deployment stops with a migration-specific error
-instead of letting CloudFormation create a conflicting route. Import is
-permitted only when the endpoint is `available`, is a `Gateway` endpoint for
-`com.amazonaws.<region>.dynamodb` in `VpcId`, is associated exclusively with
-`LambdaRouteTableId`, and has exactly the documented default full-access
-policy. A shared endpoint or custom policy is rejected and is never changed by
-the setup script.
-
-Keep the live endpoint ID only in the operator session. First run
-`wireguard-gateway-setup.sh` through preflight and stop at its import
-error; any other endpoint validation error must be resolved without this
-procedure. CloudFormation import operations cannot add or modify stack outputs,
-and unspecified parameters use the new template's defaults. Create an
-import-only copy that omits the new endpoint output, and explicitly preserve
-every parameter already stored on the stack. The parameter query below returns
-only parameter names and `UsePreviousValue`; it does not read or persist their
-values.
-
-Then package the import-only template and create a manual `IMPORT` change set:
-
-```sh
-stack_name='aws-lambda-zig-demo'
-region='ca-central-1'
-profile='dev'
-dynamodb_endpoint_id='<legacy-vpc-endpoint-id>'
-change_set_name='import-execution-dynamodb-endpoint'
-import_source_template="$(mktemp "${TMPDIR:-/tmp}/endpoint-import-source.XXXXXX")"
-packaged_template="$(mktemp "${TMPDIR:-/tmp}/endpoint-import-packaged.XXXXXX")"
-
-awk '
-  /^  ExecutionDynamoDBGatewayEndpointId:$/ { omit = 1; next }
-  omit && /^  [A-Za-z0-9][A-Za-z0-9_-]*:$/ { omit = 0 }
-  !omit { print }
-' template.yaml >"$import_source_template"
-grep -q '^  ExecutionDynamoDBGatewayEndpoint:$' "$import_source_template" || {
-  printf 'import template is missing ExecutionDynamoDBGatewayEndpoint\n' >&2
-  exit 1
-}
-if grep -q '^  ExecutionDynamoDBGatewayEndpointId:$' "$import_source_template"; then
-  printf 'import template still contains ExecutionDynamoDBGatewayEndpointId\n' >&2
-  exit 1
-fi
-
-stack_parameters="$(
-  aws cloudformation describe-stacks \
-    --stack-name "$stack_name" \
-    --query 'Stacks[0].Parameters[].{ParameterKey:ParameterKey,UsePreviousValue:`true`}' \
-    --output json \
-    --profile "$profile" \
-    --region "$region"
-)"
-
-sam package \
-  --template-file "$import_source_template" \
-  --resolve-s3 \
-  --output-template-file "$packaged_template" \
-  --profile "$profile" \
-  --region "$region"
-aws cloudformation create-change-set \
-  --stack-name "$stack_name" \
-  --change-set-name "$change_set_name" \
-  --change-set-type IMPORT \
-  --template-body "file://$packaged_template" \
-  --resources-to-import \
-    "ResourceType=AWS::EC2::VPCEndpoint,LogicalResourceId=ExecutionDynamoDBGatewayEndpoint,ResourceIdentifier={Id=$dynamodb_endpoint_id}" \
-  --parameters "$stack_parameters" \
-  --capabilities CAPABILITY_IAM \
-  --profile "$profile" \
-  --region "$region"
-aws cloudformation wait change-set-create-complete \
-  --stack-name "$stack_name" \
-  --change-set-name "$change_set_name" \
-  --profile "$profile" \
-  --region "$region"
-aws cloudformation describe-change-set \
-  --stack-name "$stack_name" \
-  --change-set-name "$change_set_name" \
-  --query '[Status,ExecutionStatus,Changes[].[ResourceChange.Action,ResourceChange.LogicalResourceId,ResourceChange.ResourceType]]' \
+  --subnet-ids "$gateway_subnet_id" "$lambda_subnet_id" \
+  --query 'Subnets[].[SubnetId,VpcId,AvailabilityZone,CidrBlock,Ipv6CidrBlockAssociationSet]' \
   --output json \
-  --profile "$profile" \
-  --region "$region"
+  --profile dev \
+  --region ca-central-1
+aws ec2 describe-vpc-attribute \
+  --vpc-id "$vpc_id" \
+  --attribute enableDnsSupport \
+  --profile dev \
+  --region ca-central-1
+aws ec2 describe-vpc-attribute \
+  --vpc-id "$vpc_id" \
+  --attribute enableDnsHostnames \
+  --profile dev \
+  --region ca-central-1
+aws ec2 describe-route-tables \
+  --route-table-ids "$lambda_route_table_id" \
+  --query 'RouteTables[0].[RouteTableId,VpcId,Associations,Routes]' \
+  --output json \
+  --profile dev \
+  --region ca-central-1
+aws ec2 describe-egress-only-internet-gateways \
+  --filters "Name=attachment.vpc-id,Values=$vpc_id" \
+  --output json \
+  --profile dev \
+  --region ca-central-1
+aws ec2 describe-network-acls \
+  --filters "Name=association.subnet-id,Values=$lambda_subnet_id" \
+  --output json \
+  --profile dev \
+  --region ca-central-1
 ```
 
-Do not execute unless the change set is `CREATE_COMPLETE` and `AVAILABLE` and
-contains exactly one change: `Import`, `ExecutionDynamoDBGatewayEndpoint`,
-`AWS::EC2::VPCEndpoint`. Delete the change set and investigate if anything else
-appears. Once that exact check passes, execute it and verify the stack and
-resource ownership before returning to `wireguard-gateway-setup.sh`:
+If the selected VPC does not yet have IPv6, allocation is an operator-side
+address-plan decision. One possible AWS-provided allocation starts with:
 
 ```sh
-aws cloudformation execute-change-set \
-  --stack-name "$stack_name" \
-  --change-set-name "$change_set_name" \
-  --profile "$profile" \
-  --region "$region"
-aws cloudformation wait stack-import-complete \
-  --stack-name "$stack_name" \
-  --profile "$profile" \
-  --region "$region"
-aws cloudformation describe-stacks \
-  --stack-name "$stack_name" \
-  --query 'Stacks[0].StackStatus' \
-  --output text \
-  --profile "$profile" \
-  --region "$region"
-aws cloudformation describe-stack-resource \
-  --stack-name "$stack_name" \
-  --logical-resource-id ExecutionDynamoDBGatewayEndpoint \
-  --query 'StackResourceDetail.[ResourceStatus,PhysicalResourceId]' \
-  --output text \
-  --profile "$profile" \
-  --region "$region"
+aws ec2 associate-vpc-cidr-block \
+  --vpc-id "$vpc_id" \
+  --amazon-provided-ipv6-cidr-block \
+  --profile dev \
+  --region ca-central-1
 ```
 
-The stack status must be `IMPORT_COMPLETE`, and the resource's physical ID must
-equal the session's legacy endpoint ID. The resource status may subsequently
-become `UPDATE_COMPLETE` when CloudFormation applies stack-level tags to the
-imported endpoint; the successful stack import and physical-ID mapping are the
-decisive checks. Remove both temporary templates only after verification:
+Wait for that association to become active, select one unused `/64` from it,
+and associate that exact block with the Lambda subnet:
 
 ```sh
-rm -f -- "$import_source_template" "$packaged_template"
+lambda_subnet_ipv6_cidr='<unused-vpc-ipv6-subnet-cidr/64>'
+aws ec2 associate-subnet-cidr-block \
+  --subnet-id "$lambda_subnet_id" \
+  --ipv6-cidr-block "$lambda_subnet_ipv6_cidr" \
+  --profile dev \
+  --region ca-central-1
 ```
 
-Then rerun `wireguard-gateway-setup.sh` with the same network inputs.
-That normal deployment adds `ExecutionDynamoDBGatewayEndpointId` to the stack
-outputs; adding it was intentionally deferred because outputs cannot change
-during the import operation.
+Do not run those mutations against a shared VPC until its address plan and
+routing consumers have been reviewed. If DNS attributes are disabled, enable
+them as a separate, operator-approved VPC change. The helper intentionally
+fails rather than altering these shared settings.
+
+For a new dedicated Lambda subnet, select unused IPv4 and IPv6 CIDRs in the
+gateway subnet's availability zone, disable automatic public IPv4 assignment,
+create a dedicated route table, and explicitly associate it. Keep the returned
+subnet, route-table, and association IDs in the operator session. The helper
+can discover the effective route table, but explicit topology makes ownership
+and later cleanup easier to audit.
+
+On first enablement, the deployment creates the stack-owned EIGW and adds
+`ExecutionSqsIpv6Route` with destination `::/0` to the supplied route table.
+A VPC supports only one EIGW, so an existing unmanaged EIGW is a hard conflict;
+there is no EIGW-ID template parameter and no import workflow. SAM also adds
+the separate `10.200.0.0/24` route for TigerBeetle. It does not remove or
+alter any operator-owned NAT route, internet-gateway route, VPC/subnet IPv6
+association, or unrelated route.
+
+After disabling or deleting the stack, the supplied VPC, subnets, route table,
+route-table association, IPv6 allocations, DNS settings, and network ACL
+remain. Delete a dedicated external subnet or route table only as a separate
+operator action after verifying that execution and all other workloads are
+detached. Never remove a shared IPv6 association merely because this stack was
+torn down.
+
+### SQS egress security and cost tradeoff
+
+Execution's Completion `SendMessage` call uses outbound-only public IPv6 HTTPS
+through the EIGW. The security group allows TCP/443 to `::/0`, so the network
+boundary is broader than PrivateLink's private-only reachability and endpoint
+policy. The execution role's queue-scoped `sqs:SendMessage` permission is the
+service authorization boundary. The demo accepts that tradeoff to avoid an SQS
+interface endpoint and its fixed hourly and data-processing charges. No SQS
+interface endpoint, endpoint security group, private-DNS setting, or endpoint
+policy is part of this design.
+
+An EIGW has no fixed hourly or processing charge, unlike an SQS interface
+endpoint or NAT Gateway. Ordinary AWS charges still apply, including data
+transfer where applicable, SQS requests, Lambda, the EC2 WireGuard gateway,
+and its public IPv4/Elastic IP.
 
 ### Create the workstation key
 
@@ -1009,6 +999,7 @@ sam deploy --guided \
     IntakeFunctionName="$intake_function_name" \
     QueryFunctionName=query-lambda \
     ExecutionFunctionName=execution-lambda \
+    CompletionFunctionName=completion-lambda \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -1021,6 +1012,7 @@ AWS Region: ca-central-1
 Parameter IntakeFunctionName: <existing-physical-name-or-intake-lambda>
 Parameter QueryFunctionName: query-lambda
 Parameter ExecutionFunctionName: execution-lambda
+Parameter CompletionFunctionName: completion-lambda
 Parameter LambdaPrincipal: *
 Parameter PasetoPublicKey: <public-key-from-keygen>
 Confirm changes before deploy: Y
@@ -1060,6 +1052,7 @@ sam deploy \
     IntakeFunctionName="$intake_function_name" \
     QueryFunctionName=query-lambda \
     ExecutionFunctionName=execution-lambda \
+    CompletionFunctionName=completion-lambda \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -1071,8 +1064,9 @@ permissions too early. Use `wireguard-gateway-setup.sh --disable` for disablemen
 its two phases with `RetainExecutionVpcCleanupResources=true`, a verified wait
 for zero VPC-configured Lambda versions and zero ENIs on the retained security
 group, both `VpcId` and `LambdaRouteTableId` preserved, then
-`RetainExecutionVpcCleanupResources=false`. This keeps the endpoint until the
-final phase. Direct SAM commands also do not perform setup-script subnet
+`RetainExecutionVpcCleanupResources=false`. This keeps the EIGW, IPv6 route,
+execution security group, and ENI-management permission until the final phase.
+Direct SAM commands also do not perform setup-script subnet
 discovery, SSM generation, or enabled-stack reuse.
 To enable the gateway in guided mode, supply every opt-in parameter. Use the
 variables populated by the manual key workflow above and replace only the
@@ -1088,6 +1082,7 @@ sam deploy --guided \
     IntakeFunctionName="$intake_function_name" \
     QueryFunctionName=query-lambda \
     ExecutionFunctionName=execution-lambda \
+    CompletionFunctionName=completion-lambda \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY" \
     EnableWireGuardGateway=true \
@@ -1119,6 +1114,7 @@ sam deploy \
     IntakeFunctionName="$intake_function_name" \
     QueryFunctionName=query-lambda \
     ExecutionFunctionName=execution-lambda \
+    CompletionFunctionName=completion-lambda \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY" \
     EnableWireGuardGateway=true \
@@ -1166,6 +1162,18 @@ EXECUTION_FUNCTION_NAME='<execution-function-name>' ./deploy.sh
 ./deploy.sh --execution-function-name '<execution-function-name>'
 ```
 
+Override the completion function name in the same way:
+
+```sh
+COMPLETION_FUNCTION_NAME='<completion-function-name>' ./deploy.sh
+./deploy.sh --completion-function-name '<completion-function-name>'
+```
+
+When an existing stack uses a nondefault completion name, also export
+`COMPLETION_FUNCTION_NAME` for every `wireguard-gateway-setup.sh` enable,
+reconfiguration, or disable run so its shared deployment path preserves that
+physical name.
+
 `wireguard-gateway-setup.sh` resolves each gateway value from CLI, then
 environment, then a previously enabled stack, then SSM/default discovery.
 Enablement is implicit. Assuming the PASETO variables above remain set, the
@@ -1179,12 +1187,12 @@ WIREGUARD_WORKSTATION_PUBLIC_KEY="$wireguard_workstation_public_key" \
 
 The helper considers available IPv4 subnets. A gateway candidate has an active
 internet-gateway default route. A Lambda candidate is distinct and in the same
-VPC and availability zone; it does not need NAT or a pre-existing endpoint.
-Its effective route table must be eligible for the stack-managed endpoint.
-Neither subnet may overlap `10.200.0.0/24`. An explicit VPC or one subnet
+VPC and availability zone; it does not need NAT. Its effective route table
+must be eligible for stack-owned IPv6 and WireGuard routes. Neither subnet may
+overlap `10.200.0.0/24`. An explicit VPC or one subnet
 narrows the search. Each constrained subnet is inspected once. If no pair
 remains, the helper prints rejection counts for gateway routing, Lambda
-endpoint management, CIDR overlap, subnet identity, VPC, and availability
+route management, CIDR overlap, subnet identity, VPC, and availability
 zone. AWS API or malformed-response failures are reported separately instead
 of being counted as topology rejections. If multiple pairs remain, the helper
 prints every pair and a specific ambiguity error. Use the reported IDs to
@@ -1225,15 +1233,16 @@ Explicit teardown is:
 
 The detach phase sets
 `RetainExecutionVpcCleanupResources=true`, removing the gateway, Elastic IP,
-route, related resources, and execution VPC attachment while retaining the
-stack-managed DynamoDB endpoint, execution security group, and ENI-deletion
-permission. The helper passes both `VpcId` and `LambdaRouteTableId` during this
-phase, then polls for up to 20 minutes until the current function and every
-published version have an empty VPC configuration and no ENI references the
-retained security group. The cleanup phase sets
+`10.200.0.0/24` route, and related resources, and detaching execution from the
+VPC. It retains the stack-owned EIGW, `::/0` route, execution security group,
+required `VpcId` and `LambdaRouteTableId` values, and ENI-deletion permission.
+The helper then polls for up to 20 minutes until the current function and every
+published version have an empty VPC configuration and no Lambda-created ENI
+references the retained security group. The cleanup phase sets
 `RetainExecutionVpcCleanupResources=false` only after those checks pass,
-removing the endpoint and its prefix-list route before the retained group and
-permission disappear. A timeout stops before cleanup; a later
+removing the IPv6 route, EIGW, retained group, and ENI permission. An EIGW has
+no endpoint ENIs, so there is no endpoint-ENI wait branch. A timeout stops
+before cleanup; a later
 `wireguard-gateway-setup.sh --disable` run recognizes the retained phase and
 resumes the same guarded wait. Both external
 SSM parameters remain operator-owned. After teardown, a later enablement
@@ -1245,13 +1254,18 @@ address list; the setup script also validates gateway syntax. Set
 `TIGERBEETLE_CLUSTER_ID` and `TIGERBEETLE_ADDRESSES`, or pass
 `--tigerbeetle-cluster-id` and
 `--tigerbeetle-addresses`, to override their defaults. A non-dry-run
-setup discovers and verifies the topology, including DynamoDB endpoint
-creation eligibility or stack ownership, checks for a conflicting
-`10.200.0.0/24` route, and reads SSM parameter metadata without decrypting the
-private value. A legacy unmanaged endpoint triggers the import procedure above;
-shared, unavailable, duplicate-route, custom-policy, or mismatched endpoints
-are rejected. `--dry-run` performs no AWS discovery or key creation and reports
-that gateway preflight is deferred.
+setup discovers and verifies the topology. It checks the VPC and subnet IPv6
+associations, VPC DNS attributes, effective route table, `10.200.0.0/24` and
+`::/0` route conflicts, first-enable EIGW conflicts or current stack ownership,
+network-ACL behavior, and regional SQS dual-stack availability. Reconfiguration
+and cleanup also verify that the retained EIGW and IPv6 route belong to the
+current stack. The SQS availability probe requires `sqs:ListQueues`. Preflight
+reads SSM parameter metadata without decrypting the private value. It rejects
+plainly incompatible or malformed state and warns when an ordered network ACL
+needs operator review. The ACL parser recognizes AWS's implicit IPv6 terminal
+deny at rule number `32768` while rejecting other out-of-range rule shapes.
+`--dry-run` performs no AWS discovery or key creation and reports that gateway
+preflight is deferred.
 
 `deploy.sh` reads the required `PASETO_PUBLIC_KEY` from the host environment and
 passes it as the `PasetoPublicKey` SAM parameter. When post-deploy checks are
@@ -1262,7 +1276,7 @@ tenant-safe 404, authenticated wrong methods return 405, and an authenticated
 bodyless intake POST returns 400. The private key and test token are not printed
 or passed to the Lambda environment. Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run` to run the
-local checks, rebuild all three Lambda zip archives, and validate `template.yaml` without
+local checks, rebuild all four Lambda zip archives, and validate `template.yaml` without
 deploying to AWS.
 
 For non-dry-run deployments, the helper clears inherited static AWS credential
@@ -1289,6 +1303,30 @@ billing, has only the `id` string partition key, and has no local or global
 secondary indexes. It then resolves the `OperationsQueue` physical resource and calls
 `GetQueueAttributes` to print a concise SQS summary. This probe verifies that
 the deployed queue can be queried but does not enforce SQS attribute values.
+Resolve and inspect `CompletionQueue` separately when verifying the complete
+deployment:
+
+```sh
+completion_queue_url="$(
+  aws cloudformation describe-stack-resource \
+    --stack-name aws-lambda-zig-demo \
+    --logical-resource-id CompletionQueue \
+    --query StackResourceDetail.PhysicalResourceId \
+    --output text \
+    --profile dev \
+    --region ca-central-1
+)"
+aws sqs get-queue-attributes \
+  --queue-url "$completion_queue_url" \
+  --attribute-names QueueArn VisibilityTimeout MessageRetentionPeriod \
+  --output json \
+  --profile dev \
+  --region ca-central-1
+```
+
+Its `VisibilityTimeout` must be `90`. The queue has no public stack output;
+resolve its physical URL when needed instead of recording it.
+
 After a successful enablement, the setup script resolves and validates the
 gateway endpoint, gateway public key, workstation address, and deployed Lambda
 subnet CIDR. It then prints the conditional network outputs and a delimited,
@@ -1312,12 +1350,13 @@ QueryFunctionArn
 QueryFunctionUrl
 ExecutionFunctionName
 ExecutionFunctionArn
+CompletionFunctionName
+CompletionFunctionArn
 ```
 
 An enabled deployment also emits these conditional outputs:
 
 ```text
-ExecutionDynamoDBGatewayEndpointId
 WireGuardGatewayInstanceId
 WireGuardGatewayElasticIp
 WireGuardGatewayEndpoint
@@ -1344,13 +1383,14 @@ the repository:
 ```sh
 aws cloudformation describe-stacks \
   --stack-name aws-lambda-zig-demo \
-  --query "Stacks[0].Outputs[?OutputKey=='ExecutionDynamoDBGatewayEndpointId' || OutputKey=='WireGuardGatewayInstanceId' || OutputKey=='WireGuardGatewayElasticIp' || OutputKey=='WireGuardGatewayEndpoint' || OutputKey=='WireGuardGatewayPublicKey' || OutputKey=='WireGuardGatewayAddress' || OutputKey=='WireGuardWorkstationAddress' || OutputKey=='TigerBeetleEndpoint'].[OutputKey,OutputValue]" \
+  --query "Stacks[0].Outputs[?OutputKey=='WireGuardGatewayInstanceId' || OutputKey=='WireGuardGatewayElasticIp' || OutputKey=='WireGuardGatewayEndpoint' || OutputKey=='WireGuardGatewayPublicKey' || OutputKey=='WireGuardGatewayAddress' || OutputKey=='WireGuardWorkstationAddress' || OutputKey=='TigerBeetleEndpoint'].[OutputKey,OutputValue]" \
   --output table \
   --profile dev \
   --region ca-central-1
 ```
 
-`lambda_logs.sh` resolves the explicit intake, query, or execution function-name output.
+`lambda_logs.sh` resolves the explicit intake, query, execution, or completion
+function-name output.
 `persistence.sh` and `queue.sh` resolve the `OperationsTable` and
 `OperationsQueue` physical resources directly because those data-plane names
 are intentionally not public stack outputs. Normal local command use does not
@@ -1392,58 +1432,63 @@ socket that includes the WireGuard interface; binding only to loopback or a
 different local interface is insufficient. The gateway performs routing, not
 NAT.
 
-### Check the DynamoDB endpoint and routes
+### Check the IPv6 SQS egress and routes
 
-Resolve the endpoint output and verify CloudFormation ownership, endpoint
-state, exclusive route-table association, the AWS-managed DynamoDB prefix-list
-route, and the unchanged WireGuard route:
+Resolve the stack-owned EIGW and verify its CloudFormation status, VPC
+attachment, active `::/0` route, unchanged WireGuard route, and execution
+dual-stack configuration:
 
 ```sh
-dynamodb_endpoint_id="$(
-  aws cloudformation describe-stacks \
+eigw_id="$(
+  aws cloudformation describe-stack-resource \
     --stack-name aws-lambda-zig-demo \
-    --query "Stacks[0].Outputs[?OutputKey=='ExecutionDynamoDBGatewayEndpointId'].OutputValue | [0]" \
+    --logical-resource-id ExecutionEgressOnlyInternetGateway \
+    --query StackResourceDetail.PhysicalResourceId \
     --output text \
     --profile dev \
     --region ca-central-1
 )"
 lambda_route_table_id='<lambda-route-table-id>'
+execution_function_name='<execution-function-name>'
 
-aws cloudformation describe-stack-resource \
+aws cloudformation describe-stack-resources \
   --stack-name aws-lambda-zig-demo \
-  --logical-resource-id ExecutionDynamoDBGatewayEndpoint \
-  --query 'StackResourceDetail.[ResourceStatus,PhysicalResourceId]' \
-  --output text \
-  --profile dev \
-  --region ca-central-1
-aws ec2 describe-vpc-endpoints \
-  --vpc-endpoint-ids "$dynamodb_endpoint_id" \
-  --query 'VpcEndpoints[0].[State,VpcId,ServiceName,VpcEndpointType,RouteTableIds]' \
+  --query "StackResources[?LogicalResourceId=='ExecutionEgressOnlyInternetGateway' || LogicalResourceId=='ExecutionSqsIpv6Route'].[LogicalResourceId,ResourceStatus,PhysicalResourceId]" \
   --output table \
   --profile dev \
   --region ca-central-1
-aws ec2 describe-route-tables \
-  --route-table-ids "$lambda_route_table_id" \
-  --query "RouteTables[0].Routes[?VpcEndpointId=='$dynamodb_endpoint_id'].[DestinationPrefixListId,VpcEndpointId,State]" \
-  --output table \
+aws ec2 describe-egress-only-internet-gateways \
+  --egress-only-internet-gateway-ids "$eigw_id" \
+  --query 'EgressOnlyInternetGateways[0].[EgressOnlyInternetGatewayId,Attachments]' \
+  --output json \
   --profile dev \
   --region ca-central-1
 aws ec2 describe-route-tables \
   --route-table-ids "$lambda_route_table_id" \
-  --query "RouteTables[0].Routes[?DestinationCidrBlock=='10.200.0.0/24'].[DestinationCidrBlock,InstanceId,State]" \
+  --query "RouteTables[0].Routes[?DestinationIpv6CidrBlock=='::/0' || DestinationCidrBlock=='10.200.0.0/24'].[DestinationIpv6CidrBlock,DestinationCidrBlock,EgressOnlyInternetGatewayId,InstanceId,State,Origin]" \
   --output table \
+  --profile dev \
+  --region ca-central-1
+aws lambda get-function-configuration \
+  --function-name "$execution_function_name" \
+  --query '[VpcConfig,Environment.Variables.AWS_USE_DUALSTACK_ENDPOINT]' \
+  --output json \
+  --profile dev \
+  --region ca-central-1
+AWS_USE_DUALSTACK_ENDPOINT=true aws sqs list-queues \
+  --max-results 1 \
   --profile dev \
   --region ca-central-1
 ```
 
-The CloudFormation status must be `CREATE_COMPLETE` or `IMPORT_COMPLETE`; the
-physical ID must match the output. The endpoint must be `available`, use the
-regional DynamoDB service and `Gateway` type, and list only
-`lambda_route_table_id`. Its route must be `active` and target the endpoint.
-The `10.200.0.0/24` route must still target the WireGuard instance. With no NAT
-default route, complete one normal execution operation while TigerBeetle is
-reachable and confirm its DynamoDB update succeeds.
-
+Both CloudFormation resources must have a complete status. The EIGW must have
+one attached association to the selected VPC. The `::/0` route must be active,
+created by `CreateRoute`, and target that EIGW; the `10.200.0.0/24` route
+must still target the WireGuard instance. Execution's VPC configuration must
+show `Ipv6AllowedForDualStack: true`, and its environment must show
+`AWS_USE_DUALSTACK_ENDPOINT=true`. The SQS probe confirms regional dual-stack
+endpoint availability with the operator's identity; it does not expand the
+execution role.
 ### Check the instance and tunnel
 
 Resolve the instance ID, wait for both EC2 status checks, and confirm that the
@@ -1577,7 +1622,7 @@ aws ec2 wait instance-status-ok \
 | EC2 reaches neither `10.200.0.2` nor TCP/3000 | Check workstation WireGuard state, local routes, and its firewall before checking AWS. |
 | EC2 reaches `10.200.0.2`, but not TCP/3000 | Permit TCP/3000 from `LambdaSubnetCidr` and make TigerBeetle listen on `10.200.0.2:3000` or an inclusive bind address. |
 | EC2 works, but Lambda cannot reach the overlay | Confirm the `10.200.0.0/24` VPC route, `SourceDestCheck=false`, execution VPC attachment, and TCP/3000 security-group egress. |
-| Execution loses DynamoDB access after VPC attachment | Confirm `ExecutionDynamoDBGatewayEndpoint` is `CREATE_COMPLETE`, `IMPORT_COMPLETE`, or `UPDATE_COMPLETE`, the endpoint is `available`, and its regional DynamoDB prefix-list route targets the endpoint from `LambdaRouteTableId`. |
+| Execution cannot publish Completion messages after VPC attachment | Confirm the VPC/subnet IPv6 associations and DNS attributes, the stack-owned EIGW and active `::/0` route, `Ipv6AllowedForDualStack=true`, `AWS_USE_DUALSTACK_ENDPOINT=true`, IPv6 TCP/443 security-group egress, the network ACL response path, and regional SQS dual-stack availability. |
 | SSM registration or bootstrap fails | Check gateway-subnet internet routing, the instance role, `cloud-init` logs, and the exact SSM parameter name/version. The role can read only that parameter. |
 
 ### Rotate WireGuard keys
@@ -1652,7 +1697,8 @@ The workstation-initiated handshake, routed TCP/3000 connection, execution
 Lambda VPC attachment, reboot recovery, and key rotation are cloud acceptance
 checks and remain unexecuted until an operator explicitly authorizes and runs
 the deployment. Once deployed, a queued valid Operation exercises a real
-TigerBeetle account request and transfer request before DynamoDB completion.
+TigerBeetle account request and transfer request, Completion queue publication,
+and the completion Lambda's DynamoDB update.
 
 ## 8. Test query GET and intake POST
 
@@ -1743,13 +1789,22 @@ different verified subject returns the static `409 Conflict` response.
 
 Delivery is at least once. The standard queue, acknowledgement loss, and
 concurrent `SUBMITTED` retries can create duplicate messages. Consumers must use the
-Operation ID and hash idempotently. Execution conditionally completes only a
-matching `SUBMITTED` item with no stored result after the replay-safe
-TigerBeetle account and transfer sequence. It acknowledges invalid records,
-persisted definitive TigerBeetle rejections, and DynamoDB conditional
-conflicts. TigerBeetle client/request uncertainty and DynamoDB service
-uncertainty return that message ID as a partial-batch failure and leave the
-Operation submitted without a result.
+Operation ID and hash idempotently. Execution performs the replay-safe
+TigerBeetle account and transfer sequence, aggregates terminal ID/result
+entries, and acknowledges represented Operations records only after the one
+Completion message is published. Invalid Operations records are acknowledged;
+TigerBeetle uncertainty retries only the affected Operations record, and
+publication uncertainty retries every record represented by the aggregate.
+
+Completion receives one aggregate message per invocation and applies its
+entries sequentially. It conditionally updates only the item selected by the
+canonical ID while its stored state is `SUBMITTED`. Duplicate or stale entries
+become acknowledged conflicts without changing the stored result. A malformed
+entry with a trustworthy canonical ID becomes a deterministic failure result;
+one without such an ID is acknowledged without a write. Transient DynamoDB or
+allocation uncertainty retries the one Completion message. On partial replay,
+earlier successful writes conflict safely and later entries are still reached;
+new writes use their actual write-time timestamp and TTL.
 
 ## 9. Download Lambda logs
 
@@ -1759,11 +1814,13 @@ Run the stack-aware log helper with an explicit Lambda selection:
 ./lambda_logs.sh intake
 ./lambda_logs.sh query
 ./lambda_logs.sh execution
+./lambda_logs.sh completion
 ```
 
 The stack name is fixed as `aws-lambda-zig-demo`. The helper resolves
-`IntakeFunctionName`, `QueryFunctionName`, or `ExecutionFunctionName` and writes a root-level file named
-after that function, such as `intake-lambda.log`. It uses only the standard
+`IntakeFunctionName`, `QueryFunctionName`, `ExecutionFunctionName`, or
+`CompletionFunctionName` and writes a root-level file named after that
+function, such as `intake-lambda.log`. It uses only the standard
 `AWS_PROFILE` and `AWS_REGION` environment variables, defaulting to `dev` and
 `ca-central-1`:
 
@@ -1869,8 +1926,8 @@ The caller running `persistence.sh` needs `dynamodb:GetItem`,
 `dynamodb:PutItem`, and `dynamodb:UpdateItem` permissions for the table, plus
 `cloudformation:DescribeStackResource` to resolve the table resource. Its `delete-all`
 command additionally needs `dynamodb:Scan` and `dynamodb:DeleteItem`. The
-Lambda execution role's inline policy does not grant these permissions to the
-local AWS identity.
+Lambda roles do not grant these permissions to the local AWS identity;
+execution itself has no DynamoDB permissions.
 
 ### Troubleshoot persistence command configuration
 
@@ -1912,12 +1969,19 @@ A nonexistent table, missing `GetItem` permission, or DynamoDB service failure
 is discovered by the first authenticated `GET /<uuid>` and returns a sanitized
 HTTP 503. A malformed stored item returns a sanitized HTTP 500.
 
-The execution Lambda requires `OPERATIONS_TABLE_NAME`,
+The execution Lambda requires `COMPLETION_QUEUE_URL`,
 `TIGERBEETLE_CLUSTER_ID`, and `TIGERBEETLE_ADDRESSES`. Missing or invalid
-settings exit during execution INIT. A nonexistent table, missing `UpdateItem`
-permission, or DynamoDB service failure is discovered during a record
-completion attempt. Execution logs that failure, continues the batch, and
-requests a retry for that record in the partial-batch response.
+settings exit during execution INIT. A syntactically valid but nonexistent
+Completion queue, missing `SendMessage` permission, or SQS service failure is
+discovered when execution publishes its aggregate. Execution logs that
+failure and requests retries for all Operations records represented by the
+unsent message.
+
+The completion Lambda requires only `OPERATIONS_TABLE_NAME`. A missing or
+invalid table-name setting exits during completion INIT. A nonexistent table,
+missing `UpdateItem` permission, or DynamoDB service failure is discovered
+while processing a Completion entry. Completion logs the failure, stops that
+aggregate, and requests a retry for the invocation's single SQS message.
 
 ## 11. Send, receive, and check queued Operations
 
@@ -1983,7 +2047,9 @@ The caller needs these queue-scoped permissions for the commands it uses:
 
 `queue.sh` also needs `cloudformation:DescribeStackResource`. These local caller
 permissions are independent of the Lambda roles. Intake remains send-only for SQS, execution has
-queue-scoped polling permissions, and query has no SQS permissions.
+Operations queue-scoped polling and Completion queue-scoped send permissions,
+completion has Completion queue-scoped polling permissions, and query has no
+SQS permissions.
 
 If `sqs: missing or invalid configuration` is emitted, the local command
 implementation could not load its AWS settings. `queue.sh` supplies the
@@ -2001,6 +2067,7 @@ zig build --release -Darch=arm
 zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
 zip -qj query-lambda.zip zig-out/bin/query/bootstrap
 zip -qj execution-lambda.zip zig-out/bin/execution/bootstrap
+zip -qj completion-lambda.zip zig-out/bin/completion/bootstrap
 ```
 
 Then redeploy the stack:
@@ -2009,12 +2076,26 @@ Then redeploy the stack:
 sam deploy --profile dev --region ca-central-1
 ```
 
-SAM uploads all three packages and updates their CloudFormation-managed Lambda functions.
+SAM uploads all four packages and updates their CloudFormation-managed Lambda functions.
 
 ## 13. Delete the SAM stack
 
-To remove all three SAM-managed functions, roles, the operations table and
-queue, Function URLs, permissions, and any enabled gateway resources:
+If the WireGuard gateway is enabled or retained cleanup is in progress, first
+run the guarded disable flow:
+
+```sh
+./wireguard-gateway-setup.sh --disable
+```
+
+This detaches execution, waits for every published version and Lambda-created
+ENI to release the retained security group, then removes the stack-owned EIGW,
+IPv6 route, security group, and ENI-management IAM before clearing saved
+gateway inputs. A timed-out run leaves those resources retained; rerun the
+same command to resume. Do not replace this sequence with direct deletion of
+an enabled stack.
+
+Then remove all four SAM-managed functions and roles, the operations table,
+both queues, Function URLs, permissions, and any remaining stack resources:
 
 ```sh
 sam delete \
@@ -2027,15 +2108,17 @@ This deletes only resources owned by the SAM stack. The operations table has
 `DeletionPolicy: Delete` and `UpdateReplacePolicy: Delete`, so deleting the
 stack or replacing the table permanently deletes its data. Point-in-time
 recovery is disabled; this demo configuration provides no recovery capability.
-The operations queue uses the same deletion policies, so deleting or replacing
-it permanently deletes any queued messages.
+Both queues use the same deletion policies, so deleting or replacing either
+one permanently deletes its queued messages. Neither has a dead-letter queue
+or another retention/replay resource.
 
-For an enabled deployment, stack deletion also terminates the EC2 gateway,
-releases its Elastic IP, removes the `10.200.0.0/24` route and security groups,
-and deletes the stack-owned launch template, IAM role, and instance profile.
-The gateway private/public SSM parameters are intentionally external and are
-not deleted. The workstation keys and TigerBeetle process and data are also
-workstation-owned and remain untouched.
+The guarded disable terminates the EC2 gateway, releases its Elastic IP,
+removes both stack-owned routes and security groups, and deletes the
+stack-owned EIGW, launch template, IAM role, and instance profile. It never
+deletes the external VPC/subnet IPv6 associations, VPC, subnets, route table,
+network ACL, or DNS configuration. The gateway private/public SSM parameters
+are also intentionally external and are not deleted. The workstation keys and
+TigerBeetle process and data remain workstation-owned and untouched.
 
 After confirming that neither the gateway nor its keys will be reused, the
 operator can explicitly delete both external parameters and securely remove the
@@ -2061,7 +2144,8 @@ This demo intentionally creates two publicly reachable Lambda Function URLs,
 and both Function URL handlers require a valid PASETO bearer token. The
 execution Lambda has no Function URL and is invoked from SQS. For production,
 consider combining application authentication with stricter infrastructure
-authorization, narrower IAM policies, or an API Gateway/CloudFront layer.
+authorization, narrower IAM policies, or an API Gateway/CloudFront layer. The
+completion Lambda also has no Function URL and is invoked from its SQS mapping.
 
 When the gateway is enabled, IPv4 UDP/51820 is deliberately open from
 `0.0.0.0/0` because the NAT public address of the development workstation is
@@ -2071,6 +2155,13 @@ filter increases exposure to UDP scanning and floods and to future kernel or
 WireGuard vulnerabilities. The gateway opens no IPv6 ingress, SSH, public
 TigerBeetle TCP port, or other public ingress. Keep the gateway disabled when
 it is not needed and account for its EC2 and Elastic IP cost while enabled.
+
+Execution's IPv6 TCP/443 egress to `::/0` can reach public IPv6 HTTPS
+destinations; it is not the private-only, endpoint-policy boundary an SQS
+interface endpoint would provide. Queue-scoped IAM limits the function's SQS
+action to `SendMessage` on `CompletionQueue`. The EIGW adds no fixed hourly or
+processing charge, but ordinary data-transfer, SQS, Lambda, EC2, and Elastic
+IP charges still apply.
 
 No private WireGuard key is a CloudFormation parameter, template value, tag,
 log, or stack output. The instance role can read only the configured external

@@ -20,6 +20,14 @@ WIREGUARD_KEY_DIR=""
 WIREGUARD_ACTION=enable
 WIREGUARD_ACTION_EXPLICIT=0
 WIREGUARD_DEPLOYMENT_MODE=enabled
+WIREGUARD_EGRESS_RESOURCES_EXPECTED=0
+WIREGUARD_STACK_VPC_ID=""
+WIREGUARD_STACK_ROUTE_TABLE_ID=""
+WIREGUARD_PRIOR_GATEWAY_ENABLED=false
+WIREGUARD_CLEANUP_VPC_ID=""
+WIREGUARD_CLEANUP_LAMBDA_SUBNET_ID=""
+WIREGUARD_CLEANUP_ROUTE_TABLE_ID=""
+WIREGUARD_PARAMETER_RESET_FILE=""
 DEPLOYMENT_CONTROLLER=wireguard_gateway_controller
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -163,6 +171,129 @@ validate_ipv4_cidr() {
     fi
 }
 
+# AWS emits compressed IPv6 CIDRs. Fixed-width groups make containment checks
+# independent of the textual compression chosen for either allocation.
+normalize_ipv6_cidr() {
+    local cidr="$1"
+    local address prefix prefix_value left right segment normalized_segment
+    local group_index group_value groups_zero_count groups_total
+    local prefix_groups prefix_bits host_mask first_host_group
+    local -a groups_left=() groups_right=() groups=() normalized_groups=()
+
+    case "$cidr" in
+        */*) ;;
+        *) return 1 ;;
+    esac
+    address="${cidr%/*}"
+    prefix="${cidr#*/}"
+    [ -n "$address" ] && [ "$prefix" != "$cidr" ] &&
+        [[ "$address" != */* ]] || return 1
+    [[ "$prefix" =~ ^([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] || return 1
+    [[ "$address" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    prefix_value=$((10#$prefix))
+
+    if [[ "$address" == *::* ]]; then
+        left="${address%%::*}"
+        right="${address#*::}"
+        [[ "$right" != *::* ]] || return 1
+        [ -z "$left" ] || {
+            [[ "$left" != :* && "$left" != *: ]] || return 1
+            IFS=: read -r -a groups_left <<<"$left"
+        }
+        [ -z "$right" ] || {
+            [[ "$right" != :* && "$right" != *: ]] || return 1
+            IFS=: read -r -a groups_right <<<"$right"
+        }
+        groups_total=$((${#groups_left[@]} + ${#groups_right[@]}))
+        [ "$groups_total" -lt 8 ] || return 1
+        groups_zero_count=$((8 - groups_total))
+    else
+        [[ "$address" != :* && "$address" != *: ]] || return 1
+        IFS=: read -r -a groups_left <<<"$address"
+        [ "${#groups_left[@]}" -eq 8 ] || return 1
+        groups_zero_count=0
+    fi
+
+    # Bash 3.2 treats an empty array expansion as unset with nounset enabled.
+    if [ "${#groups_left[@]}" -ne 0 ]; then
+        for segment in "${groups_left[@]}"; do
+            [[ "$segment" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        done
+    fi
+    if [ "${#groups_right[@]}" -ne 0 ]; then
+        for segment in "${groups_right[@]}"; do
+            [[ "$segment" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        done
+    fi
+    groups=()
+    if [ "${#groups_left[@]}" -ne 0 ]; then
+        groups=("${groups_left[@]}")
+    fi
+    for ((group_index = 0; group_index < groups_zero_count; group_index++)); do
+        groups+=(0)
+    done
+    if [ "${#groups_right[@]}" -ne 0 ]; then
+        groups+=("${groups_right[@]}")
+    fi
+    [ "${#groups[@]}" -eq 8 ] || return 1
+
+    for segment in "${groups[@]}"; do
+        group_value=$((16#$segment))
+        printf -v normalized_segment '%04x' "$group_value"
+        normalized_groups+=("$normalized_segment")
+    done
+
+    prefix_groups=$((prefix_value / 16))
+    prefix_bits=$((prefix_value % 16))
+    first_host_group="$prefix_groups"
+    if [ "$prefix_bits" -ne 0 ]; then
+        host_mask=$(((1 << (16 - prefix_bits)) - 1))
+        group_value=$((16#${normalized_groups[$prefix_groups]}))
+        [ $((group_value & host_mask)) -eq 0 ] || return 1
+        first_host_group=$((prefix_groups + 1))
+    fi
+    for ((group_index = first_host_group; group_index < 8; group_index++)); do
+        [ "${normalized_groups[$group_index]}" = 0000 ] || return 1
+    done
+
+    printf '%s' "$prefix_value"
+    printf '|%s' "${normalized_groups[@]}"
+    printf '\n'
+}
+
+ipv6_cidr_contains() {
+    local parent_cidr="$1"
+    local child_cidr="$2"
+    local parent_normalized child_normalized
+    local parent_prefix child_prefix group_index prefix_groups prefix_bits mask
+    local parent_group child_group
+    local -a parent_groups child_groups
+
+    parent_normalized="$(normalize_ipv6_cidr "$parent_cidr")" || return 2
+    child_normalized="$(normalize_ipv6_cidr "$child_cidr")" || return 2
+    IFS='|' read -r parent_prefix parent_groups[0] parent_groups[1] \
+        parent_groups[2] parent_groups[3] parent_groups[4] parent_groups[5] \
+        parent_groups[6] parent_groups[7] <<<"$parent_normalized"
+    IFS='|' read -r child_prefix child_groups[0] child_groups[1] \
+        child_groups[2] child_groups[3] child_groups[4] child_groups[5] \
+        child_groups[6] child_groups[7] <<<"$child_normalized"
+    [ "$child_prefix" -ge "$parent_prefix" ] || return 1
+
+    prefix_groups=$((parent_prefix / 16))
+    prefix_bits=$((parent_prefix % 16))
+    for ((group_index = 0; group_index < prefix_groups; group_index++)); do
+        [ "${parent_groups[$group_index]}" = "${child_groups[$group_index]}" ] ||
+            return 1
+    done
+    if [ "$prefix_bits" -ne 0 ]; then
+        mask=$(((0xFFFF << (16 - prefix_bits)) & 0xFFFF))
+        parent_group=$((16#${parent_groups[$prefix_groups]}))
+        child_group=$((16#${child_groups[$prefix_groups]}))
+        [ $((parent_group & mask)) -eq $((child_group & mask)) ] || return 1
+    fi
+    return 0
+}
+
 validate_wireguard_gateway_syntax() {
     case "$ENABLE_WIREGUARD_GATEWAY" in
         0) return 0 ;;
@@ -238,27 +369,34 @@ validate_wireguard_gateway_configuration() {
 effective_route_table_id() {
     local subnet_id="$1"
     local vpc_id="$2"
-    local route_table_id
+    local route_table_ids route_table_id route_table_count=0
 
-    route_table_id="$(aws ec2 describe-route-tables \
+    route_table_ids="$(aws ec2 describe-route-tables \
         --filters "Name=association.subnet-id,Values=$subnet_id" \
-        --query 'RouteTables[0].RouteTableId' \
+        --query 'RouteTables[].RouteTableId' \
         --output text \
         --region "$REGION")" || return 1
-    case "$route_table_id" in
+    case "$route_table_ids" in
         "" | None)
-            route_table_id="$(aws ec2 describe-route-tables \
+            route_table_ids="$(aws ec2 describe-route-tables \
                 --filters \
                 "Name=vpc-id,Values=$vpc_id" \
                 "Name=association.main,Values=true" \
-                --query 'RouteTables[0].RouteTableId' \
+                --query 'RouteTables[].RouteTableId' \
                 --output text \
                 --region "$REGION")" || return 1
             ;;
     esac
-    case "$route_table_id" in
+    case "$route_table_ids" in
         "" | None) return 1 ;;
     esac
+
+    for route_table_id in $route_table_ids; do
+        [[ "$route_table_id" =~ ^rtb-([0-9a-f]{8}|[0-9a-f]{17})$ ]] || return 1
+        route_table_count=$((route_table_count + 1))
+        [ "$route_table_count" -eq 1 ] || return 1
+    done
+    [ "$route_table_count" -eq 1 ] || return 1
     printf '%s\n' "$route_table_id"
 }
 
@@ -319,27 +457,12 @@ load_prior_wireguard_configuration() {
     printf '==> Reused unspecified WireGuard values from the enabled stack\n'
 }
 
-dynamodb_gateway_endpoint_ids_for_route_table() {
-    local route_table_id="$1"
-    local vpc_id="$2"
-
-    aws ec2 describe-vpc-endpoints \
-        --filters \
-        "Name=vpc-id,Values=$vpc_id" \
-        "Name=service-name,Values=com.amazonaws.$REGION.dynamodb" \
-        --query "VpcEndpoints[?contains(RouteTableIds, '$route_table_id')].VpcEndpointId" \
-        --output text \
-        --region "$REGION"
-}
-
 inspect_wireguard_subnet() {
     local subnet_id="$1"
     local vpc_id="$2"
     local availability_zone="$3"
     local cidr="$4"
-    local inspect_dynamodb="$5"
-    local cidr_overlaps=0 route_table_id gateway_id=None endpoint_ids endpoint_id
-    local endpoint_count=0 endpoint_manageable=0
+    local cidr_overlaps=0 route_table_id gateway_id=None
 
     if ipv4_cidr_overlaps_wireguard "$cidr"; then
         cidr_overlaps=1
@@ -370,46 +493,16 @@ inspect_wireguard_subnet() {
             return 1
         }
         gateway_id="${gateway_id:-None}"
-
-        if [ "$inspect_dynamodb" -eq 1 ]; then
-            endpoint_ids="$(dynamodb_gateway_endpoint_ids_for_route_table \
-                "$route_table_id" \
-                "$vpc_id")" || {
-                printf 'AWS inspection failed: could not inspect DynamoDB endpoints for subnet %s\n' \
-                    "$subnet_id" >&2
-                return 1
-            }
-            case "$endpoint_ids" in
-                "" | None) ;;
-                *)
-                    for endpoint_id in $endpoint_ids; do
-                        [[ "$endpoint_id" =~ ^vpce-([0-9a-f]{8}|[0-9a-f]{17})$ ]] || {
-                            printf 'AWS inspection failed: invalid DynamoDB endpoint ID for subnet %s\n' \
-                                "$subnet_id" >&2
-                            return 1
-                        }
-                        endpoint_count=$((endpoint_count + 1))
-                    done
-                    ;;
-            esac
-            [ "$endpoint_count" -le 1 ] || {
-                printf 'AWS inspection failed: route table %s has more than one DynamoDB gateway endpoint route\n' \
-                    "$route_table_id" >&2
-                return 1
-            }
-            endpoint_manageable=1
-        fi
     fi
 
-    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    printf '%s|%s|%s|%s|%s|%s|%s\n' \
         "$subnet_id" \
         "$vpc_id" \
         "$availability_zone" \
         "$cidr" \
         "$cidr_overlaps" \
         "${route_table_id:-None}" \
-        "$gateway_id" \
-        "$endpoint_manageable"
+        "$gateway_id"
 }
 
 print_wireguard_candidates() {
@@ -444,14 +537,14 @@ discover_wireguard_network() {
     local requested_lambda_cidr="$LAMBDA_SUBNET_CIDR"
     local requested_lambda_route_table_id="$LAMBDA_ROUTE_TABLE_ID"
     local subnets candidate inspected_subnet
-    local subnet_id subnet_vpc_id subnet_az subnet_cidr subnet_cidr_overlaps
-    local subnet_route_table_id subnet_gateway_id subnet_endpoint_manageable
+    local subnet_id subnet_vpc_id subnet_az subnet_cidr subnet_extra
+    local subnet_cidr_overlaps subnet_route_table_id subnet_gateway_id
     local gateway_id gateway_vpc_id gateway_az gateway_cidr gateway_route_table_id
     local lambda_id lambda_vpc_id lambda_az lambda_cidr lambda_route_table_id
     local resolved_gateway_id resolved_lambda_id resolved_vpc_id resolved_az
     local resolved_lambda_cidr resolved_lambda_route_table_id
     local gateway_allowed lambda_allowed
-    local rejection_gateway_routing=0 rejection_lambda_endpoint=0
+    local rejection_gateway_routing=0
     local rejection_cidr_overlap=0 rejection_subnet_identity=0
     local rejection_vpc=0 rejection_availability_zone=0
     local -a candidates=()
@@ -470,8 +563,12 @@ discover_wireguard_network() {
         --output text \
         --region "$REGION")" || fail "could not list available IPv4 subnets in $REGION"
 
-    while IFS=$'\t' read -r subnet_id subnet_vpc_id subnet_az subnet_cidr; do
+    while IFS=$'\t' read -r \
+        subnet_id subnet_vpc_id subnet_az subnet_cidr subnet_extra
+    do
         [ -n "$subnet_id" ] || continue
+        [ -z "$subnet_extra" ] ||
+            fail "subnet discovery returned a malformed record"
         gateway_allowed=0
         lambda_allowed=0
         if [ -z "$GATEWAY_PUBLIC_SUBNET_ID" ] ||
@@ -488,8 +585,7 @@ discover_wireguard_network() {
             "$subnet_id" \
             "$subnet_vpc_id" \
             "$subnet_az" \
-            "$subnet_cidr" \
-            "$lambda_allowed")" ||
+            "$subnet_cidr")" ||
             fail "could not complete WireGuard topology discovery because AWS inspection failed"
         IFS='|' read -r \
             subnet_id \
@@ -498,8 +594,7 @@ discover_wireguard_network() {
             subnet_cidr \
             subnet_cidr_overlaps \
             subnet_route_table_id \
-            subnet_gateway_id \
-            subnet_endpoint_manageable <<<"$inspected_subnet"
+            subnet_gateway_id <<<"$inspected_subnet"
 
         if [ "$subnet_cidr_overlaps" -eq 1 ]; then
             rejection_cidr_overlap=$((rejection_cidr_overlap + 1))
@@ -516,13 +611,9 @@ discover_wireguard_network() {
             esac
         fi
         if [ "$lambda_allowed" -eq 1 ]; then
-            if [ "$subnet_endpoint_manageable" -eq 1 ]; then
-                lambda_subnets+=(
-                    "$subnet_id|$subnet_vpc_id|$subnet_az|$subnet_cidr|$subnet_route_table_id"
-                )
-            else
-                rejection_lambda_endpoint=$((rejection_lambda_endpoint + 1))
-            fi
+            lambda_subnets+=(
+                "$subnet_id|$subnet_vpc_id|$subnet_az|$subnet_cidr|$subnet_route_table_id"
+            )
         fi
     done <<<"$subnets"
 
@@ -557,7 +648,6 @@ discover_wireguard_network() {
             print_wireguard_candidates
             printf 'WireGuard topology rejection counts:\n' >&2
             printf '    gateway routing: %s\n' "$rejection_gateway_routing" >&2
-            printf '    Lambda endpoint management: %s\n' "$rejection_lambda_endpoint" >&2
             printf '    CIDR overlap: %s\n' "$rejection_cidr_overlap" >&2
             printf '    subnet identity: %s\n' "$rejection_subnet_identity" >&2
             printf '    VPC: %s\n' "$rejection_vpc" >&2
@@ -855,155 +945,424 @@ stack_owns_wireguard_route() {
     [ "$stack_instance_id" = "$route_instance_id" ]
 }
 
-stack_dynamodb_gateway_endpoint_id() {
-    local endpoint_id
+active_lambda_subnet_ipv6_cidr() {
+    local associations record cidr association_state extra normalized prefix
+    local association_count=0 active_count=0 active_cidr=""
+    local association_count_max=16
 
-    if endpoint_id="$(aws cloudformation describe-stack-resource \
-        --stack-name "$STACK_NAME" \
-        --logical-resource-id ExecutionDynamoDBGatewayEndpoint \
-        --query StackResourceDetail.PhysicalResourceId \
+    associations="$(aws ec2 describe-subnets \
+        --subnet-ids "$LAMBDA_SUBNET_ID" \
+        --query 'Subnets[0].Ipv6CidrBlockAssociationSet[].[Ipv6CidrBlock,Ipv6CidrBlockState.State]' \
         --output text \
-        --region "$REGION" 2>&1)"
-    then
-        case "$endpoint_id" in
-            "" | None) return 2 ;;
+        --region "$REGION")" ||
+        fail "could not inspect Lambda subnet IPv6 CIDR associations"
+    case "$associations" in
+        "" | None)
+            fail "LAMBDA_SUBNET_ID has no IPv6 CIDR association; add one outside this helper"
+            ;;
+    esac
+
+    while IFS= read -r record; do
+        [ -n "$record" ] || continue
+        IFS=$'\t' read -r cidr association_state extra <<<"$record"
+        [ -n "$cidr" ] && [ -n "$association_state" ] && [ -z "$extra" ] ||
+            fail "LAMBDA_SUBNET_ID returned a malformed IPv6 CIDR association"
+        association_count=$((association_count + 1))
+        [ "$association_count" -le "$association_count_max" ] ||
+            fail "LAMBDA_SUBNET_ID returned more than $association_count_max IPv6 CIDR associations"
+        normalized="$(normalize_ipv6_cidr "$cidr")" ||
+            fail "LAMBDA_SUBNET_ID returned malformed IPv6 CIDR $cidr"
+        case "$association_state" in
+            associated)
+                prefix="${normalized%%|*}"
+                [ "$prefix" -eq 64 ] ||
+                    fail "active Lambda subnet IPv6 CIDR $cidr is not a /64"
+                active_count=$((active_count + 1))
+                active_cidr="$cidr"
+                ;;
+            associating | disassociating | disassociated | failing | failed) ;;
+            *) fail "LAMBDA_SUBNET_ID returned invalid IPv6 association state $association_state" ;;
         esac
-        printf '%s\n' "$endpoint_id"
+    done <<<"$associations"
+
+    [ "$active_count" -ne 0 ] ||
+        fail "LAMBDA_SUBNET_ID has no active IPv6 /64; activate one outside this helper"
+    [ "$active_count" -eq 1 ] ||
+        fail "LAMBDA_SUBNET_ID has more than one active IPv6 /64; select an unambiguous subnet"
+    printf '%s\n' "$active_cidr"
+}
+
+validate_vpc_ipv6_contains_subnet() {
+    local subnet_cidr="$1"
+    local associations record cidr association_state extra
+    local association_count=0 containing_count=0
+    local association_count_max=16
+
+    associations="$(aws ec2 describe-vpcs \
+        --vpc-ids "$VPC_ID" \
+        --query 'Vpcs[0].Ipv6CidrBlockAssociationSet[].[Ipv6CidrBlock,Ipv6CidrBlockState.State]' \
+        --output text \
+        --region "$REGION")" ||
+        fail "could not inspect VPC IPv6 CIDR associations"
+    case "$associations" in
+        "" | None)
+            fail "VPC_ID has no IPv6 CIDR association; add one outside this helper"
+            ;;
+    esac
+
+    while IFS= read -r record; do
+        [ -n "$record" ] || continue
+        IFS=$'\t' read -r cidr association_state extra <<<"$record"
+        [ -n "$cidr" ] && [ -n "$association_state" ] && [ -z "$extra" ] ||
+            fail "VPC_ID returned a malformed IPv6 CIDR association"
+        association_count=$((association_count + 1))
+        [ "$association_count" -le "$association_count_max" ] ||
+            fail "VPC_ID returned more than $association_count_max IPv6 CIDR associations"
+        normalize_ipv6_cidr "$cidr" >/dev/null ||
+            fail "VPC_ID returned malformed IPv6 CIDR $cidr"
+        case "$association_state" in
+            associated)
+                if ipv6_cidr_contains "$cidr" "$subnet_cidr"; then
+                    containing_count=$((containing_count + 1))
+                fi
+                ;;
+            associating | disassociating | disassociated | failing | failed) ;;
+            *) fail "VPC_ID returned invalid IPv6 association state $association_state" ;;
+        esac
+    done <<<"$associations"
+
+    [ "$containing_count" -ne 0 ] ||
+        fail "no active VPC IPv6 CIDR association contains Lambda subnet IPv6 CIDR $subnet_cidr"
+    [ "$containing_count" -eq 1 ] ||
+        fail "more than one active VPC IPv6 CIDR association contains Lambda subnet IPv6 CIDR $subnet_cidr"
+}
+
+validate_vpc_dns_attribute() {
+    local attribute="$1"
+    local display_name="$2"
+    local value
+
+    value="$(aws ec2 describe-vpc-attribute \
+        --vpc-id "$VPC_ID" \
+        --attribute "$attribute" \
+        --query "${display_name}.Value" \
+        --output text \
+        --region "$REGION")" ||
+        fail "could not inspect VPC $attribute"
+    case "$value" in
+        True) ;;
+        False) fail "VPC_ID must have $attribute enabled for dual-stack AWS service DNS" ;;
+        *) fail "VPC_ID returned a malformed $attribute value" ;;
+    esac
+}
+
+validate_stack_owned_ipv6_egress() {
+    local eigw_records route_records record
+    local eigw_id eigw_vpc_id attachment_state attachment_count eigw_extra
+    local route_eigw_id route_state route_origin route_destination route_extra
+    local stack_eigw stack_eigw_id stack_eigw_status stack_eigw_extra
+    local stack_route_status
+    local eigw_count=0 route_count=0 record_count_max=4
+
+    eigw_records="$(aws ec2 describe-egress-only-internet-gateways \
+        --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+        --query 'EgressOnlyInternetGateways[].[EgressOnlyInternetGatewayId,Attachments[0].VpcId,Attachments[0].State,length(Attachments)]' \
+        --output text \
+        --region "$REGION")" || fail "could not inspect EIGWs attached to VPC_ID"
+    case "$eigw_records" in
+        "" | None) eigw_records="" ;;
+    esac
+    while IFS= read -r record; do
+        [ -n "$record" ] || continue
+        IFS=$'\t' read -r \
+            eigw_id eigw_vpc_id attachment_state attachment_count eigw_extra <<<"$record"
+        [ -n "$eigw_id" ] && [ -n "$eigw_vpc_id" ] &&
+            [ -n "$attachment_state" ] && [ -n "$attachment_count" ] &&
+            [ -z "$eigw_extra" ] || fail "VPC_ID returned a malformed EIGW record"
+        eigw_count=$((eigw_count + 1))
+        [ "$eigw_count" -le "$record_count_max" ] ||
+            fail "VPC_ID returned more than $record_count_max EIGWs"
+    done <<<"$eigw_records"
+
+    if [ "$WIREGUARD_EGRESS_RESOURCES_EXPECTED" -eq 0 ]; then
+        [ "$eigw_count" -eq 0 ] ||
+            fail "VPC_ID already has an unmanaged EIGW; remove the conflict before first enablement"
+    else
+        [ "$eigw_count" -ne 0 ] || fail "the stack-owned EIGW is missing from VPC_ID"
+        [ "$eigw_count" -eq 1 ] || fail "VPC_ID returned multiple attached EIGWs"
+        [[ "$eigw_id" =~ ^eigw-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
+            fail "VPC_ID returned a malformed EIGW ID"
+        [ "$eigw_vpc_id" = "$VPC_ID" ] || fail "the attached EIGW belongs to the wrong VPC"
+        [ "$attachment_count" = 1 ] || fail "the EIGW returned malformed attachments"
+        [ "$attachment_state" = attached ] ||
+            fail "the EIGW attachment is not in the attached state"
+    fi
+
+    route_records="$(aws ec2 describe-route-tables \
+        --route-table-ids "$LAMBDA_ROUTE_TABLE_ID" \
+        --query "RouteTables[0].Routes[?DestinationIpv6CidrBlock=='::/0'].[EgressOnlyInternetGatewayId,State,Origin,DestinationIpv6CidrBlock]" \
+        --output text \
+        --region "$REGION")" || fail "could not inspect the IPv6 default route"
+    case "$route_records" in
+        "" | None) route_records="" ;;
+    esac
+    while IFS= read -r record; do
+        [ -n "$record" ] || continue
+        IFS=$'\t' read -r \
+            route_eigw_id route_state route_origin route_destination route_extra <<<"$record"
+        [ -n "$route_eigw_id" ] && [ -n "$route_state" ] &&
+            [ -n "$route_origin" ] && [ -n "$route_destination" ] &&
+            [ -z "$route_extra" ] ||
+            fail "LAMBDA_ROUTE_TABLE_ID returned a malformed ::/0 route"
+        route_count=$((route_count + 1))
+        [ "$route_count" -le "$record_count_max" ] ||
+            fail "LAMBDA_ROUTE_TABLE_ID returned more than $record_count_max ::/0 routes"
+    done <<<"$route_records"
+
+    if [ "$WIREGUARD_EGRESS_RESOURCES_EXPECTED" -eq 0 ]; then
+        [ "$route_count" -eq 0 ] ||
+            fail "LAMBDA_ROUTE_TABLE_ID already has an unmanaged ::/0 route"
         return 0
     fi
 
-    case "$endpoint_id" in
-        *"does not exist"* | *"Unable to find details"*) return 1 ;;
-        *) return 2 ;;
+    [ "$route_count" -ne 0 ] || fail "the stack-owned ::/0 route is missing"
+    [ "$route_count" -eq 1 ] || fail "LAMBDA_ROUTE_TABLE_ID returned duplicate ::/0 routes"
+    [ "$route_destination" = "::/0" ] || fail "the IPv6 default route is malformed"
+    [ "$route_origin" = CreateRoute ] || fail "the IPv6 default route has an invalid origin"
+    [ "$route_state" = active ] || fail "the IPv6 default route is not active"
+    [ "$route_eigw_id" = "$eigw_id" ] || fail "the IPv6 default route targets the wrong EIGW"
+    [ "$WIREGUARD_STACK_VPC_ID" = "$VPC_ID" ] ||
+        fail "the stack-owned EIGW belongs to a different configured VPC"
+    [ "$WIREGUARD_STACK_ROUTE_TABLE_ID" = "$LAMBDA_ROUTE_TABLE_ID" ] ||
+        fail "the stack-owned IPv6 route belongs to a different configured route table"
+
+    stack_eigw="$(aws cloudformation describe-stack-resource \
+        --stack-name "$STACK_NAME" \
+        --logical-resource-id ExecutionEgressOnlyInternetGateway \
+        --query '[StackResourceDetail.PhysicalResourceId,StackResourceDetail.ResourceStatus]' \
+        --output text \
+        --profile "$PROFILE" \
+        --region "$REGION")" || fail "could not verify stack ownership of the EIGW"
+    read -r stack_eigw_id stack_eigw_status stack_eigw_extra <<<"$stack_eigw"
+    [ -z "$stack_eigw_extra" ] || fail "the stack returned malformed EIGW resource state"
+    [ "$stack_eigw_id" = "$eigw_id" ] || fail "the attached EIGW is not owned by this stack"
+    case "$stack_eigw_status" in
+        CREATE_COMPLETE | UPDATE_COMPLETE) ;;
+        *) fail "the stack-owned EIGW is not in a complete state" ;;
+    esac
+    stack_route_status="$(aws cloudformation describe-stack-resource \
+        --stack-name "$STACK_NAME" \
+        --logical-resource-id ExecutionSqsIpv6Route \
+        --query StackResourceDetail.ResourceStatus \
+        --output text \
+        --profile "$PROFILE" \
+        --region "$REGION")" || fail "could not verify stack ownership of the IPv6 route"
+    case "$stack_route_status" in
+        CREATE_COMPLETE | UPDATE_COMPLETE) ;;
+        *) fail "the stack-owned IPv6 route is not in a complete state" ;;
     esac
 }
 
-dynamodb_gateway_endpoint_details() {
-    local endpoint_id="$1"
-    local route_table_id="$2"
+network_acl_rule_port_relation() {
+    local egress="$1"
+    local protocol="$2"
+    local port_from="$3"
+    local port_to="$4"
+    local required_from required_to
 
-    aws ec2 describe-vpc-endpoints \
-        --vpc-endpoint-ids "$endpoint_id" \
-        --query "VpcEndpoints[0].[VpcEndpointId,VpcId,ServiceName,VpcEndpointType,State,length(RouteTableIds),contains(RouteTableIds, '$route_table_id')]" \
-        --output text \
-        --region "$REGION"
-}
-
-dynamodb_gateway_endpoint_policy() {
-    local endpoint_id="$1"
-
-    aws ec2 describe-vpc-endpoints \
-        --vpc-endpoint-ids "$endpoint_id" \
-        --query 'VpcEndpoints[0].PolicyDocument' \
-        --output text \
-        --region "$REGION"
-}
-
-endpoint_policy_is_default_full_access() {
-    local policy="$1"
-    local compact_policy
-
-    compact_policy="$(printf '%s' "$policy" | tr -d '[:space:]')"
-    [ "$compact_policy" = \
-        '{"Version":"2008-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}]}' ]
-}
-
-validate_dynamodb_gateway_endpoint() {
-    local endpoint_id="$1"
-    local require_default_policy="$2"
-    local endpoint_details actual_endpoint_id endpoint_vpc_id service_name
-    local endpoint_type endpoint_state route_table_count has_route_table policy
-
-    endpoint_details="$(dynamodb_gateway_endpoint_details \
-        "$endpoint_id" \
-        "$LAMBDA_ROUTE_TABLE_ID")" ||
-        fail "could not inspect DynamoDB gateway endpoint $endpoint_id"
-    read -r \
-        actual_endpoint_id \
-        endpoint_vpc_id \
-        service_name \
-        endpoint_type \
-        endpoint_state \
-        route_table_count \
-        has_route_table <<<"$endpoint_details"
-
-    [ "$actual_endpoint_id" = "$endpoint_id" ] ||
-        fail "DynamoDB gateway endpoint $endpoint_id does not exist in $REGION"
-    [ "$endpoint_vpc_id" = "$VPC_ID" ] ||
-        fail "DynamoDB gateway endpoint $endpoint_id does not belong to VPC_ID"
-    [ "$service_name" = "com.amazonaws.$REGION.dynamodb" ] ||
-        fail "DynamoDB gateway endpoint $endpoint_id has a mismatched service"
-    [ "$endpoint_type" = Gateway ] ||
-        fail "DynamoDB gateway endpoint $endpoint_id is not a Gateway endpoint"
-    [ "$endpoint_state" = available ] ||
-        fail "DynamoDB gateway endpoint $endpoint_id is $endpoint_state; expected available"
-    [[ "$route_table_count" =~ ^[0-9]+$ ]] ||
-        fail "DynamoDB gateway endpoint $endpoint_id returned an invalid route-table count"
-    [ "$route_table_count" -eq 1 ] && [ "$has_route_table" = True ] ||
-        fail "DynamoDB gateway endpoint $endpoint_id must be associated exclusively with LAMBDA_ROUTE_TABLE_ID"
-
-    [ "$require_default_policy" = true ] || return 0
-    policy="$(dynamodb_gateway_endpoint_policy "$endpoint_id")" ||
-        fail "could not inspect the policy for DynamoDB gateway endpoint $endpoint_id"
-    endpoint_policy_is_default_full_access "$policy" ||
-        fail "unmanaged DynamoDB gateway endpoint $endpoint_id has a custom policy and cannot be imported safely"
-}
-
-preflight_dynamodb_gateway_endpoint() {
-    local endpoint_ids endpoint_id stack_endpoint_id="" stack_endpoint_status
-    local -a route_endpoint_ids=()
-
-    endpoint_ids="$(dynamodb_gateway_endpoint_ids_for_route_table \
-        "$LAMBDA_ROUTE_TABLE_ID" \
-        "$VPC_ID")" ||
-        fail "could not inspect DynamoDB endpoints for LAMBDA_ROUTE_TABLE_ID"
-    case "$endpoint_ids" in
-        "" | None) ;;
-        *)
-            for endpoint_id in $endpoint_ids; do
-                [[ "$endpoint_id" =~ ^vpce-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
-                    fail "LAMBDA_ROUTE_TABLE_ID returned an invalid DynamoDB endpoint ID"
-                route_endpoint_ids+=("$endpoint_id")
-            done
+    case "$egress" in
+        True)
+            required_from=443
+            required_to=443
             ;;
+        False)
+            required_from=1024
+            required_to=65535
+            ;;
+        *) return 3 ;;
     esac
-    [ "${#route_endpoint_ids[@]}" -le 1 ] ||
-        fail "LAMBDA_ROUTE_TABLE_ID has more than one DynamoDB gateway endpoint route"
-
-    if stack_endpoint_id="$(stack_dynamodb_gateway_endpoint_id)"; then
-        stack_endpoint_status=0
-    else
-        stack_endpoint_status=$?
+    if [ "$protocol" = -1 ]; then
+        [ "$port_from" = None ] && [ "$port_to" = None ] || return 3
+        return 0
     fi
-    case "$stack_endpoint_status" in
-        0)
-            [[ "$stack_endpoint_id" =~ ^vpce-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
-                fail "stack resource ExecutionDynamoDBGatewayEndpoint has an invalid physical ID"
-            validate_dynamodb_gateway_endpoint "$stack_endpoint_id" false
-            [ "${#route_endpoint_ids[@]}" -eq 1 ] &&
-                [ "${route_endpoint_ids[0]}" = "$stack_endpoint_id" ] ||
-                fail "stack-owned DynamoDB gateway endpoint does not match LAMBDA_ROUTE_TABLE_ID"
-            printf '==> Reusing stack-owned DynamoDB gateway endpoint %s\n' \
-                "$stack_endpoint_id"
-            ;;
-        1)
-            if [ "${#route_endpoint_ids[@]}" -eq 0 ]; then
-                printf '==> LAMBDA_ROUTE_TABLE_ID is eligible for a stack-managed DynamoDB gateway endpoint\n'
-                return 0
+    [ "$protocol" = 6 ] || return 2
+    [[ "$port_from" =~ ^[0-9]+$ ]] && [[ "$port_to" =~ ^[0-9]+$ ]] || return 3
+    [ "$port_from" -le 65535 ] && [ "$port_to" -le 65535 ] || return 3
+    [ "$port_from" -le "$port_to" ] || return 3
+    if [ "$port_to" -lt "$required_from" ] || [ "$required_to" -lt "$port_from" ]; then
+        return 2
+    fi
+    if [ "$port_from" -le "$required_from" ] && [ "$required_to" -le "$port_to" ]; then
+        return 0
+    fi
+    return 1
+}
+
+classify_network_acl_ipv6_policy() {
+    local entries="$1"
+    local record rule_number egress protocol action ipv6_cidr port_from port_to extra
+    local normalized relation direction
+    local entry_count=0 entry_count_max=128
+    local outbound_rule=32768 outbound_action="" outbound_ambiguous=32768
+    local inbound_rule=32768 inbound_action="" inbound_ambiguous=32768
+
+    while IFS= read -r record; do
+        [ -n "$record" ] || continue
+        IFS=$'\t' read -r \
+            rule_number egress protocol action ipv6_cidr port_from port_to extra <<<"$record"
+        [ -n "$rule_number" ] && [ -n "$egress" ] && [ -n "$protocol" ] &&
+            [ -n "$action" ] && [ -n "$ipv6_cidr" ] && [ -n "$port_from" ] &&
+            [ -n "$port_to" ] && [ -z "$extra" ] || return 3
+        entry_count=$((entry_count + 1))
+        [ "$entry_count" -le "$entry_count_max" ] || return 3
+        [[ "$rule_number" =~ ^[1-9][0-9]*$ ]] || return 3
+        case "$egress" in True | False) ;; *) return 3 ;; esac
+        case "$action" in allow | deny) ;; *) return 3 ;; esac
+        [[ "$protocol" =~ ^-1$|^[0-9]+$ ]] || return 3
+        [ "$protocol" -eq -1 ] || [ "$protocol" -le 255 ] || return 3
+        if [ "$rule_number" -eq 32768 ]; then
+            [ "$action" = deny ] && [ "$protocol" = -1 ] &&
+                [ "$ipv6_cidr" = ::/0 ] && [ "$port_from" = None ] &&
+                [ "$port_to" = None ] || return 3
+            continue
+        fi
+        [ "$rule_number" -le 32767 ] || return 3
+        [ "$ipv6_cidr" != None ] || continue
+        normalized="$(normalize_ipv6_cidr "$ipv6_cidr")" || return 3
+        network_acl_rule_port_relation \
+            "$egress" "$protocol" "$port_from" "$port_to"
+        relation=$?
+        [ "$relation" -ne 3 ] || return 3
+        [ "$relation" -ne 2 ] || continue
+        if [ "$egress" = True ]; then
+            direction=outbound
+        else
+            direction=inbound
+        fi
+        if [ "$normalized" != '0|0000|0000|0000|0000|0000|0000|0000|0000' ] ||
+            [ "$relation" -eq 1 ]
+        then
+            if [ "$direction" = outbound ] && [ "$rule_number" -lt "$outbound_ambiguous" ]; then
+                outbound_ambiguous="$rule_number"
+            elif [ "$direction" = inbound ] && [ "$rule_number" -lt "$inbound_ambiguous" ]; then
+                inbound_ambiguous="$rule_number"
             fi
-            endpoint_id="${route_endpoint_ids[0]}"
-            validate_dynamodb_gateway_endpoint "$endpoint_id" true
-            fail "unmanaged DynamoDB gateway endpoint $endpoint_id must be imported as ExecutionDynamoDBGatewayEndpoint before deployment; see docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md"
-            ;;
-        *) fail "could not inspect stack ownership of ExecutionDynamoDBGatewayEndpoint" ;;
+            continue
+        fi
+        if [ "$direction" = outbound ] && [ "$rule_number" -lt "$outbound_rule" ]; then
+            outbound_rule="$rule_number"
+            outbound_action="$action"
+        elif [ "$direction" = inbound ] && [ "$rule_number" -lt "$inbound_rule" ]; then
+            inbound_rule="$rule_number"
+            inbound_action="$action"
+        fi
+    done <<<"$entries"
+    [ "$entry_count" -ne 0 ] || return 3
+
+    if [ "$outbound_ambiguous" -lt "$outbound_rule" ] ||
+        [ "$inbound_ambiguous" -lt "$inbound_rule" ] ||
+        [ -z "$outbound_action" ] || [ -z "$inbound_action" ]
+    then
+        return 2
+    fi
+    [ "$outbound_action" = allow ] || return 1
+    [ "$inbound_action" = allow ] || return 1
+    return 0
+}
+
+validate_lambda_subnet_network_acl() {
+    local acl_records record acl_id acl_vpc_id association_count acl_extra
+    local entries classification
+    local acl_count=0 acl_count_max=4
+
+    acl_records="$(aws ec2 describe-network-acls \
+        --filters "Name=association.subnet-id,Values=$LAMBDA_SUBNET_ID" \
+        --query "NetworkAcls[].[NetworkAclId,VpcId,length(Associations[?SubnetId=='$LAMBDA_SUBNET_ID'])]" \
+        --output text \
+        --region "$REGION")" || fail "could not inspect the Lambda subnet network ACL"
+    case "$acl_records" in
+        "" | None) fail "the Lambda subnet has no effective network ACL" ;;
     esac
+    while IFS= read -r record; do
+        [ -n "$record" ] || continue
+        IFS=$'\t' read -r acl_id acl_vpc_id association_count acl_extra <<<"$record"
+        [ -n "$acl_id" ] && [ -n "$acl_vpc_id" ] &&
+            [ -n "$association_count" ] && [ -z "$acl_extra" ] ||
+            fail "the Lambda subnet returned a malformed network ACL record"
+        acl_count=$((acl_count + 1))
+        [ "$acl_count" -le "$acl_count_max" ] ||
+            fail "the Lambda subnet returned more than $acl_count_max network ACLs"
+    done <<<"$acl_records"
+    [ "$acl_count" -eq 1 ] || fail "the Lambda subnet has an ambiguous effective network ACL"
+    [[ "$acl_id" =~ ^acl-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
+        fail "the Lambda subnet returned a malformed network ACL ID"
+    [ "$acl_vpc_id" = "$VPC_ID" ] || fail "the Lambda subnet network ACL belongs to another VPC"
+    [ "$association_count" = 1 ] || fail "the network ACL has a malformed subnet association"
+
+    entries="$(aws ec2 describe-network-acls \
+        --network-acl-ids "$acl_id" \
+        --query 'NetworkAcls[0].Entries[].[RuleNumber,Egress,Protocol,RuleAction,Ipv6CidrBlock,PortRange.From,PortRange.To]' \
+        --output text \
+        --region "$REGION")" || fail "could not inspect network ACL $acl_id rules"
+    if classify_network_acl_ipv6_policy "$entries"; then
+        printf '==> Lambda subnet network ACL has an obvious IPv6 HTTPS allow path\n'
+        return 0
+    else
+        classification=$?
+    fi
+    case "$classification" in
+        1)
+            fail "network ACL $acl_id plainly blocks outbound IPv6 TCP/443 or inbound TCP/1024-65535"
+            ;;
+        2)
+            printf 'warning: network ACL %s has a nontrivial ordered IPv6 policy; operator verification is required for outbound TCP/443 and inbound TCP/1024-65535 to the regional SQS dual-stack endpoint\n' \
+                "$acl_id" >&2
+            ;;
+        *) fail "network ACL $acl_id returned malformed or unbounded rules" ;;
+    esac
+}
+
+validate_regional_sqs_dualstack_endpoint() {
+    local queue_count
+
+    queue_count="$(AWS_USE_DUALSTACK_ENDPOINT=true aws sqs list-queues \
+        --max-results 1 \
+        --query 'length(QueueUrls || `[]`)' \
+        --output text \
+        --region "$REGION")" ||
+        fail "could not confirm an SQS dual-stack endpoint in $REGION; verify region support and sqs:ListQueues permission"
+    [[ "$queue_count" =~ ^[0-9]+$ ]] && [ "$queue_count" -le 1 ] ||
+        fail "the SQS dual-stack availability probe returned a malformed response"
+    printf '==> SQS dual-stack endpoint is available in %s\n' "$REGION"
+}
+
+preflight_ipv6_egress() {
+    case "$WIREGUARD_EGRESS_RESOURCES_EXPECTED" in
+        0 | 1) ;;
+        *) fail "internal EIGW ownership state is invalid" ;;
+    esac
+
+    printf '==> Checking stack-owned IPv6 SQS egress\n'
+    validate_stack_owned_ipv6_egress
+    validate_lambda_subnet_network_acl
+    validate_regional_sqs_dualstack_endpoint
+    printf '==> Stack-owned IPv6 SQS egress checks passed\n'
+}
+
+preflight_retained_ipv6_egress() {
+    [ "$WIREGUARD_EGRESS_RESOURCES_EXPECTED" -eq 1 ] ||
+        fail "retained cleanup has no expected stack-owned IPv6 egress resources"
+    printf '==> Checking retained stack-owned IPv6 SQS egress\n'
+    validate_stack_owned_ipv6_egress
+    printf '==> Retained stack-owned IPv6 SQS egress checks passed\n'
 }
 
 preflight_wireguard_gateway() {
     local actual_vpc_id gateway_subnet lambda_subnet lambda_route_table
     local gateway_subnet_id gateway_vpc_id gateway_az gateway_subnet_cidr
-    local lambda_subnet_id lambda_vpc_id lambda_az lambda_subnet_cidr
-    local lambda_route_table_id lambda_route_table_vpc_id
+    local lambda_subnet_id lambda_vpc_id lambda_az lambda_subnet_cidr lambda_extra
+    local lambda_subnet_ipv6_cidr
+    local lambda_route_table_id lambda_route_table_vpc_id lambda_route_table_extra
     local effective_lambda_route_table_id effective_gateway_route_table_id
     local gateway_default_route_target wireguard_route_count
     local wireguard_route_instance_id
@@ -1035,16 +1394,20 @@ preflight_wireguard_gateway() {
         --query 'Subnets[0].[SubnetId,VpcId,AvailabilityZone,CidrBlock]' \
         --output text \
         --region "$REGION")" || fail "LAMBDA_SUBNET_ID does not exist in $REGION"
-    read -r lambda_subnet_id lambda_vpc_id lambda_az lambda_subnet_cidr \
+    read -r \
+        lambda_subnet_id lambda_vpc_id lambda_az lambda_subnet_cidr lambda_extra \
         <<<"$lambda_subnet"
     [ "$lambda_subnet_id" = "$LAMBDA_SUBNET_ID" ] ||
         fail "LAMBDA_SUBNET_ID does not exist in $REGION"
+    [ -z "$lambda_extra" ] ||
+        fail "LAMBDA_SUBNET_ID returned a malformed subnet record"
     [ "$lambda_vpc_id" = "$VPC_ID" ] ||
         fail "LAMBDA_SUBNET_ID does not belong to VPC_ID"
     [ "$lambda_az" = "$gateway_az" ] ||
         fail "gateway and Lambda subnets must be in the same availability zone"
     [ "$lambda_subnet_cidr" = "$LAMBDA_SUBNET_CIDR" ] ||
         fail "LAMBDA_SUBNET_CIDR does not equal the subnet primary IPv4 CIDR"
+    lambda_subnet_ipv6_cidr="$(active_lambda_subnet_ipv6_cidr)" || return 1
 
     lambda_route_table="$(aws ec2 describe-route-tables \
         --route-table-ids "$LAMBDA_ROUTE_TABLE_ID" \
@@ -1052,9 +1415,13 @@ preflight_wireguard_gateway() {
         --output text \
         --region "$REGION")" ||
         fail "LAMBDA_ROUTE_TABLE_ID does not exist in $REGION"
-    read -r lambda_route_table_id lambda_route_table_vpc_id <<<"$lambda_route_table"
+    read -r \
+        lambda_route_table_id lambda_route_table_vpc_id lambda_route_table_extra \
+        <<<"$lambda_route_table"
     [ "$lambda_route_table_id" = "$LAMBDA_ROUTE_TABLE_ID" ] ||
         fail "LAMBDA_ROUTE_TABLE_ID does not exist in $REGION"
+    [ -z "$lambda_route_table_extra" ] ||
+        fail "LAMBDA_ROUTE_TABLE_ID returned a malformed route-table record"
     [ "$lambda_route_table_vpc_id" = "$VPC_ID" ] ||
         fail "LAMBDA_ROUTE_TABLE_ID does not belong to VPC_ID"
 
@@ -1063,7 +1430,9 @@ preflight_wireguard_gateway() {
     )" || fail "could not resolve the Lambda subnet effective route table"
     [ "$effective_lambda_route_table_id" = "$LAMBDA_ROUTE_TABLE_ID" ] ||
         fail "LAMBDA_ROUTE_TABLE_ID is not the Lambda subnet effective route table"
-    preflight_dynamodb_gateway_endpoint
+    validate_vpc_ipv6_contains_subnet "$lambda_subnet_ipv6_cidr"
+    validate_vpc_dns_attribute enableDnsSupport EnableDnsSupport
+    validate_vpc_dns_attribute enableDnsHostnames EnableDnsHostnames
 
     effective_gateway_route_table_id="$(
         effective_route_table_id "$GATEWAY_PUBLIC_SUBNET_ID" "$VPC_ID"
@@ -1095,6 +1464,7 @@ preflight_wireguard_gateway() {
             "$wireguard_route_instance_id" ||
             fail "LAMBDA_ROUTE_TABLE_ID has a conflicting 10.200.0.0/24 route"
     fi
+    preflight_ipv6_egress
     printf '==> WireGuard gateway VPC topology checks passed\n'
 }
 
@@ -1118,7 +1488,15 @@ plan_wireguard_deployment() {
     local prior_parameters parameter_key parameter_value
     local prior_gateway_enabled=false
     local prior_cleanup_retained=false
-    local prior_vpc_id="" prior_lambda_route_table_id=""
+    local prior_vpc_id="" prior_lambda_subnet_id="" prior_lambda_route_table_id=""
+
+    WIREGUARD_EGRESS_RESOURCES_EXPECTED=0
+    WIREGUARD_STACK_VPC_ID=""
+    WIREGUARD_STACK_ROUTE_TABLE_ID=""
+    WIREGUARD_PRIOR_GATEWAY_ENABLED=false
+    WIREGUARD_CLEANUP_VPC_ID=""
+    WIREGUARD_CLEANUP_LAMBDA_SUBNET_ID=""
+    WIREGUARD_CLEANUP_ROUTE_TABLE_ID=""
 
     if ! prior_parameters="$(aws cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
@@ -1145,9 +1523,28 @@ plan_wireguard_deployment() {
                 prior_cleanup_retained="$parameter_value"
                 ;;
             VpcId) prior_vpc_id="$parameter_value" ;;
+            LambdaSubnetId) prior_lambda_subnet_id="$parameter_value" ;;
             LambdaRouteTableId) prior_lambda_route_table_id="$parameter_value" ;;
         esac
     done <<<"$prior_parameters"
+
+    case "$prior_gateway_enabled" in
+        true | false) ;;
+        *) fail "stack returned a malformed EnableWireGuardGateway state" ;;
+    esac
+    case "$prior_cleanup_retained" in
+        true | false) ;;
+        *) fail "stack returned a malformed RetainExecutionVpcCleanupResources state" ;;
+    esac
+    if [ "$prior_gateway_enabled" = true ] || [ "$prior_cleanup_retained" = true ]; then
+        WIREGUARD_EGRESS_RESOURCES_EXPECTED=1
+        WIREGUARD_STACK_VPC_ID="$prior_vpc_id"
+        WIREGUARD_STACK_ROUTE_TABLE_ID="$prior_lambda_route_table_id"
+        WIREGUARD_CLEANUP_VPC_ID="$prior_vpc_id"
+        WIREGUARD_CLEANUP_LAMBDA_SUBNET_ID="$prior_lambda_subnet_id"
+        WIREGUARD_CLEANUP_ROUTE_TABLE_ID="$prior_lambda_route_table_id"
+    fi
+    WIREGUARD_PRIOR_GATEWAY_ENABLED="$prior_gateway_enabled"
 
     if [ "$ENABLE_WIREGUARD_GATEWAY" -eq 1 ] &&
         [ "$prior_gateway_enabled" = false ] &&
@@ -1172,6 +1569,34 @@ plan_wireguard_deployment() {
             ;;
     esac
 }
+
+plan_wireguard_topology_change() {
+    [ "$WIREGUARD_DEPLOYMENT_MODE" = enabled ] || return 0
+    [ "$WIREGUARD_PRIOR_GATEWAY_ENABLED" = true ] || return 0
+
+    [[ "$WIREGUARD_CLEANUP_VPC_ID" =~ ^vpc-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
+        fail "enabled stack has no valid VpcId for guarded reconfiguration"
+    [[ "$WIREGUARD_CLEANUP_LAMBDA_SUBNET_ID" =~ ^subnet-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
+        fail "enabled stack has no valid LambdaSubnetId for guarded reconfiguration"
+    [[ "$WIREGUARD_CLEANUP_ROUTE_TABLE_ID" =~ ^rtb-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
+        fail "enabled stack has no valid LambdaRouteTableId for guarded reconfiguration"
+
+    if [ "$VPC_ID" != "$WIREGUARD_CLEANUP_VPC_ID" ] ||
+        [ "$LAMBDA_SUBNET_ID" != "$WIREGUARD_CLEANUP_LAMBDA_SUBNET_ID" ] ||
+        [ "$LAMBDA_ROUTE_TABLE_ID" != "$WIREGUARD_CLEANUP_ROUTE_TABLE_ID" ]
+    then
+        WIREGUARD_DEPLOYMENT_MODE=detach-then-reconfigure
+    fi
+}
+
+preflight_planned_cleanup_ipv6_egress() (
+    VPC_ID="$WIREGUARD_CLEANUP_VPC_ID"
+    LAMBDA_ROUTE_TABLE_ID="$WIREGUARD_CLEANUP_ROUTE_TABLE_ID"
+    WIREGUARD_EGRESS_RESOURCES_EXPECTED=1
+    WIREGUARD_STACK_VPC_ID="$WIREGUARD_CLEANUP_VPC_ID"
+    WIREGUARD_STACK_ROUTE_TABLE_ID="$WIREGUARD_CLEANUP_ROUTE_TABLE_ID"
+    preflight_retained_ipv6_egress
+)
 
 execution_vpc_cleanup_ready() {
     local function_configuration function_state last_update_status
@@ -1227,7 +1652,9 @@ execution_vpc_cleanup_ready() {
         return 2
 
     eni_count="$(aws ec2 describe-network-interfaces \
-        --filters "Name=group-id,Values=$execution_security_group_id" \
+        --filters \
+        "Name=group-id,Values=$execution_security_group_id" \
+        "Name=interface-type,Values=lambda" \
         --query 'length(NetworkInterfaces)' \
         --output json \
         --profile "$PROFILE" \
@@ -1267,7 +1694,7 @@ wait_for_execution_vpc_cleanup() {
         fi
     done
 
-    fail "execution Lambda VPC cleanup did not finish within the bounded wait; the retained DynamoDB endpoint, permissions, and security group remain"
+    fail "execution Lambda VPC cleanup did not finish within the bounded wait; retained EIGW, IPv6 route, execution security group, and ENI-management IAM remain"
 }
 
 build_wireguard_parameter_overrides() {
@@ -1297,7 +1724,9 @@ build_wireguard_parameter_overrides() {
         )
     else
         DEPLOYMENT_PARAMETER_OVERRIDES+=("EnableWireGuardGateway=false")
-        if [ "$retain_cleanup_resources" = true ]; then
+        if [ -n "$VPC_ID" ] || [ -n "$LAMBDA_ROUTE_TABLE_ID" ]; then
+            [ -n "$VPC_ID" ] && [ -n "$LAMBDA_ROUTE_TABLE_ID" ] ||
+                fail "cleanup must preserve both VpcId and LambdaRouteTableId"
             DEPLOYMENT_PARAMETER_OVERRIDES+=(
                 "VpcId=$VPC_ID"
                 "LambdaRouteTableId=$LAMBDA_ROUTE_TABLE_ID"
@@ -1314,6 +1743,58 @@ deploy_wireguard_stack_phase() {
     deploy_stack_phase "$phase_description"
 }
 
+deploy_wireguard_cleanup_phase() {
+    local retain_cleanup_resources="$1"
+    local phase_description="$2"
+    local ENABLE_WIREGUARD_GATEWAY=0
+    local VPC_ID="$WIREGUARD_CLEANUP_VPC_ID"
+    local LAMBDA_ROUTE_TABLE_ID="$WIREGUARD_CLEANUP_ROUTE_TABLE_ID"
+
+    deploy_wireguard_stack_phase "$retain_cleanup_resources" "$phase_description"
+}
+
+build_wireguard_parameter_reset_overrides() {
+    [ -z "$WIREGUARD_PARAMETER_RESET_FILE" ] ||
+        fail "internal WireGuard parameter reset file already exists"
+    WIREGUARD_PARAMETER_RESET_FILE="$(
+        mktemp "${TMPDIR:-/tmp}/wireguard-parameter-reset.XXXXXX.yaml"
+    )" || fail "could not create the WireGuard parameter reset file"
+    {
+        printf '%s\n' \
+            'VpcId:' \
+            'GatewayPublicSubnetId:' \
+            'LambdaSubnetId:' \
+            'LambdaRouteTableId:' \
+            'LambdaSubnetCidr:' \
+            'WireGuardPrivateKeyParameterName:' \
+            'WireGuardPrivateKeyParameterVersion: 1' \
+            'WireGuardGatewayPublicKey:' \
+            'WireGuardWorkstationPublicKey:' \
+            'WireGuardInstanceType: t4g.nano'
+    } >"$WIREGUARD_PARAMETER_RESET_FILE" ||
+        fail "could not write the WireGuard parameter reset file"
+
+    DEPLOYMENT_PARAMETER_OVERRIDES=(
+        "EnableWireGuardGateway=false"
+        "RetainExecutionVpcCleanupResources=false"
+        "file://$WIREGUARD_PARAMETER_RESET_FILE"
+    )
+}
+
+clear_saved_wireguard_parameters() {
+    build_wireguard_parameter_reset_overrides
+    deploy_stack_phase "Clearing saved WireGuard inputs"
+}
+
+finish_wireguard_cleanup() {
+    DEPLOYMENT_ERROR_PHASE="execution Lambda VPC cleanup wait"
+    wait_for_execution_vpc_cleanup || return
+    deploy_wireguard_cleanup_phase \
+        false \
+        "Removing retained VPC cleanup resources" || return
+    clear_saved_wireguard_parameters
+}
+
 run_wireguard_deployment() {
     local deployment_mode="$1"
 
@@ -1321,26 +1802,39 @@ run_wireguard_deployment() {
         enabled)
             deploy_wireguard_stack_phase false "Deploying enabled WireGuard stack"
             ;;
-        detach-then-cleanup)
-            deploy_wireguard_stack_phase true "Detaching execution Lambda from the VPC" ||
+        detach-then-cleanup | detach-then-reconfigure)
+            deploy_wireguard_cleanup_phase \
+                true \
+                "Detaching execution Lambda from the VPC" ||
                 return
-            DEPLOYMENT_ERROR_PHASE="execution Lambda VPC cleanup wait"
-            wait_for_execution_vpc_cleanup || return
-            deploy_wireguard_stack_phase false "Removing retained VPC cleanup resources"
+            finish_wireguard_cleanup || return
+            if [ "$deployment_mode" = detach-then-reconfigure ]; then
+                WIREGUARD_EGRESS_RESOURCES_EXPECTED=0
+                WIREGUARD_STACK_VPC_ID=""
+                WIREGUARD_STACK_ROUTE_TABLE_ID=""
+                preflight_wireguard_gateway || return
+                deploy_wireguard_stack_phase \
+                    false \
+                    "Deploying reconfigured WireGuard stack"
+            fi
             ;;
         resume-cleanup)
-            DEPLOYMENT_ERROR_PHASE="execution Lambda VPC cleanup wait"
-            wait_for_execution_vpc_cleanup || return
-            deploy_wireguard_stack_phase false "Removing retained VPC cleanup resources"
+            finish_wireguard_cleanup
             ;;
         disabled)
-            deploy_wireguard_stack_phase false "Deploying disabled WireGuard stack"
+            clear_saved_wireguard_parameters
             ;;
         *) fail "unknown WireGuard deployment mode: $deployment_mode" ;;
     esac
 }
 
 wireguard_cleanup() {
+    if [ -n "$WIREGUARD_PARAMETER_RESET_FILE" ] &&
+        [ -f "$WIREGUARD_PARAMETER_RESET_FILE" ]
+    then
+        rm -f -- "$WIREGUARD_PARAMETER_RESET_FILE"
+        WIREGUARD_PARAMETER_RESET_FILE=""
+    fi
     if [ -n "$WIREGUARD_KEY_DIR" ] && [ -d "$WIREGUARD_KEY_DIR" ]; then
         rm -rf -- "$WIREGUARD_KEY_DIR"
     fi
@@ -1355,7 +1849,7 @@ print_wireguard_peer_configuration() {
 
     stack_outputs="$(aws cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='ExecutionDynamoDBGatewayEndpointId' || OutputKey=='WireGuardGatewayInstanceId' || OutputKey=='WireGuardGatewayElasticIp' || OutputKey=='WireGuardGatewayEndpoint' || OutputKey=='WireGuardGatewayPublicKey' || OutputKey=='WireGuardGatewayAddress' || OutputKey=='WireGuardWorkstationAddress' || OutputKey=='TigerBeetleEndpoint'].join('|', [OutputKey,OutputValue])" \
+        --query "Stacks[0].Outputs[?OutputKey=='WireGuardGatewayInstanceId' || OutputKey=='WireGuardGatewayElasticIp' || OutputKey=='WireGuardGatewayEndpoint' || OutputKey=='WireGuardGatewayPublicKey' || OutputKey=='WireGuardGatewayAddress' || OutputKey=='WireGuardWorkstationAddress' || OutputKey=='TigerBeetleEndpoint'].join('|', [OutputKey,OutputValue])" \
         --output text \
         --profile "$PROFILE" \
         --region "$REGION")" ||
@@ -1450,14 +1944,25 @@ wireguard_gateway_controller() {
                 [ -n "$WIREGUARD_WORKSTATION_PUBLIC_KEY" ] ||
                     fail "WIREGUARD_WORKSTATION_PUBLIC_KEY is required on first enablement"
                 discover_wireguard_network
-                preflight_wireguard_gateway
+                plan_wireguard_topology_change
+                if [ "$WIREGUARD_DEPLOYMENT_MODE" = detach-then-reconfigure ]; then
+                    preflight_planned_cleanup_ipv6_egress
+                else
+                    preflight_wireguard_gateway
+                fi
                 resolve_wireguard_key_configuration
                 validate_wireguard_gateway_configuration
+            elif [ "$WIREGUARD_DEPLOYMENT_MODE" = detach-then-cleanup ] ||
+                [ "$WIREGUARD_DEPLOYMENT_MODE" = resume-cleanup ]
+            then
+                preflight_planned_cleanup_ipv6_egress
             fi
             ;;
         deploy) run_wireguard_deployment "$WIREGUARD_DEPLOYMENT_MODE" ;;
         outputs)
-            if [ "$WIREGUARD_DEPLOYMENT_MODE" = enabled ]; then
+            if [ "$WIREGUARD_DEPLOYMENT_MODE" = enabled ] ||
+                [ "$WIREGUARD_DEPLOYMENT_MODE" = detach-then-reconfigure ]
+            then
                 print_wireguard_peer_configuration
             fi
             ;;
