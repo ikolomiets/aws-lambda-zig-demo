@@ -1,6 +1,8 @@
-# aws-lambda-zig
+# Zig AWS Lambda Operations Framework
 
-A minimal AWS Lambda demo written in Zig.
+A 100% Zig implementation of AWS Lambda functions and runtime, integrated with
+DynamoDB and SQS to create an asynchronous operation-processing framework backed
+by TigerBeetle over a WireGuard VPN.
 
 The project builds custom `provided.al2023` intake, query, execution, and completion Lambda
 bootstraps and a host-native PASETO v4.public utility named `paseto`. The
@@ -28,7 +30,7 @@ Definitive account or transfer rejections are terminal failures. TigerBeetle or 
 queue uncertainty is returned through Operations queue partial-batch failures; transient
 DynamoDB uncertainty retries the single Completion queue message.
 
-## Requirements
+## Requirements for Zig on AWS Lambda
 
 - Zig 0.16.0 or newer within the supported 0.16.x line.
 - AWS CLI v2 and AWS SAM CLI for the SAM deployment flow and stack queries.
@@ -53,7 +55,7 @@ that match so the existing intake Lambda and Function URL stay managed in
 place. The query Lambda and its Function URL, plus the SQS-driven execution and completion
 Lambdas, are added alongside them.
 
-## Build
+## Build the Lambda Stack
 
 Build the stripped ReleaseSafe Linux ARM64 Lambda executables:
 
@@ -99,7 +101,7 @@ zip -qj completion-lambda.zip zig-out/bin/completion/bootstrap
 All four zip archives are intentionally ignored by Git because they are generated
 deployment artifacts.
 
-## PASETO CLI
+## PASETO Authentication
 
 Generate an Ed25519 signing key pair with OS cryptographic randomness:
 
@@ -137,7 +139,7 @@ if one is present, but that safeguard is not a secret-management system and
 does not cover differently named variables. Verification needs only
 `PASETO_PUBLIC_KEY`; it never falls back to the private key.
 
-## Persistence commands
+## DynamoDB Operations
 
 `persistence.sh` creates, reads, updates, and deletes Operations in the SAM
 stack's DynamoDB table. It defaults to profile `dev`, region
@@ -259,7 +261,7 @@ The SAM table enables native DynamoDB TTL on `expires_at`. Expiration is
 best-effort: an Operation becomes eligible for deletion after 24 hours but may
 remain readable until DynamoDB removes it asynchronously.
 
-## Queue commands
+## SQS Workflows
 
 `queue.sh` sends canonical Operations, destructively consumes queued messages,
 and checks the SAM stack's operations queue. It uses `PROFILE`, `REGION`, and
@@ -423,7 +425,7 @@ invocation and replays the one aggregate message. On replay, earlier successful 
 acknowledged conflicts and processing reaches the failed and later entries; every newly
 successful write receives its actual replay-time timestamp.
 
-## Lambda logs
+## Lambda Observability
 
 `lambda_logs.sh` downloads one Lambda's CloudWatch events into a root-level
 file named after the deployed function. The stack name is fixed as
@@ -461,7 +463,7 @@ details; treat custom copies the same way. Logs created by earlier versions of
 the helper with `[event-id=...]` headers are unsupported; remove or rename the
 existing log before running the updated helper.
 
-## Deploy
+## Deploy to AWS
 
 The supported deployment path is AWS SAM:
 
@@ -507,7 +509,7 @@ aws cloudformation describe-stacks \
   --region ca-central-1
 ```
 
-### Optional EC2 WireGuard gateway
+### Connect to External TigerBeetle with an EC2 WireGuard Gateway
 
 `wireguard-gateway-setup.sh` enables, reconfigures, or disables the optional EC2
 WireGuard gateway and VPC-attaches only the execution Lambda so it can reach TigerBeetle on
@@ -562,7 +564,7 @@ AWS SAM.
 See [docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md)
 for the full SAM workflow.
 
-## Test The Function URL
+## Test the Authenticated APIs
 
 After deployment, call either Function URL printed by SAM:
 
@@ -658,7 +660,7 @@ Production endpoints should also consider stricter infrastructure
 authorization, narrower IAM policies, or a fronting layer such as API Gateway
 or CloudFront.
 
-## Project Layout
+## Project Structure
 
 - `src/intake_lambda.zig`: authenticated POST intake entrypoint and handler.
 - `src/query_lambda.zig`: authenticated tenant-scoped Operation GET entrypoint and handler.
@@ -683,7 +685,7 @@ or CloudFront.
 - `docs/`: the SAM deployment guide, ADRs, and the Zig style reference.
 - `AGENTS.md`: repository guidance for coding agents.
 
-## Development Notes
+## Development and Validation
 
 Run formatting checks before committing Zig changes:
 
