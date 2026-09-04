@@ -5,7 +5,7 @@ const sqs_queue = @import("sqs_queue");
 
 const Allocator = std.mem.Allocator;
 
-const argument_count_max = 4;
+const argument_count_max = 5;
 const stdin_size_max = 8 * 1024;
 const io_buffer_size = 4096;
 const receive_loop_is_intentionally_unbounded = true;
@@ -21,6 +21,11 @@ const Command = union(enum) {
     send: SendOptions,
     receive,
     check,
+};
+
+const Invocation = struct {
+    queue_name: ?[]const u8,
+    command: Command,
 };
 
 const SendOptions = struct {
@@ -39,9 +44,9 @@ const CliError = error{InvalidInvocation};
 
 const usage =
     \\Usage:
-    \\  sqs send --tenant <tenant>
-    \\  sqs receive
-    \\  sqs check
+    \\  sqs <queue-name> send --tenant <tenant>
+    \\  sqs <queue-name> receive
+    \\  sqs <queue-name> check
     \\
     \\Commands:
     \\  send     Read an Operation from stdin and enqueue it as SUBMITTED
@@ -49,8 +54,8 @@ const usage =
     \\  check    Print all queue attributes as JSON
     \\
     \\Environment:
-    \\  TigerBeetleQueue  URL of the fixed SQS TigerBeetle queue
-    \\  AWS_*             Standard AWS credentials, region, profile, and endpoint
+    \\  <queue-name>  URL of the selected SQS queue
+    \\  AWS_*         Standard AWS credentials, region, profile, and endpoint
     \\
 ;
 
@@ -64,9 +69,10 @@ pub fn main(init: std.process.Init) u8 {
     const arguments = collectArguments(init.minimal.args, &arguments_buffer) catch {
         return finish(&stdout_file.interface, &stderr_file.interface, 2, .invocation);
     };
-    const command = parseCommand(arguments) catch {
+    const invocation = parseCommand(arguments) catch {
         return finish(&stdout_file.interface, &stderr_file.interface, 2, .invocation);
     };
+    const command = invocation.command;
     var stdin_buffer: [stdin_size_max + 1]u8 = undefined;
     const stdin = readCommandInput(init.io, command, &stdin_buffer) catch {
         return finish(&stdout_file.interface, &stderr_file.interface, 2, .validation);
@@ -82,6 +88,7 @@ pub fn main(init: std.process.Init) u8 {
         const code = runCommand(command, context, null);
         return finish(context.stdout, context.stderr, code, null);
     }
+    std.debug.assert(invocation.queue_name != null);
 
     var config = aws.Config.load(init.gpa, init.io, init.environ_map, .{}) catch {
         return finish(context.stdout, context.stderr, 2, .configuration);
@@ -93,7 +100,7 @@ pub fn main(init: std.process.Init) u8 {
         init.gpa,
         &config,
         init.environ_map,
-        "TigerBeetleQueue",
+        invocation.queue_name.?,
     ) catch {
         return finish(context.stdout, context.stderr, 2, .configuration);
     };
@@ -205,19 +212,52 @@ fn unixSeconds(io: std.Io) operation.UnixSeconds {
     return result;
 }
 
-fn parseCommand(arguments: []const []const u8) CliError!Command {
+fn parseCommand(arguments: []const []const u8) CliError!Invocation {
     if (arguments.len < 2) return error.InvalidInvocation;
     if (arguments.len > argument_count_max) return error.InvalidInvocation;
 
-    const name = arguments[1];
-    if (isHelp(name)) {
+    const queue_name = arguments[1];
+    if (isHelp(queue_name)) {
         if (arguments.len != 2) return error.InvalidInvocation;
-        return .help;
+        return .{ .queue_name = null, .command = .help };
     }
-    if (std.mem.eql(u8, name, "send")) return parseSend(arguments[2..]);
-    if (std.mem.eql(u8, name, "receive")) return parseNoOptions(arguments[2..], .receive);
-    if (std.mem.eql(u8, name, "check")) return parseNoOptions(arguments[2..], .check);
+    try validateQueueName(queue_name);
+    if (arguments.len < 3) return error.InvalidInvocation;
+
+    const command_name = arguments[2];
+    if (isHelp(command_name)) {
+        if (arguments.len != 3) return error.InvalidInvocation;
+        return .{ .queue_name = queue_name, .command = .help };
+    }
+    if (std.mem.eql(u8, command_name, "send")) {
+        return .{ .queue_name = queue_name, .command = try parseSend(arguments[3..]) };
+    }
+    if (std.mem.eql(u8, command_name, "receive")) {
+        return .{
+            .queue_name = queue_name,
+            .command = try parseNoOptions(arguments[3..], .receive),
+        };
+    }
+    if (std.mem.eql(u8, command_name, "check")) {
+        return .{
+            .queue_name = queue_name,
+            .command = try parseNoOptions(arguments[3..], .check),
+        };
+    }
     return error.InvalidInvocation;
+}
+
+fn validateQueueName(queue_name: []const u8) CliError!void {
+    if (queue_name.len == 0) return error.InvalidInvocation;
+    if (queue_name.len > sqs_queue.environment_variable_name_size_max) {
+        return error.InvalidInvocation;
+    }
+    if (!std.ascii.isAlphabetic(queue_name[0])) return error.InvalidInvocation;
+    for (queue_name[1..]) |character| {
+        if (!std.ascii.isAlphanumeric(character)) return error.InvalidInvocation;
+    }
+    std.debug.assert(queue_name.len > 0);
+    std.debug.assert(queue_name.len <= sqs_queue.environment_variable_name_size_max);
 }
 
 fn parseSend(arguments: []const []const u8) CliError!Command {
@@ -520,6 +560,8 @@ fn executeCheck(
 const test_input =
     "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
     "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
+const test_tigerbeetle_queue_name = "TigerBeetleQueue";
+const test_completion_queue_name = "CompletionQueue";
 
 const FakeQueue = struct {
     message: ?sqs_queue.Message = null,
@@ -634,10 +676,11 @@ fn runForTest(
     var result: TestResult = undefined;
     var stdout: std.Io.Writer = .fixed(&result.stdout_buffer);
     var stderr: std.Io.Writer = .fixed(&result.stderr_buffer);
-    const command = parseCommand(arguments) catch {
+    const invocation = parseCommand(arguments) catch {
         writeDiagnostic(&stderr, .invocation);
         return testResultFinish(&result, &stdout, &stderr, 2);
     };
+    const command = invocation.command;
     const input = switch (command) {
         .send => stdin,
         .help, .receive, .check => "",
@@ -677,25 +720,28 @@ test "help works without AWS configuration and command parsing is bounded" {
         &.{ "sqs", "--help" },
         &.{ "sqs", "-h" },
         &.{ "sqs", "help" },
-        &.{ "sqs", "send", "--help" },
-        &.{ "sqs", "receive", "--help" },
-        &.{ "sqs", "check", "--help" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "--help" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "send", "--help" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "receive", "--help" },
+        &.{ "sqs", test_completion_queue_name, "check", "--help" },
     };
     for (help_arguments) |arguments| {
         const result = runForTest(arguments, "", 0, &fake);
         try std.testing.expectEqual(@as(u8, 0), result.exit_code);
         try std.testing.expect(std.mem.startsWith(u8, result.stdout(), "Usage:\n"));
         try std.testing.expect(std.mem.indexOf(u8, result.stdout(), "until interrupted") != null);
-        try std.testing.expect(std.mem.indexOf(u8, result.stdout(), "TigerBeetleQueue") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout(), "<queue-name>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout(), "TigerBeetleQueue") == null);
         try std.testing.expectEqualStrings("", result.stderr());
     }
 
     const invalid_arguments = [_][]const []const u8{
         &.{"sqs"},
         &.{ "sqs", "unknown" },
-        &.{ "sqs", "receive", "extra" },
-        &.{ "sqs", "check", "extra" },
-        &.{ "sqs", "send", "--tenant", "tenant", "extra" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "unknown" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "receive", "extra" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "check", "extra" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", "tenant", "extra" },
     };
     for (invalid_arguments) |arguments| {
         const result = runForTest(arguments, "", 0, &fake);
@@ -707,6 +753,42 @@ test "help works without AWS configuration and command parsing is bounded" {
     }
 }
 
+test "commands require a valid explicit queue logical resource ID" {
+    const queue_names = [_][]const u8{
+        test_tigerbeetle_queue_name,
+        test_completion_queue_name,
+        "A",
+        "A" ** sqs_queue.environment_variable_name_size_max,
+    };
+    for (queue_names) |queue_name| {
+        const send = try parseCommand(&.{ "sqs", queue_name, "send", "--tenant", "tenant" });
+        try std.testing.expectEqualStrings(queue_name, send.queue_name.?);
+        try std.testing.expectEqualStrings("tenant", send.command.send.tenant);
+
+        const receive = try parseCommand(&.{ "sqs", queue_name, "receive" });
+        try std.testing.expectEqualStrings(queue_name, receive.queue_name.?);
+        try std.testing.expect(receive.command == .receive);
+
+        const check = try parseCommand(&.{ "sqs", queue_name, "check" });
+        try std.testing.expectEqualStrings(queue_name, check.queue_name.?);
+        try std.testing.expect(check.command == .check);
+    }
+
+    const invalid_queue_names = [_][]const u8{
+        "",
+        "1Queue",
+        "Queue-Name",
+        "Queue_Name",
+        "A" ** (sqs_queue.environment_variable_name_size_max + 1),
+    };
+    for (invalid_queue_names) |queue_name| {
+        try std.testing.expectError(
+            error.InvalidInvocation,
+            parseCommand(&.{ "sqs", queue_name, "check" }),
+        );
+    }
+}
+
 test "send requires one valid bounded tenant and bounded Operation input" {
     const valid = [_][]const u8{
         "a",
@@ -714,8 +796,10 @@ test "send requires one valid bounded tenant and bounded Operation input" {
         "é" ** (operation.tenant_size_max / 2),
     };
     for (valid) |tenant| {
-        const command = try parseCommand(&.{ "sqs", "send", "--tenant", tenant });
-        try std.testing.expectEqualStrings(tenant, command.send.tenant);
+        const invocation = try parseCommand(
+            &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", tenant },
+        );
+        try std.testing.expectEqualStrings(tenant, invocation.command.send.tenant);
     }
     const invalid = [_][]const u8{
         "",
@@ -726,14 +810,16 @@ test "send requires one valid bounded tenant and bounded Operation input" {
     for (invalid) |tenant| {
         try std.testing.expectError(
             error.InvalidInvocation,
-            parseCommand(&.{ "sqs", "send", "--tenant", tenant }),
+            parseCommand(
+                &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", tenant },
+            ),
         );
     }
 
     var fake: FakeQueue = .{};
     const oversized = "a" ** (stdin_size_max + 1);
     const result = runForTest(
-        &.{ "sqs", "send", "--tenant", "tenant-a" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", "tenant-a" },
         oversized,
         0,
         &fake,
@@ -762,7 +848,7 @@ test "send queues and prints the same canonical SUBMITTED Operation" {
     for (inputs) |input| {
         var fake: FakeQueue = .{};
         const result = runForTest(
-            &.{ "sqs", "send", "--tenant", "tenant-a" },
+            &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", "tenant-a" },
             input,
             1_700_000_000,
             &fake,
@@ -784,7 +870,7 @@ test "send queues and prints the same canonical SUBMITTED Operation" {
 test "send validates through Operation and reports AWS failures without output" {
     var fake: FakeQueue = .{};
     const invalid = runForTest(
-        &.{ "sqs", "send", "--tenant", "tenant-a" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", "tenant-a" },
         "null",
         0,
         &fake,
@@ -802,7 +888,7 @@ test "send validates through Operation and reports AWS failures without output" 
         );
         defer std.testing.allocator.free(input);
         const invalid_state = runForTest(
-            &.{ "sqs", "send", "--tenant", "tenant-a" },
+            &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", "tenant-a" },
             input,
             0,
             &fake,
@@ -813,7 +899,7 @@ test "send validates through Operation and reports AWS failures without output" 
 
     fake.send_error = error.AWSFailure;
     const failed = runForTest(
-        &.{ "sqs", "send", "--tenant", "tenant-a" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", "tenant-a" },
         test_input,
         1_700_000_000,
         &fake,
@@ -837,7 +923,12 @@ test "receive continues through empty polls and prints and deletes messages in o
         .receive_batches = &batches,
         .receive_error_after = batches.len + 1,
     };
-    const result = runForTest(&.{ "sqs", "receive" }, "", 0, &fake);
+    const result = runForTest(
+        &.{ "sqs", test_tigerbeetle_queue_name, "receive" },
+        "",
+        0,
+        &fake,
+    );
     try std.testing.expectEqual(@as(u8, 2), result.exit_code);
     try std.testing.expectEqualStrings("first\nsecond\nline\n", result.stdout());
     try std.testing.expectEqualStrings("sqs: operation failed\n", result.stderr());
@@ -980,14 +1071,19 @@ test "receive flushes output before delete and does not delete after output fail
 
 test "receive reports invalid service, AWS, and delete failures" {
     var response_fake: FakeQueue = .{ .receive_error = error.InvalidServiceResponse };
-    const response_failed = runForTest(&.{ "sqs", "receive" }, "", 0, &response_fake);
+    const response_failed = runForTest(
+        &.{ "sqs", test_tigerbeetle_queue_name, "receive" },
+        "",
+        0,
+        &response_fake,
+    );
     try std.testing.expectEqual(@as(u8, 2), response_failed.exit_code);
     try std.testing.expectEqualStrings("sqs: invalid AWS response\n", response_failed.stderr());
     try std.testing.expectEqual(@as(u8, 0), response_fake.delete_count);
 
     var receive_fake: FakeQueue = .{ .receive_error = error.AWSFailure };
     const receive_failed = runForTest(
-        &.{ "sqs", "receive" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "receive" },
         "",
         0,
         &receive_fake,
@@ -1005,7 +1101,7 @@ test "receive reports invalid service, AWS, and delete failures" {
         .delete_error = error.AWSFailure,
     };
     const delete_failed = runForTest(
-        &.{ "sqs", "receive" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "receive" },
         "",
         0,
         &delete_fake,
@@ -1023,7 +1119,12 @@ test "check writes every known and unknown attribute as escaped JSON" {
         .{ .key = "Future\"Attribute", .value = "line\nvalue\\suffix" },
     };
     var fake: FakeQueue = .{ .attributes = &attributes };
-    const result = runForTest(&.{ "sqs", "check" }, "", 0, &fake);
+    const result = runForTest(
+        &.{ "sqs", test_tigerbeetle_queue_name, "check" },
+        "",
+        0,
+        &fake,
+    );
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
     try std.testing.expectEqualStrings(
         "{\"ApproximateNumberOfMessages\":\"3\"," ++
@@ -1034,7 +1135,12 @@ test "check writes every known and unknown attribute as escaped JSON" {
     try std.testing.expectEqual(@as(u8, 1), fake.check_count);
 
     fake.attributes = &.{};
-    const empty = runForTest(&.{ "sqs", "check" }, "", 0, &fake);
+    const empty = runForTest(
+        &.{ "sqs", test_completion_queue_name, "check" },
+        "",
+        0,
+        &fake,
+    );
     try std.testing.expectEqualStrings("{}\n", empty.stdout());
 }
 
@@ -1048,7 +1154,12 @@ test "AWS and internal diagnostics do not echo message data" {
         .message = message,
         .delete_error = error.UnexpectedPrivateFailure,
     };
-    const result = runForTest(&.{ "sqs", "receive" }, "", 0, &fake);
+    const result = runForTest(
+        &.{ "sqs", test_tigerbeetle_queue_name, "receive" },
+        "",
+        0,
+        &fake,
+    );
     try std.testing.expectEqual(@as(u8, 2), result.exit_code);
     try std.testing.expectEqualStrings("sqs: operation failed\n", result.stderr());
     try std.testing.expect(std.mem.indexOf(u8, result.stderr(), body_marker) == null);

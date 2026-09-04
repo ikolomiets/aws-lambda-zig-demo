@@ -265,17 +265,19 @@ remain readable until DynamoDB removes it asynchronously.
 ## SQS Workflows
 
 `queue.sh` sends canonical Operations, destructively consumes queued messages,
-and checks the SAM stack's TigerBeetle queue. It uses `PROFILE`, `REGION`, and
-`STACK_NAME`, defaulting to `dev`, `ca-central-1`, and
-`aws-lambda-zig-demo`. It exports temporary profile credentials and resolves
-the `TigerBeetleQueue` physical resource, then exports its URL under the exact
-`TigerBeetleQueue` setting expected by the fixed-queue CLI. Send a validated
-Operation input like this:
+and checks a named SQS queue in the SAM stack. Its first argument must be the
+queue's SAM logical resource ID, such as `TigerBeetleQueue` or
+`CompletionQueue`. It uses `PROFILE`, `REGION`, and `STACK_NAME`, defaulting to
+`dev`, `ca-central-1`, and `aws-lambda-zig-demo`. It exports temporary profile
+credentials, resolves the selected physical queue URL, and exports that URL
+under the logical resource ID expected by the CLI. Send a validated Operation
+to the TigerBeetle queue like this:
 
 ```sh
 operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"echo","body":{"message":"hello","count":2}}'
-printf '%s\n' "$operation_json" | ./queue.sh send --tenant 'tenant-a'
+printf '%s\n' "$operation_json" \
+  | ./queue.sh TigerBeetleQueue send --tenant 'tenant-a'
 ```
 
 `send` parses and validates the input through the shared Operation model using
@@ -286,19 +288,21 @@ The exact compact JSON bytes sent to SQS contain `id`, `tenant`, `name`,
 succeeds, the same bytes are printed followed by a newline; the SQS message
 does not include that newline. State is excluded from the existing Operation
 hash, along with `id`, timestamps, expiration, and result. This command does
-not read or update DynamoDB.
+not read or update DynamoDB. `send` always produces an Operation message, so it
+must not be used with `CompletionQueue`, whose consumer expects a Completion
+batch.
 
 Inspect all queue attributes, including attributes added by future AWS API
 versions:
 
 ```sh
-./queue.sh check
+./queue.sh TigerBeetleQueue check
 ```
 
 Consume messages until interrupted:
 
 ```sh
-./queue.sh receive
+./queue.sh TigerBeetleQueue receive
 ```
 
 `receive` is a destructive long-running consumer. It requests one message at a
@@ -325,8 +329,9 @@ roles remain separate. The intake role is limited to table-scoped
 permissions. The execution role can poll only the TigerBeetle queue and send to only the
 Completion queue. The completion role can poll only the Completion queue and has
 table-scoped `dynamodb:UpdateItem`; execution has no DynamoDB permission.
-Once the event source mapping is enabled, `queue.sh receive` competes with the
-execution Lambda for messages.
+Once an event source mapping is enabled, `queue.sh <queue-name> receive`
+competes with that queue's Lambda consumer. In this stack, `TigerBeetleQueue`
+feeds execution and `CompletionQueue` feeds completion.
 
 Both Lambda Function URLs require the token in an HTTP authorization header:
 

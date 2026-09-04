@@ -10,6 +10,14 @@ fail() {
     exit 1
 }
 
+[ "$#" -ge 2 ] || fail "usage: ./queue.sh <queue-name> send|receive|check [arguments]"
+queue_name="$1"
+shift
+[ "${#queue_name}" -le 256 ] || fail "queue logical resource ID is too long"
+if [[ ! "$queue_name" =~ ^[A-Za-z][A-Za-z0-9]*$ ]]; then
+    fail "invalid queue logical resource ID: $queue_name"
+fi
+
 command -v aws >/dev/null 2>&1 || fail "missing required command: aws"
 
 cd "$(dirname "$0")"
@@ -32,17 +40,17 @@ export AWS_PROFILE="$PROFILE"
 export AWS_REGION="$REGION"
 export AWS_EC2_METADATA_DISABLED=true
 
-tigerbeetle_queue_url="$(
+queue_url="$(
     aws cloudformation describe-stack-resource \
         --stack-name "$STACK_NAME" \
-        --logical-resource-id TigerBeetleQueue \
+        --logical-resource-id "$queue_name" \
         --query StackResourceDetail.PhysicalResourceId \
         --output text \
         --region "$REGION"
-)" || fail "failed to resolve TigerBeetleQueue from stack $STACK_NAME"
-[ -n "$tigerbeetle_queue_url" ] || fail "stack $STACK_NAME has no TigerBeetleQueue resource"
-[ "$tigerbeetle_queue_url" != "None" ] || fail "stack $STACK_NAME has no TigerBeetleQueue resource"
-export TigerBeetleQueue="$tigerbeetle_queue_url"
-unset tigerbeetle_queue_url
+)" || fail "failed to resolve $queue_name from stack $STACK_NAME"
+[ -n "$queue_url" ] || fail "stack $STACK_NAME has no $queue_name resource"
+[ "$queue_url" != "None" ] || fail "stack $STACK_NAME has no $queue_name resource"
+export "$queue_name=$queue_url"
+unset queue_url
 
-exec ./zig-out/bin/sqs "$@"
+exec ./zig-out/bin/sqs "$queue_name" "$@"

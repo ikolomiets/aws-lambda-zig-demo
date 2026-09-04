@@ -517,8 +517,9 @@ queue-scoped poller policy and Completion queue-scoped `SendMessage` policy.
 Completion receives its separate Completion queue-scoped poller policy and
 table-scoped `UpdateItem`; neither role grants queue-management access. The
 `queue.sh` command uses the local caller's AWS identity and does not expand any
-Lambda role. Its `receive` command competes with the enabled execution event
-source mapping for TigerBeetle queue messages.
+Lambda role. Its `receive` command competes with the selected queue's enabled
+event source mapping: execution for `TigerBeetleQueue` or completion for
+`CompletionQueue`.
 
 `TigerBeetleQueue` and `CompletionQueue` are standard queues with 90-second
 visibility timeouts, six times
@@ -1406,10 +1407,10 @@ aws cloudformation describe-stacks \
 
 `lambda_logs.sh` resolves the explicit intake, query, execution, or completion
 function-name output.
-`persistence.sh` and `queue.sh` resolve the `OperationsTable` and
-`TigerBeetleQueue` physical resources directly because those data-plane names
-are intentionally not public stack outputs. Normal local command use does not
-require exporting those values.
+`persistence.sh` resolves the `OperationsTable` physical resource, while
+`queue.sh` resolves the queue logical resource ID supplied by the caller. These
+data-plane names are intentionally not public stack outputs. Normal local
+command use does not require exporting those values.
 
 ### Configure the workstation
 
@@ -2006,17 +2007,19 @@ aggregate, and requests a retry for the invocation's single SQS message.
 
 `queue.sh` is the supported local queue command. It defaults to profile `dev`,
 region `ca-central-1`, and stack `aws-lambda-zig-demo`. It exports the selected
-profile's temporary credentials, resolves the `TigerBeetleQueue` physical
-resource, exports its URL under the same `TigerBeetleQueue` key used by intake,
-and runs the requested operation. Override the defaults with
-`PROFILE`, `REGION`, or `STACK_NAME`.
+profile's temporary credentials and requires a queue SAM logical resource ID as
+its first argument. It resolves that resource's physical queue URL, exports the
+URL under the same logical ID used by the CLI, and runs the requested operation.
+Use `TigerBeetleQueue` or `CompletionQueue` for this template. Override the
+environment defaults with `PROFILE`, `REGION`, or `STACK_NAME`.
 
 Send an Operation while supplying required tenant metadata separately:
 
 ```sh
 operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"echo","body":{"message":"hello","count":2}}'
-printf '%s\n' "$operation_json" | ./queue.sh send --tenant 'tenant-a'
+printf '%s\n' "$operation_json" \
+  | ./queue.sh TigerBeetleQueue send --tenant 'tenant-a'
 ```
 
 `send` validates the input with `src/operation.zig` and derives `last_updated`
@@ -2026,23 +2029,27 @@ once. The SQS message contains the compact canonical JSON with `id`, `tenant`,
 `name`, `body`, `state`, `last_updated`, `expires_at`, and `hash`, with no
 trailing newline. After `SendMessage` succeeds, stdout receives those exact
 bytes followed by a newline. State remains excluded from the Operation hash.
-The command does not read or update DynamoDB.
+The command does not read or update DynamoDB. `send` always produces an
+Operation message and must not target `CompletionQueue`, whose consumer expects
+a Completion batch.
 
 Request every queue attribute and print one JSON object. Unknown future keys
 are retained:
 
 ```sh
-./queue.sh check
+./queue.sh TigerBeetleQueue check
 ```
 
 Consume queued messages until interrupted:
 
 ```sh
-./queue.sh receive
+./queue.sh TigerBeetleQueue receive
 ```
 
-On a deployed stack, this local consumer competes with the enabled execution Lambda event source
-mapping. Use it only when intentionally taking messages away from the execution handler.
+On a deployed stack, this local consumer competes with the selected queue's
+enabled Lambda event source mapping. `TigerBeetleQueue` feeds execution and
+`CompletionQueue` feeds completion. Use `receive` only when intentionally
+taking messages away from that handler.
 
 This is a destructive long-running consumer. It requests one message at a time
 with `WaitTimeSeconds` set to `20` and silently polls again when SQS returns no
@@ -2073,11 +2080,11 @@ SQS permissions.
 
 If `sqs: missing or invalid configuration` is emitted, the local command
 implementation could not load its AWS settings. `queue.sh` supplies the
-resolved queue URL as `TigerBeetleQueue`, temporary credentials, and region,
-and validates that the URL is non-empty. Confirm `PROFILE`, `REGION`, and
-`STACK_NAME`. Configuration
-is checked before Operation input is parsed; AWS failures after configuration
-loading instead report `sqs: AWS request failed`.
+resolved queue URL under the requested logical resource ID, temporary
+credentials, and region, and validates that the URL is non-empty. Confirm the
+queue name, `PROFILE`, `REGION`, and `STACK_NAME`. Configuration is checked
+before Operation input is parsed; AWS failures after configuration loading
+instead report `sqs: AWS request failed`.
 
 ## 12. Update the deployed Lambda code
 
