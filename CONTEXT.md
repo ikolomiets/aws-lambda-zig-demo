@@ -25,12 +25,12 @@ The JSON value produced when an operation succeeds or fails.
 _Avoid_: Response, output body
 
 **Operation State**:
-The operation's current lifecycle position: new, succeeded, or failed.
+The operation's current lifecycle position: submitted or completed.
 _Avoid_: Status
 
 **Terminal State**:
-A succeeded or failed state after which an operation has a result.
-_Avoid_: Completed state
+The completed state, after which an Operation has an immutable success or failure result.
+_Avoid_: Success state, failure state
 
 **Operation Hash**:
 A stable fingerprint of an operation's tenant, name, and body used to identify the requested work.

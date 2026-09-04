@@ -435,7 +435,7 @@ fn executeOperation(
     queued: *const operation.Operation,
     execution: ExecutionAdapter,
 ) ExecutionOutcome {
-    std.debug.assert(queued.status == .submitted);
+    std.debug.assert(queued.state == .submitted);
     std.debug.assert(queued.body != null);
 
     const account = accountingAccount(queued.id);
@@ -560,7 +560,7 @@ fn accountingTransfer(operation_id: u128) tigerbeetle.Transfer {
 }
 
 fn validateQueuedOperation(queued: *const operation.Operation) !void {
-    if (queued.status != .submitted) return error.InvalidState;
+    if (queued.state != .submitted) return error.InvalidState;
     if (queued.body == null) return error.MissingBody;
     std.debug.assert(queued.hash != null);
     std.debug.assert(queued.last_updated != null);
@@ -636,7 +636,7 @@ fn testMessage(allocator: Allocator, id: u128) ![]u8 {
         .tenant = "tenant-a",
         .name = "echo",
         .body = .{ .bool = true },
-        .status = .submitted,
+        .state = .submitted,
         .last_updated = 1_700_000_000,
         .expires_at = 1_700_086_400,
         .hash = [_]u8{0xAB} ** 32,

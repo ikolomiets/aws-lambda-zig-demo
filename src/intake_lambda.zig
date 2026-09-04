@@ -273,7 +273,7 @@ fn post_invocation_outcome(
             else => .internal_server_error,
         };
     };
-    if (created.status != .submitted) return operation_success_outcome(allocator, &created);
+    if (created.state != .submitted) return operation_success_outcome(allocator, &created);
 
     var queued = created;
     queued.body = parsed.body;
@@ -293,7 +293,7 @@ fn operation_message_body(
     queued: *const operation.Operation,
 ) ![]const u8 {
     std.debug.assert(queued.body != null);
-    std.debug.assert(queued.status == .submitted);
+    std.debug.assert(queued.state == .submitted);
 
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
@@ -392,7 +392,7 @@ const FakeIntake = struct {
     create_count: u8 = 0,
     send_count: u8 = 0,
     last_id: u128 = 0,
-    last_state: ?operation.State = null,
+    last_state: ?operation.StateTag = null,
     last_updated: ?operation.UnixSeconds = null,
     last_expires_at: ?operation.UnixSeconds = null,
     last_hash: ?[32]u8 = null,
@@ -415,7 +415,7 @@ const FakeIntake = struct {
         std.debug.assert(source.name.len <= fake.last_name_buffer.len);
         fake.create_count += 1;
         fake.last_id = source.id;
-        fake.last_state = operation.statusToState(&source.status);
+        fake.last_state = operation.stateTag(&source.state);
         fake.last_updated = source.last_updated;
         fake.last_expires_at = source.expires_at;
         fake.last_hash = source.hash;
@@ -567,7 +567,7 @@ test "authenticated POST persists and queues SUBMITTED then returns without its 
             operation.uuidFromString("00112233-4455-6677-8899-aabbccddeeff") catch unreachable,
             fake.last_id,
         );
-        try std.testing.expectEqual(operation.State.submitted, fake.last_state.?);
+        try std.testing.expectEqual(operation.StateTag.submitted, fake.last_state.?);
         try std.testing.expectEqual(@as(i64, 1_700_000_000), fake.last_updated.?);
         try std.testing.expectEqual(@as(i64, 1_700_086_400), fake.last_expires_at.?);
         try std.testing.expectEqualStrings("lambda-test-user", fake.lastTenant());
@@ -750,7 +750,7 @@ test "matching SUBMITTED POST requeues and returns the stored snapshot" {
         ) catch unreachable,
         .tenant = "lambda-test-user",
         .name = "echo",
-        .status = .submitted,
+        .state = .submitted,
         .last_updated = 1_699_999_000,
         .expires_at = 1_700_085_400,
         .hash = expected_hash,
@@ -799,7 +799,7 @@ test "matching POST retry returns the latest stored persistent view" {
         ) catch unreachable,
         .tenant = "lambda-test-user",
         .name = "echo",
-        .status = .{
+        .state = .{
             .completed = .{
                 .success = (try operation.parseCompletionJSON(
                     result_arena.allocator(),
@@ -849,7 +849,7 @@ test "matching POST retry returns the latest stored persistent view" {
     try std.testing.expectEqual(@as(u8, 1), fake.create_count);
 }
 
-test "matching POST in every terminal state returns without enqueueing" {
+test "matching POST with every completed outcome returns without enqueueing" {
     const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
         .seed_byte = 0x53,
         .now = 1_700_000_000,
@@ -888,7 +888,7 @@ test "matching POST in every terminal state returns without enqueueing" {
             ) catch unreachable,
             .tenant = "lambda-test-user",
             .name = "echo",
-            .status = .{ .completed = completion },
+            .state = .{ .completed = completion },
             .last_updated = 1_700_000_123,
             .expires_at = 1_700_086_523,
             .hash = expected_hash,

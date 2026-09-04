@@ -27,7 +27,7 @@ const CreateOptions = struct {
 
 const UpdateOptions = struct {
     id: u128,
-    state: operation.State,
+    state: operation.StateTag,
 };
 
 const Context = struct {
@@ -187,7 +187,7 @@ fn validateCommandInput(command: Command, input: []const u8) !void {
     switch (command) {
         .create => {},
         .update => |options| {
-            if (operation.stateIsTerminal(options.state)) {
+            if (operation.stateTagIsTerminal(options.state)) {
                 if (input.len > operation.result_size_max) return error.InputTooLarge;
             } else {
                 if (input.len != 0) return error.UnexpectedInput;
@@ -250,7 +250,7 @@ fn parseUpdate(arguments: []const []const u8) CliError!Command {
     if (arguments.len != 4) return error.InvalidInvocation;
 
     var id: ?u128 = null;
-    var state: ?operation.State = null;
+    var state: ?operation.StateTag = null;
     var index: usize = 0;
     while (index < arguments.len) : (index += 2) {
         const option = arguments[index];
@@ -260,7 +260,7 @@ fn parseUpdate(arguments: []const []const u8) CliError!Command {
             id = operation.uuidFromString(value) catch return error.InvalidInvocation;
         } else if (std.mem.eql(u8, option, "--state")) {
             if (state != null) return error.InvalidInvocation;
-            state = operation.stateFromString(value) catch return error.InvalidInvocation;
+            state = operation.stateTagFromString(value) catch return error.InvalidInvocation;
         } else {
             return error.InvalidInvocation;
         }
@@ -473,16 +473,16 @@ fn executeUpdate(
 ) !void {
     const snapshot = try backend.read(context.allocator, options.id);
     try operation.validatePersistent(&snapshot);
-    const replacement_status: operation.Status = switch (options.state) {
+    const replacement_state: operation.State = switch (options.state) {
         .submitted => .submitted,
         .completed => .{ .completed = try operation.parseCompletionJSON(
             context.allocator,
             context.stdin,
         ) },
     };
-    try operation.validateStatusTransition(&snapshot.status, &replacement_status);
+    try operation.validateStateTransition(&snapshot.state, &replacement_state);
     var replacement = snapshot;
-    replacement.status = replacement_status;
+    replacement.state = replacement_state;
     replacement.last_updated = context.now;
     replacement.expires_at = try operation.expires_at_from_last_updated(context.now);
     try operation.validatePersistent(&replacement);
@@ -508,7 +508,7 @@ const FakePersistence = struct {
         .id = operation.uuidFromString(test_id) catch unreachable,
         .tenant = "tenant-a",
         .name = "echo",
-        .status = .submitted,
+        .state = .submitted,
         .last_updated = 1_700_000_000,
         .expires_at = 1_700_086_400,
         .hash = test_hash,
@@ -520,7 +520,7 @@ const FakePersistence = struct {
     read_count: u8 = 0,
     update_count: u8 = 0,
     last_id: u128 = 0,
-    last_state: ?operation.State = null,
+    last_state: ?operation.StateTag = null,
     create_last_updated: ?operation.UnixSeconds = null,
     create_tenant_buffer: [operation.tenant_size_max]u8 = undefined,
     create_tenant_len: u8 = 0,
@@ -532,7 +532,7 @@ const FakePersistence = struct {
     ) !operation.Operation {
         fake.create_count += 1;
         fake.last_id = source.id;
-        fake.last_state = operation.statusToState(&source.status);
+        fake.last_state = operation.stateTag(&source.state);
         fake.create_tenant_len = @intCast(source.tenant.len);
         @memcpy(fake.create_tenant_buffer[0..source.tenant.len], source.tenant);
         if (fake.create_error) |err| return err;
@@ -567,7 +567,7 @@ const FakePersistence = struct {
         replacement: *const operation.Operation,
     ) !operation.Operation {
         fake.update_count += 1;
-        fake.last_state = operation.statusToState(&replacement.status);
+        fake.last_state = operation.stateTag(&replacement.state);
         if (fake.update_error) |err| return err;
         return replacement.*;
     }
@@ -706,7 +706,7 @@ test "create parses stdin dispatches once and writes canonical JSON" {
     );
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
     try std.testing.expectEqual(@as(u8, 1), fake.create_count);
-    try std.testing.expectEqual(operation.State.submitted, fake.last_state.?);
+    try std.testing.expectEqual(operation.StateTag.submitted, fake.last_state.?);
     try std.testing.expectEqualStrings("tenant-a", fake.createTenant());
     try std.testing.expectEqualStrings(
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
@@ -839,7 +839,7 @@ test "read reports missing and AWS failures with stable exit codes" {
 
 test "update accepts submitted refresh and both completed envelopes" {
     const cases = [_]struct {
-        state: operation.State,
+        state: operation.StateTag,
         input: []const u8,
         expected: []const u8,
     }{
@@ -877,7 +877,7 @@ test "update accepts submitted refresh and both completed envelopes" {
                 "dynamodb",
                 "update",
                 "--state",
-                operation.stateToString(case.state),
+                operation.stateTagToString(case.state),
                 "--id",
                 test_id,
             },
@@ -894,11 +894,11 @@ test "update accepts submitted refresh and both completed envelopes" {
 }
 
 test "update rejects every target from either completed outcome" {
-    const completed = [_]operation.Status{
+    const completed = [_]operation.State{
         .{ .completed = .{ .success = .{ .bool = true } } },
         .{ .completed = .{ .failure = .{ .bool = false } } },
     };
-    const targets = [_]struct { state: operation.State, input: []const u8 }{
+    const targets = [_]struct { state: operation.StateTag, input: []const u8 }{
         .{ .state = .submitted, .input = "" },
         .{
             .state = .completed,
@@ -912,7 +912,7 @@ test "update rejects every target from either completed outcome" {
     for (completed) |current| {
         for (targets) |target| {
             var fake: FakePersistence = .{};
-            fake.stored.status = current;
+            fake.stored.state = current;
             const result = runForTest(
                 &.{
                     "dynamodb",
@@ -920,7 +920,7 @@ test "update rejects every target from either completed outcome" {
                     "--id",
                     test_id,
                     "--state",
-                    operation.stateToString(target.state),
+                    operation.stateTagToString(target.state),
                 },
                 target.input,
                 1_700_000_001,

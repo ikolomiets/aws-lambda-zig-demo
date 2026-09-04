@@ -222,7 +222,7 @@ const CompletionByIdRequest = struct {
 };
 
 fn createRequestInit(request: *CreateRequest, source: *const operation.Operation) !void {
-    const state = operation.statusToState(&source.status);
+    const state_tag = operation.stateTag(&source.state);
     const timestamp = timestampString(source.last_updated.?, &request.timestamp_buffer);
     const expires_at = timestampString(source.expires_at.?, &request.expires_at_buffer);
     request.hash_buffer = std.fmt.bytesToHex(source.hash.?, .lower);
@@ -230,12 +230,12 @@ fn createRequestInit(request: *CreateRequest, source: *const operation.Operation
     request.items[0] = stringAttribute("id", operation.uuidToString(source.id, &request.id_buffer));
     request.items[1] = stringAttribute("tenant", source.tenant);
     request.items[2] = stringAttribute("name", source.name);
-    request.items[3] = stringAttribute("state", operation.stateToString(state));
+    request.items[3] = stringAttribute("state", operation.stateTagToString(state_tag));
     request.items[4] = numberAttribute("last_updated", timestamp);
     request.items[5] = numberAttribute("expires_at", expires_at);
     request.items[6] = stringAttribute("hash", &request.hash_buffer);
     request.item_count = attribute_count_min;
-    if (operation.statusCompletion(&source.status)) |completion| {
+    if (operation.stateCompletion(&source.state)) |completion| {
         const result = try operation.writeCompletionJSON(&request.result_buffer, completion);
         request.items[request.item_count] = stringAttribute("result", result);
         request.item_count += 1;
@@ -282,13 +282,13 @@ fn updateRequestInit(
     updateValue(request, ":old_tenant", .{ .s = snapshot.tenant });
     updateValue(request, ":old_name", .{ .s = snapshot.name });
     updateValue(request, ":old_state", .{
-        .s = operation.stateToString(operation.statusToState(&snapshot.status)),
+        .s = operation.stateTagToString(operation.stateTag(&snapshot.state)),
     });
     updateValue(request, ":old_time", .{ .n = old_time });
     updateValue(request, ":old_expires_at", .{ .n = old_expires_at });
     updateValue(request, ":old_hash", .{ .s = &request.old_hash_buffer });
     updateValue(request, ":new_state", .{
-        .s = operation.stateToString(operation.statusToState(&replacement.status)),
+        .s = operation.stateTagToString(operation.stateTag(&replacement.state)),
     });
     updateValue(request, ":new_time", .{ .n = new_time });
     updateValue(request, ":new_expires_at", .{ .n = new_expires_at });
@@ -300,7 +300,7 @@ fn updateRequestResult(
     snapshot: *const operation.Operation,
     replacement: *const operation.Operation,
 ) !void {
-    if (operation.statusCompletion(&snapshot.status)) |completion| {
+    if (operation.stateCompletion(&snapshot.state)) |completion| {
         const serialized = try operation.writeCompletionJSON(
             &request.old_result_buffer,
             completion,
@@ -310,7 +310,7 @@ fn updateRequestResult(
     } else {
         request.condition_expression = condition_without_result;
     }
-    if (operation.statusCompletion(&replacement.status)) |completion| {
+    if (operation.stateCompletion(&replacement.state)) |completion| {
         const serialized = try operation.writeCompletionJSON(
             &request.new_result_buffer,
             completion,
@@ -348,8 +348,8 @@ fn completionRequestInit(
         stringAttribute(":tenant", queued.tenant),
         stringAttribute(":name", queued.name),
         stringAttribute(":hash", &request.hash_buffer),
-        stringAttribute(":submitted", operation.stateToString(.submitted)),
-        stringAttribute(":completed", operation.stateToString(.completed)),
+        stringAttribute(":submitted", operation.stateTagToString(.submitted)),
+        stringAttribute(":completed", operation.stateTagToString(.completed)),
         numberAttribute(":now", timestampString(now, &request.timestamp_buffer)),
         numberAttribute(":expires_at", timestampString(
             expires_at,
@@ -376,8 +376,8 @@ fn completionByIdRequestInit(
         .{ .key = "#state", .value = "state" },
     };
     request.values = .{
-        stringAttribute(":submitted", operation.stateToString(.submitted)),
-        stringAttribute(":completed", operation.stateToString(.completed)),
+        stringAttribute(":submitted", operation.stateTagToString(.submitted)),
+        stringAttribute(":completed", operation.stateTagToString(.completed)),
         numberAttribute(":now", timestampString(now, &request.timestamp_buffer)),
         numberAttribute(":expires_at", timestampString(
             expires_at,
@@ -481,15 +481,15 @@ const DecodedFields = struct {
             return error.InvalidItem;
         }
         const state_text = fields.state orelse return error.InvalidItem;
-        const state = operation.stateFromString(state_text) catch return error.InvalidItem;
-        const status: operation.Status = switch (state) {
-            .submitted => status: {
+        const state_tag = operation.stateTagFromString(state_text) catch return error.InvalidItem;
+        const state: operation.State = switch (state_tag) {
+            .submitted => state: {
                 if (fields.result != null) return error.InvalidItem;
-                break :status .submitted;
+                break :state .submitted;
             },
-            .completed => status: {
+            .completed => state: {
                 const result_text = fields.result orelse return error.InvalidItem;
-                break :status .{ .completed = try parseStoredCompletion(arena, result_text) };
+                break :state .{ .completed = try parseStoredCompletion(arena, result_text) };
             },
         };
         const name_text = fields.name orelse return error.InvalidItem;
@@ -499,7 +499,7 @@ const DecodedFields = struct {
             .id = id,
             .tenant = try arena.dupe(u8, tenant_text),
             .name = try arena.dupe(u8, name_text),
-            .status = status,
+            .state = state,
             .last_updated = try timestampFromString(fields.last_updated orelse {
                 return error.InvalidItem;
             }),
@@ -541,16 +541,16 @@ fn validateStored(source: *const operation.Operation) !void {
 
 fn validateCreation(source: *const operation.Operation) !void {
     try validateStored(source);
-    if (source.status != .submitted) return error.InvalidState;
+    if (source.state != .submitted) return error.InvalidState;
 }
 
 fn validateCompletion(queued: *const operation.Operation) !void {
-    if (queued.status != .submitted) return error.InvalidState;
+    if (queued.state != .submitted) return error.InvalidState;
     if (queued.body == null) return error.MissingBody;
     var persisted = queued.*;
     persisted.body = null;
     try validateStored(&persisted);
-    std.debug.assert(persisted.status == .submitted);
+    std.debug.assert(persisted.state == .submitted);
 }
 
 fn validateUpdate(
@@ -563,7 +563,7 @@ fn validateUpdate(
     if (!std.mem.eql(u8, snapshot.tenant, replacement.tenant)) return error.ImmutableField;
     if (!std.mem.eql(u8, snapshot.name, replacement.name)) return error.ImmutableField;
     if (!std.mem.eql(u8, &snapshot.hash.?, &replacement.hash.?)) return error.ImmutableField;
-    try operation.validateStatusTransition(&snapshot.status, &replacement.status);
+    try operation.validateStateTransition(&snapshot.state, &replacement.state);
     std.debug.assert(snapshot.body == null);
     std.debug.assert(replacement.body == null);
 }
@@ -576,7 +576,7 @@ fn validateUpdateResult(
     if (!std.mem.eql(u8, updated.tenant, replacement.tenant)) return error.InvalidItem;
     if (!std.mem.eql(u8, updated.name, replacement.name)) return error.InvalidItem;
     if (!std.mem.eql(u8, &updated.hash.?, &replacement.hash.?)) return error.InvalidItem;
-    if (!try statusEqual(&updated.status, &replacement.status)) return error.InvalidItem;
+    if (!try stateEqual(&updated.state, &replacement.state)) return error.InvalidItem;
     if (updated.last_updated != replacement.last_updated) return error.InvalidItem;
     if (updated.expires_at != replacement.expires_at) return error.InvalidItem;
 }
@@ -702,28 +702,28 @@ fn hashFromString(value: []const u8) ![32]u8 {
     return hash;
 }
 
-fn statusEqual(first: *const operation.Status, second: *const operation.Status) !bool {
-    if (operation.statusToState(first) != operation.statusToState(second)) return false;
-    if (operation.statusCompletion(first)) |first_completion| {
-        const second_completion = operation.statusCompletion(second) orelse return false;
+fn stateEqual(first: *const operation.State, second: *const operation.State) !bool {
+    if (operation.stateTag(first) != operation.stateTag(second)) return false;
+    if (operation.stateCompletion(first)) |first_completion| {
+        const second_completion = operation.stateCompletion(second) orelse return false;
         var first_buffer: [operation.result_size_max]u8 = undefined;
         var second_buffer: [operation.result_size_max]u8 = undefined;
         const first_json = try operation.writeCompletionJSON(&first_buffer, first_completion);
         const second_json = try operation.writeCompletionJSON(&second_buffer, second_completion);
         return std.mem.eql(u8, first_json, second_json);
     }
-    return operation.statusCompletion(second) == null;
+    return operation.stateCompletion(second) == null;
 }
 
 const test_id = "00112233-4455-6677-8899-aabbccddeeff";
 const test_hash = [_]u8{0xAB} ** 32;
 
-fn testOperation(state: operation.State, completion: ?operation.Completion) operation.Operation {
+fn testOperation(state_tag: operation.StateTag, completion: ?operation.Completion) operation.Operation {
     return .{
         .id = operation.uuidFromString(test_id) catch unreachable,
         .tenant = "tenant-a",
         .name = "echo",
-        .status = switch (state) {
+        .state = switch (state_tag) {
             .submitted => .submitted,
             .completed => .{ .completed = completion.? },
         },
@@ -757,8 +757,8 @@ test "items round trip submitted and both completed outcomes without body" {
         .{ .failure = .{ .bool = false } },
     };
     for (completions) |completion| {
-        const state: operation.State = if (completion == null) .submitted else .completed;
-        var source = testOperation(state, completion);
+        const state_tag: operation.StateTag = if (completion == null) .submitted else .completed;
+        var source = testOperation(state_tag, completion);
         source.body = .{ .bool = true };
         const persisted = persistentCopy(&source);
         try validateStored(&persisted);
@@ -767,17 +767,17 @@ test "items round trip submitted and both completed outcomes without body" {
         const item = request.items[0..request.item_count];
         const decoded = try decodeItem(arena.allocator(), item);
 
-        try std.testing.expectEqual(state, operation.statusToState(&decoded.status));
+        try std.testing.expectEqual(state_tag, operation.stateTag(&decoded.state));
         try std.testing.expectEqualStrings(
-            operation.stateToString(state),
+            operation.stateTagToString(state_tag),
             try stringValue(findAttribute(item, "state").?),
         );
         try std.testing.expectEqualStrings("tenant-a", decoded.tenant);
         try std.testing.expect(decoded.tenant.ptr != source.tenant.ptr);
         try std.testing.expect(findAttribute(item, "body") == null);
         try std.testing.expectEqual(
-            operation.stateIsTerminal(state),
-            operation.statusCompletion(&decoded.status) != null,
+            operation.stateTagIsTerminal(state_tag),
+            operation.stateCompletion(&decoded.state) != null,
         );
         try std.testing.expectEqual(@as(usize, request.item_count), item.len);
     }
@@ -841,7 +841,7 @@ test "persistent copy omits the private body without copying arena-owned Values"
     try std.testing.expect(created.body == null);
     try std.testing.expectEqual(source.id, created.id);
     try std.testing.expectEqualStrings(source.tenant, created.tenant);
-    try std.testing.expect(try statusEqual(&source.status, &created.status));
+    try std.testing.expect(try stateEqual(&source.state, &created.state));
     try std.testing.expectEqual(source.last_updated, created.last_updated);
     try std.testing.expectEqual(source.expires_at, created.expires_at);
     try std.testing.expectEqualSlices(u8, &source.hash.?, &created.hash.?);
@@ -1031,15 +1031,15 @@ test "completion envelopes round trip through canonical DynamoDB strings" {
             findAttribute(request.items[0..request.item_count], "result").?,
         ));
         const decoded = try decodeItem(arena.allocator(), request.items[0..request.item_count]);
-        try std.testing.expectEqual(operation.State.completed, operation.statusToState(
-            &decoded.status,
+        try std.testing.expectEqual(operation.StateTag.completed, operation.stateTag(
+            &decoded.state,
         ));
         var result_buffer: [operation.result_size_max]u8 = undefined;
         try std.testing.expectEqualStrings(
             canonical,
             try operation.writeCompletionJSON(
                 &result_buffer,
-                operation.statusCompletion(&decoded.status).?,
+                operation.stateCompletion(&decoded.state).?,
             ),
         );
     }
@@ -1050,7 +1050,7 @@ test "updates snapshot every stored field and return all new attributes" {
     defer arena.deinit();
     const snapshot = testOperation(.submitted, null);
     var replacement = snapshot;
-    replacement.status = .{ .completed = try testCompletion(
+    replacement.state = .{ .completed = try testCompletion(
         arena.allocator(),
         "{\"type\":\"SUCCESS\",\"payload\":{\"ok\":true}}",
     ) };
@@ -1301,26 +1301,26 @@ test "completion accepts only queued SUBMITTED operations with body" {
     queued.body = .null;
     try validateCompletion(&queued);
 
-    queued.status = .{ .completed = .{ .success = .{ .bool = true } } };
+    queued.state = .{ .completed = .{ .success = .{ .bool = true } } };
     try std.testing.expectError(error.InvalidState, validateCompletion(&queued));
-    queued.status = .{ .completed = .{ .failure = .{ .bool = false } } };
+    queued.state = .{ .completed = .{ .failure = .{ .bool = false } } };
     try std.testing.expectError(error.InvalidState, validateCompletion(&queued));
     queued = testOperation(.submitted, null);
     try std.testing.expectError(error.MissingBody, validateCompletion(&queued));
 }
 
-test "updates enforce every status transition" {
-    const statuses = [_]operation.Status{
+test "updates enforce every state transition" {
+    const states = [_]operation.State{
         .submitted,
         .{ .completed = .{ .success = .{ .bool = true } } },
         .{ .completed = .{ .failure = .{ .bool = false } } },
     };
-    for (statuses) |current| {
-        for (statuses) |target| {
+    for (states) |current| {
+        for (states) |target| {
             var snapshot = testOperation(.submitted, null);
-            snapshot.status = current;
+            snapshot.state = current;
             var replacement = snapshot;
-            replacement.status = target;
+            replacement.state = target;
             replacement.last_updated.? += 1;
             replacement.expires_at.? += 1;
             const allowed = current == .submitted;
@@ -1391,12 +1391,12 @@ test "update result requires exact completion outcome and canonical payload" {
     var updated = replacement;
     try validateUpdateResult(&updated, &replacement);
 
-    updated.status = testOperation(.completed, .{ .failure = .{ .bool = true } }).status;
+    updated.state = testOperation(.completed, .{ .failure = .{ .bool = true } }).state;
     try std.testing.expectError(
         error.InvalidItem,
         validateUpdateResult(&updated, &replacement),
     );
-    updated.status = testOperation(.completed, .{ .success = .{ .bool = false } }).status;
+    updated.state = testOperation(.completed, .{ .success = .{ .bool = false } }).state;
     try std.testing.expectError(
         error.InvalidItem,
         validateUpdateResult(&updated, &replacement),
@@ -1436,7 +1436,7 @@ test "matching create retry returns the stored Operation in every state" {
             &diagnostic,
             &requested,
         );
-        try std.testing.expect(try statusEqual(&existing.status, &created.status));
+        try std.testing.expect(try stateEqual(&existing.state, &created.state));
         try std.testing.expectEqual(existing.last_updated, created.last_updated);
         try std.testing.expectEqual(existing.expires_at, created.expires_at);
         try std.testing.expectEqualStrings("echo", created.name);

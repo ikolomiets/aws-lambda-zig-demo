@@ -512,14 +512,14 @@ fn handleInvocationWithCacheForTest(
     );
 }
 
-fn testOperation(tenant: []const u8, state: operation.State) operation.Operation {
+fn testOperation(tenant: []const u8, state_tag: operation.StateTag) operation.Operation {
     return .{
         .id = operation.uuidFromString(
             "00112233-4455-6677-8899-aabbccddeeff",
         ) catch unreachable,
         .tenant = tenant,
         .name = "echo",
-        .status = switch (state) {
+        .state = switch (state_tag) {
             .submitted => .submitted,
             .completed => .{ .completed = .{ .success = .{ .string = "done" } } },
         },
@@ -633,7 +633,7 @@ test "authenticated GET returns exact completed success and failure envelopes" {
     try std.testing.expectEqualStrings(expected, response);
 
     var failure = testOperation("lambda-test-user", .completed);
-    failure.status = .{ .completed = .{ .failure = .{ .string = "done" } } };
+    failure.state = .{ .completed = .{ .failure = .{ .string = "done" } } };
     fake.response = failure;
     const failure_response = handleInvocationForTest(
         std.testing.allocator,
@@ -1095,7 +1095,7 @@ test "malformed stored output and allocation failures remain sanitized" {
         .id = 0,
         .tenant = "lambda-test-user",
         .name = "encoding-failure-marker",
-        .status = .submitted,
+        .state = .submitted,
         .last_updated = 1000,
         .expires_at = 1001,
         .hash = [_]u8{0} ** 32,
