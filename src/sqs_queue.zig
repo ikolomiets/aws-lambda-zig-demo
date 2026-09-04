@@ -4,8 +4,8 @@ const sqs = @import("sqs");
 
 const Allocator = std.mem.Allocator;
 
-const environment_variable_name_size_max = 256;
-const queue_url_size_max = 2048;
+pub const environment_variable_name_size_max = 256;
+pub const queue_url_size_max = 2048;
 const message_size_max = 1024 * 1024;
 const receipt_handle_size_max = 64 * 1024;
 const attribute_count_max = 64;
@@ -36,9 +36,38 @@ pub const Attribute = struct {
     value: []const u8,
 };
 
-/// Owns SQS configuration, requests, responses, and validation for one queue.
-pub const Queue = struct {
+/// Owns the reusable SQS client used to send to validated queue URLs.
+pub const Sender = struct {
     client: sqs.Client,
+
+    const Self = @This();
+
+    pub fn init(target: *Self, allocator: Allocator, aws_config: *aws.Config) void {
+        target.* = .{ .client = sqs.Client.init(allocator, aws_config) };
+        std.debug.assert(target.client.config == aws_config);
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.client.deinit();
+        self.* = undefined;
+    }
+
+    pub fn send(
+        self: *Self,
+        arena: Allocator,
+        queue_url: []const u8,
+        body: []const u8,
+    ) !void {
+        const request = try send_request(queue_url, body);
+        _ = self.client.sendMessage(arena, request, .{}) catch |err| {
+            return map_aws_error(err);
+        };
+    }
+};
+
+/// Owns SQS configuration and operations for one fixed queue.
+pub const Queue = struct {
+    sender: Sender,
     queue_url: []const u8,
 
     const Self = @This();
@@ -57,30 +86,28 @@ pub const Queue = struct {
             return error.InvalidConfiguration;
         };
         target.* = .{
-            .client = sqs.Client.init(allocator, aws_config),
+            .sender = undefined,
             .queue_url = queue_url,
         };
-        std.debug.assert(target.client.config == aws_config);
+        Sender.init(&target.sender, allocator, aws_config);
+        std.debug.assert(target.sender.client.config == aws_config);
         std.debug.assert(target.queue_url.len > 0);
         std.debug.assert(target.queue_url.len <= queue_url_size_max);
     }
 
     pub fn deinit(self: *Self) void {
-        self.client.deinit();
+        self.sender.deinit();
         self.* = undefined;
     }
 
     pub fn send(self: *Self, arena: Allocator, body: []const u8) !void {
-        const request = try send_request(self.queue_url, body);
-        _ = self.client.sendMessage(arena, request, .{}) catch |err| {
-            return map_aws_error(err);
-        };
+        return self.sender.send(arena, self.queue_url, body);
     }
 
     /// Returns at most one message after polling for up to 20 seconds.
     pub fn receive(self: *Self, arena: Allocator) !?Message {
         const request = receive_request(self.queue_url);
-        const output = self.client.receiveMessage(arena, request, .{}) catch |err| {
+        const output = self.sender.client.receiveMessage(arena, request, .{}) catch |err| {
             return map_aws_error(err);
         };
         return decode_receive_output(output);
@@ -88,7 +115,7 @@ pub const Queue = struct {
 
     pub fn delete(self: *Self, arena: Allocator, receipt_handle: []const u8) !void {
         const request = try delete_request(self.queue_url, receipt_handle);
-        _ = self.client.deleteMessage(arena, request, .{}) catch |err| {
+        _ = self.sender.client.deleteMessage(arena, request, .{}) catch |err| {
             return map_aws_error(err);
         };
     }
@@ -96,7 +123,7 @@ pub const Queue = struct {
     /// Returns every queue attribute, including attributes added by future SDK versions.
     pub fn get_attributes(self: *Self, arena: Allocator) ![]const Attribute {
         const request = get_attributes_request(self.queue_url);
-        const output = self.client.getQueueAttributes(arena, request, .{}) catch |err| {
+        const output = self.sender.client.getQueueAttributes(arena, request, .{}) catch |err| {
             return map_aws_error(err);
         };
         return decode_attributes_output(arena, output);
@@ -104,6 +131,7 @@ pub const Queue = struct {
 };
 
 fn send_request(queue_url: []const u8, body: []const u8) !sqs.SendMessageInput {
+    try validate_queue_url(queue_url);
     try validate_message_body(body);
     return .{
         .message_body = body,
@@ -195,7 +223,7 @@ fn validate_attributes(attributes: []const aws.map.StringMapEntry) !void {
     std.debug.assert(attributes.len <= attribute_count_max);
 }
 
-fn configured_queue_url(
+pub fn configured_queue_url(
     environment: *const std.process.Environ.Map,
     queue_url_environment_variable: []const u8,
 ) ![]const u8 {
@@ -203,11 +231,15 @@ fn configured_queue_url(
     const queue_url = environment.get(queue_url_environment_variable) orelse {
         return error.InvalidConfiguration;
     };
-    if (queue_url.len == 0) return error.InvalidConfiguration;
-    if (queue_url.len > queue_url_size_max) return error.InvalidConfiguration;
+    validate_queue_url(queue_url) catch return error.InvalidConfiguration;
+    return queue_url;
+}
+
+fn validate_queue_url(queue_url: []const u8) !void {
+    if (queue_url.len == 0) return error.InvalidQueueURL;
+    if (queue_url.len > queue_url_size_max) return error.InvalidQueueURL;
     std.debug.assert(queue_url.len > 0);
     std.debug.assert(queue_url.len <= queue_url_size_max);
-    return queue_url;
 }
 
 fn validate_environment_variable_name(name: []const u8) !void {
@@ -226,10 +258,19 @@ fn map_aws_error(err: anyerror) error{ OutOfMemory, AWSFailure } {
     return error.AWSFailure;
 }
 
-const test_queue_url = "https://sqs.example.invalid/operations";
+const test_queue_url = "https://sqs.example.invalid/tigerbeetle";
 const test_completion_queue_url = "https://sqs.example.invalid/completions";
-const operations_queue_url_environment_variable = "OPERATIONS_QUEUE_URL";
+const tigerbeetle_queue_url_environment_variable = "TigerBeetleQueue";
 const completion_queue_url_environment_variable = "COMPLETION_QUEUE_URL";
+
+test "sender initialization does not require a fixed queue URL" {
+    var config: aws.Config = undefined;
+    var sender: Sender = undefined;
+    Sender.init(&sender, std.testing.allocator, &config);
+    defer sender.deinit();
+
+    try std.testing.expect(sender.client.config == &config);
+}
 
 test "initialization requires a nonempty bounded URL for either requested setting" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
@@ -238,7 +279,7 @@ test "initialization requires a nonempty bounded URL for either requested settin
     var queue: Queue = undefined;
 
     const settings = [_][]const u8{
-        operations_queue_url_environment_variable,
+        tigerbeetle_queue_url_environment_variable,
         completion_queue_url_environment_variable,
     };
     for (settings) |setting| {
@@ -261,14 +302,14 @@ test "initialization requires a nonempty bounded URL for either requested settin
     }
 }
 
-test "initialization supports operations and completion queue URL settings" {
+test "initialization supports TigerBeetle and completion queue URL settings" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
-    try environment.put(operations_queue_url_environment_variable, test_queue_url);
+    try environment.put(tigerbeetle_queue_url_environment_variable, test_queue_url);
     try environment.put(completion_queue_url_environment_variable, test_completion_queue_url);
     var config: aws.Config = undefined;
     const settings = [_]struct { name: []const u8, queue_url: []const u8 }{
-        .{ .name = operations_queue_url_environment_variable, .queue_url = test_queue_url },
+        .{ .name = tigerbeetle_queue_url_environment_variable, .queue_url = test_queue_url },
         .{
             .name = completion_queue_url_environment_variable,
             .queue_url = test_completion_queue_url,
@@ -285,7 +326,7 @@ test "initialization supports operations and completion queue URL settings" {
         );
         defer queue.deinit();
 
-        try std.testing.expect(queue.client.config == &config);
+        try std.testing.expect(queue.sender.client.config == &config);
         try std.testing.expectEqualStrings(setting.queue_url, queue.queue_url);
     }
 }
@@ -328,6 +369,14 @@ test "requests use the configured URL and fixed queue contracts" {
 }
 
 test "send and delete requests reject empty and oversized values" {
+    try std.testing.expectError(
+        error.InvalidQueueURL,
+        send_request("", "queued-operation"),
+    );
+    try std.testing.expectError(
+        error.InvalidQueueURL,
+        send_request("a" ** (queue_url_size_max + 1), "queued-operation"),
+    );
     try std.testing.expectError(
         error.InvalidMessage,
         send_request(test_queue_url, ""),

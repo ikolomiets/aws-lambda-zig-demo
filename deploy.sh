@@ -834,19 +834,19 @@ run_deployment() {
     [ "$GLOBAL_INDEX_COUNT" = 0 ] ||
         fail "DynamoDB table has $GLOBAL_INDEX_COUNT global secondary indexes; expected 0"
 
-    OPERATIONS_QUEUE_URL="$(aws cloudformation describe-stack-resource \
+    TIGERBEETLE_QUEUE_URL="$(aws cloudformation describe-stack-resource \
         --stack-name "$STACK_NAME" \
-        --logical-resource-id OperationsQueue \
+        --logical-resource-id TigerBeetleQueue \
         --query StackResourceDetail.PhysicalResourceId \
         --output text \
         --region "$REGION")"
-    case "$OPERATIONS_QUEUE_URL" in
-        "" | None) fail "stack resource OperationsQueue has no physical URL" ;;
+    case "$TIGERBEETLE_QUEUE_URL" in
+        "" | None) fail "stack resource TigerBeetleQueue has no physical URL" ;;
     esac
 
-    printf '==> SQS queue summary\n'
+    printf '==> TigerBeetle SQS queue summary\n'
     aws sqs get-queue-attributes \
-        --queue-url "$OPERATIONS_QUEUE_URL" \
+        --queue-url "$TIGERBEETLE_QUEUE_URL" \
         --attribute-names \
         QueueArn \
         SqsManagedSseEnabled \

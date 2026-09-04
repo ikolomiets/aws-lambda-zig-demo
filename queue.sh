@@ -32,17 +32,17 @@ export AWS_PROFILE="$PROFILE"
 export AWS_REGION="$REGION"
 export AWS_EC2_METADATA_DISABLED=true
 
-operations_queue_url="$(
+tigerbeetle_queue_url="$(
     aws cloudformation describe-stack-resource \
         --stack-name "$STACK_NAME" \
-        --logical-resource-id OperationsQueue \
+        --logical-resource-id TigerBeetleQueue \
         --query StackResourceDetail.PhysicalResourceId \
         --output text \
         --region "$REGION"
-)" || fail "failed to resolve OperationsQueue from stack $STACK_NAME"
-[ -n "$operations_queue_url" ] || fail "stack $STACK_NAME has no OperationsQueue resource"
-[ "$operations_queue_url" != "None" ] || fail "stack $STACK_NAME has no OperationsQueue resource"
-export OPERATIONS_QUEUE_URL="$operations_queue_url"
-unset operations_queue_url
+)" || fail "failed to resolve TigerBeetleQueue from stack $STACK_NAME"
+[ -n "$tigerbeetle_queue_url" ] || fail "stack $STACK_NAME has no TigerBeetleQueue resource"
+[ "$tigerbeetle_queue_url" != "None" ] || fail "stack $STACK_NAME has no TigerBeetleQueue resource"
+export TigerBeetleQueue="$tigerbeetle_queue_url"
+unset tigerbeetle_queue_url
 
 exec ./zig-out/bin/sqs "$@"

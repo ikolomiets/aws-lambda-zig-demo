@@ -50,8 +50,8 @@ guarded route and security-group cleanup.
 
 ### The source queue does not need function-subnet egress
 
-The `ExecutionFunctionOperationsQueueMapping` is a Lambda event source mapping. AWS's
-Lambda-managed poller reads the Operations queue and invokes execution; the execution
+The `ExecutionFunctionTigerBeetleQueueMapping` is a Lambda event source mapping. AWS's
+Lambda-managed poller reads the TigerBeetle queue and invokes execution; the execution
 code does not poll that queue through its VPC network. AWS documents this polling model
 in [Using Lambda with Amazon SQS](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html).
 

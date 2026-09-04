@@ -180,11 +180,12 @@ Resources:
         AttributeName: expires_at
         Enabled: true
 
-  OperationsQueue:
+  TigerBeetleQueue:
     Type: AWS::SQS::Queue
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
+      QueueName: TigerBeetleQueue
       VisibilityTimeout: 90
 
   CompletionQueue:
@@ -217,11 +218,11 @@ Resources:
             - Effect: Allow
               Action:
                 - sqs:SendMessage
-              Resource: !GetAtt OperationsQueue.Arn
+              Resource: !GetAtt TigerBeetleQueue.Arn
       Environment:
         Variables:
           LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
-          OPERATIONS_QUEUE_URL: !Ref OperationsQueue
+          TigerBeetleQueue: !Ref TigerBeetleQueue
           OPERATIONS_TABLE_NAME: !Ref OperationsTable
           PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 
@@ -317,7 +318,7 @@ Resources:
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: ExecutionFunctionSqsPoller
+        - PolicyName: ExecutionFunctionTigerBeetleQueuePoller
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -329,7 +330,7 @@ Resources:
                   - sqs:DeleteMessageBatch
                   - sqs:GetQueueAttributes
                   - sqs:ReceiveMessage
-                Resource: !GetAtt OperationsQueue.Arn
+                Resource: !GetAtt TigerBeetleQueue.Arn
         - PolicyName: ExecutionFunctionCompletionPublisher
           PolicyDocument:
             Version: "2012-10-17"
@@ -386,11 +387,11 @@ Resources:
             - !Ref LambdaSubnetId
         - !Ref AWS::NoValue
 
-  ExecutionFunctionOperationsQueueMapping:
+  ExecutionFunctionTigerBeetleQueueMapping:
     Type: AWS::Lambda::EventSourceMapping
     Properties:
       FunctionName: !Ref ExecutionFunction
-      EventSourceArn: !GetAtt OperationsQueue.Arn
+      EventSourceArn: !GetAtt TigerBeetleQueue.Arn
       Enabled: true
       BatchSize: 10
       MaximumBatchingWindowInSeconds: 0

@@ -25,11 +25,15 @@ const internal_server_error_response =
     "\"},\"body\":\"Internal Server Error\\n\"}";
 const method_not_allowed_body = "Method Not Allowed\n";
 const operation_message_size_max = 8 * 1024;
+const operation_queue_key_suffix = "Queue";
+const operation_queue_key_size_max = operation.name_size_max + operation_queue_key_suffix.len;
 const service_unavailable_body = "Service Unavailable\n";
 const unauthorized_body = "Unauthorized\n";
 
 comptime {
     std.debug.assert(operation_message_size_max > operation.body_size_max);
+    std.debug.assert(operation_queue_key_size_max > operation.name_size_max);
+    std.debug.assert(operation_queue_key_size_max <= sqs_queue.environment_variable_name_size_max);
     std.debug.assert(lambda_auth.subject_size_max == operation.tenant_size_max);
 }
 
@@ -65,7 +69,7 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
 const RuntimeResources = struct {
     config: aws.Config,
     persistence: operation_persistence.Persistence,
-    queue: sqs_queue.Queue,
+    sender: sqs_queue.Sender,
 
     fn init(resources: *RuntimeResources, process_init: std.process.Init) !void {
         resources.config = aws.Config.load(
@@ -76,14 +80,8 @@ const RuntimeResources = struct {
         ) catch return error.AWSConfigurationFailure;
         errdefer resources.config.deinit();
 
-        sqs_queue.Queue.init(
-            &resources.queue,
-            process_init.gpa,
-            &resources.config,
-            process_init.environ_map,
-            "OPERATIONS_QUEUE_URL",
-        ) catch return error.InvalidQueueConfiguration;
-        errdefer resources.queue.deinit();
+        sqs_queue.Sender.init(&resources.sender, process_init.gpa, &resources.config);
+        errdefer resources.sender.deinit();
         operation_persistence.Persistence.init(
             &resources.persistence,
             process_init.gpa,
@@ -94,7 +92,7 @@ const RuntimeResources = struct {
 
     fn deinit(resources: *RuntimeResources) void {
         resources.persistence.deinit();
-        resources.queue.deinit();
+        resources.sender.deinit();
         resources.config.deinit();
         resources.* = undefined;
     }
@@ -110,10 +108,12 @@ const RuntimeResources = struct {
     fn send(
         resources: *RuntimeResources,
         arena: Allocator,
+        queue_url: []const u8,
         message: []const u8,
     ) !void {
+        std.debug.assert(queue_url.len > 0);
         std.debug.assert(message.len > 0);
-        return resources.queue.send(arena, message);
+        return resources.sender.send(arena, queue_url, message);
     }
 };
 
@@ -127,6 +127,7 @@ const IntakeAdapter = struct {
     send_fn: *const fn (
         *anyopaque,
         Allocator,
+        []const u8,
         []const u8,
     ) anyerror!void,
 
@@ -149,10 +150,11 @@ const IntakeAdapter = struct {
             fn send(
                 context: *anyopaque,
                 allocator: Allocator,
+                queue_url: []const u8,
                 message: []const u8,
             ) anyerror!void {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.send(allocator, message);
+                return self.send(allocator, queue_url, message);
             }
         };
         return .{
@@ -173,9 +175,10 @@ const IntakeAdapter = struct {
     fn send(
         intake: IntakeAdapter,
         allocator: Allocator,
+        queue_url: []const u8,
         message: []const u8,
     ) !void {
-        return intake.send_fn(intake.context, allocator, message);
+        return intake.send_fn(intake.context, allocator, queue_url, message);
     }
 };
 
@@ -217,6 +220,8 @@ const Success = struct {
     content_type: []const u8,
 };
 
+const test_queue_url = "https://sqs.example.invalid/tigerbeetle";
+
 fn invocationOutcome(
     allocator: Allocator,
     event: []const u8,
@@ -240,13 +245,14 @@ fn invocationOutcome(
         return .method_not_allowed;
     };
     if (method != .POST) return .method_not_allowed;
-    return post_invocation_outcome(allocator, identity.subject, &request, intake, now);
+    return post_invocation_outcome(allocator, identity.subject, &request, env, intake, now);
 }
 
 fn post_invocation_outcome(
     allocator: Allocator,
     tenant: []const u8,
     request: *const lambda.url.Request,
+    env: *const std.process.Environ.Map,
     intake: IntakeAdapter,
     now: operation.UnixSeconds,
 ) InvocationOutcome {
@@ -267,6 +273,13 @@ fn post_invocation_outcome(
             else => .bad_request,
         };
     };
+    var queue_key_buffer: [operation_queue_key_size_max]u8 = undefined;
+    const queue_key = operation_queue_key(parsed.name, &queue_key_buffer) catch {
+        return .bad_request;
+    };
+    const queue_url = sqs_queue.configured_queue_url(env, queue_key) catch {
+        return .bad_request;
+    };
     const created = intake.create(arena, &parsed) catch |err| {
         return switch (err) {
             error.OperationConflict => .conflict,
@@ -280,12 +293,26 @@ fn post_invocation_outcome(
     const message = operation_message_body(arena, &queued) catch {
         return .internal_server_error;
     };
-    intake.send(arena, message) catch |err| {
-        if (err == error.OutOfMemory) return .internal_server_error;
+    intake.send(arena, queue_url, message) catch {
         return .service_unavailable;
     };
 
     return operation_success_outcome(allocator, &created);
+}
+
+fn operation_queue_key(
+    operation_name: []const u8,
+    buffer: *[operation_queue_key_size_max]u8,
+) ![]const u8 {
+    if (operation_name.len == 0) return error.InvalidOperationName;
+    if (operation_name.len > operation.name_size_max) return error.InvalidOperationName;
+    const key_size = operation_name.len + operation_queue_key_suffix.len;
+    std.debug.assert(key_size > operation_name.len);
+    std.debug.assert(key_size <= buffer.len);
+
+    @memcpy(buffer[0..operation_name.len], operation_name);
+    @memcpy(buffer[operation_name.len..key_size], operation_queue_key_suffix);
+    return buffer[0..key_size];
 }
 
 fn operation_message_body(
@@ -402,6 +429,8 @@ const FakeIntake = struct {
     last_name_len: u8 = 0,
     last_body_buffer: [operation.body_size_max]u8 = undefined,
     last_body_len: u16 = 0,
+    last_queue_url_buffer: [sqs_queue.queue_url_size_max]u8 = undefined,
+    last_queue_url_len: u16 = 0,
     last_message_buffer: [operation_message_size_max]u8 = undefined,
     last_message_len: u16 = 0,
 
@@ -439,11 +468,15 @@ const FakeIntake = struct {
     fn send(
         fake: *FakeIntake,
         _: Allocator,
+        queue_url: []const u8,
         message: []const u8,
     ) !void {
         std.debug.assert(fake.send_count < 32);
+        std.debug.assert(queue_url.len <= fake.last_queue_url_buffer.len);
         std.debug.assert(message.len <= fake.last_message_buffer.len);
         fake.send_count += 1;
+        fake.last_queue_url_len = @intCast(queue_url.len);
+        @memcpy(fake.last_queue_url_buffer[0..queue_url.len], queue_url);
         fake.last_message_len = @intCast(message.len);
         @memcpy(fake.last_message_buffer[0..message.len], message);
         if (fake.send_error) |err| return err;
@@ -463,6 +496,10 @@ const FakeIntake = struct {
 
     fn lastMessage(fake: *const FakeIntake) []const u8 {
         return fake.last_message_buffer[0..fake.last_message_len];
+    }
+
+    fn lastQueueURL(fake: *const FakeIntake) []const u8 {
+        return fake.last_queue_url_buffer[0..fake.last_queue_url_len];
     }
 };
 
@@ -486,6 +523,15 @@ fn handleInvocationForTest(
     );
 }
 
+fn put_test_queue_url(
+    environment: *std.process.Environ.Map,
+    operation_name: []const u8,
+) !void {
+    var queue_key_buffer: [operation_queue_key_size_max]u8 = undefined;
+    const queue_key = try operation_queue_key(operation_name, &queue_key_buffer);
+    try environment.put(queue_key, test_queue_url);
+}
+
 test "AWS SDK exposes the runtime configuration type" {
     comptime {
         std.debug.assert(@TypeOf(aws.Config) == type);
@@ -503,6 +549,131 @@ test "AWS SDK debug logging is enabled" {
     try std.testing.expect(std.log.logEnabled(.debug, .aws_sdk));
 }
 
+test "operation queue keys append Queue exactly within the name bound" {
+    var buffer: [operation_queue_key_size_max]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "TigerBeetleQueue",
+        try operation_queue_key("TigerBeetle", &buffer),
+    );
+    try std.testing.expectEqualStrings(
+        ("a" ** operation.name_size_max) ++ operation_queue_key_suffix,
+        try operation_queue_key("a" ** operation.name_size_max, &buffer),
+    );
+    try std.testing.expectError(
+        error.InvalidOperationName,
+        operation_queue_key("", &buffer),
+    );
+    try std.testing.expectError(
+        error.InvalidOperationName,
+        operation_queue_key("a" ** (operation.name_size_max + 1), &buffer),
+    );
+}
+
+test "POST routes TigerBeetle exactly and rejects other casing and unmapped names" {
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x62,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
+    defer std.testing.allocator.free(token);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try lambda_auth.testing.put_public_key(&environment, 0x62);
+    try environment.put("TigerBeetleQueue", test_queue_url);
+    const cases = [_]struct { name: []const u8, mapped: bool }{
+        .{ .name = "TigerBeetle", .mapped = true },
+        .{ .name = "tigerBeetle", .mapped = false },
+        .{ .name = "Tigerbeetle", .mapped = false },
+        .{ .name = "Unmapped", .mapped = false },
+    };
+
+    for (cases) |case| {
+        const input = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+                "\"name\":\"{s}\",\"body\":true}}",
+            .{case.name},
+        );
+        defer std.testing.allocator.free(input);
+        const event = try test_authorization_request_event(
+            std.testing.allocator,
+            .POST,
+            "Authorization",
+            "Bearer",
+            token,
+            input,
+        );
+        defer std.testing.allocator.free(event);
+        var fake: FakeIntake = .{};
+        const response = handleInvocationForTest(
+            std.testing.allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            &fake,
+            1000,
+        );
+        defer std.testing.allocator.free(response);
+
+        if (case.mapped) {
+            try expectContains(response, "\"statusCode\":200");
+            try std.testing.expectEqual(@as(u8, 1), fake.create_count);
+            try std.testing.expectEqual(@as(u8, 1), fake.send_count);
+            try std.testing.expectEqualStrings(test_queue_url, fake.lastQueueURL());
+        } else {
+            try expectBadRequest(response);
+            try std.testing.expectEqual(@as(u8, 0), fake.create_count);
+            try std.testing.expectEqual(@as(u8, 0), fake.send_count);
+        }
+    }
+}
+
+test "POST rejects empty and oversized queue mappings before persistence" {
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x63,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
+    defer std.testing.allocator.free(token);
+    const event = try test_authorization_request_event(
+        std.testing.allocator,
+        .POST,
+        "Authorization",
+        "Bearer",
+        token,
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+            "\"name\":\"TigerBeetle\",\"body\":true}",
+    );
+    defer std.testing.allocator.free(event);
+    const invalid_urls = [_][]const u8{
+        "",
+        "a" ** (sqs_queue.queue_url_size_max + 1),
+    };
+
+    for (invalid_urls) |queue_url| {
+        var environment = std.process.Environ.Map.init(std.testing.allocator);
+        defer environment.deinit();
+        try lambda_auth.testing.put_public_key(&environment, 0x63);
+        try environment.put("TigerBeetleQueue", queue_url);
+        var fake: FakeIntake = .{};
+        const response = handleInvocationForTest(
+            std.testing.allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            &fake,
+            1000,
+        );
+        defer std.testing.allocator.free(response);
+
+        try expectBadRequest(response);
+        try std.testing.expectEqual(@as(u8, 0), fake.create_count);
+        try std.testing.expectEqual(@as(u8, 0), fake.send_count);
+    }
+}
+
 test "authenticated POST persists and queues SUBMITTED then returns without its body" {
     const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
         .seed_byte = 0x42,
@@ -513,6 +684,7 @@ test "authenticated POST persists and queues SUBMITTED then returns without its 
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x42);
+    try put_test_queue_url(&environment, "echo");
 
     const inputs = [_][]const u8{
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
@@ -577,6 +749,7 @@ test "authenticated POST persists and queues SUBMITTED then returns without its 
             fake.lastBody(),
         );
         try std.testing.expectEqualStrings(expected_message, fake.lastMessage());
+        try std.testing.expectEqualStrings(test_queue_url, fake.lastQueueURL());
         try std.testing.expectEqual(@as(u8, 1), fake.send_count);
         var expected_hash: [32]u8 = undefined;
         _ = try std.fmt.hexToBytes(
@@ -597,6 +770,7 @@ test "POST queues every JSON body variant as exact full Operation JSON" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x51);
+    try put_test_queue_url(&environment, "variants");
 
     const bodies = [_][]const u8{ "null", "false", "42", "\"text\"", "[1]", "{\"a\":1}" };
     const messages = [_][]const u8{
@@ -672,6 +846,7 @@ test "POST derives tenant and hash from distinct bounded verified subjects" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x49);
+    try put_test_queue_url(&environment, "echo");
     const subjects = [_][]const u8{
         "a" ** lambda_auth.subject_size_max,
         "tenant-b",
@@ -727,6 +902,7 @@ test "matching SUBMITTED POST requeues and returns the stored snapshot" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x52);
+    try put_test_queue_url(&environment, "echo");
     const input =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
@@ -787,6 +963,7 @@ test "matching POST retry returns the latest stored persistent view" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x45);
+    try put_test_queue_url(&environment, "echo");
 
     var expected_hash: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(
@@ -859,6 +1036,7 @@ test "matching POST with every completed outcome returns without enqueueing" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x53);
+    try put_test_queue_url(&environment, "echo");
     const input =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
@@ -923,6 +1101,7 @@ test "POST conflict returns only the static conflict response" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x46);
+    try put_test_queue_url(&environment, "conflict-marker");
     var fake = FakeIntake{ .create_error = error.OperationConflict };
     const event = try test_authorization_request_event(
         std.testing.allocator,
@@ -960,6 +1139,7 @@ test "POST persistence failures return only the static internal error" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x47);
+    try put_test_queue_url(&environment, "failure-marker");
     const event = try test_authorization_request_event(
         std.testing.allocator,
         .POST,
@@ -1006,6 +1186,7 @@ test "SQS failure leaves SUBMITTED unchanged and a matching POST can requeue" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x50);
+    try put_test_queue_url(&environment, "queue-failure-marker");
     const event = try test_authorization_request_event(
         std.testing.allocator,
         .POST,
@@ -1016,22 +1197,28 @@ test "SQS failure leaves SUBMITTED unchanged and a matching POST can requeue" {
             "\"name\":\"queue-failure-marker\",\"body\":true}",
     );
     defer std.testing.allocator.free(event);
-    var fake = FakeIntake{ .send_error = error.AWSFailure };
-
-    const failed = handleInvocationForTest(
-        std.testing.allocator,
-        event,
-        .{},
-        .{},
-        &environment,
-        &fake,
-        1000,
-    );
-    defer std.testing.allocator.free(failed);
-    try expectServiceUnavailable(failed);
-    try expectNotContains(failed, "queue-failure-marker");
-    try expectNotContains(failed, "AWSFailure");
-    try std.testing.expectEqual(@as(u8, 1), fake.send_count);
+    var fake: FakeIntake = .{};
+    const failures = [_]anyerror{ error.AWSFailure, error.OutOfMemory };
+    for (failures, 0..) |failure, index| {
+        fake.send_error = failure;
+        const failed = handleInvocationForTest(
+            std.testing.allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            &fake,
+            1000,
+        );
+        defer std.testing.allocator.free(failed);
+        try expectServiceUnavailable(failed);
+        try expectNotContains(failed, "queue-failure-marker");
+        try expectNotContains(failed, @errorName(failure));
+        const expected_count: u8 = @intCast(index + 1);
+        try std.testing.expectEqual(expected_count, fake.create_count);
+        try std.testing.expectEqual(expected_count, fake.send_count);
+        try std.testing.expectEqualStrings(test_queue_url, fake.lastQueueURL());
+    }
 
     fake.send_error = null;
     const retried = handleInvocationForTest(
@@ -1045,8 +1232,9 @@ test "SQS failure leaves SUBMITTED unchanged and a matching POST can requeue" {
     );
     defer std.testing.allocator.free(retried);
     try expectContains(retried, "SUBMITTED");
-    try std.testing.expectEqual(@as(u8, 2), fake.create_count);
-    try std.testing.expectEqual(@as(u8, 2), fake.send_count);
+    try std.testing.expectEqual(@as(u8, failures.len + 1), fake.create_count);
+    try std.testing.expectEqual(@as(u8, failures.len + 1), fake.send_count);
+    try std.testing.expectEqualStrings(test_queue_url, fake.lastQueueURL());
 }
 
 test "warm invocations reuse one adapter without retaining request data" {
@@ -1059,6 +1247,8 @@ test "warm invocations reuse one adapter without retaining request data" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x48);
+    try put_test_queue_url(&environment, "first-operation");
+    try put_test_queue_url(&environment, "second-operation");
     var fake: FakeIntake = .{};
     const intake = IntakeAdapter.init(&fake);
     const inputs = [_][]const u8{

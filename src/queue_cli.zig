@@ -49,8 +49,8 @@ const usage =
     \\  check    Print all queue attributes as JSON
     \\
     \\Environment:
-    \\  OPERATIONS_QUEUE_URL  URL of the SQS operations queue
-    \\  AWS_*                 Standard AWS credentials, region, profile, and endpoint
+    \\  TigerBeetleQueue  URL of the fixed SQS TigerBeetle queue
+    \\  AWS_*             Standard AWS credentials, region, profile, and endpoint
     \\
 ;
 
@@ -93,7 +93,7 @@ pub fn main(init: std.process.Init) u8 {
         init.gpa,
         &config,
         init.environ_map,
-        "OPERATIONS_QUEUE_URL",
+        "TigerBeetleQueue",
     ) catch {
         return finish(context.stdout, context.stderr, 2, .configuration);
     };
@@ -686,6 +686,7 @@ test "help works without AWS configuration and command parsing is bounded" {
         try std.testing.expectEqual(@as(u8, 0), result.exit_code);
         try std.testing.expect(std.mem.startsWith(u8, result.stdout(), "Usage:\n"));
         try std.testing.expect(std.mem.indexOf(u8, result.stdout(), "until interrupted") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout(), "TigerBeetleQueue") != null);
         try std.testing.expectEqualStrings("", result.stderr());
     }
 

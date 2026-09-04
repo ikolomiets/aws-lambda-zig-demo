@@ -58,7 +58,7 @@ persisted as `COMPLETED`, using the applicable exact result envelope:
 ```
 
 TigerBeetle client/request uncertainty or failure to publish a terminal entry
-leaves the affected Operation `SUBMITTED` and is reported as an Operations-queue
+leaves the affected Operation `SUBMITTED` and is reported as a TigerBeetle queue
 partial-batch failure. After publication, Completion delivery and DynamoDB
 service uncertainty are retried through the Completion queue.
 Conditional completion conflicts are acknowledged without changing the stored
@@ -220,7 +220,7 @@ AWS SDK select the regional public SQS dual-stack endpoint. SAM creates
 targets that EIGW. The same route table carries `WireGuardLambdaRoute`, the
 unchanged IPv4 `10.200.0.0/24` route to the gateway instance.
 
-Execution polls `OperationsQueue` through Lambda's managed event-source mapping
+Execution polls `TigerBeetleQueue` through Lambda's managed event-source mapping
 and uses its SDK only to send to `CompletionQueue`. The completion Lambda remains
 outside the VPC and updates the DynamoDB Operations table. Intake and query also
 remain outside the customer VPC. Execution has no VPC attachment in steady

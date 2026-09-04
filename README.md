@@ -14,8 +14,9 @@ accepts only `GET /<uuid>`, strongly reads the Operation from DynamoDB, and
 returns it only when its tenant matches the verified token subject. The intake
 Lambda accepts only POST, validates and hashes an
 Operation JSON document, derives required tenant metadata from the verified
-token subject, persists the Operation idempotently in DynamoDB, submits new
-work to SQS, and returns the current stored output view without the body.
+token subject, resolves the exact `<name>Queue` environment mapping, persists
+the Operation idempotently in DynamoDB, submits new work to that SQS queue, and
+returns the current stored output view without the body.
 The execution Lambda consumes Operations SQS batches and creates a replay-safe
 TigerBeetle account and transfer for each valid queued `SUBMITTED` Operation. It publishes
 the terminal outcomes in at most one bounded aggregate message containing only Operation IDs
@@ -23,11 +24,11 @@ and tagged success or failure results. The completion Lambda consumes one aggreg
 time and owns the conditional DynamoDB transition from `SUBMITTED` to `COMPLETED`:
 
 ```text
-intake -> Operations queue -> execution/TigerBeetle -> Completion queue -> completion -> DynamoDB
+intake -> TigerBeetle queue -> execution/TigerBeetle -> Completion queue -> completion -> DynamoDB
 ```
 
 Definitive account or transfer rejections are terminal failures. TigerBeetle or Completion
-queue uncertainty is returned through Operations queue partial-batch failures; transient
+queue uncertainty is returned through TigerBeetle queue partial-batch failures; transient
 DynamoDB uncertainty retries the single Completion queue message.
 
 ## Requirements for Zig on AWS Lambda
@@ -264,11 +265,12 @@ remain readable until DynamoDB removes it asynchronously.
 ## SQS Workflows
 
 `queue.sh` sends canonical Operations, destructively consumes queued messages,
-and checks the SAM stack's operations queue. It uses `PROFILE`, `REGION`, and
+and checks the SAM stack's TigerBeetle queue. It uses `PROFILE`, `REGION`, and
 `STACK_NAME`, defaulting to `dev`, `ca-central-1`, and
 `aws-lambda-zig-demo`. It exports temporary profile credentials and resolves
-the `OperationsQueue` physical resource. Send a validated Operation input like
-this:
+the `TigerBeetleQueue` physical resource, then exports its URL under the exact
+`TigerBeetleQueue` setting expected by the fixed-queue CLI. Send a validated
+Operation input like this:
 
 ```sh
 operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
@@ -319,8 +321,8 @@ The AWS identity running `queue.sh` needs `sqs:SendMessage` for
 `sqs:GetQueueAttributes` for `check`. The command additionally calls
 `cloudformation:DescribeStackResource`. These are caller permissions: the Lambda
 roles remain separate. The intake role is limited to table-scoped
-`dynamodb:PutItem` and Operations queue-scoped `sqs:SendMessage`; the query role has no SQS
-permissions. The execution role can poll only the Operations queue and send to only the
+`dynamodb:PutItem` and TigerBeetle queue-scoped `sqs:SendMessage`; the query role has no SQS
+permissions. The execution role can poll only the TigerBeetle queue and send to only the
 Completion queue. The completion role can poll only the Completion queue and has
 table-scoped `dynamodb:UpdateItem`; execution has no DynamoDB permission.
 Once the event source mapping is enabled, `queue.sh receive` competes with the
@@ -343,8 +345,11 @@ paths that are not exactly one UUID segment receive `400 Bad Request`. Missing
 Operations and Operations owned by another tenant both receive the same static
 `404 Not Found` response. A POST that
 reuses an Operation ID with a different server-computed hash receives a
-sanitized `409 Conflict`. Query DynamoDB request or service failures and intake
-SQS submission failures receive a static `503 Service Unavailable` response.
+sanitized `409 Conflict`. Intake appends `Queue` to the operation name without
+case conversion; a missing, empty, or oversized resulting environment mapping
+receives `400 Bad Request` before DynamoDB or SQS is called. Query DynamoDB
+request or service failures and intake SQS submission failures receive a static
+`503 Service Unavailable` response.
 Malformed stored items and other unexpected failures receive the static
 `500 Internal Server Error` response.
 
@@ -353,28 +358,30 @@ authorization boundary. The DynamoDB `id` partition key remains globally
 scoped; query authorization is enforced after `GetItem` by comparing the stored
 tenant with the verified token subject.
 
-`OPERATIONS_TABLE_NAME` and `OPERATIONS_QUEUE_URL` are mandatory at intake Lambda
-initialization. The intake bootstrap validates the non-empty, at-most-2,048-byte queue
-URL and table name while initializing the Operation persistence and queue
-modules around one shared AWS SDK configuration. Each module privately owns its
-respective DynamoDB or SQS client, and both clients share that configuration
-and its HTTP pool. The module values, configuration, and pool are reused across
-warm invocations. Missing or invalid configuration prevents intake request
-handling. Resource existence and IAM authorization are checked
-only when POST first calls the services, so DynamoDB failures return a
-sanitized HTTP 500 and SQS send failures return a sanitized HTTP 503.
+`OPERATIONS_TABLE_NAME` is mandatory at intake Lambda initialization. The
+bootstrap validates the table name and initializes Operation persistence plus
+one reusable SQS sender around a shared AWS SDK configuration and HTTP pool.
+Those resources are reused across warm invocations. For each valid POST, intake
+forms the bounded, case-sensitive key `<operation.name>Queue`; for example,
+`"name":"TigerBeetle"` selects `TigerBeetleQueue`. It resolves and validates a
+non-empty, at-most-2,048-byte URL under that key before persistence. An absent
+or invalid mapping returns HTTP 400 without writing or sending. Resource
+existence and IAM authorization are checked when POST calls the services, so a
+DynamoDB failure returns a sanitized HTTP 500. An SQS send failure after a
+successful write returns HTTP 503 and leaves the stored `SUBMITTED` Operation
+available for a matching POST to retry.
 
 `OPERATIONS_TABLE_NAME` is also mandatory at query Lambda initialization. The
 query bootstrap initializes one AWS SDK configuration and one Operation
 persistence client and reuses them across warm invocations. It does not receive
-`OPERATIONS_QUEUE_URL` or initialize an SQS client. Query DynamoDB request or
+queue mappings or initialize an SQS client. Query DynamoDB request or
 service failures return sanitized HTTP 503; malformed items and unexpected
 failures return sanitized HTTP 500.
 
 The execution Lambda has no authentication configuration or Function URL. It
 receives `COMPLETION_QUEUE_URL`, `TIGERBEETLE_CLUSTER_ID`, and
 `TIGERBEETLE_ADDRESSES`; it reuses its SQS resources and one TigerBeetle client across warm
-invocations. Lambda polls `OperationsQueue` in batches of at most 10 records with no batching
+invocations. Lambda polls `TigerBeetleQueue` in batches of at most 10 records with no batching
 delay.
 
 For every record, the handler retains the debug log containing its message ID
@@ -399,12 +406,12 @@ stage and raw TigerBeetle status:
 {"type":"FAILURE","payload":{"stage":"TRANSFER","status":22}}
 ```
 
-Processing continues after every Operations queue record. Invalid records are acknowledged;
+Processing continues after every TigerBeetle queue record. Invalid records are acknowledged;
 TigerBeetle client/request and result-construction failures add the exact message ID to
 `batchItemFailures`. The terminal entries are encoded into at most one Completion message per
 execution invocation. Its JSON contract is `{"results":[...]}`, is bounded to 1 MiB, and gives
 each entry only a canonical `operation_id` and a validated `result`; no Operation snapshot is
-copied. If that single send fails, every Operations queue record represented in the aggregate
+copied. If that single send fails, every TigerBeetle queue record represented in the aggregate
 is retried.
 Account `1` must be pre-provisioned on ledger `1`; the executor never creates it.
 
@@ -553,13 +560,18 @@ See the [SAM deployment guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md) for the compl
 parameter, validation, and deployment workflow.
 
 The SAM-managed DynamoDB table and both SQS queues are mandatory. Intake receives the table
-name and Operations queue URL with table-scoped `PutItem` and queue-scoped `SendMessage`.
+name and TigerBeetle queue URL with table-scoped `PutItem` and queue-scoped `SendMessage`.
 Query receives only the table name and table-scoped `GetItem`. Execution receives the
-Completion queue URL and TigerBeetle configuration, polls only the Operations queue, and can
+Completion queue URL and TigerBeetle configuration, polls only the TigerBeetle queue, and can
 send only to the Completion queue; it has no DynamoDB access. Completion receives only the
 table name, polls only the Completion queue, and has table-scoped `UpdateItem`. Both SQS
 mappings report partial-batch failures. Deploy the complete stack from `template.yaml` with
 AWS SAM.
+
+The TigerBeetle queue has the fixed physical name `TigerBeetleQueue`, so only one
+stack using this template can exist in an AWS account and region. Replacing the
+former queue resource deletes its queued messages under the template's
+`DeletionPolicy: Delete` and `UpdateReplacePolicy: Delete` settings.
 
 See [docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md)
 for the full SAM workflow.
@@ -597,7 +609,7 @@ curl -L \
   -H "Content-Type: application/json" \
   --data \
     '{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
-'"name":"echo","body":{"message":"hello","count":2}}' \
+'"name":"TigerBeetle","body":{"message":"hello","count":2}}' \
   <IntakeFunctionUrl>
 ```
 
@@ -609,11 +621,11 @@ hash. The input body is intentionally omitted:
 {
   "id": "00112233-4455-6677-8899-aabbccddeeff",
   "tenant": "example-user",
-  "name": "echo",
+  "name": "TigerBeetle",
   "state": "SUBMITTED",
   "last_updated": 1700000000,
   "expires_at": 1700086400,
-  "hash": "f4142429f9f7373c34b7b5eeab555ed5b4534a746193c40bfca65bb73f9a3014"
+  "hash": "a155fdd43dc72aafd9d8914da4af79cfde80983ce96e1eec3bd634d36ce7e80f"
 }
 ```
 
@@ -648,8 +660,8 @@ handle the Operation ID and hash idempotently. Reusing the ID for different
 work or from a different verified subject still returns `409 Conflict`. Execution performs
 replay-safe TigerBeetle accounting and sends terminal ID/result entries to the Completion
 queue. Completion conditionally updates only a stored `SUBMITTED` item; duplicate or stale
-entries conflict without changing it. TigerBeetle uncertainty retries only its Operations
-queue record, Completion publication uncertainty retries every represented record, and
+entries conflict without changing it. TigerBeetle uncertainty retries only the affected
+TigerBeetle queue record, Completion publication uncertainty retries every represented record, and
 DynamoDB uncertainty replays the single aggregate Completion message as described above.
 
 The template intentionally creates publicly reachable intake POST and query
@@ -662,7 +674,7 @@ or CloudFront.
 
 ## Project Structure
 
-- `src/intake_lambda.zig`: authenticated POST intake entrypoint and handler.
+- `src/intake_lambda.zig`: authenticated POST intake entrypoint, named-queue routing, and handler.
 - `src/query_lambda.zig`: authenticated tenant-scoped Operation GET entrypoint and handler.
 - `src/execution_lambda.zig`: SQS-driven execution entrypoint and handler.
 - `src/completion_lambda.zig`: SQS-driven conditional completion entrypoint and handler.
@@ -670,7 +682,7 @@ or CloudFront.
 - `src/lambda_auth.zig`: shared bearer-token parsing and PASETO verification.
 - `src/operation.zig`: Operation JSON model, validation, and hash contract.
 - `src/operation_persistence.zig`: DynamoDB Operation mapping and conditional writes.
-- `src/sqs_queue.zig`: shared SQS queue configuration and message transport contract.
+- `src/sqs_queue.zig`: reusable SQS sender plus fixed-queue configuration and transport contract.
 - `src/persistence_cli.zig`: persistence command implementation and tests.
 - `src/queue_cli.zig`: queue command implementation and tests.
 - `src/paseto.zig`: shared PASETO v4.public issuance and verification.

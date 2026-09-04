@@ -5,12 +5,12 @@ using AWS SAM and `template.yaml`.
 
 SAM deploys all four Lambda functions as one CloudFormation-managed stack. It creates
 their execution roles, public Function URLs for intake and query, the DynamoDB
-operations table, the Operations queue sent by intake and consumed by execution,
+operations table, the TigerBeetle queue sent by intake and consumed by execution,
 and the Completion queue sent by execution and consumed by completion. The complete
 data flow is:
 
 ```text
-intake -> Operations queue -> execution/TigerBeetle -> Completion queue -> completion -> DynamoDB
+intake -> TigerBeetle queue -> execution/TigerBeetle -> Completion queue -> completion -> DynamoDB
 ```
 
 The template can also provision an optional EC2 WireGuard gateway that routes
@@ -31,6 +31,8 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
   `completion-lambda.zip` each contain one Linux ARM64 executable named
   `bootstrap`.
 - Both Lambda Function URLs are intentionally public for authenticated demo testing.
+- The fixed physical name `TigerBeetleQueue` permits only one such queue per AWS
+  account and region; deploy only one stack using this template in that scope.
 - `LAMBDA_PRINCIPAL` defaults to `'*'` unless you override the
   `LambdaPrincipal` template parameter.
 - `PASETO_PUBLIC_KEY` contains the padded Base64 Ed25519 public key generated
@@ -242,7 +244,7 @@ Both commands should report that `template.yaml` is valid.
 `template.yaml` defines these resources:
 
 - `OperationsTable`: `AWS::DynamoDB::Table`
-- `OperationsQueue`: `AWS::SQS::Queue`
+- `TigerBeetleQueue`: `AWS::SQS::Queue`
 - `CompletionQueue`: `AWS::SQS::Queue`
 - `IntakeFunction`: `AWS::Serverless::Function`
 - `IntakeFunctionUrl`: `AWS::Lambda::Url`
@@ -256,7 +258,7 @@ Both commands should report that `template.yaml` is valid.
   through the query Function URL
 - `ExecutionFunction`: `AWS::Serverless::Function`
 - `ExecutionFunctionRole`: `AWS::IAM::Role`
-- `ExecutionFunctionOperationsQueueMapping`: `AWS::Lambda::EventSourceMapping`
+- `ExecutionFunctionTigerBeetleQueueMapping`: `AWS::Lambda::EventSourceMapping`
 - `CompletionFunction`: `AWS::Serverless::Function`
 - `CompletionFunctionRole`: `AWS::IAM::Role`
 - `CompletionFunctionCompletionQueueMapping`: `AWS::Lambda::EventSourceMapping`
@@ -313,8 +315,9 @@ Environment:
     PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 ```
 
-The intake function additionally receives `OPERATIONS_QUEUE_URL` and the
-following table-write and queue-send permissions:
+The intake function additionally receives the queue URL under the exact
+operation-routing key `TigerBeetleQueue` and the following table-write and
+queue-send permissions:
 
 ```yaml
 Policies:
@@ -327,20 +330,20 @@ Policies:
       - Effect: Allow
         Action:
           - sqs:SendMessage
-        Resource: !GetAtt OperationsQueue.Arn
+        Resource: !GetAtt TigerBeetleQueue.Arn
 Environment:
   Variables:
-    OPERATIONS_QUEUE_URL: !Ref OperationsQueue
+    TigerBeetleQueue: !Ref TigerBeetleQueue
 ```
 
 The query function receives its own inline policy containing only
 `dynamodb:GetItem` for this stack's operations table. It does not receive
-`OPERATIONS_QUEUE_URL` or any SQS permission.
+`TigerBeetleQueue` or any SQS permission.
 
 The execution function uses the same `provided.al2023` ARM64 runtime, 128 MB
 memory, a 15-second timeout, and basic logging policy. It has no Function URL
 or authentication configuration. Its explicit role grants queue-scoped
-polling permissions for `OperationsQueue` and `sqs:SendMessage` only for
+polling permissions for `TigerBeetleQueue` and `sqs:SendMessage` only for
 `CompletionQueue`. It has no DynamoDB permission. When the gateway is enabled,
 the role also receives the six EC2 network-interface actions required by a
 VPC-attached Lambda. The function receives `COMPLETION_QUEUE_URL` plus the
@@ -362,8 +365,9 @@ only `dynamodb:UpdateItem` on `OperationsTable`. Its only application
 environment value is `OPERATIONS_TABLE_NAME`.
 
 The least-privilege boundary is deliberate: intake creates an Operation and
-sends it to `OperationsQueue`; query reads the table; execution polls
-`OperationsQueue` and publishes terminal results to `CompletionQueue`; and
+routes `"name":"TigerBeetle"` to `TigerBeetleQueue`; query reads the table;
+execution polls `TigerBeetleQueue` and publishes terminal results to
+`CompletionQueue`; and
 completion polls `CompletionQueue` and updates the table. Lambda's managed
 event-source pollers consume both source queues outside the function execution
 environment. Therefore only execution's AWS SDK `SendMessage` call needs the
@@ -422,10 +426,10 @@ with its stage and raw TigerBeetle status. The failure results are exactly:
 {"type":"FAILURE","payload":{"stage":"TRANSFER","status":22}}
 ```
 
-Processing always advances to the next Operations record. A definite
+Processing always advances to the next TigerBeetle queue record. A definite
 TigerBeetle rejection is logged and represented as a terminal Completion
 entry. TigerBeetle client/request or result-construction uncertainty adds only
-that Operations message ID to `batchItemFailures`. After processing the
+that TigerBeetle queue message ID to `batchItemFailures`. After processing the
 invocation, execution encodes all terminal entries into at most one aggregate
 Completion message and sends it once. The stable account and transfer IDs make
 Operations retries replay-safe: `created` and identical `exists` proceed,
@@ -436,7 +440,7 @@ the canonical `operation_id` and a validated tagged `result`; it does not copy
 the queued Operation snapshot, tenant, name, hash, or timestamps. The codec
 rejects an empty aggregate and bounds the complete encoded message to 1 MiB.
 That byte limit, rather than a promised fixed number of result entries, is the
-message contract. If publication fails, every Operations record represented
+message contract. If publication fails, every TigerBeetle queue record represented
 in that aggregate is returned for retry. If publication succeeds, those source
 records are acknowledged; execution never acknowledges a terminal result
 before its Completion message is published.
@@ -480,45 +484,52 @@ succeeded or reached an acknowledged deterministic/conflict outcome.
 `OPERATIONS_TABLE_NAME` contains the CloudFormation-generated physical table
 name. Intake, query, and completion initialize the Operation persistence
 module around an AWS configuration and reuse their clients and HTTP pools
-across warm invocations. Intake additionally validates
-`OPERATIONS_QUEUE_URL`; execution validates `COMPLETION_QUEUE_URL`, initializes
-the SQS module, and retains one TigerBeetle client across warm invocations.
-Missing or invalid configuration prevents the affected Lambda from handling
-invocations. The local persistence and queue command implementations use the
-same modules and contracts.
+across warm invocations. Intake also initializes one reusable SQS sender. On
+each valid POST it appends `Queue` to the exact, case-sensitive operation name
+and resolves that environment key before persistence; `"name":"TigerBeetle"`
+therefore resolves `TigerBeetleQueue`. Execution validates
+`COMPLETION_QUEUE_URL`, initializes the fixed-queue SQS module, and retains one
+TigerBeetle client across warm invocations. Missing or invalid cold-start
+configuration prevents the affected Lambda from handling invocations. The
+local persistence and queue command implementations use the same modules and
+contracts.
 
-Startup validation makes no DynamoDB or SQS request. A missing table or
-insufficient DynamoDB permission is discovered by a POST persistence request
+Startup validation makes no DynamoDB or SQS request. A missing, empty, or
+oversized intake route mapping returns HTTP 400 before persistence or send. A
+missing table or insufficient DynamoDB permission is discovered by a POST persistence request
 and returned by intake as a sanitized HTTP 500. A query DynamoDB request or
 service failure returns a sanitized HTTP 503, while a malformed stored item or
 unexpected failure returns HTTP 500. A missing queue, insufficient
 `SendMessage` permission, or another SQS send failure is returned as a
 sanitized HTTP 503. Execution discovers a missing Completion queue, insufficient
 `SendMessage` permission, or another Completion queue send failure while
-publishing the aggregate and retries every represented Operations record.
+publishing the aggregate and retries every represented TigerBeetle queue record.
 Completion discovers a missing table, insufficient `UpdateItem` permission,
 or another DynamoDB service failure while processing an entry and retries the
 single Completion message.
 
 The second intake inline-policy statement grants that function only
-`SendMessage` access to this stack's Operations queue. The handler sends full
+`SendMessage` access to this stack's TigerBeetle queue. The handler sends full
 compact `SUBMITTED` Operation JSON, but has no receive, delete, purge, or
-queue-management permissions. Execution receives its separate Operations
+queue-management permissions. Execution receives its separate TigerBeetle queue
 queue-scoped poller policy and Completion queue-scoped `SendMessage` policy.
 Completion receives its separate Completion queue-scoped poller policy and
 table-scoped `UpdateItem`; neither role grants queue-management access. The
 `queue.sh` command uses the local caller's AWS identity and does not expand any
 Lambda role. Its `receive` command competes with the enabled execution event
-source mapping for Operations messages.
+source mapping for TigerBeetle queue messages.
 
-`OperationsQueue` and `CompletionQueue` are standard queues with
-CloudFormation-generated names and 90-second visibility timeouts, six times
+`TigerBeetleQueue` and `CompletionQueue` are standard queues with 90-second
+visibility timeouts, six times
 their consumer functions' 15-second timeouts. The template does not configure
 FIFO behavior or a dead-letter queue for either queue. No additional
 retention or replay path is introduced. `DeletionPolicy: Delete` and
 `UpdateReplacePolicy: Delete` mean deleting the stack or replacing either
 queue permanently deletes its queued messages; retries do not outlive the
 queue's configured retention period.
+`TigerBeetleQueue` has that exact fixed physical name, while CloudFormation
+generates the Completion queue name. Renaming from the former queue resource
+replaces it and deletes any messages left in the old queue under these policies.
 
 The operations table uses on-demand `PAY_PER_REQUEST` billing and has one
 string partition key named `id`. It has no sort key, secondary indexes,
@@ -1303,7 +1314,7 @@ After a successful deployment, the shared runner resolves the
 `OperationsTable` physical resource, waits for the table to exist, and prints a
 concise table summary. It fails unless the table is active, uses on-demand
 billing, has only the `id` string partition key, and has no local or global
-secondary indexes. It then resolves the `OperationsQueue` physical resource and calls
+secondary indexes. It then resolves the `TigerBeetleQueue` physical resource and calls
 `GetQueueAttributes` to print a concise SQS summary. This probe verifies that
 the deployed queue can be queried but does not enforce SQS attribute values.
 Resolve and inspect `CompletionQueue` separately when verifying the complete
@@ -1395,7 +1406,7 @@ aws cloudformation describe-stacks \
 `lambda_logs.sh` resolves the explicit intake, query, execution, or completion
 function-name output.
 `persistence.sh` and `queue.sh` resolve the `OperationsTable` and
-`OperationsQueue` physical resources directly because those data-plane names
+`TigerBeetleQueue` physical resources directly because those data-plane names
 are intentionally not public stack outputs. Normal local command use does not
 require exporting those values.
 
@@ -1737,7 +1748,7 @@ curl -L \
   -H "Content-Type: application/json" \
   --data \
     '{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
-'"name":"echo","body":{"message":"hello","count":2}}' \
+'"name":"TigerBeetle","body":{"message":"hello","count":2}}' \
   <IntakeFunctionUrl>
 ```
 
@@ -1750,11 +1761,11 @@ expiry, the verified subject as tenant, and the stable hash:
 {
   "id": "00112233-4455-6677-8899-aabbccddeeff",
   "tenant": "example-user",
-  "name": "echo",
+  "name": "TigerBeetle",
   "state": "SUBMITTED",
   "last_updated": 1700000000,
   "expires_at": 1700086400,
-  "hash": "f4142429f9f7373c34b7b5eeab555ed5b4534a746193c40bfca65bb73f9a3014"
+  "hash": "a155fdd43dc72aafd9d8914da4af79cfde80983ce96e1eec3bd634d36ce7e80f"
 }
 ```
 
@@ -1794,9 +1805,9 @@ Delivery is at least once. The standard queue, acknowledgement loss, and
 concurrent `SUBMITTED` retries can create duplicate messages. Consumers must use the
 Operation ID and hash idempotently. Execution performs the replay-safe
 TigerBeetle account and transfer sequence, aggregates terminal ID/result
-entries, and acknowledges represented Operations records only after the one
-Completion message is published. Invalid Operations records are acknowledged;
-TigerBeetle uncertainty retries only the affected Operations record, and
+entries, and acknowledges represented TigerBeetle queue records only after the
+one Completion message is published. Invalid TigerBeetle queue records are
+acknowledged; TigerBeetle uncertainty retries only the affected queue record, and
 publication uncertainty retries every record represented by the aggregate.
 
 Completion receives one aggregate message per invocation and applies its
@@ -1951,12 +1962,14 @@ DynamoDB failures after configuration loading instead report
 
 ### Troubleshoot Lambda initialization
 
-The SAM template supplies the intake Lambda with `OPERATIONS_TABLE_NAME`,
-`OPERATIONS_QUEUE_URL`, and their scoped IAM policies together. Removing either
-variable, configuring an empty or oversized queue URL, or configuring an
-invalid DynamoDB table name makes the intake bootstrap exit during Lambda INIT,
-before it requests an invocation. Check the deployed template and function
-configuration; no HTTP response can be produced for an INIT failure.
+The SAM template supplies the intake Lambda with `OPERATIONS_TABLE_NAME`, the
+`TigerBeetleQueue` route mapping, and their scoped IAM policies together. A
+missing or invalid DynamoDB table name makes the intake bootstrap exit during
+Lambda INIT, before it requests an invocation. Check the deployed template and
+function configuration; no HTTP response can be produced for an INIT failure.
+The route mapping is request-specific: a missing, empty, or oversized
+`<operation.name>Queue` value returns HTTP 400 before DynamoDB persistence or
+SQS send. Route names are exact and case-sensitive.
 
 A syntactically valid but nonexistent table, or missing `PutItem` permission,
 does not fail INIT because startup makes no DynamoDB request. The first valid,
@@ -1964,7 +1977,8 @@ authenticated POST returns a sanitized HTTP 500 in those cases; inspect Lambda
 logs and the SAM-managed stack resources without recording live table names or
 account-specific identifiers in this repository. Likewise, a syntactically
 valid but nonexistent queue or missing `SendMessage` permission is discovered
-only when POST attempts submission and returns a sanitized HTTP 503.
+only after POST persists the `SUBMITTED` Operation and attempts submission. It
+returns a sanitized HTTP 503, leaving the row available for a matching retry.
 
 The query Lambda requires only `OPERATIONS_TABLE_NAME`; it has no queue
 configuration. A missing or invalid table-name setting exits during query INIT.
@@ -1977,7 +1991,7 @@ The execution Lambda requires `COMPLETION_QUEUE_URL`,
 settings exit during execution INIT. A syntactically valid but nonexistent
 Completion queue, missing `SendMessage` permission, or SQS service failure is
 discovered when execution publishes its aggregate. Execution logs that
-failure and requests retries for all Operations records represented by the
+failure and requests retries for all TigerBeetle queue records represented by the
 unsent message.
 
 The completion Lambda requires only `OPERATIONS_TABLE_NAME`. A missing or
@@ -1990,8 +2004,9 @@ aggregate, and requests a retry for the invocation's single SQS message.
 
 `queue.sh` is the supported local queue command. It defaults to profile `dev`,
 region `ca-central-1`, and stack `aws-lambda-zig-demo`. It exports the selected
-profile's temporary credentials, resolves the `OperationsQueue` physical
-resource, and runs the requested operation. Override the defaults with
+profile's temporary credentials, resolves the `TigerBeetleQueue` physical
+resource, exports its URL under the same `TigerBeetleQueue` key used by intake,
+and runs the requested operation. Override the defaults with
 `PROFILE`, `REGION`, or `STACK_NAME`.
 
 Send an Operation while supplying required tenant metadata separately:
@@ -2050,14 +2065,15 @@ The caller needs these queue-scoped permissions for the commands it uses:
 
 `queue.sh` also needs `cloudformation:DescribeStackResource`. These local caller
 permissions are independent of the Lambda roles. Intake remains send-only for SQS, execution has
-Operations queue-scoped polling and Completion queue-scoped send permissions,
+TigerBeetle queue-scoped polling and Completion queue-scoped send permissions,
 completion has Completion queue-scoped polling permissions, and query has no
 SQS permissions.
 
 If `sqs: missing or invalid configuration` is emitted, the local command
 implementation could not load its AWS settings. `queue.sh` supplies the
-resolved queue URL, temporary credentials, and region, and validates that the
-URL is non-empty. Confirm `PROFILE`, `REGION`, and `STACK_NAME`. Configuration
+resolved queue URL as `TigerBeetleQueue`, temporary credentials, and region,
+and validates that the URL is non-empty. Confirm `PROFILE`, `REGION`, and
+`STACK_NAME`. Configuration
 is checked before Operation input is parsed; AWS failures after configuration
 loading instead report `sqs: AWS request failed`.
 
