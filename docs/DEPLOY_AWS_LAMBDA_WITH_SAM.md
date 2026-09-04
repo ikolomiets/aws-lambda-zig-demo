@@ -485,9 +485,10 @@ succeeded or reached an acknowledged deterministic/conflict outcome.
 name. Intake, query, and completion initialize the Operation persistence
 module around an AWS configuration and reuse their clients and HTTP pools
 across warm invocations. Intake also initializes one reusable SQS sender. On
-each valid POST it appends `Queue` to the exact, case-sensitive operation name
-and resolves that environment key before persistence; `"name":"TigerBeetle"`
-therefore resolves `TigerBeetleQueue`. Execution validates
+each valid POST it rejects the exact reserved operation name `Completion`, then
+appends `Queue` to any other case-sensitive operation name and resolves that
+environment key before persistence; `"name":"TigerBeetle"` therefore resolves
+`TigerBeetleQueue`. Execution validates
 `COMPLETION_QUEUE_URL`, initializes the fixed-queue SQS module, and retains one
 TigerBeetle client across warm invocations. Missing or invalid cold-start
 configuration prevents the affected Lambda from handling invocations. The
@@ -1967,9 +1968,10 @@ The SAM template supplies the intake Lambda with `OPERATIONS_TABLE_NAME`, the
 missing or invalid DynamoDB table name makes the intake bootstrap exit during
 Lambda INIT, before it requests an invocation. Check the deployed template and
 function configuration; no HTTP response can be produced for an INIT failure.
-The route mapping is request-specific: a missing, empty, or oversized
-`<operation.name>Queue` value returns HTTP 400 before DynamoDB persistence or
-SQS send. Route names are exact and case-sensitive.
+The route mapping is request-specific: the exact operation name `Completion`
+is reserved and returns HTTP 400 before route lookup. A missing, empty, or
+oversized `<operation.name>Queue` value also returns HTTP 400 before DynamoDB
+persistence or SQS send. Route names are exact and case-sensitive.
 
 A syntactically valid but nonexistent table, or missing `PutItem` permission,
 does not fail INIT because startup makes no DynamoDB request. The first valid,

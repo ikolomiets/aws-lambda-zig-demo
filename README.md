@@ -345,11 +345,13 @@ paths that are not exactly one UUID segment receive `400 Bad Request`. Missing
 Operations and Operations owned by another tenant both receive the same static
 `404 Not Found` response. A POST that
 reuses an Operation ID with a different server-computed hash receives a
-sanitized `409 Conflict`. Intake appends `Queue` to the operation name without
-case conversion; a missing, empty, or oversized resulting environment mapping
-receives `400 Bad Request` before DynamoDB or SQS is called. Query DynamoDB
-request or service failures and intake SQS submission failures receive a static
-`503 Service Unavailable` response.
+sanitized `409 Conflict`. The exact operation name `Completion` is reserved and
+receives `400 Bad Request` before route lookup, DynamoDB, or SQS. For other
+names, intake appends `Queue` without case conversion; a missing, empty, or
+oversized resulting environment mapping receives `400 Bad Request` before
+DynamoDB or SQS is called. Query DynamoDB request or service failures and
+intake SQS submission failures receive a static `503 Service Unavailable`
+response.
 Malformed stored items and other unexpected failures receive the static
 `500 Internal Server Error` response.
 
@@ -362,14 +364,15 @@ tenant with the verified token subject.
 bootstrap validates the table name and initializes Operation persistence plus
 one reusable SQS sender around a shared AWS SDK configuration and HTTP pool.
 Those resources are reused across warm invocations. For each valid POST, intake
-forms the bounded, case-sensitive key `<operation.name>Queue`; for example,
+rejects the exact reserved operation name `Completion`, then forms the bounded,
+case-sensitive key `<operation.name>Queue`; for example,
 `"name":"TigerBeetle"` selects `TigerBeetleQueue`. It resolves and validates a
-non-empty, at-most-2,048-byte URL under that key before persistence. An absent
-or invalid mapping returns HTTP 400 without writing or sending. Resource
-existence and IAM authorization are checked when POST calls the services, so a
-DynamoDB failure returns a sanitized HTTP 500. An SQS send failure after a
-successful write returns HTTP 503 and leaves the stored `SUBMITTED` Operation
-available for a matching POST to retry.
+non-empty, at-most-2,048-byte URL under that key before persistence. A reserved
+name or absent or invalid mapping returns HTTP 400 without writing or sending.
+Resource existence and IAM authorization are checked when POST calls the
+services, so a DynamoDB failure returns a sanitized HTTP 500. An SQS send
+failure after a successful write returns HTTP 503 and leaves the stored
+`SUBMITTED` Operation available for a matching POST to retry.
 
 `OPERATIONS_TABLE_NAME` is also mandatory at query Lambda initialization. The
 query bootstrap initializes one AWS SDK configuration and one Operation

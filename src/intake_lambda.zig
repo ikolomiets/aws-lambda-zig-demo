@@ -27,6 +27,8 @@ const method_not_allowed_body = "Method Not Allowed\n";
 const operation_message_size_max = 8 * 1024;
 const operation_queue_key_suffix = "Queue";
 const operation_queue_key_size_max = operation.name_size_max + operation_queue_key_suffix.len;
+// CompletionQueue is an internal execution-to-completion route.
+const reserved_operation_name = "Completion";
 const service_unavailable_body = "Service Unavailable\n";
 const unauthorized_body = "Unauthorized\n";
 
@@ -34,6 +36,8 @@ comptime {
     std.debug.assert(operation_message_size_max > operation.body_size_max);
     std.debug.assert(operation_queue_key_size_max > operation.name_size_max);
     std.debug.assert(operation_queue_key_size_max <= sqs_queue.environment_variable_name_size_max);
+    std.debug.assert(reserved_operation_name.len > 0);
+    std.debug.assert(reserved_operation_name.len <= operation.name_size_max);
     std.debug.assert(lambda_auth.subject_size_max == operation.tenant_size_max);
 }
 
@@ -306,6 +310,9 @@ fn operation_queue_key(
 ) ![]const u8 {
     if (operation_name.len == 0) return error.InvalidOperationName;
     if (operation_name.len > operation.name_size_max) return error.InvalidOperationName;
+    if (std.mem.eql(u8, operation_name, reserved_operation_name)) {
+        return error.InvalidOperationName;
+    }
     const key_size = operation_name.len + operation_queue_key_suffix.len;
     std.debug.assert(key_size > operation_name.len);
     std.debug.assert(key_size <= buffer.len);
@@ -549,7 +556,7 @@ test "AWS SDK debug logging is enabled" {
     try std.testing.expect(std.log.logEnabled(.debug, .aws_sdk));
 }
 
-test "operation queue keys append Queue exactly within the name bound" {
+test "operation queue keys append Queue for routable names and reject invalid names" {
     var buffer: [operation_queue_key_size_max]u8 = undefined;
     try std.testing.expectEqualStrings(
         "TigerBeetleQueue",
@@ -567,9 +574,13 @@ test "operation queue keys append Queue exactly within the name bound" {
         error.InvalidOperationName,
         operation_queue_key("a" ** (operation.name_size_max + 1), &buffer),
     );
+    try std.testing.expectError(
+        error.InvalidOperationName,
+        operation_queue_key(reserved_operation_name, &buffer),
+    );
 }
 
-test "POST routes TigerBeetle exactly and rejects other casing and unmapped names" {
+test "POST routes names exactly and rejects reserved and unmapped names" {
     const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
         .seed_byte = 0x62,
         .now = 1000,
@@ -580,8 +591,12 @@ test "POST routes TigerBeetle exactly and rejects other casing and unmapped name
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x62);
     try environment.put("TigerBeetleQueue", test_queue_url);
+    try environment.put("CompletionQueue", test_queue_url);
+    try environment.put("completionQueue", test_queue_url);
     const cases = [_]struct { name: []const u8, mapped: bool }{
         .{ .name = "TigerBeetle", .mapped = true },
+        .{ .name = "Completion", .mapped = false },
+        .{ .name = "completion", .mapped = true },
         .{ .name = "tigerBeetle", .mapped = false },
         .{ .name = "Tigerbeetle", .mapped = false },
         .{ .name = "Unmapped", .mapped = false },
