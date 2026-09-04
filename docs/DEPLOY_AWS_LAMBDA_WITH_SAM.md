@@ -380,10 +380,13 @@ address-syntax validation during cold start. `deploy.sh` exposes matching
 environment overrides.
 
 The execution event source mapping is enabled with `BatchSize: 10`,
-`MaximumBatchingWindowInSeconds: 0`, and `ReportBatchItemFailures`. Lambda polls
-the queue and invokes execution with SQS events. The mapping remains enabled
-when the managed WireGuard gateway is disabled; operators must provide another
-trusted route to the configured TigerBeetle address or accept timeout-driven
+`MaximumBatchingWindowInSeconds: 0`, `MaximumConcurrency: 8`, and
+`ReportBatchItemFailures`. The event-source concurrency cap limits the mapping
+to eight concurrent execution invocations, preventing unbounded Lambda scaling
+from consuming TigerBeetle's default 64 client sessions. Lambda polls the queue
+and invokes execution with SQS events. The mapping remains enabled when the
+managed WireGuard gateway is disabled; operators must provide another trusted
+route to the configured TigerBeetle address or accept timeout-driven
 partial-batch retries. For each record, the handler
 retains the debug log containing `message_id` and `body`, parses and validates
 the complete Operation output, and processes only a queued `SUBMITTED` Operation with
