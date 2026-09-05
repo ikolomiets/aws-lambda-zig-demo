@@ -50,8 +50,10 @@ Options:
                          Intake Lambda name. Defaults to intake-lambda.
   --query-function-name NAME
                          Query Lambda name. Defaults to query-lambda.
-  --execution-function-name NAME
-                         Execution Lambda name. Defaults to execution-lambda.
+  --tiger-beetle-processor-name NAME
+                         TigerBeetle processor name. Defaults to tiger-beetle-processor.
+  --completion-processor-name NAME
+                         Completion processor name. Defaults to completion-processor.
   --tigerbeetle-cluster-id ID
                          Unsigned decimal cluster ID. Defaults to 0.
   --tigerbeetle-addresses ADDRESSES
@@ -60,10 +62,10 @@ Options:
                          LAMBDA_PRINCIPAL environment value. Defaults to *.
   --enable-wireguard-gateway
                          Accepted for compatibility; enablement is implicit.
-  --vpc-id ID            Existing VPC for the gateway and execution Lambda.
+  --vpc-id ID            Existing VPC for the gateway and TigerBeetle processor.
   --gateway-public-subnet-id ID
                          Existing public subnet for the EC2 gateway.
-  --lambda-subnet-id ID  Existing private subnet for the execution Lambda.
+  --lambda-subnet-id ID  Existing private subnet for the TigerBeetle processor.
   --lambda-route-table-id ID
                          Optional assertion for the discovered route table.
   --lambda-subnet-cidr CIDR
@@ -81,13 +83,13 @@ Options:
   --use-local-libs       Use local dependency checkouts with zig build --fork.
                          aws_lambda defaults to ../aws-lambda-zig.
   --dry-run              Run local checks, build, package, and validation only.
-  --migration-check-only Validate the existing intake function name, then exit.
   --no-url-check         Skip the post-deploy Function URL HTTP status check.
   -h, --help             Show this help.
 
 Environment overrides:
   PROFILE, REGION, STACK_NAME, INTAKE_FUNCTION_NAME, QUERY_FUNCTION_NAME,
-  EXECUTION_FUNCTION_NAME, TIGERBEETLE_CLUSTER_ID, TIGERBEETLE_ADDRESSES,
+  TIGER_BEETLE_PROCESSOR_NAME, COMPLETION_PROCESSOR_NAME,
+  TIGERBEETLE_CLUSTER_ID, TIGERBEETLE_ADDRESSES,
   LAMBDA_PRINCIPAL, PASETO_PRIVATE_KEY,
   PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT, ENABLE_WIREGUARD_GATEWAY,
   VPC_ID, GATEWAY_PUBLIC_SUBNET_ID, LAMBDA_SUBNET_ID,
@@ -1138,7 +1140,7 @@ validate_stack_owned_ipv6_egress() {
 
     stack_eigw="$(aws cloudformation describe-stack-resource \
         --stack-name "$STACK_NAME" \
-        --logical-resource-id ExecutionEgressOnlyInternetGateway \
+        --logical-resource-id TigerBeetleProcessorEgressOnlyInternetGateway \
         --query '[StackResourceDetail.PhysicalResourceId,StackResourceDetail.ResourceStatus]' \
         --output text \
         --profile "$PROFILE" \
@@ -1152,7 +1154,7 @@ validate_stack_owned_ipv6_egress() {
     esac
     stack_route_status="$(aws cloudformation describe-stack-resource \
         --stack-name "$STACK_NAME" \
-        --logical-resource-id ExecutionSqsIpv6Route \
+        --logical-resource-id TigerBeetleProcessorSqsIpv6Route \
         --query StackResourceDetail.ResourceStatus \
         --output text \
         --profile "$PROFILE" \
@@ -1519,7 +1521,7 @@ plan_wireguard_deployment() {
     while IFS=$'\t' read -r parameter_key parameter_value; do
         case "$parameter_key" in
             EnableWireGuardGateway) prior_gateway_enabled="$parameter_value" ;;
-            RetainExecutionVpcCleanupResources)
+            RetainTigerBeetleProcessorVpcCleanupResources)
                 prior_cleanup_retained="$parameter_value"
                 ;;
             VpcId) prior_vpc_id="$parameter_value" ;;
@@ -1534,7 +1536,7 @@ plan_wireguard_deployment() {
     esac
     case "$prior_cleanup_retained" in
         true | false) ;;
-        *) fail "stack returned a malformed RetainExecutionVpcCleanupResources state" ;;
+        *) fail "stack returned a malformed RetainTigerBeetleProcessorVpcCleanupResources state" ;;
     esac
     if [ "$prior_gateway_enabled" = true ] || [ "$prior_cleanup_retained" = true ]; then
         WIREGUARD_EGRESS_RESOURCES_EXPECTED=1
@@ -1598,13 +1600,13 @@ preflight_planned_cleanup_ipv6_egress() (
     preflight_retained_ipv6_egress
 )
 
-execution_vpc_cleanup_ready() {
+tiger_beetle_processor_vpc_cleanup_ready() {
     local function_configuration function_state last_update_status
     local vpc_id_length subnet_count security_group_count
-    local configured_version_count execution_security_group_id eni_count
+    local configured_version_count tiger_beetle_processor_security_group_id eni_count
 
     function_configuration="$(aws lambda get-function-configuration \
-        --function-name "$EXECUTION_FUNCTION_NAME" \
+        --function-name "$TIGER_BEETLE_PROCESSOR_NAME" \
         --query '[State,LastUpdateStatus,length(VpcConfig.VpcId),length(VpcConfig.SubnetIds),length(VpcConfig.SecurityGroupIds)]' \
         --output text \
         --profile "$PROFILE" \
@@ -1625,35 +1627,35 @@ execution_vpc_cleanup_ready() {
         [ "$subnet_count" -ne 0 ] ||
         [ "$security_group_count" -ne 0 ]
     then
-        printf '==> Waiting for the execution Lambda VPC configuration to detach\n'
+        printf '==> Waiting for the TigerBeetle processor VPC configuration to detach\n'
         return 1
     fi
 
     configured_version_count="$(aws lambda list-versions-by-function \
-        --function-name "$EXECUTION_FUNCTION_NAME" \
+        --function-name "$TIGER_BEETLE_PROCESSOR_NAME" \
         --query "length(Versions[?VpcConfig.VpcId!=''])" \
         --output json \
         --profile "$PROFILE" \
         --region "$REGION")" || return 2
     [[ "$configured_version_count" =~ ^[0-9]+$ ]] || return 2
     if [ "$configured_version_count" -ne 0 ]; then
-        printf '==> Waiting for all execution Lambda versions to detach from the VPC\n'
+        printf '==> Waiting for all TigerBeetle processor versions to detach from the VPC\n'
         return 1
     fi
 
-    execution_security_group_id="$(aws cloudformation describe-stack-resource \
+    tiger_beetle_processor_security_group_id="$(aws cloudformation describe-stack-resource \
         --stack-name "$STACK_NAME" \
-        --logical-resource-id ExecutionLambdaSecurityGroup \
+        --logical-resource-id TigerBeetleProcessorSecurityGroup \
         --query StackResourceDetail.PhysicalResourceId \
         --output text \
         --profile "$PROFILE" \
         --region "$REGION")" || return 2
-    [[ "$execution_security_group_id" =~ ^sg-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
+    [[ "$tiger_beetle_processor_security_group_id" =~ ^sg-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
         return 2
 
     eni_count="$(aws ec2 describe-network-interfaces \
         --filters \
-        "Name=group-id,Values=$execution_security_group_id" \
+        "Name=group-id,Values=$tiger_beetle_processor_security_group_id" \
         "Name=interface-type,Values=lambda" \
         --query 'length(NetworkInterfaces)' \
         --output json \
@@ -1669,7 +1671,7 @@ execution_vpc_cleanup_ready() {
     return 0
 }
 
-wait_for_execution_vpc_cleanup() {
+wait_for_tiger_beetle_processor_vpc_cleanup() {
     local max_attempts="${VPC_CLEANUP_MAX_ATTEMPTS:-121}"
     local poll_seconds="${VPC_CLEANUP_POLL_SECONDS:-10}"
     local attempt readiness_status
@@ -1681,20 +1683,20 @@ wait_for_execution_vpc_cleanup() {
 
     printf '==> Waiting for Lambda VPC cleanup before removing retained resources\n'
     for ((attempt = 1; attempt <= 10#$max_attempts; attempt++)); do
-        if execution_vpc_cleanup_ready; then
+        if tiger_beetle_processor_vpc_cleanup_ready; then
             printf '==> Lambda VPC cleanup is complete\n'
             return 0
         else
             readiness_status=$?
         fi
         [ "$readiness_status" -eq 1 ] ||
-            fail "could not verify execution Lambda VPC cleanup"
+            fail "could not verify TigerBeetle processor VPC cleanup"
         if [ "$attempt" -lt "$max_attempts" ]; then
             sleep "$poll_seconds"
         fi
     done
 
-    fail "execution Lambda VPC cleanup did not finish within the bounded wait; retained EIGW, IPv6 route, execution security group, and ENI-management IAM remain"
+    fail "TigerBeetle processor VPC cleanup did not finish within the bounded wait; retained EIGW, IPv6 route, TigerBeetle processor security group, and ENI-management IAM remain"
 }
 
 build_wireguard_parameter_overrides() {
@@ -1706,7 +1708,7 @@ build_wireguard_parameter_overrides() {
     esac
 
     DEPLOYMENT_PARAMETER_OVERRIDES=(
-        "RetainExecutionVpcCleanupResources=$retain_cleanup_resources"
+        "RetainTigerBeetleProcessorVpcCleanupResources=$retain_cleanup_resources"
     )
     if [ "$ENABLE_WIREGUARD_GATEWAY" -eq 1 ]; then
         DEPLOYMENT_PARAMETER_OVERRIDES+=(
@@ -1776,7 +1778,7 @@ build_wireguard_parameter_reset_overrides() {
 
     DEPLOYMENT_PARAMETER_OVERRIDES=(
         "EnableWireGuardGateway=false"
-        "RetainExecutionVpcCleanupResources=false"
+        "RetainTigerBeetleProcessorVpcCleanupResources=false"
         "file://$WIREGUARD_PARAMETER_RESET_FILE"
     )
 }
@@ -1787,8 +1789,8 @@ clear_saved_wireguard_parameters() {
 }
 
 finish_wireguard_cleanup() {
-    DEPLOYMENT_ERROR_PHASE="execution Lambda VPC cleanup wait"
-    wait_for_execution_vpc_cleanup || return
+    DEPLOYMENT_ERROR_PHASE="TigerBeetle processor VPC cleanup wait"
+    wait_for_tiger_beetle_processor_vpc_cleanup || return
     deploy_wireguard_cleanup_phase \
         false \
         "Removing retained VPC cleanup resources" || return
@@ -1805,7 +1807,7 @@ run_wireguard_deployment() {
         detach-then-cleanup | detach-then-reconfigure)
             deploy_wireguard_cleanup_phase \
                 true \
-                "Detaching execution Lambda from the VPC" ||
+                "Detaching TigerBeetle processor from the VPC" ||
                 return
             finish_wireguard_cleanup || return
             if [ "$deployment_mode" = detach-then-reconfigure ]; then
@@ -2058,7 +2060,8 @@ parse_wireguard_options() {
                 case "$1" in
                     --profile | --region | --stack-name | \
                         --intake-function-name | --query-function-name | \
-                        --execution-function-name | --tigerbeetle-cluster-id | \
+                        --tiger-beetle-processor-name | --completion-processor-name | \
+                        --tigerbeetle-cluster-id | \
                         --tigerbeetle-addresses | --lambda-principal)
                         need_value "$1" "${2:-}"
                         COMMON_DEPLOYMENT_ARGS+=("$2")

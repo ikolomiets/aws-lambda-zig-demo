@@ -8,7 +8,7 @@ const operation_persistence = @import("operation_persistence");
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{
         .{
-            .scope = .completion,
+            .scope = .completion_processor,
             .level = .debug,
         },
         .{
@@ -20,7 +20,7 @@ pub const std_options: std.Options = .{
 
 const Allocator = std.mem.Allocator;
 const record_count_max = 1;
-const log = std.log.scoped(.completion);
+const log = std.log.scoped(.completion_processor);
 
 comptime {
     std.debug.assert(record_count_max == 1);
@@ -675,7 +675,7 @@ test "completion handler tests run in ReleaseSafe" {
 
 test "completion declares debug log scopes for ReleaseSafe" {
     try std.testing.expectEqual(@as(usize, 2), std_options.log_scope_levels.len);
-    try std.testing.expect(std_options.log_scope_levels[0].scope == .completion);
+    try std.testing.expect(std_options.log_scope_levels[0].scope == .completion_processor);
     try std.testing.expectEqual(.debug, std_options.log_scope_levels[0].level);
     try std.testing.expect(std_options.log_scope_levels[1].scope == .aws_sdk);
     try std.testing.expectEqual(.debug, std_options.log_scope_levels[1].level);

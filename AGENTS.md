@@ -3,7 +3,7 @@
 ## Repository and Sources of Truth
 
 This repository is a small Zig 0.16.0 AWS Lambda example. The root build files
-define the intake, query, execution, and completion Lambda bootstrap executables,
+define the intake, query, TigerBeetle processor, and Completion processor bootstrap executables,
 application code lives in `src/`, AWS
 deployment material lives in `template.yaml`, `deploy.sh`,
 `wireguard-gateway-setup.sh`, and `docs/`, while the vendored `aws_lambda`
@@ -15,8 +15,8 @@ Use these sources in order:
   selection, dependency graph, optimization mode, and installed executable.
 - `src/intake_lambda.zig` is the authenticated POST intake entrypoint and handler.
 - `src/query_lambda.zig` is the authenticated GET environment-query entrypoint and handler.
-- `src/execution_lambda.zig` is the SQS-driven execution entrypoint and handler.
-- `src/completion_lambda.zig` is the SQS-driven completion entrypoint and handler.
+- `src/tiger_beetle_processor.zig` is the SQS-driven TigerBeetle processor entrypoint and handler.
+- `src/completion_processor.zig` is the SQS-driven Completion processor entrypoint and handler.
 - `src/completion_batch.zig` is the bounded ID-and-result Completion message contract.
 - `src/lambda_auth.zig` is the shared bearer-token and PASETO verification module.
 - `template.yaml` defines the SAM-managed Lambdas, Function URLs, permissions,
@@ -73,10 +73,10 @@ effect.
 Treat generated build artifacts as artifacts:
 
 - `zig-out/bin/intake/bootstrap`, `zig-out/bin/query/bootstrap`,
-  `zig-out/bin/execution/bootstrap`, and `zig-out/bin/completion/bootstrap` are produced by
+  `zig-out/bin/tiger_beetle_processor/bootstrap`, and `zig-out/bin/completion_processor/bootstrap` are produced by
   `zig build`.
-- `intake-lambda.zip`, `query-lambda.zip`, `execution-lambda.zip`, and
-  `completion-lambda.zip` package their matching bootstraps for Lambda/SAM.
+- `intake-lambda.zip`, `query-lambda.zip`, `tiger-beetle-processor.zip`, and
+  `completion-processor.zip` package their matching bootstraps for Lambda/SAM.
 
 Only refresh artifacts when the task requires a deployable package.
 
@@ -135,22 +135,22 @@ the AWS CLI query that retrieves it instead of recording the value itself.
 
 Use these local checks:
 
-- `zig fmt --check build.zig src/completion_batch.zig src/completion_lambda.zig src/execution_lambda.zig src/intake_lambda.zig src/lambda_auth.zig src/query_lambda.zig`:
+- `zig fmt --check build.zig src/completion_batch.zig src/completion_processor.zig src/tiger_beetle_processor.zig src/intake_lambda.zig src/lambda_auth.zig src/query_lambda.zig`:
   verify Zig formatting.
-- `zig build test-deploy`: run only the dependency-free deployment-helper
-  regression tests; these use mocked AWS commands and require no credentials or
-  network access.
-- `bash -n deploy.sh wireguard-gateway-setup.sh tests/*.sh`: verify deployment
+- `zig build test-deploy`: run only the local deployment-helper
+  regression tests; these use mocked AWS commands, require Bash and `jq`, and need
+  no credentials or network access.
+- `bash -n deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh`: verify deployment
   helper and shell-test syntax.
 - `zig build test`: run the Zig tests and the deployment-helper regression
   tests.
 - `zig build --release -Darch=arm`: build the stripped ReleaseSafe Linux ARM64 intake,
-  query, execution, and completion Lambda bootstraps. Execution remains multithread-capable
+  query, TigerBeetle processor, and Completion processor bootstraps. TigerBeetle processor remains multithread-capable
   for the TigerBeetle callback thread; the other three are single-threaded.
 - `zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap` and
   `zip -qj query-lambda.zip zig-out/bin/query/bootstrap` and
-  `zip -qj execution-lambda.zip zig-out/bin/execution/bootstrap` and
-  `zip -qj completion-lambda.zip zig-out/bin/completion/bootstrap`: refresh deployable
+  `zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap` and
+  `zip -qj completion-processor.zip zig-out/bin/completion_processor/bootstrap`: refresh deployable
   packages when required.
 - `sam validate --template-file template.yaml --region ca-central-1`: validate
   the SAM template when `template.yaml` changes.

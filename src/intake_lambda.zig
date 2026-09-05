@@ -27,7 +27,7 @@ const method_not_allowed_body = "Method Not Allowed\n";
 const operation_message_size_max = 8 * 1024;
 const operation_queue_key_suffix = "Queue";
 const operation_queue_key_size_max = operation.name_size_max + operation_queue_key_suffix.len;
-// CompletionQueue is an internal execution-to-completion route.
+// CompletionQueue routes results from the TigerBeetle processor to the Completion processor.
 const reserved_operation_name = "Completion";
 const service_unavailable_body = "Service Unavailable\n";
 const unauthorized_body = "Unauthorized\n";

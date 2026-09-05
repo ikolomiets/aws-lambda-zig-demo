@@ -47,38 +47,38 @@ test_source_guards() {
         fail_test "sourcing deployment helpers produced output: $source_output"
 }
 
-test_completion_function_name_options() (
+test_completion_processor_name_options() (
     local default_name invalid_name_output usage_output
 
-    default_name="$(env -u COMPLETION_FUNCTION_NAME bash -c \
-        'source "$1/deploy.sh"; printf "%s\n" "$COMPLETION_FUNCTION_NAME"' \
+    default_name="$(env -u COMPLETION_PROCESSOR_NAME bash -c \
+        'source "$1/deploy.sh"; printf "%s\n" "$COMPLETION_PROCESSOR_NAME"' \
         bash "$REPOSITORY_ROOT")" ||
         fail_test "default completion function name could not be resolved"
-    [ "$default_name" = completion-lambda ] ||
+    [ "$default_name" = completion-processor ] ||
         fail_test "default completion function name did not match the SAM parameter"
 
-    COMPLETION_FUNCTION_NAME=completion-lambda
-    parse_deployment_options --completion-function-name completion-custom
-    validate_completion_function_name
-    [ "$COMPLETION_FUNCTION_NAME" = completion-custom ] ||
+    COMPLETION_PROCESSOR_NAME=completion-processor
+    parse_deployment_options --completion-processor-name completion-custom
+    validate_completion_processor_name
+    [ "$COMPLETION_PROCESSOR_NAME" = completion-custom ] ||
         fail_test "separate completion function-name option was not applied"
 
-    parse_deployment_options --completion-function-name=completion_equal
-    validate_completion_function_name
-    [ "$COMPLETION_FUNCTION_NAME" = completion_equal ] ||
+    parse_deployment_options --completion-processor-name=completion_equal
+    validate_completion_processor_name
+    [ "$COMPLETION_PROCESSOR_NAME" = completion_equal ] ||
         fail_test "equals completion function-name option was not applied"
 
     if invalid_name_output="$({
-        parse_deployment_options --completion-function-name ''
-        validate_completion_function_name
+        parse_deployment_options --completion-processor-name ''
+        validate_completion_processor_name
     } 2>&1)"; then
         fail_test "empty completion function-name argument was accepted"
     fi
-    assert_contains "$invalid_name_output" "empty value for --completion-function-name"
+    assert_contains "$invalid_name_output" "empty value for --completion-processor-name"
 
     if invalid_name_output="$({
-        parse_deployment_options --completion-function-name completion/name
-        validate_completion_function_name
+        parse_deployment_options --completion-processor-name completion/name
+        validate_completion_processor_name
     } 2>&1)"; then
         fail_test "invalid completion function-name argument was accepted"
     fi
@@ -86,17 +86,17 @@ test_completion_function_name_options() (
 
     if invalid_name_output="$({
         parse_deployment_options \
-            --completion-function-name \
+            --completion-processor-name \
             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-        validate_completion_function_name
+        validate_completion_processor_name
     } 2>&1)"; then
         fail_test "oversized completion function-name argument was accepted"
     fi
     assert_contains "$invalid_name_output" "must be at most 64 characters"
 
     usage_output="$(usage)"
-    assert_contains "$usage_output" "--completion-function-name NAME"
-    assert_contains "$usage_output" "COMPLETION_FUNCTION_NAME"
+    assert_contains "$usage_output" "--completion-processor-name NAME"
+    assert_contains "$usage_output" "COMPLETION_PROCESSOR_NAME"
 )
 
 test_completion_parameter_preserves_stack_state() (
@@ -104,8 +104,8 @@ test_completion_parameter_preserves_stack_state() (
 
     INTAKE_FUNCTION_NAME=intake-existing
     QUERY_FUNCTION_NAME=query-existing
-    EXECUTION_FUNCTION_NAME=execution-existing
-    COMPLETION_FUNCTION_NAME=completion-explicit
+    TIGER_BEETLE_PROCESSOR_NAME=tiger-beetle-existing
+    COMPLETION_PROCESSOR_NAME=completion-explicit
     DEPLOYMENT_PARAMETER_OVERRIDES=(
         "EnableWireGuardGateway=true"
         "VpcId=vpc-00000001"
@@ -115,8 +115,8 @@ test_completion_parameter_preserves_stack_state() (
     overrides=" ${SAM_PARAMETER_OVERRIDES[*]} "
     assert_contains "$overrides" " IntakeFunctionName=intake-existing "
     assert_contains "$overrides" " QueryFunctionName=query-existing "
-    assert_contains "$overrides" " ExecutionFunctionName=execution-existing "
-    assert_contains "$overrides" " CompletionFunctionName=completion-explicit "
+    assert_contains "$overrides" " TigerBeetleProcessorName=tiger-beetle-existing "
+    assert_contains "$overrides" " CompletionProcessorName=completion-explicit "
     assert_contains "$overrides" " EnableWireGuardGateway=true "
     assert_contains "$overrides" " VpcId=vpc-00000001 "
     [ "${#SAM_PARAMETER_OVERRIDES[@]}" -eq 10 ] ||
@@ -128,13 +128,13 @@ test_deployed_function_name_outputs() (
 
     INTAKE_FUNCTION_NAME=intake-existing
     QUERY_FUNCTION_NAME=query-existing
-    EXECUTION_FUNCTION_NAME=execution-existing
-    COMPLETION_FUNCTION_NAME=completion-existing
+    TIGER_BEETLE_PROCESSOR_NAME=tiger-beetle-existing
+    COMPLETION_PROCESSOR_NAME=completion-existing
     aws() {
         printf 'IntakeFunctionName|intake-existing\t'
         printf 'QueryFunctionName|query-existing\t'
-        printf 'ExecutionFunctionName|execution-existing\t'
-        printf 'CompletionFunctionName|%s\n' "$MOCK_COMPLETION_OUTPUT"
+        printf 'TigerBeetleProcessorName|tiger-beetle-existing\t'
+        printf 'CompletionProcessorName|%s\n' "$MOCK_COMPLETION_OUTPUT"
     }
 
     MOCK_COMPLETION_OUTPUT=completion-existing
@@ -146,7 +146,7 @@ test_deployed_function_name_outputs() (
     if output="$(validate_deployed_function_names 2>&1)"; then
         fail_test "mismatched completion function-name output was accepted"
     fi
-    assert_contains "$output" "CompletionFunctionName does not match"
+    assert_contains "$output" "CompletionProcessorName does not match"
 )
 
 test_four_lambda_artifacts() (
@@ -162,8 +162,8 @@ test_four_lambda_artifacts() (
     for archive in \
         intake-lambda.zip \
         query-lambda.zip \
-        execution-lambda.zip \
-        completion-lambda.zip
+        tiger-beetle-processor.zip \
+        completion-processor.zip
     do
         printf 'stale archive\n' >"$archive"
     done
@@ -171,13 +171,13 @@ test_four_lambda_artifacts() (
     file() {
         printf '%s\n' "$1" >>"$MOCK_FILE_CALLS"
         case "$1" in
-            zig-out/bin/execution/bootstrap)
+            zig-out/bin/tiger_beetle_processor/bootstrap)
                 printf '%s\n' \
                     "$1: ELF 64-bit LSB executable, ARM aarch64, dynamically linked, stripped"
                 ;;
             zig-out/bin/intake/bootstrap | \
                 zig-out/bin/query/bootstrap | \
-                zig-out/bin/completion/bootstrap)
+                zig-out/bin/completion_processor/bootstrap)
                 printf '%s\n' \
                     "$1: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped"
                 ;;
@@ -200,19 +200,19 @@ test_four_lambda_artifacts() (
 
     artifact_output="$(validate_lambda_bootstraps)" ||
         fail_test "four-bootstrap artifact validation failed"
-    assert_contains "$artifact_output" "zig-out/bin/completion/bootstrap"
+    assert_contains "$artifact_output" "zig-out/bin/completion_processor/bootstrap"
     package_lambda_archives
 
     expected_file_calls='zig-out/bin/intake/bootstrap
 zig-out/bin/query/bootstrap
-zig-out/bin/completion/bootstrap
-zig-out/bin/execution/bootstrap'
+zig-out/bin/completion_processor/bootstrap
+zig-out/bin/tiger_beetle_processor/bootstrap'
     [ "$(<"$MOCK_FILE_CALLS")" = "$expected_file_calls" ] ||
         fail_test "bootstrap validation did not retain the four expected paths"
     expected_zip_calls='intake-lambda.zip|zig-out/bin/intake/bootstrap
 query-lambda.zip|zig-out/bin/query/bootstrap
-execution-lambda.zip|zig-out/bin/execution/bootstrap
-completion-lambda.zip|zig-out/bin/completion/bootstrap'
+tiger-beetle-processor.zip|zig-out/bin/tiger_beetle_processor/bootstrap
+completion-processor.zip|zig-out/bin/completion_processor/bootstrap'
     [ "$(<"$MOCK_ZIP_CALLS")" = "$expected_zip_calls" ] ||
         fail_test "packaging did not retain the four expected archive mappings"
 )
@@ -281,15 +281,15 @@ test_ipv6_egress_ownership_state() (
         case "$MOCK_STACK_STATE" in
             enabled)
                 printf 'EnableWireGuardGateway\ttrue\n'
-                printf 'RetainExecutionVpcCleanupResources\tfalse\n'
+                printf 'RetainTigerBeetleProcessorVpcCleanupResources\tfalse\n'
                 ;;
             retained)
                 printf 'EnableWireGuardGateway\tfalse\n'
-                printf 'RetainExecutionVpcCleanupResources\ttrue\n'
+                printf 'RetainTigerBeetleProcessorVpcCleanupResources\ttrue\n'
                 ;;
             disabled)
                 printf 'EnableWireGuardGateway\tfalse\n'
-                printf 'RetainExecutionVpcCleanupResources\tfalse\n'
+                printf 'RetainTigerBeetleProcessorVpcCleanupResources\tfalse\n'
                 ;;
             *) fail_test "unknown mocked stack state: $MOCK_STACK_STATE" ;;
         esac
@@ -352,7 +352,7 @@ mock_preserved_stack() {
     local enabled="$1"
 
     printf 'EnableWireGuardGateway|%s\t' "$enabled"
-    printf 'RetainExecutionVpcCleanupResources|false\t'
+    printf 'RetainTigerBeetleProcessorVpcCleanupResources|false\t'
     printf 'VpcId|vpc-00000001\t'
     printf 'GatewayPublicSubnetId|subnet-00000001\t'
     printf 'LambdaSubnetId|subnet-00000002\t'
@@ -375,7 +375,7 @@ test_ordinary_deployment_preserves_gateway_state() (
         load_preserved_wireguard_parameters
         overrides="$(joined_overrides)"
         assert_contains "$overrides" " EnableWireGuardGateway=$MOCK_ENABLED "
-        assert_contains "$overrides" " RetainExecutionVpcCleanupResources=false "
+        assert_contains "$overrides" " RetainTigerBeetleProcessorVpcCleanupResources=false "
         assert_contains "$overrides" " VpcId=vpc-00000001 "
         assert_contains "$overrides" " GatewayPublicSubnetId=subnet-00000001 "
         assert_contains "$overrides" " LambdaSubnetId=subnet-00000002 "
@@ -397,7 +397,7 @@ test_new_stack_defaults_disabled() (
     load_preserved_wireguard_parameters
     overrides="$(joined_overrides)"
     assert_contains "$overrides" " EnableWireGuardGateway=false "
-    assert_contains "$overrides" " RetainExecutionVpcCleanupResources=false "
+    assert_contains "$overrides" " RetainTigerBeetleProcessorVpcCleanupResources=false "
     [ "${#DEPLOYMENT_PARAMETER_OVERRIDES[@]}" -eq 2 ] ||
         fail_test "new stack received unexpected gateway parameters"
 )
@@ -405,7 +405,7 @@ test_new_stack_defaults_disabled() (
 test_ordinary_deployment_rejects_transition() (
     aws() {
         printf 'EnableWireGuardGateway|false\n'
-        printf 'RetainExecutionVpcCleanupResources|true\n'
+        printf 'RetainTigerBeetleProcessorVpcCleanupResources|true\n'
         printf 'VpcId|vpc-00000001\n'
         printf 'LambdaRouteTableId|rtb-00000002\n'
     }
@@ -542,7 +542,7 @@ test_failed_deployment_omits_peer_configuration() (
 )
 
 test_source_guards
-test_completion_function_name_options
+test_completion_processor_name_options
 test_completion_parameter_preserves_stack_state
 test_deployed_function_name_outputs
 test_four_lambda_artifacts

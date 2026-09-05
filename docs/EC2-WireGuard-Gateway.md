@@ -3,20 +3,20 @@
 ## 1. Purpose and current status
 
 `template.yaml` and `wireguard-gateway-setup.sh` implement an optional EC2
-WireGuard gateway between the VPC-attached execution Lambda and TigerBeetle on
+WireGuard gateway between the VPC-attached TigerBeetle processor and TigerBeetle on
 a development workstation. The gateway is disabled by default and is intended
 for development and controlled integration testing.
 
 The EC2 instance is a replaceable, stateless network appliance. It runs no
-application logic and stores no TigerBeetle data. The execution Lambda owns a
+application logic and stores no TigerBeetle data. The TigerBeetle processor owns a
 process-lifetime TigerBeetle client and sends its account and transfer requests
 through this path. End-to-end traffic remains a cloud acceptance test until an
 operator explicitly deploys and exercises it.
 
-The execution traffic paths are:
+The TigerBeetle processor traffic paths are:
 
 ```text
-Execution Lambda
+TigerBeetle processor
   +-> IPv4 10.200.0.2:3000
   |    -> Lambda subnet route table
   |    -> EC2 WireGuard gateway instance
@@ -29,16 +29,16 @@ Execution Lambda
        -> stack-owned egress-only internet gateway
        -> regional public SQS dual-stack endpoint
        -> Completion queue
-       -> completion Lambda
+       -> Completion processor
        -> DynamoDB Operations table
 ```
 
-For each valid queued Operation, execution creates account `Operation.id`
+For each valid queued Operation, TigerBeetle processor creates account `Operation.id`
 (ledger/code `1`), then creates transfer `Operation.id` from that account to
 account `1` for amount `100` (ledger/code `1`). The two event types require
-separate requests. Execution gathers each terminal operation ID and result for
+separate requests. TigerBeetle processor gathers each terminal operation ID and result for
 the invocation and publishes at most one bounded aggregate Completion message.
-The completion Lambda processes that message, conditionally transitions each
+The Completion processor processes that message, conditionally transitions each
 matching `SUBMITTED` row to `COMPLETED`, and stores exactly:
 
 ```json
@@ -95,7 +95,7 @@ Lambda subnet and install its return route through the tunnel.
 AWS VPC
 ┌─────────────────────────────────────────────────────────┐
 │                                                         │
-│  Execution Lambda (dual-stack)                          │
+│  TigerBeetle processor (dual-stack)                      │
 │      │                                                  │
 │      ├─ IPv4 TCP 10.200.0.2:3000                        │
 │      │    -> 10.200.0.0/24 -> gateway EC2 instance      │
@@ -139,7 +139,7 @@ already contain a route for `10.200.0.0/24`, except when that route belongs to
 the existing enabled deployment of this stack. Before first enablement, the
 route table must also have no `::/0` route and the VPC must have no attached
 EIGW. During reconfiguration, any EIGW and `::/0` route must be the current
-stack's `ExecutionEgressOnlyInternetGateway` and `ExecutionSqsIpv6Route`.
+stack's `TigerBeetleProcessorEgressOnlyInternetGateway` and `TigerBeetleProcessorSqsIpv6Route`.
 Attaching Lambda to a public subnet does not give it Internet access through
 the subnet's internet gateway.
 
@@ -149,7 +149,7 @@ assignment disabled, exactly one active IPv6 `/64`, and an explicitly associated
 route table containing only the VPC-local routes before enablement. The VPC,
 subnets, route table and association, IPv6 associations, DNS settings, and
 network ACL remain operator-owned outside the SAM stack. SAM creates the VPC's
-single EIGW and adds the execution-specific `::/0` route to that route table.
+single EIGW and adds the TigerBeetle processor `::/0` route to that route table.
 
 ## 4. Template parameters and conditions
 
@@ -160,11 +160,11 @@ interface controls the optional managed gateway:
 | --- | --- |
 | `TigerBeetleClusterId` | Unsigned 128-bit decimal cluster ID; defaults to `0`. |
 | `TigerBeetleAddresses` | Comma-separated replica addresses; defaults to `10.200.0.2:3000`. |
-| `EnableWireGuardGateway` | `true` creates the gateway and VPC-attaches execution; defaults to `false`. |
-| `RetainExecutionVpcCleanupResources` | Internal setup-script switch that retains the EIGW, IPv6 route, execution security group, VPC/route inputs, and ENI-management IAM between detach and cleanup phases; defaults to `false`. |
+| `EnableWireGuardGateway` | `true` creates the gateway and VPC-attaches TigerBeetle processor; defaults to `false`. |
+| `RetainTigerBeetleProcessorVpcCleanupResources` | Internal setup-script switch that retains the EIGW, IPv6 route, TigerBeetle processor security group, VPC/route inputs, and ENI-management IAM between detach and cleanup phases; defaults to `false`. |
 | `VpcId` | Existing VPC containing both subnets; its IPv6 association remains externally managed. |
 | `GatewayPublicSubnetId` | Existing public subnet for the EC2 gateway. |
-| `LambdaSubnetId` | Distinct existing dual-stack subnet for execution Lambda; its IPv6 `/64` remains externally managed. |
+| `LambdaSubnetId` | Distinct existing dual-stack subnet for TigerBeetle processor; its IPv6 `/64` remains externally managed. |
 | `LambdaRouteTableId` | Effective external route table for `LambdaSubnetId`; SAM adds the IPv4 WireGuard and IPv6 SQS routes. |
 | `LambdaSubnetCidr` | Primary IPv4 CIDR for `LambdaSubnetId`. |
 | `WireGuardPrivateKeyParameterName` | Absolute SSM path of the gateway private-key `SecureString`. |
@@ -176,10 +176,10 @@ interface controls the optional managed gateway:
 
 When `EnableWireGuardGateway=true`, the `WireGuardGatewayInputsRequired`
 CloudFormation rule requires every gateway input. The
-`ExecutionVpcCleanupInputsRequired` rule requires both `VpcId` and
+`TigerBeetleProcessorVpcCleanupInputsRequired` rule requires both `VpcId` and
 `LambdaRouteTableId` while cleanup resources are retained. The
-`WireGuardGatewayEnabled` condition controls the gateway and execution VPC
-attachment. `ExecutionVpcCleanupResourcesRetained` remains true while either
+`WireGuardGatewayEnabled` condition controls the gateway and TigerBeetle processor VPC
+attachment. `TigerBeetleProcessorVpcCleanupResourcesRetained` remains true while either
 the gateway or retained-cleanup switch is true. Empty defaults are therefore
 safe when both switches are false.
 `wireguard-gateway-setup.sh` performs the stronger live topology and SSM checks
@@ -188,14 +188,14 @@ checks.
 
 ## 5. Stack-owned resources
 
-The always-present execution role is explicit so its VPC permission can be
+The always-present TigerBeetle processor role is explicit so its VPC permission can be
 retained safely during detach. The optional resources are:
 
 | Logical resource | Type | Creation condition |
 | --- | --- | --- |
-| `ExecutionLambdaSecurityGroup` | `AWS::EC2::SecurityGroup` | Gateway enabled or cleanup resources retained |
-| `ExecutionEgressOnlyInternetGateway` | `AWS::EC2::EgressOnlyInternetGateway` | Gateway enabled or cleanup resources retained |
-| `ExecutionSqsIpv6Route` | `AWS::EC2::Route` | Gateway enabled or cleanup resources retained |
+| `TigerBeetleProcessorSecurityGroup` | `AWS::EC2::SecurityGroup` | Gateway enabled or cleanup resources retained |
+| `TigerBeetleProcessorEgressOnlyInternetGateway` | `AWS::EC2::EgressOnlyInternetGateway` | Gateway enabled or cleanup resources retained |
+| `TigerBeetleProcessorSqsIpv6Route` | `AWS::EC2::Route` | Gateway enabled or cleanup resources retained |
 | `WireGuardGatewaySecurityGroup` | `AWS::EC2::SecurityGroup` | Gateway enabled |
 | `WireGuardGatewayRole` | `AWS::IAM::Role` | Gateway enabled |
 | `WireGuardGatewayInstanceProfile` | `AWS::IAM::InstanceProfile` | Gateway enabled |
@@ -211,19 +211,19 @@ requires IMDSv2. CloudFormation also associates a stable Elastic IP with the
 instance. The route sends `10.200.0.0/24` from `LambdaRouteTableId` to the EC2
 instance and depends on the Elastic IP association.
 
-The execution function is attached only to `LambdaSubnetId` and the
-stack-managed execution security group while the gateway is enabled. It sets
+The TigerBeetle processor function is attached only to `LambdaSubnetId` and the
+stack-managed TigerBeetle processor security group while the gateway is enabled. It sets
 `Ipv6AllowedForDualStack: true`, and `AWS_USE_DUALSTACK_ENDPOINT=true` makes the
 AWS SDK select the regional public SQS dual-stack endpoint. SAM creates
-`ExecutionEgressOnlyInternetGateway` for `VpcId` and
-`ExecutionSqsIpv6Route`, an active `::/0` route in `LambdaRouteTableId` that
+`TigerBeetleProcessorEgressOnlyInternetGateway` for `VpcId` and
+`TigerBeetleProcessorSqsIpv6Route`, an active `::/0` route in `LambdaRouteTableId` that
 targets that EIGW. The same route table carries `WireGuardLambdaRoute`, the
 unchanged IPv4 `10.200.0.0/24` route to the gateway instance.
 
-Execution polls `TigerBeetleQueue` through Lambda's managed event-source mapping
-and uses its SDK only to send to `CompletionQueue`. The completion Lambda remains
+TigerBeetle processor polls `TigerBeetleQueue` through Lambda's managed event-source mapping
+and uses its SDK only to send to `CompletionQueue`. The Completion processor remains
 outside the VPC and updates the DynamoDB Operations table. Intake and query also
-remain outside the customer VPC. Execution has no VPC attachment in steady
+remain outside the customer VPC. TigerBeetle processor has no VPC attachment in steady
 disabled state.
 
 ## 6. Security and IAM boundaries
@@ -241,19 +241,19 @@ workstation's public address may change. WireGuard authenticates the configured
 peer, but the broad source increases exposure to UDP scanning and floods. The
 template opens no IPv6 ingress, SSH, public TCP/3000, or other public ingress.
 
-The execution security group has no ingress and only:
+The TigerBeetle processor security group has no ingress and only:
 
 - TCP/3000 egress to `10.200.0.2/32`; and
 - IPv6 TCP/443 egress to `::/0` for the regional public SQS dual-stack endpoint.
 
 The public IPv6 HTTPS boundary is broader than PrivateLink's private-only reach
 and endpoint policy. Queue-scoped IAM remains the service authorization
-boundary: execution receives only `sqs:SendMessage` on `CompletionQueue`. The
+boundary: TigerBeetle processor receives only `sqs:SendMessage` on `CompletionQueue`. The
 design accepts that tradeoff to avoid the fixed hourly and data-processing cost
 of an SQS interface endpoint or NAT Gateway. The EIGW itself has no fixed hourly
 or processing charge.
 
-The execution role receives its six Lambda ENI-management actions only while
+The TigerBeetle processor role receives its six Lambda ENI-management actions only while
 the gateway or retained-cleanup condition is active. The gateway role grants
 the SSM agent control/data-channel actions required for Session Manager and
 `ssm:GetParameter` for only the selected gateway-private-key parameter ARN.
@@ -343,10 +343,10 @@ prerequisites are trustworthy:
   route and target instance.
 - First enablement requires no EIGW attached to the VPC and no `::/0` route in
   the Lambda route table. There is no operator-supplied EIGW ID; SAM creates
-  `ExecutionEgressOnlyInternetGateway`.
+  `TigerBeetleProcessorEgressOnlyInternetGateway`.
 - Same-topology reconfiguration and old-topology or retained cleanup require
   exactly one attached EIGW owned by this stack and exactly one
-  `ExecutionSqsIpv6Route`. A missing, malformed, ambiguous, unmanaged, or
+  `TigerBeetleProcessorSqsIpv6Route`. A missing, malformed, ambiguous, unmanaged, or
   mismatched EIGW is rejected. The route must be unique, active, created by
   `CreateRoute`, and target that EIGW; missing, unmanaged, duplicate,
   mismatched, or blackhole `::/0` routes are rejected.
@@ -359,7 +359,7 @@ prerequisites are trustworthy:
 - `AWS_USE_DUALSTACK_ENDPOINT=true aws sqs list-queues --max-results 1` succeeds
   in the selected Region. This operator-side probe verifies regional SQS
   dual-stack availability and requires `sqs:ListQueues`; it does not broaden the
-  execution role.
+  TigerBeetle processor role.
 
 These checks inspect external topology and stack ownership but never allocate
 IPv6 space, change DNS or network ACLs, attach an EIGW directly, or add routes
@@ -432,14 +432,14 @@ The helper stops before local work when the stack status ends in
 The helper then runs Zig formatting and tests, builds all four Linux ARM64
 bootstraps, refreshes their zip archives, and runs both SAM validations. First
 enablement preflights a VPC with no EIGW or `::/0` conflict, then uses one SAM
-update. CloudFormation creates `ExecutionEgressOnlyInternetGateway`, adds
-`ExecutionSqsIpv6Route` and `WireGuardLambdaRoute`, attaches execution with its
+update. CloudFormation creates `TigerBeetleProcessorEgressOnlyInternetGateway`, adds
+`TigerBeetleProcessorSqsIpv6Route` and `WireGuardLambdaRoute`, attaches TigerBeetle processor with its
 dual-stack setting, and creates the two security groups. After success, the
 helper prints the conditional network outputs and masked peer configuration,
 then continues with the DynamoDB, SQS, and optional Function URL checks.
 
-Intake, query, and completion are stripped, statically linked executables.
-Execution is multithread-capable for the native TigerBeetle callback thread and
+Intake, query, and the Completion processor are stripped, statically linked executables.
+TigerBeetle processor is multithread-capable for the native TigerBeetle callback thread and
 is a stripped ARM64 glibc executable reported as dynamically linked; Amazon
 Linux 2023 provides its dynamic loader and system libraries.
 
@@ -468,31 +468,31 @@ Run `./wireguard-gateway-setup.sh --disable` for teardown. Guarded detach and
 topology changes use this exact old-resource sequence:
 
 1. Set `EnableWireGuardGateway=false` and
-   `RetainExecutionVpcCleanupResources=true`. This detaches execution and removes
+   `RetainTigerBeetleProcessorVpcCleanupResources=true`. This detaches TigerBeetle processor and removes
    the EC2 gateway, Elastic IP, `WireGuardLambdaRoute`, launch resources, and
-   gateway security group. It retains `ExecutionEgressOnlyInternetGateway`,
-   `ExecutionSqsIpv6Route`, `ExecutionLambdaSecurityGroup`, the old `VpcId` and
+   gateway security group. It retains `TigerBeetleProcessorEgressOnlyInternetGateway`,
+   `TigerBeetleProcessorSqsIpv6Route`, `TigerBeetleProcessorSecurityGroup`, the old `VpcId` and
    `LambdaRouteTableId`, and the role's ENI-management policy.
-2. Wait up to approximately 20 minutes for the current execution function and
+2. Wait up to approximately 20 minutes for the current TigerBeetle processor function and
    every published version to have no VPC configuration, then require zero
-   Lambda-created network interfaces associated with the retained execution
+   Lambda-created network interfaces associated with the retained TigerBeetle processor
    security group. An EIGW creates no endpoint ENIs, so the wait has no separate
    EIGW-interface branch.
-3. Set `RetainExecutionVpcCleanupResources=false` while preserving the old VPC
+3. Set `RetainTigerBeetleProcessorVpcCleanupResources=false` while preserving the old VPC
    and route-table parameters for unambiguous deletion. CloudFormation removes
-   the IPv6 route first, then the EIGW, execution security group, and conditional
+   the IPv6 route first, then the EIGW, TigerBeetle processor security group, and conditional
    ENI-management policy.
 4. Only after cleanup succeeds, clear the saved optional gateway inputs. A
    topology reconfiguration then preflights and deploys the target values.
 
 If the bounded wait or an AWS inspection fails, cleanup and parameter reset are
-not attempted. The EIGW, IPv6 route, execution security group, required
+not attempted. The EIGW, IPv6 route, TigerBeetle processor security group, required
 parameters, and ENI-management IAM remain intact. After CloudFormation is no
 longer in progress, rerun `wireguard-gateway-setup.sh --disable`; it recognizes
 the retained state and resumes the guarded wait. Never start another deployment
 while CloudFormation still reports an `_IN_PROGRESS` state.
 
-Gateway disablement does not disable the SQS event-source mapping. Execution
+Gateway disablement does not disable the SQS event-source mapping. TigerBeetle processor
 continues consuming and uses `TigerBeetleAddresses`; provide another reachable
 trusted endpoint or expect TigerBeetle timeouts to return per-record retries.
 
@@ -530,18 +530,18 @@ Resolve and verify their implemented logical IDs without recording live values:
 eigw_id="$(
   aws cloudformation describe-stack-resource \
     --stack-name aws-lambda-zig-demo \
-    --logical-resource-id ExecutionEgressOnlyInternetGateway \
+    --logical-resource-id TigerBeetleProcessorEgressOnlyInternetGateway \
     --query StackResourceDetail.PhysicalResourceId \
     --output text \
     --profile dev \
     --region ca-central-1
 )"
 lambda_route_table_id='<lambda-route-table-id>'
-execution_function_name='<execution-function-name>'
+tiger_beetle_processor_name='<tiger-beetle-processor-name>'
 
 aws cloudformation describe-stack-resources \
   --stack-name aws-lambda-zig-demo \
-  --query "StackResources[?LogicalResourceId=='ExecutionEgressOnlyInternetGateway' || LogicalResourceId=='ExecutionSqsIpv6Route'].[LogicalResourceId,ResourceStatus,PhysicalResourceId]" \
+  --query "StackResources[?LogicalResourceId=='TigerBeetleProcessorEgressOnlyInternetGateway' || LogicalResourceId=='TigerBeetleProcessorSqsIpv6Route'].[LogicalResourceId,ResourceStatus,PhysicalResourceId]" \
   --output table \
   --profile dev \
   --region ca-central-1
@@ -558,7 +558,7 @@ aws ec2 describe-route-tables \
   --profile dev \
   --region ca-central-1
 aws lambda get-function-configuration \
-  --function-name "$execution_function_name" \
+  --function-name "$tiger_beetle_processor_name" \
   --query '[VpcConfig,Environment.Variables.AWS_USE_DUALSTACK_ENDPOINT]' \
   --output json \
   --profile dev \
@@ -573,9 +573,9 @@ Both conditional resources must have a complete CloudFormation status. The
 EIGW must have one attached association to `VpcId`; the `::/0` route must be
 active, created by `CreateRoute`, and target that EIGW. The
 `10.200.0.0/24` route must still target `WireGuardGatewayInstance`.
-Execution's VPC configuration must show `Ipv6AllowedForDualStack: true`, and
+TigerBeetle processor's VPC configuration must show `Ipv6AllowedForDualStack: true`, and
 its environment must show `AWS_USE_DUALSTACK_ENDPOINT=true`. The SQS probe uses
-the operator identity and does not expand execution's queue-restricted IAM.
+the operator identity and does not expand TigerBeetle processor's queue-restricted IAM.
 
 After successful enablement, `wireguard-gateway-setup.sh` validates the endpoint,
 gateway public key, workstation address, and deployed `LambdaSubnetCidr`, then
@@ -625,11 +625,11 @@ After an explicitly authorized cloud deployment, validate in this order:
    increasing RX/TX counters.
 4. Verify the active VPC/subnet IPv6 associations and VPC DNS attributes, the
    effective Lambda route table, the stack-owned EIGW attachment, both route
-   targets, `SourceDestCheck=false`, both security groups, and execution's
+   targets, `SourceDestCheck=false`, both security groups, and TigerBeetle processor's
    `Ipv6AllowedForDualStack` and `AWS_USE_DUALSTACK_ENDPOINT` settings.
 5. Pre-provision TigerBeetle account `1` on ledger `1` with flags compatible
    with receiving credits. Submit a unique valid Operation and verify that
-   execution creates account `Operation.id`, posts transfer `Operation.id` for
+   TigerBeetle processor creates account `Operation.id`, posts transfer `Operation.id` for
    amount `100` from that account to account `1`, and sends the bounded result
    to `CompletionQueue`. Verify that completion then marks the DynamoDB row
    `COMPLETED` with the exact `SUCCESS` envelope above. A duplicate delivery
@@ -646,13 +646,13 @@ Useful failure boundaries are:
 | Bootstrap public-key mismatch | Selected SSM private version and matching `WireGuardGatewayPublicKey` |
 | Handshake but no routed traffic | Workstation `AllowedIPs = <LambdaSubnetCidr>` and gateway peer route `10.200.0.2/32` |
 | EC2 reaches the workstation but not TCP/3000 | Workstation firewall and TigerBeetle bind address |
-| EC2 works but Lambda cannot reach the overlay | VPC route, source/destination check, Lambda VPC attachment, and execution security-group egress |
+| EC2 works but Lambda cannot reach the overlay | VPC route, source/destination check, Lambda VPC attachment, and TigerBeetle processor security-group egress |
 | Preflight reports missing or ambiguous IPv6 | Activate exactly one Lambda-subnet IPv6 `/64` contained by exactly one active VPC IPv6 association; allocation and association are external operator actions |
-| Preflight reports an EIGW conflict | First enablement and a post-cleanup target preflight require no attached EIGW; same-topology reconfiguration or retained cleanup requires exactly one attached `ExecutionEgressOnlyInternetGateway` owned by the current stack |
+| Preflight reports an EIGW conflict | First enablement and a post-cleanup target preflight require no attached EIGW; same-topology reconfiguration or retained cleanup requires exactly one attached `TigerBeetleProcessorEgressOnlyInternetGateway` owned by the current stack |
 | Dual-stack hostname resolution fails | Confirm VPC `enableDnsSupport` and `enableDnsHostnames`, then resolve the regional SQS dual-stack hostname from an equivalent dual-stack environment |
-| IPv6 route is absent, mismatched, duplicate, or blackhole | Confirm `LambdaRouteTableId` is the Lambda subnet's effective route table and inspect `ExecutionSqsIpv6Route` and its EIGW target |
-| IPv6 HTTPS times out | Check IPv6 TCP/443 execution-security-group egress plus outbound TCP/443 and inbound TCP/1024-65535 in the effective network ACL |
-| Execution cannot publish Completion messages | Confirm the EIGW attachment and active `::/0` route, `Ipv6AllowedForDualStack=true`, `AWS_USE_DUALSTACK_ENDPOINT=true`, and the regional SQS dual-stack probe; IAM must still allow `sqs:SendMessage` only to `CompletionQueue` |
+| IPv6 route is absent, mismatched, duplicate, or blackhole | Confirm `LambdaRouteTableId` is the Lambda subnet's effective route table and inspect `TigerBeetleProcessorSqsIpv6Route` and its EIGW target |
+| IPv6 HTTPS times out | Check IPv6 TCP/443 TigerBeetle processor security-group egress plus outbound TCP/443 and inbound TCP/1024-65535 in the effective network ACL |
+| TigerBeetle processor cannot publish Completion messages | Confirm the EIGW attachment and active `::/0` route, `Ipv6AllowedForDualStack=true`, `AWS_USE_DUALSTACK_ENDPOINT=true`, and the regional SQS dual-stack probe; IAM must still allow `sqs:SendMessage` only to `CompletionQueue` |
 | SSM or bootstrap fails | Gateway Internet route, instance role, cloud-init output, and exact SSM parameter name/version |
 
 Cloud handshake, routing, reboot recovery, rotation, and TigerBeetle checks are
@@ -661,8 +661,8 @@ operator explicitly authorizes and runs them.
 
 ## 13. Ownership and teardown
 
-The SAM stack owns the execution VPC attachment, both conditional security
-groups, `ExecutionEgressOnlyInternetGateway`, `ExecutionSqsIpv6Route`, gateway
+The SAM stack owns the TigerBeetle processor VPC attachment, both conditional security
+groups, `TigerBeetleProcessorEgressOnlyInternetGateway`, `TigerBeetleProcessorSqsIpv6Route`, gateway
 role and instance profile, launch template, EC2 instance, Elastic IP and
 association, and `WireGuardLambdaRoute` for `10.200.0.0/24`.
 
@@ -673,9 +673,9 @@ WireGuard configuration and private key, local firewall policy, and TigerBeetle
 process and data.
 
 Disabling the gateway removes only stack-owned optional resources. The detach
-update removes the WireGuard route and gateway resources and detaches execution;
+update removes the WireGuard route and gateway resources and detaches TigerBeetle processor;
 after guarded Lambda ENI cleanup, the retained-resource update deletes the
-SAM-owned IPv6 route, EIGW, execution security group, and conditional
+SAM-owned IPv6 route, EIGW, TigerBeetle processor security group, and conditional
 ENI-management IAM. The sequence never deletes or disassociates the external
 VPC/subnet IPv6 allocations.
 

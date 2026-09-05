@@ -1,21 +1,21 @@
-# Deploy the intake, query, execution, and completion Lambdas with SAM
+# Deploy intake, query, and the TigerBeetle and Completion processors with SAM
 
 This guide documents how to deploy the four Zig Lambda packages in this repository
 using AWS SAM and `template.yaml`.
 
 SAM deploys all four Lambda functions as one CloudFormation-managed stack. It creates
 their execution roles, public Function URLs for intake and query, the DynamoDB
-operations table, the TigerBeetle queue sent by intake and consumed by execution,
-and the Completion queue sent by execution and consumed by completion. The complete
+operations table, the TigerBeetle queue sent by intake and consumed by the TigerBeetle processor,
+and the Completion queue sent by the TigerBeetle processor and consumed by the Completion processor. The complete
 data flow is:
 
 ```text
-intake -> TigerBeetle queue -> execution/TigerBeetle -> Completion queue -> completion -> DynamoDB
+intake -> TigerBeetleQueue -> tiger-beetle-processor -> CompletionQueue -> completion-processor -> DynamoDB
 ```
 
 The template can also provision an optional EC2 WireGuard gateway that routes
-execution-Lambda traffic to TigerBeetle on a development workstation. While
-execution is VPC-attached, SAM supplies outbound IPv6 access to the regional SQS
+TigerBeetle processor traffic to TigerBeetle on a development workstation. While
+the TigerBeetle processor is VPC-attached, SAM supplies outbound IPv6 access to the regional SQS
 dual-stack endpoint through a stack-owned egress-only internet gateway (EIGW).
 The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 
@@ -23,12 +23,12 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 
 - AWS CLI v2 and SAM CLI are installed.
 - `zip`, `unzip`, and `file` are installed for package validation.
-- `jq` is installed when using `lambda_logs.sh`.
+- `jq` is installed for `lambda_logs.sh` and shell regression tests.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
-- `intake-lambda.zip`, `query-lambda.zip`, `execution-lambda.zip`, and
-  `completion-lambda.zip` each contain one Linux ARM64 executable named
+- `intake-lambda.zip`, `query-lambda.zip`, `tiger-beetle-processor.zip`, and
+  `completion-processor.zip` each contain one Linux ARM64 executable named
   `bootstrap`.
 - Both Lambda Function URLs are intentionally public for authenticated demo testing.
 - The fixed physical name `TigerBeetleQueue` permits only one such queue per AWS
@@ -65,7 +65,7 @@ Enabling the WireGuard gateway additionally requires:
   when both default SSM parameters are absent.
 - Permission for the deployment identity to create, inspect, and delete the
   additional EC2 instance, Elastic IP, security groups, IPv4 and IPv6 routes,
-  EIGW, IAM role and instance profile, launch template, and execution-Lambda
+  EIGW, IAM role and instance profile, launch template, and TigerBeetle processor
   network interfaces. Preflight also describes VPCs, subnets, route tables,
   EIGWs, network ACLs, VPC DNS attributes, Lambda versions, and network
   interfaces, and probes regional SQS dual-stack availability with
@@ -110,14 +110,14 @@ profiles are unsupported. Dry runs make no AWS authentication calls.
 Check Zig and shell formatting/syntax before the test graph:
 
 ```sh
-zig fmt --check build.zig src/completion_batch.zig src/completion_lambda.zig \
-  src/execution_lambda.zig src/intake_lambda.zig src/lambda_auth.zig \
+zig fmt --check build.zig src/completion_batch.zig src/completion_processor.zig \
+  src/tiger_beetle_processor.zig src/intake_lambda.zig src/lambda_auth.zig \
   src/query_lambda.zig
-bash -n deploy.sh wireguard-gateway-setup.sh tests/*.sh
+bash -n deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh
 ```
 
 Run the full local test graph before packaging. This includes the Zig tests and
-the dependency-free deployment-helper regression tests:
+the local deployment-helper regression tests:
 
 ```sh
 zig build test
@@ -130,7 +130,7 @@ zig build test-deploy
 ```
 
 The deployment-helper tests replace AWS commands with shell mocks, so they
-require no AWS credentials or network access. `deploy.sh` invokes only
+require Bash and `jq`, with no AWS credentials or network access. `deploy.sh` invokes only
 `zig build test`, which includes these tests exactly once.
 
 Build the stripped ReleaseSafe Lambda executables for AWS Lambda ARM64. ARM64
@@ -150,47 +150,47 @@ Verify that all four built artifacts are Linux ARM64 executables.
 ```sh
 file zig-out/bin/intake/bootstrap \
   zig-out/bin/query/bootstrap \
-  zig-out/bin/execution/bootstrap \
-  zig-out/bin/completion/bootstrap
+  zig-out/bin/tiger_beetle_processor/bootstrap \
+  zig-out/bin/completion_processor/bootstrap
 ```
 
-Inspect the execution bootstrap before creating or updating any AWS resource. It must be the
+Inspect the TigerBeetle processor bootstrap before creating or updating any AWS resource. It must be the
 stripped ARM64 glibc executable and must contain the patched epoll client markers. The native
 client must not expose `io_uring` syscall names or diagnostic strings:
 
 ```sh
-execution_bootstrap=zig-out/bin/execution/bootstrap
-file "$execution_bootstrap"
-strings "$execution_bootstrap" | rg 'epoll_create1|eventfd|timerfd_create'
-if strings "$execution_bootstrap" | rg -i 'io_uring'; then
-  echo 'unexpected io_uring marker in execution bootstrap' >&2
+tiger_beetle_processor_bootstrap=zig-out/bin/tiger_beetle_processor/bootstrap
+file "$tiger_beetle_processor_bootstrap"
+strings "$tiger_beetle_processor_bootstrap" | rg 'epoll_create1|eventfd|timerfd_create'
+if strings "$tiger_beetle_processor_bootstrap" | rg -i 'io_uring'; then
+  echo 'unexpected io_uring marker in TigerBeetle processor bootstrap' >&2
   exit 1
 fi
 ```
 
-The execution bootstrap is linked against the Amazon Linux 2023 ARM64 glibc loader. On a Linux
+The TigerBeetle processor bootstrap is linked against the Amazon Linux 2023 ARM64 glibc loader. On a Linux
 machine with binutils installed, inspect the loader and dynamic dependencies explicitly:
 
 ```sh
-readelf -lW "$execution_bootstrap" | rg 'Requesting program interpreter|ld-linux-aarch64'
-readelf -dW "$execution_bootstrap" | rg 'NEEDED|libc|libm|libdl'
+readelf -lW "$tiger_beetle_processor_bootstrap" | rg 'Requesting program interpreter|ld-linux-aarch64'
+readelf -dW "$tiger_beetle_processor_bootstrap" | rg 'NEEDED|libc|libm|libdl'
 ```
 
 The package-level check is independent of the Lambda executable: `strings` on
 `lib/aarch64-linux-gnu.2.27/libtb_client.a` must show epoll, eventfd, and timerfd markers and no
 `io_uring` marker. The macOS archive remains the Darwin/kqueue build.
 
-Intake, query, and completion remain single-threaded, statically linked
+Intake, query, and the Completion processor remain single-threaded, statically linked
 executables:
 
 ```text
 ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
 ```
 
-Execution is multithread-capable because the TigerBeetle C client completes
+TigerBeetle processor is multithread-capable because the TigerBeetle C client completes
 requests on a native callback thread. It is a stripped ARM64 glibc executable
 and `file` reports it as dynamically linked. Amazon Linux 2023 supplies the
-glibc loader and libraries; do not expect the execution bootstrap to be
+glibc loader and libraries; do not expect the TigerBeetle processor bootstrap to be
 static.
 
 Create or refresh all four packages.
@@ -198,23 +198,23 @@ Create or refresh all four packages.
 ```sh
 zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
 zip -qj query-lambda.zip zig-out/bin/query/bootstrap
-zip -qj execution-lambda.zip zig-out/bin/execution/bootstrap
-zip -qj completion-lambda.zip zig-out/bin/completion/bootstrap
+zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
+zip -qj completion-processor.zip zig-out/bin/completion_processor/bootstrap
 ```
 
 SAM reads the packages from the matching `CodeUri` properties in `template.yaml`.
 
-### Deferred execution cold-start acceptance
+### Deferred TigerBeetle processor cold-start acceptance
 
 Local bootstrap inspection proves the architecture, glibc linkage, and native epoll artifact only;
 it does not prove Lambda cold-start acceptance. Do not refresh the zip files, deploy, invoke SQS, or
 claim cold-start acceptance as part of this artifact-only validation.
 
-After a separately authorized deployment, inspect the published execution version and its first
+After a separately authorized deployment, inspect the published TigerBeetle processor version and its first
 invocation in the target environment. Confirm the Lambda ARM64 architecture, the expected
 `provided.al2023` runtime, the configured TigerBeetle address, successful native-client
 initialization, and a completed accounting operation in CloudWatch logs. Also verify that the
-execution subnet route/security-group path reaches the TigerBeetle replica and that a deferred
+TigerBeetle processor subnet route/security-group path reaches the TigerBeetle replica and that a deferred
 invocation after the first cold start reuses the retained client. Record the invocation ID,
 bootstrap logs, and operation result before accepting the cold start; a timeout, initialization
 error, or SQS retry is not acceptance evidence.
@@ -256,18 +256,18 @@ Both commands should report that `template.yaml` is valid.
 - `QueryFunctionUrlInvokeFunctionUrlPermission`: allows `lambda:InvokeFunctionUrl`
 - `QueryFunctionUrlInvokeFunctionPermission`: allows `lambda:InvokeFunction` only
   through the query Function URL
-- `ExecutionFunction`: `AWS::Serverless::Function`
-- `ExecutionFunctionRole`: `AWS::IAM::Role`
-- `ExecutionFunctionTigerBeetleQueueMapping`: `AWS::Lambda::EventSourceMapping`
-- `CompletionFunction`: `AWS::Serverless::Function`
-- `CompletionFunctionRole`: `AWS::IAM::Role`
-- `CompletionFunctionCompletionQueueMapping`: `AWS::Lambda::EventSourceMapping`
+- `TigerBeetleProcessor`: `AWS::Serverless::Function`
+- `TigerBeetleProcessorRole`: `AWS::IAM::Role`
+- `TigerBeetleProcessorQueueMapping`: `AWS::Lambda::EventSourceMapping`
+- `CompletionProcessor`: `AWS::Serverless::Function`
+- `CompletionProcessorRole`: `AWS::IAM::Role`
+- `CompletionProcessorQueueMapping`: `AWS::Lambda::EventSourceMapping`
 
 When `EnableWireGuardGateway=true`, the template also creates:
 
-- `ExecutionLambdaSecurityGroup`: `AWS::EC2::SecurityGroup`
-- `ExecutionEgressOnlyInternetGateway`: `AWS::EC2::EgressOnlyInternetGateway`
-- `ExecutionSqsIpv6Route`: `AWS::EC2::Route`
+- `TigerBeetleProcessorSecurityGroup`: `AWS::EC2::SecurityGroup`
+- `TigerBeetleProcessorEgressOnlyInternetGateway`: `AWS::EC2::EgressOnlyInternetGateway`
+- `TigerBeetleProcessorSqsIpv6Route`: `AWS::EC2::Route`
 - `WireGuardGatewaySecurityGroup`: `AWS::EC2::SecurityGroup`
 - `WireGuardGatewayRole`: `AWS::IAM::Role`
 - `WireGuardGatewayInstanceProfile`: `AWS::IAM::InstanceProfile`
@@ -278,12 +278,12 @@ When `EnableWireGuardGateway=true`, the template also creates:
 - `WireGuardLambdaRoute`: `AWS::EC2::Route`
 
 Every gateway resource and output is conditional. The internal
-`RetainExecutionVpcCleanupResources` parameter temporarily keeps
-`ExecutionEgressOnlyInternetGateway`, `ExecutionSqsIpv6Route`,
-`ExecutionLambdaSecurityGroup`, the required `VpcId` and `LambdaRouteTableId`
-values, and the execution role's EC2 network-interface policy during a
+`RetainTigerBeetleProcessorVpcCleanupResources` parameter temporarily keeps
+`TigerBeetleProcessorEgressOnlyInternetGateway`, `TigerBeetleProcessorSqsIpv6Route`,
+`TigerBeetleProcessorSecurityGroup`, the required `VpcId` and `LambdaRouteTableId`
+values, and the TigerBeetle processor role's EC2 network-interface policy during a
 setup-script detach or reconfiguration transition. In steady disabled state,
-the execution Lambda has no VPC attachment or EC2 network-interface
+the TigerBeetle processor has no VPC attachment or EC2 network-interface
 permissions, and the empty gateway parameter defaults create no gateway or
 cleanup resources.
 
@@ -340,7 +340,7 @@ The query function receives its own inline policy containing only
 `dynamodb:GetItem` for this stack's operations table. It does not receive
 `TigerBeetleQueue` or any SQS permission.
 
-The execution function uses the same `provided.al2023` ARM64 runtime, 128 MB
+The TigerBeetle processor function uses the same `provided.al2023` ARM64 runtime, 128 MB
 memory, a 15-second timeout, and basic logging policy. It has no Function URL
 or authentication configuration. Its explicit role grants queue-scoped
 polling permissions for `TigerBeetleQueue` and `sqs:SendMessage` only for
@@ -349,16 +349,16 @@ the role also receives the six EC2 network-interface actions required by a
 VPC-attached Lambda. The function receives `COMPLETION_QUEUE_URL` plus the
 TigerBeetle settings.
 
-Only execution is attached to `LambdaSubnetId`. Its VPC configuration sets
+Only TigerBeetle processor is attached to `LambdaSubnetId`. Its VPC configuration sets
 `Ipv6AllowedForDualStack: true`, its stack-managed security group allows IPv4
 TCP/3000 only to `10.200.0.2/32` and IPv6 TCP/443 to `::/0`, and
 `AWS_USE_DUALSTACK_ENDPOINT=true` makes the AWS SDK select the regional public
-SQS dual-stack endpoint. SAM creates the VPC's EIGW and an execution-specific
+SQS dual-stack endpoint. SAM creates the VPC's EIGW and an TigerBeetle processor
 `::/0` route in `LambdaRouteTableId`. The externally supplied VPC, subnets,
 route table, IPv6 associations, DNS settings, and network ACL remain outside
 the stack.
 
-The completion function uses `provided.al2023`, ARM64, 128 MB, and a 15-second
+The Completion processor function uses `provided.al2023`, ARM64, 128 MB, and a 15-second
 timeout. It has no Function URL, authentication configuration, or VPC
 attachment. Its explicit role can poll only `CompletionQueue` and can call
 only `dynamodb:UpdateItem` on `OperationsTable`. Its only application
@@ -366,11 +366,11 @@ environment value is `OPERATIONS_TABLE_NAME`.
 
 The least-privilege boundary is deliberate: intake creates an Operation and
 routes `"name":"TigerBeetle"` to `TigerBeetleQueue`; query reads the table;
-execution polls `TigerBeetleQueue` and publishes terminal results to
+TigerBeetle processor polls `TigerBeetleQueue` and publishes terminal results to
 `CompletionQueue`; and
-completion polls `CompletionQueue` and updates the table. Lambda's managed
-event-source pollers consume both source queues outside the function execution
-environment. Therefore only execution's AWS SDK `SendMessage` call needs the
+the Completion processor polls `CompletionQueue` and updates the table. Lambda's managed
+event-source pollers consume both source queues outside the function TigerBeetle processor
+environment. Therefore only TigerBeetle processor's AWS SDK `SendMessage` call needs the
 VPC SQS egress path. Completion remains outside the VPC and reaches DynamoDB
 normally.
 
@@ -383,12 +383,12 @@ address-syntax validation during cold start. `deploy.sh` exposes matching
 `--tigerbeetle-cluster-id` and `--tigerbeetle-addresses` options plus matching
 environment overrides.
 
-The execution event source mapping is enabled with `BatchSize: 10`,
+The TigerBeetle processor event source mapping is enabled with `BatchSize: 10`,
 `MaximumBatchingWindowInSeconds: 0`, `MaximumConcurrency: 8`, and
 `ReportBatchItemFailures`. The event-source concurrency cap limits the mapping
-to eight concurrent execution invocations, preventing unbounded Lambda scaling
+to eight concurrent TigerBeetle processor invocations, preventing unbounded Lambda scaling
 from consuming TigerBeetle's default 64 client sessions. Lambda polls the queue
-and invokes execution with SQS events. The mapping remains enabled when the
+and invokes TigerBeetle processor with SQS events. The mapping remains enabled when the
 managed WireGuard gateway is disabled; operators must provide another trusted
 route to the configured TigerBeetle address or accept timeout-driven
 partial-batch retries. For each record, the handler
@@ -398,17 +398,17 @@ a body and no result. Records are handled sequentially within the ten-record
 bound. Invalid records are logged and acknowledged without contacting
 TigerBeetle.
 
-For each valid Operation, execution first creates a TigerBeetle account with
+For each valid Operation, TigerBeetle processor first creates a TigerBeetle account with
 `id = Operation.id`, ledger `1`, and code `1`. It then creates a posted transfer
 with `id = Operation.id`, debit account `Operation.id`, credit account `1`,
 amount `100`, ledger `1`, and code `1`. Account and transfer creation are
 separate requests because linked events cannot atomically join different
 TigerBeetle event types. Account `1` is an operator-provisioned prerequisite;
-execution never creates it, and it must use ledger `1` with flags compatible
+TigerBeetle processor never creates it, and it must use ledger `1` with flags compatible
 with receiving this credit.
 
 After both accounting requests return `created` or the replay-safe identical
-`exists`, execution creates a terminal success entry. The success result is
+`exists`, TigerBeetle processor creates a terminal success entry. The success result is
 exactly:
 
 ```json
@@ -430,7 +430,7 @@ Processing always advances to the next TigerBeetle queue record. A definite
 TigerBeetle rejection is logged and represented as a terminal Completion
 entry. TigerBeetle client/request or result-construction uncertainty adds only
 that TigerBeetle queue message ID to `batchItemFailures`. After processing the
-invocation, execution encodes all terminal entries into at most one aggregate
+invocation, TigerBeetle processor encodes all terminal entries into at most one aggregate
 Completion message and sends it once. The stable account and transfer IDs make
 Operations retries replay-safe: `created` and identical `exists` proceed,
 while every `exists_with_different_*` result is a definitive terminal failure.
@@ -442,10 +442,10 @@ rejects an empty aggregate and bounds the complete encoded message to 1 MiB.
 That byte limit, rather than a promised fixed number of result entries, is the
 message contract. If publication fails, every TigerBeetle queue record represented
 in that aggregate is returned for retry. If publication succeeds, those source
-records are acknowledged; execution never acknowledges a terminal result
+records are acknowledged; TigerBeetle processor never acknowledges a terminal result
 before its Completion message is published.
 
-The completion event source mapping uses `BatchSize: 1`,
+The Completion processor event source mapping uses `BatchSize: 1`,
 `MaximumBatchingWindowInSeconds: 0`, and `ReportBatchItemFailures`. One Lambda
 invocation therefore receives one aggregate Completion queue message and
 updates only that message's entries, sequentially. The 15-second function
@@ -455,7 +455,7 @@ will necessarily finish in 15 seconds: use measured cold-start and worst-case
 sequential DynamoDB latency when changing the encoded-message bound, function
 timeout, or queue visibility timeout, and size all three together.
 
-For each valid entry, completion performs one ID-only `UpdateItem`: the
+For each valid entry, the Completion processor performs one ID-only `UpdateItem`: the
 canonical ID selects the item and the condition is only stored
 `state = SUBMITTED`. There is no read-before-write and no comparison against
 tenant, name, hash, `last_updated`, `expires_at`, a queued snapshot, or an
@@ -482,13 +482,13 @@ Completion acknowledges the SQS message only after every entry has either
 succeeded or reached an acknowledged deterministic/conflict outcome.
 
 `OPERATIONS_TABLE_NAME` contains the CloudFormation-generated physical table
-name. Intake, query, and completion initialize the Operation persistence
+name. Intake, query, and the Completion processor initialize the Operation persistence
 module around an AWS configuration and reuse their clients and HTTP pools
 across warm invocations. Intake also initializes one reusable SQS sender. On
 each valid POST it rejects the exact reserved operation name `Completion`, then
 appends `Queue` to any other case-sensitive operation name and resolves that
 environment key before persistence; `"name":"TigerBeetle"` therefore resolves
-`TigerBeetleQueue`. Execution validates
+`TigerBeetleQueue`. TigerBeetle processor validates
 `COMPLETION_QUEUE_URL`, initializes the fixed-queue SQS module, and retains one
 TigerBeetle client across warm invocations. Missing or invalid cold-start
 configuration prevents the affected Lambda from handling invocations. The
@@ -502,7 +502,7 @@ and returned by intake as a sanitized HTTP 500. A query DynamoDB request or
 service failure returns a sanitized HTTP 503, while a malformed stored item or
 unexpected failure returns HTTP 500. A missing queue, insufficient
 `SendMessage` permission, or another SQS send failure is returned as a
-sanitized HTTP 503. Execution discovers a missing Completion queue, insufficient
+sanitized HTTP 503. TigerBeetle processor discovers a missing Completion queue, insufficient
 `SendMessage` permission, or another Completion queue send failure while
 publishing the aggregate and retries every represented TigerBeetle queue record.
 Completion discovers a missing table, insufficient `UpdateItem` permission,
@@ -512,13 +512,13 @@ single Completion message.
 The second intake inline-policy statement grants that function only
 `SendMessage` access to this stack's TigerBeetle queue. The handler sends full
 compact `SUBMITTED` Operation JSON, but has no receive, delete, purge, or
-queue-management permissions. Execution receives its separate TigerBeetle queue
+queue-management permissions. TigerBeetle processor receives its separate TigerBeetle queue
 queue-scoped poller policy and Completion queue-scoped `SendMessage` policy.
 Completion receives its separate Completion queue-scoped poller policy and
 table-scoped `UpdateItem`; neither role grants queue-management access. The
 `queue.sh` command uses the local caller's AWS identity and does not expand any
 Lambda role. Its `receive` command competes with the selected queue's enabled
-event source mapping: execution for `TigerBeetleQueue` or completion for
+event source mapping: TigerBeetle processor for `TigerBeetleQueue` or the Completion processor for
 `CompletionQueue`.
 
 `TigerBeetleQueue` and `CompletionQueue` are standard queues with 90-second
@@ -574,7 +574,7 @@ constraint because DynamoDB and CloudFormation cannot enforce a per-attribute
 size limit. Completed result input and its compact serialization, including
 both `type` and `payload`, must fit the bound. The adapter serializes
 caller-provided tagged results into fixed request buffers and validates them
-immediately before persistence; execution builds one of its bounded success or
+immediately before persistence; TigerBeetle processor builds one of its bounded success or
 failure envelopes. On reads, the adapter
 parses the stored string once into the caller's arena and requires the string
 to equal the compact reserialization, rejecting malformed, duplicate-key,
@@ -590,7 +590,7 @@ transition once to `COMPLETED`; every completed Operation is immutable,
 including a same-outcome refresh. New items and every successful update set
 `expires_at` to `last_updated + 86,400`.
 Result-size validation remains in the application rather than a DynamoDB
-condition expression. The completion Lambda uses the separate relaxed
+condition expression. The Completion processor uses the separate relaxed
 ID-only update described above; the strict snapshot-based update interface
 remains available to local persistence callers.
 
@@ -634,12 +634,12 @@ The template defaults to:
 ```text
 intake-lambda
 query-lambda
-execution-lambda
-completion-lambda
+tiger-beetle-processor
+completion-processor
 ```
 
 They are controlled by `IntakeFunctionName`, `QueryFunctionName`,
-`ExecutionFunctionName`, and `CompletionFunctionName`. Before
+`TigerBeetleProcessorName`, and `CompletionProcessorName`. Before
 updating an existing stack, resolve the current intake physical name and reuse
 it exactly:
 
@@ -657,33 +657,12 @@ printf '%s\n' "$intake_function_name"
 ```
 
 Pass that value as `IntakeFunctionName`. `deploy.sh` performs the same preflight
-and stops before building or deploying if the requested name differs. Use
-`./deploy.sh --migration-check-only` to run only this guard. An absent stack is
-accepted as a first deployment; a matching existing name is accepted; a
-mismatch is rejected. The `IntakeFunction`, `IntakeFunctionUrl`,
-`FunctionUrlInvokeFunctionUrlPermission`, and
-`FunctionUrlInvokeFunctionPermission` logical IDs remain unchanged, so this
-guard keeps the current intake Lambda and URL managed in place.
+and stops before building or deploying if the requested name differs. An absent
+stack is accepted as a first deployment. This guard prevents accidental intake
+function replacement during routine updates.
 
 For a first deployment with no stack, set `intake_function_name=intake-lambda`
 before using the direct SAM commands below.
-
-Remove obsolete `FunctionName=...` entries from `samconfig.toml`, then add
-`IntakeFunctionName=<existing-physical-name>` and
-`QueryFunctionName=query-lambda`, `ExecutionFunctionName=execution-lambda`, and
-`CompletionFunctionName=completion-lambda` if parameter overrides are saved
-there. The
-removed `FunctionName` parameter and generic function outputs were template
-interfaces, not physical resources, so they require no cleanup.
-
-The automated flow never deletes cloud resources. If an operator deliberately
-changes the physical intake name outside this guard, CloudFormation replaces
-the function because [`FunctionName` changes require replacement](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-lambda-function.html)
-and CloudFormation normally [deletes replaced resources during update cleanup](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-cfn-updating-stacks-update-behaviors.html).
-Review stack events for `DELETE_FAILED`. After validating the replacement,
-inspect the old `/aws/lambda/<old-name>` log group and delete it explicitly if
-it is no longer required; deleting a Lambda does not delete its log group
-([Lambda logging guidance](https://docs.aws.amazon.com/lambda/latest/dg/nodejs-logging.html)).
 
 The `LambdaPrincipal` parameter defaults to:
 
@@ -714,11 +693,11 @@ The optional gateway parameters are:
 | Parameter | Meaning |
 | --- | --- |
 | `EnableWireGuardGateway` | `true` enables the gateway; defaults to `false`. |
-| `RetainExecutionVpcCleanupResources` | Internal `wireguard-gateway-setup.sh` lifecycle switch; retains the stack-owned EIGW, IPv6 route, execution security group, required VPC/route-table values, and ENI permissions between detach and cleanup phases. Defaults to `false`. |
+| `RetainTigerBeetleProcessorVpcCleanupResources` | Internal `wireguard-gateway-setup.sh` lifecycle switch; retains the stack-owned EIGW, IPv6 route, TigerBeetle processor security group, required VPC/route-table values, and ENI permissions between detach and cleanup phases. Defaults to `false`. |
 | `VpcId` | Existing VPC containing both supplied subnets; its IPv6 CIDR association remains externally managed. |
 | `GatewayPublicSubnetId` | Existing public subnet for the EC2 gateway. |
-| `LambdaSubnetId` | Distinct existing subnet for the execution Lambda; its IPv6 `/64` association remains externally managed. |
-| `LambdaRouteTableId` | Effective external route table for `LambdaSubnetId`; SAM adds its execution-specific routes. |
+| `LambdaSubnetId` | Distinct existing subnet for the TigerBeetle processor; its IPv6 `/64` association remains externally managed. |
+| `LambdaRouteTableId` | Effective external route table for `LambdaSubnetId`; SAM adds its TigerBeetle processor routes. |
 | `LambdaSubnetCidr` | Primary IPv4 CIDR of `LambdaSubnetId`; it must not overlap `10.200.0.0/24`. |
 | `WireGuardPrivateKeyParameterName` | Absolute path of the external gateway-private-key SSM `SecureString`. |
 | `WireGuardPrivateKeyParameterVersion` | Exact positive version to retrieve; defaults to `1`. |
@@ -731,7 +710,7 @@ The optional gateway parameters are:
 
 The recommended development topology keeps an existing internet-routed subnet
 for the EC2 gateway and uses a distinct private subnet in the same availability
-zone for execution. The Lambda subnet has no automatic public IPv4 assignment
+zone for TigerBeetle processor. The Lambda subnet has no automatic public IPv4 assignment
 and uses an explicitly associated route table. The VPC, subnets, route table,
 route-table association, IPv6 CIDR associations, DNS attributes, and network
 ACL are operator-owned prerequisites. Neither the SAM template nor
@@ -749,7 +728,7 @@ Before enablement, the topology must satisfy all of these constraints:
 - `LambdaRouteTableId` is the Lambda subnet's effective route table. Before
   first enablement it has no `::/0` route and the VPC has no attached EIGW.
   During reconfiguration, any such route and EIGW must be the current stack's
-  `ExecutionSqsIpv6Route` and `ExecutionEgressOnlyInternetGateway`.
+  `TigerBeetleProcessorSqsIpv6Route` and `TigerBeetleProcessorEgressOnlyInternetGateway`.
 - The Lambda subnet's effective network ACL allows outbound IPv6 TCP/443 and
   the corresponding inbound TCP/1024-65535 response traffic. A clearly denying
   policy is rejected; a valid but nontrivial ordered policy produces a warning
@@ -842,7 +821,7 @@ can discover the effective route table, but explicit topology makes ownership
 and later cleanup easier to audit.
 
 On first enablement, the deployment creates the stack-owned EIGW and adds
-`ExecutionSqsIpv6Route` with destination `::/0` to the supplied route table.
+`TigerBeetleProcessorSqsIpv6Route` with destination `::/0` to the supplied route table.
 A VPC supports only one EIGW, so an existing unmanaged EIGW is a hard conflict;
 there is no EIGW-ID template parameter and no import workflow. SAM also adds
 the separate `10.200.0.0/24` route for TigerBeetle. It does not remove or
@@ -852,16 +831,16 @@ association, or unrelated route.
 After disabling or deleting the stack, the supplied VPC, subnets, route table,
 route-table association, IPv6 allocations, DNS settings, and network ACL
 remain. Delete a dedicated external subnet or route table only as a separate
-operator action after verifying that execution and all other workloads are
+operator action after verifying that TigerBeetle processor and all other workloads are
 detached. Never remove a shared IPv6 association merely because this stack was
 torn down.
 
 ### SQS egress security and cost tradeoff
 
-Execution's Completion `SendMessage` call uses outbound-only public IPv6 HTTPS
+TigerBeetle processor's Completion `SendMessage` call uses outbound-only public IPv6 HTTPS
 through the EIGW. The security group allows TCP/443 to `::/0`, so the network
 boundary is broader than PrivateLink's private-only reachability and endpoint
-policy. The execution role's queue-scoped `sqs:SendMessage` permission is the
+policy. The TigerBeetle processor role's queue-scoped `sqs:SendMessage` permission is the
 service authorization boundary. The demo accepts that tradeoff to avoid an SQS
 interface endpoint and its fixed hourly and data-processing charges. No SQS
 interface endpoint, endpoint security group, private-DNS setting, or endpoint
@@ -1014,8 +993,8 @@ sam deploy --guided \
   --parameter-overrides \
     IntakeFunctionName="$intake_function_name" \
     QueryFunctionName=query-lambda \
-    ExecutionFunctionName=execution-lambda \
-    CompletionFunctionName=completion-lambda \
+    TigerBeetleProcessorName=tiger-beetle-processor \
+    CompletionProcessorName=completion-processor \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -1027,8 +1006,8 @@ Stack Name: aws-lambda-zig-demo
 AWS Region: ca-central-1
 Parameter IntakeFunctionName: <existing-physical-name-or-intake-lambda>
 Parameter QueryFunctionName: query-lambda
-Parameter ExecutionFunctionName: execution-lambda
-Parameter CompletionFunctionName: completion-lambda
+Parameter TigerBeetleProcessorName: tiger-beetle-processor
+Parameter CompletionProcessorName: completion-processor
 Parameter LambdaPrincipal: *
 Parameter PasetoPublicKey: <public-key-from-keygen>
 Confirm changes before deploy: Y
@@ -1067,8 +1046,8 @@ sam deploy \
   --parameter-overrides \
     IntakeFunctionName="$intake_function_name" \
     QueryFunctionName=query-lambda \
-    ExecutionFunctionName=execution-lambda \
-    CompletionFunctionName=completion-lambda \
+    TigerBeetleProcessorName=tiger-beetle-processor \
+    CompletionProcessorName=completion-processor \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -1077,11 +1056,11 @@ The preceding commands leave a new or already-disabled stack disabled. Do not
 use a single direct SAM update to transition an enabled stack to disabled: it
 does not perform the required Lambda VPC-detach wait and could remove ENI
 permissions too early. Use `wireguard-gateway-setup.sh --disable` for disablement, or manually reproduce
-its two phases with `RetainExecutionVpcCleanupResources=true`, a verified wait
+its two phases with `RetainTigerBeetleProcessorVpcCleanupResources=true`, a verified wait
 for zero VPC-configured Lambda versions and zero ENIs on the retained security
 group, both `VpcId` and `LambdaRouteTableId` preserved, then
-`RetainExecutionVpcCleanupResources=false`. This keeps the EIGW, IPv6 route,
-execution security group, and ENI-management permission until the final phase.
+`RetainTigerBeetleProcessorVpcCleanupResources=false`. This keeps the EIGW, IPv6 route,
+TigerBeetle processor security group, and ENI-management permission until the final phase.
 Direct SAM commands also do not perform setup-script subnet
 discovery, SSM generation, or enabled-stack reuse.
 To enable the gateway in guided mode, supply every opt-in parameter. Use the
@@ -1097,8 +1076,8 @@ sam deploy --guided \
   --parameter-overrides \
     IntakeFunctionName="$intake_function_name" \
     QueryFunctionName=query-lambda \
-    ExecutionFunctionName=execution-lambda \
-    CompletionFunctionName=completion-lambda \
+    TigerBeetleProcessorName=tiger-beetle-processor \
+    CompletionProcessorName=completion-processor \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY" \
     EnableWireGuardGateway=true \
@@ -1129,8 +1108,8 @@ sam deploy \
   --parameter-overrides \
     IntakeFunctionName="$intake_function_name" \
     QueryFunctionName=query-lambda \
-    ExecutionFunctionName=execution-lambda \
-    CompletionFunctionName=completion-lambda \
+    TigerBeetleProcessorName=tiger-beetle-processor \
+    CompletionProcessorName=completion-processor \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY" \
     EnableWireGuardGateway=true \
@@ -1171,24 +1150,24 @@ LAMBDA_PRINCIPAL='<lambda-principal>' ./deploy.sh
 ./deploy.sh --lambda-principal '<lambda-principal>'
 ```
 
-Override the execution function name with either supported interface:
+Override the TigerBeetle processor function name with either supported interface:
 
 ```sh
-EXECUTION_FUNCTION_NAME='<execution-function-name>' ./deploy.sh
-./deploy.sh --execution-function-name '<execution-function-name>'
+TIGER_BEETLE_PROCESSOR_NAME='<tiger-beetle-processor-name>' ./deploy.sh
+./deploy.sh --tiger-beetle-processor-name '<tiger-beetle-processor-name>'
 ```
 
-Override the completion function name in the same way:
+Override the Completion processor function name in the same way:
 
 ```sh
-COMPLETION_FUNCTION_NAME='<completion-function-name>' ./deploy.sh
-./deploy.sh --completion-function-name '<completion-function-name>'
+COMPLETION_PROCESSOR_NAME='<completion-processor-name>' ./deploy.sh
+./deploy.sh --completion-processor-name '<completion-processor-name>'
 ```
 
-When an existing stack uses a nondefault completion name, also export
-`COMPLETION_FUNCTION_NAME` for every `wireguard-gateway-setup.sh` enable,
-reconfiguration, or disable run so its shared deployment path preserves that
-physical name.
+Both deployment helpers accept both processor name flags, in separate or
+`--option=value` form. When using custom names, pass them or export
+`TIGER_BEETLE_PROCESSOR_NAME` and `COMPLETION_PROCESSOR_NAME` on every deploy,
+WireGuard enable, reconfigure, and disable run.
 
 `wireguard-gateway-setup.sh` resolves each gateway value from CLI, then
 environment, then a previously enabled stack, then SSM/default discovery.
@@ -1248,14 +1227,14 @@ Explicit teardown is:
 ```
 
 The detach phase sets
-`RetainExecutionVpcCleanupResources=true`, removing the gateway, Elastic IP,
-`10.200.0.0/24` route, and related resources, and detaching execution from the
-VPC. It retains the stack-owned EIGW, `::/0` route, execution security group,
+`RetainTigerBeetleProcessorVpcCleanupResources=true`, removing the gateway, Elastic IP,
+`10.200.0.0/24` route, and related resources, and detaching TigerBeetle processor from the
+VPC. It retains the stack-owned EIGW, `::/0` route, TigerBeetle processor security group,
 required `VpcId` and `LambdaRouteTableId` values, and ENI-deletion permission.
 The helper then polls for up to 20 minutes until the current function and every
 published version have an empty VPC configuration and no Lambda-created ENI
 references the retained security group. The cleanup phase sets
-`RetainExecutionVpcCleanupResources=false` only after those checks pass,
+`RetainTigerBeetleProcessorVpcCleanupResources=false` only after those checks pass,
 removing the IPv6 route, EIGW, retained group, and ENI permission. An EIGW has
 no endpoint ENIs, so there is no endpoint-ENI wait branch. A timeout stops
 before cleanup; a later
@@ -1364,10 +1343,10 @@ IntakeFunctionUrl
 QueryFunctionName
 QueryFunctionArn
 QueryFunctionUrl
-ExecutionFunctionName
-ExecutionFunctionArn
-CompletionFunctionName
-CompletionFunctionArn
+TigerBeetleProcessorName
+TigerBeetleProcessorArn
+CompletionProcessorName
+CompletionProcessorArn
 ```
 
 An enabled deployment also emits these conditional outputs:
@@ -1405,7 +1384,7 @@ aws cloudformation describe-stacks \
   --region ca-central-1
 ```
 
-`lambda_logs.sh` resolves the explicit intake, query, execution, or completion
+`lambda_logs.sh` resolves the explicit intake, query, TigerBeetle processor, or Completion processor
 function-name output.
 `persistence.sh` resolves the `OperationsTable` physical resource, while
 `queue.sh` resolves the queue logical resource ID supplied by the caller. These
@@ -1451,25 +1430,25 @@ NAT.
 ### Check the IPv6 SQS egress and routes
 
 Resolve the stack-owned EIGW and verify its CloudFormation status, VPC
-attachment, active `::/0` route, unchanged WireGuard route, and execution
+attachment, active `::/0` route, unchanged WireGuard route, and TigerBeetle processor
 dual-stack configuration:
 
 ```sh
 eigw_id="$(
   aws cloudformation describe-stack-resource \
     --stack-name aws-lambda-zig-demo \
-    --logical-resource-id ExecutionEgressOnlyInternetGateway \
+    --logical-resource-id TigerBeetleProcessorEgressOnlyInternetGateway \
     --query StackResourceDetail.PhysicalResourceId \
     --output text \
     --profile dev \
     --region ca-central-1
 )"
 lambda_route_table_id='<lambda-route-table-id>'
-execution_function_name='<execution-function-name>'
+tiger_beetle_processor_name='<tiger-beetle-processor-name>'
 
 aws cloudformation describe-stack-resources \
   --stack-name aws-lambda-zig-demo \
-  --query "StackResources[?LogicalResourceId=='ExecutionEgressOnlyInternetGateway' || LogicalResourceId=='ExecutionSqsIpv6Route'].[LogicalResourceId,ResourceStatus,PhysicalResourceId]" \
+  --query "StackResources[?LogicalResourceId=='TigerBeetleProcessorEgressOnlyInternetGateway' || LogicalResourceId=='TigerBeetleProcessorSqsIpv6Route'].[LogicalResourceId,ResourceStatus,PhysicalResourceId]" \
   --output table \
   --profile dev \
   --region ca-central-1
@@ -1486,7 +1465,7 @@ aws ec2 describe-route-tables \
   --profile dev \
   --region ca-central-1
 aws lambda get-function-configuration \
-  --function-name "$execution_function_name" \
+  --function-name "$tiger_beetle_processor_name" \
   --query '[VpcConfig,Environment.Variables.AWS_USE_DUALSTACK_ENDPOINT]' \
   --output json \
   --profile dev \
@@ -1500,11 +1479,11 @@ AWS_USE_DUALSTACK_ENDPOINT=true aws sqs list-queues \
 Both CloudFormation resources must have a complete status. The EIGW must have
 one attached association to the selected VPC. The `::/0` route must be active,
 created by `CreateRoute`, and target that EIGW; the `10.200.0.0/24` route
-must still target the WireGuard instance. Execution's VPC configuration must
+must still target the WireGuard instance. TigerBeetle processor's VPC configuration must
 show `Ipv6AllowedForDualStack: true`, and its environment must show
 `AWS_USE_DUALSTACK_ENDPOINT=true`. The SQS probe confirms regional dual-stack
 endpoint availability with the operator's identity; it does not expand the
-execution role.
+TigerBeetle processor role.
 ### Check the instance and tunnel
 
 Resolve the instance ID, wait for both EC2 status checks, and confirm that the
@@ -1592,26 +1571,26 @@ aws ec2 describe-instance-attribute \
 
 aws cloudformation describe-stack-resources \
   --stack-name aws-lambda-zig-demo \
-  --query "StackResources[?LogicalResourceId=='ExecutionLambdaSecurityGroup' || LogicalResourceId=='WireGuardGatewaySecurityGroup'].[LogicalResourceId,PhysicalResourceId]" \
+  --query "StackResources[?LogicalResourceId=='TigerBeetleProcessorSecurityGroup' || LogicalResourceId=='WireGuardGatewaySecurityGroup'].[LogicalResourceId,PhysicalResourceId]" \
   --output table \
   --profile dev \
   --region ca-central-1
 
 aws ec2 describe-security-groups \
-  --group-ids '<execution-lambda-security-group-id>' \
+  --group-ids '<tiger-beetle-processor-security-group-id>' \
     '<wireguard-gateway-security-group-id>' \
   --profile dev \
   --region ca-central-1
 
 aws lambda get-function-configuration \
-  --function-name '<execution-function-name>' \
+  --function-name '<tiger-beetle-processor-name>' \
   --query VpcConfig \
   --profile dev \
   --region ca-central-1
 ```
 
 The route target must be the gateway instance, source/destination checking
-must be `false`, the execution security group must have only the documented
+must be `false`, the TigerBeetle processor security group must have only the documented
 TCP/3000 and TCP/443 egress, and the gateway group must match the documented
 ingress and egress. To test reboot recovery, explicitly reboot, wait for status
 checks again, reconnect with Session Manager, and repeat the interface and
@@ -1637,8 +1616,8 @@ aws ec2 wait instance-status-ok \
 | Handshake succeeds but routed counters do not increase | Check the workstation peer `AllowedIPs = <LambdaSubnetCidr>` and the gateway peer route `10.200.0.2/32`. |
 | EC2 reaches neither `10.200.0.2` nor TCP/3000 | Check workstation WireGuard state, local routes, and its firewall before checking AWS. |
 | EC2 reaches `10.200.0.2`, but not TCP/3000 | Permit TCP/3000 from `LambdaSubnetCidr` and make TigerBeetle listen on `10.200.0.2:3000` or an inclusive bind address. |
-| EC2 works, but Lambda cannot reach the overlay | Confirm the `10.200.0.0/24` VPC route, `SourceDestCheck=false`, execution VPC attachment, and TCP/3000 security-group egress. |
-| Execution cannot publish Completion messages after VPC attachment | Confirm the VPC/subnet IPv6 associations and DNS attributes, the stack-owned EIGW and active `::/0` route, `Ipv6AllowedForDualStack=true`, `AWS_USE_DUALSTACK_ENDPOINT=true`, IPv6 TCP/443 security-group egress, the network ACL response path, and regional SQS dual-stack availability. |
+| EC2 works, but Lambda cannot reach the overlay | Confirm the `10.200.0.0/24` VPC route, `SourceDestCheck=false`, TigerBeetle processor VPC attachment, and TCP/3000 security-group egress. |
+| TigerBeetle processor cannot publish Completion messages after VPC attachment | Confirm the VPC/subnet IPv6 associations and DNS attributes, the stack-owned EIGW and active `::/0` route, `Ipv6AllowedForDualStack=true`, `AWS_USE_DUALSTACK_ENDPOINT=true`, IPv6 TCP/443 security-group egress, the network ACL response path, and regional SQS dual-stack availability. |
 | SSM registration or bootstrap fails | Check gateway-subnet internet routing, the instance role, `cloud-init` logs, and the exact SSM parameter name/version. The role can read only that parameter. |
 
 ### Rotate WireGuard keys
@@ -1709,12 +1688,12 @@ key local, pass only its new public key as `WireGuardWorkstationPublicKey`,
 redeploy, and update the workstation interface. Verify a new handshake and
 TCP/3000 connectivity after either rotation.
 
-The workstation-initiated handshake, routed TCP/3000 connection, execution
+The workstation-initiated handshake, routed TCP/3000 connection, TigerBeetle processor
 Lambda VPC attachment, reboot recovery, and key rotation are cloud acceptance
 checks and remain unexecuted until an operator explicitly authorizes and runs
 the deployment. Once deployed, a queued valid Operation exercises a real
 TigerBeetle account request and transfer request, Completion queue publication,
-and the completion Lambda's DynamoDB update.
+and the Completion processor's DynamoDB update.
 
 ## 8. Test query GET and intake POST
 
@@ -1805,7 +1784,7 @@ different verified subject returns the static `409 Conflict` response.
 
 Delivery is at least once. The standard queue, acknowledgement loss, and
 concurrent `SUBMITTED` retries can create duplicate messages. Consumers must use the
-Operation ID and hash idempotently. Execution performs the replay-safe
+Operation ID and hash idempotently. TigerBeetle processor performs the replay-safe
 TigerBeetle account and transfer sequence, aggregates terminal ID/result
 entries, and acknowledges represented TigerBeetle queue records only after the
 one Completion message is published. Invalid TigerBeetle queue records are
@@ -1829,13 +1808,13 @@ Run the stack-aware log helper with an explicit Lambda selection:
 ```sh
 ./lambda_logs.sh intake
 ./lambda_logs.sh query
-./lambda_logs.sh execution
-./lambda_logs.sh completion
+./lambda_logs.sh tiger-beetle-processor
+./lambda_logs.sh completion-processor
 ```
 
 The stack name is fixed as `aws-lambda-zig-demo`. The helper resolves
-`IntakeFunctionName`, `QueryFunctionName`, `ExecutionFunctionName`, or
-`CompletionFunctionName` and writes a root-level file named after that
+`IntakeFunctionName`, `QueryFunctionName`, `TigerBeetleProcessorName`, or
+`CompletionProcessorName` and writes a root-level file named after that
 function, such as `intake-lambda.log`. It uses only the standard
 `AWS_PROFILE` and `AWS_REGION` environment variables, defaulting to `dev` and
 `ca-central-1`:
@@ -1943,7 +1922,7 @@ The caller running `persistence.sh` needs `dynamodb:GetItem`,
 `cloudformation:DescribeStackResource` to resolve the table resource. Its `delete-all`
 command additionally needs `dynamodb:Scan` and `dynamodb:DeleteItem`. The
 Lambda roles do not grant these permissions to the local AWS identity;
-execution itself has no DynamoDB permissions.
+TigerBeetle processor itself has no DynamoDB permissions.
 
 ### Troubleshoot persistence command configuration
 
@@ -1989,16 +1968,16 @@ A nonexistent table, missing `GetItem` permission, or DynamoDB service failure
 is discovered by the first authenticated `GET /<uuid>` and returns a sanitized
 HTTP 503. A malformed stored item returns a sanitized HTTP 500.
 
-The execution Lambda requires `COMPLETION_QUEUE_URL`,
+The TigerBeetle processor requires `COMPLETION_QUEUE_URL`,
 `TIGERBEETLE_CLUSTER_ID`, and `TIGERBEETLE_ADDRESSES`. Missing or invalid
-settings exit during execution INIT. A syntactically valid but nonexistent
+settings exit during TigerBeetle processor INIT. A syntactically valid but nonexistent
 Completion queue, missing `SendMessage` permission, or SQS service failure is
-discovered when execution publishes its aggregate. Execution logs that
+discovered when TigerBeetle processor publishes its aggregate. TigerBeetle processor logs that
 failure and requests retries for all TigerBeetle queue records represented by the
 unsent message.
 
-The completion Lambda requires only `OPERATIONS_TABLE_NAME`. A missing or
-invalid table-name setting exits during completion INIT. A nonexistent table,
+The Completion processor requires only `OPERATIONS_TABLE_NAME`. A missing or
+invalid table-name setting exits during Completion processor INIT. A nonexistent table,
 missing `UpdateItem` permission, or DynamoDB service failure is discovered
 while processing a Completion entry. Completion logs the failure, stops that
 aggregate, and requests a retry for the invocation's single SQS message.
@@ -2047,8 +2026,8 @@ Consume queued messages until interrupted:
 ```
 
 On a deployed stack, this local consumer competes with the selected queue's
-enabled Lambda event source mapping. `TigerBeetleQueue` feeds execution and
-`CompletionQueue` feeds completion. Use `receive` only when intentionally
+enabled Lambda event source mapping. `TigerBeetleQueue` feeds TigerBeetle processor and
+`CompletionQueue` feeds the Completion processor. Use `receive` only when intentionally
 taking messages away from that handler.
 
 This is a destructive long-running consumer. It requests one message at a time
@@ -2073,9 +2052,9 @@ The caller needs these queue-scoped permissions for the commands it uses:
 - `sqs:GetQueueAttributes` for `check`
 
 `queue.sh` also needs `cloudformation:DescribeStackResource`. These local caller
-permissions are independent of the Lambda roles. Intake remains send-only for SQS, execution has
+permissions are independent of the Lambda roles. Intake remains send-only for SQS, TigerBeetle processor has
 TigerBeetle queue-scoped polling and Completion queue-scoped send permissions,
-completion has Completion queue-scoped polling permissions, and query has no
+the Completion processor has Completion queue-scoped polling permissions, and query has no
 SQS permissions.
 
 If `sqs: missing or invalid configuration` is emitted, the local command
@@ -2094,8 +2073,8 @@ After changing Zig source code, rebuild and repackage:
 zig build --release -Darch=arm
 zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
 zip -qj query-lambda.zip zig-out/bin/query/bootstrap
-zip -qj execution-lambda.zip zig-out/bin/execution/bootstrap
-zip -qj completion-lambda.zip zig-out/bin/completion/bootstrap
+zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
+zip -qj completion-processor.zip zig-out/bin/completion_processor/bootstrap
 ```
 
 Then redeploy the stack:
@@ -2115,7 +2094,7 @@ run the guarded disable flow:
 ./wireguard-gateway-setup.sh --disable
 ```
 
-This detaches execution, waits for every published version and Lambda-created
+This detaches TigerBeetle processor, waits for every published version and Lambda-created
 ENI to release the retained security group, then removes the stack-owned EIGW,
 IPv6 route, security group, and ENI-management IAM before clearing saved
 gateway inputs. A timed-out run leaves those resources retained; rerun the
@@ -2170,10 +2149,10 @@ rmdir '<private-key-directory>'
 
 This demo intentionally creates two publicly reachable Lambda Function URLs,
 and both Function URL handlers require a valid PASETO bearer token. The
-execution Lambda has no Function URL and is invoked from SQS. For production,
+TigerBeetle processor has no Function URL and is invoked from SQS. For production,
 consider combining application authentication with stricter infrastructure
 authorization, narrower IAM policies, or an API Gateway/CloudFront layer. The
-completion Lambda also has no Function URL and is invoked from its SQS mapping.
+Completion processor also has no Function URL and is invoked from its SQS mapping.
 
 When the gateway is enabled, IPv4 UDP/51820 is deliberately open from
 `0.0.0.0/0` because the NAT public address of the development workstation is
@@ -2184,7 +2163,7 @@ WireGuard vulnerabilities. The gateway opens no IPv6 ingress, SSH, public
 TigerBeetle TCP port, or other public ingress. Keep the gateway disabled when
 it is not needed and account for its EC2 and Elastic IP cost while enabled.
 
-Execution's IPv6 TCP/443 egress to `::/0` can reach public IPv6 HTTPS
+TigerBeetle processor's IPv6 TCP/443 egress to `::/0` can reach public IPv6 HTTPS
 destinations; it is not the private-only, endpoint-policy boundary an SQS
 interface endpoint would provide. Queue-scoped IAM limits the function's SQS
 action to `SendMessage` on `CompletionQueue`. The EIGW adds no fixed hourly or

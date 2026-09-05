@@ -191,7 +191,7 @@ test_enabled_stack_detach_plan() (
     build_sam_parameter_overrides
     joined_overrides=" ${SAM_PARAMETER_OVERRIDES[*]} "
     assert_contains "$joined_overrides" " EnableWireGuardGateway=false "
-    assert_contains "$joined_overrides" " RetainExecutionVpcCleanupResources=true "
+    assert_contains "$joined_overrides" " RetainTigerBeetleProcessorVpcCleanupResources=true "
     assert_contains "$joined_overrides" " VpcId=vpc-00000001 "
     assert_contains "$joined_overrides" " LambdaRouteTableId=rtb-00000001 "
 )
@@ -241,46 +241,46 @@ test_stack_owned_ipv6_egress_cleanup_condition() {
     assert_not_contains "$parameter_rules" "EgressOnlyInternetGatewayId"
 
     eigw_template="$(sed -n \
-        '/^  ExecutionEgressOnlyInternetGateway:/,/^  ExecutionSqsIpv6Route:/p' \
+        '/^  TigerBeetleProcessorEgressOnlyInternetGateway:/,/^  TigerBeetleProcessorSqsIpv6Route:/p' \
         "$REPOSITORY_ROOT/template.yaml")"
     assert_contains "$eigw_template" \
         "Type: AWS::EC2::EgressOnlyInternetGateway"
     assert_contains "$eigw_template" \
-        "Condition: ExecutionVpcCleanupResourcesRetained"
+        "Condition: TigerBeetleProcessorVpcCleanupResourcesRetained"
     assert_contains "$eigw_template" "DeletionPolicy: Delete"
     assert_contains "$eigw_template" "UpdateReplacePolicy: Delete"
     assert_contains "$eigw_template" "VpcId: !Ref VpcId"
 
     security_group_template="$(sed -n \
-        '/^  ExecutionLambdaSecurityGroup:/,/^  ExecutionEgressOnlyInternetGateway:/p' \
+        '/^  TigerBeetleProcessorSecurityGroup:/,/^  TigerBeetleProcessorEgressOnlyInternetGateway:/p' \
         "$REPOSITORY_ROOT/template.yaml")"
     assert_contains "$security_group_template" \
-        "Condition: ExecutionVpcCleanupResourcesRetained"
+        "Condition: TigerBeetleProcessorVpcCleanupResourcesRetained"
 
     route_template="$(sed -n \
-        '/^  ExecutionSqsIpv6Route:/,/^  WireGuardGatewaySecurityGroup:/p' \
+        '/^  TigerBeetleProcessorSqsIpv6Route:/,/^  WireGuardGatewaySecurityGroup:/p' \
         "$REPOSITORY_ROOT/template.yaml")"
     assert_contains "$route_template" "Type: AWS::EC2::Route"
     assert_contains "$route_template" \
-        "Condition: ExecutionVpcCleanupResourcesRetained"
+        "Condition: TigerBeetleProcessorVpcCleanupResourcesRetained"
     assert_contains "$route_template" "DeletionPolicy: Delete"
     assert_contains "$route_template" "UpdateReplacePolicy: Delete"
     assert_contains "$route_template" "RouteTableId: !Ref LambdaRouteTableId"
     assert_contains "$route_template" 'DestinationIpv6CidrBlock: "::/0"'
     assert_contains "$route_template" \
-        "EgressOnlyInternetGatewayId: !Ref ExecutionEgressOnlyInternetGateway"
+        "EgressOnlyInternetGatewayId: !Ref TigerBeetleProcessorEgressOnlyInternetGateway"
 
     cleanup_condition="$(sed -n \
-        '/^  ExecutionVpcCleanupResourcesRetained:/,/^Resources:/p' \
+        '/^  TigerBeetleProcessorVpcCleanupResourcesRetained:/,/^Resources:/p' \
         "$REPOSITORY_ROOT/template.yaml")"
     assert_contains "$cleanup_condition" "!Condition WireGuardGatewayEnabled"
     assert_contains "$cleanup_condition" \
-        '!Equals [!Ref RetainExecutionVpcCleanupResources, "true"]'
+        '!Equals [!Ref RetainTigerBeetleProcessorVpcCleanupResources, "true"]'
 
     role_template="$(sed -n \
-        '/^  ExecutionFunctionRole:/,/^  ExecutionFunction:/p' \
+        '/^  TigerBeetleProcessorRole:/,/^  TigerBeetleProcessor:/p' \
         "$REPOSITORY_ROOT/template.yaml")"
-    assert_contains "$role_template" "ExecutionVpcCleanupResourcesRetained"
+    assert_contains "$role_template" "TigerBeetleProcessorVpcCleanupResourcesRetained"
     assert_contains "$role_template" "ec2:CreateNetworkInterface"
     assert_contains "$role_template" "ec2:DeleteNetworkInterface"
 }
@@ -318,26 +318,26 @@ test_cleanup_readiness() {
     MOCK_FUNCTION_VPC_ATTACHED=1
     MOCK_CONFIGURED_VERSION_COUNT=0
     MOCK_ENI_COUNT=0
-    if execution_vpc_cleanup_ready; then
+    if tiger_beetle_processor_vpc_cleanup_ready; then
         fail_test "cleanup became ready while the function retained VPC configuration"
     fi
 
     MOCK_FUNCTION_VPC_ATTACHED=0
     MOCK_CONFIGURED_VERSION_COUNT=1
     MOCK_ENI_COUNT=0
-    if execution_vpc_cleanup_ready; then
+    if tiger_beetle_processor_vpc_cleanup_ready; then
         fail_test "cleanup became ready while a Lambda version retained VPC configuration"
     fi
 
     MOCK_CONFIGURED_VERSION_COUNT=0
     MOCK_ENI_COUNT=1
-    if execution_vpc_cleanup_ready; then
+    if tiger_beetle_processor_vpc_cleanup_ready; then
         fail_test "cleanup became ready while an ENI retained the security group"
     fi
 
     MOCK_CONFIGURED_VERSION_COUNT=0
     MOCK_ENI_COUNT=0
-    execution_vpc_cleanup_ready ||
+    tiger_beetle_processor_vpc_cleanup_ready ||
         fail_test "cleanup was not ready after Lambda versions detached and ENIs reached zero"
 }
 
@@ -347,11 +347,11 @@ deploy_stack_phase() {
     local call_name reset_override reset_file reset_contents
 
     case "$phase_description" in
-        "Detaching execution Lambda from the VPC")
+        "Detaching TigerBeetle processor from the VPC")
             call_name=retained
             assert_contains "$joined_overrides" " EnableWireGuardGateway=false "
             assert_contains "$joined_overrides" \
-                " RetainExecutionVpcCleanupResources=true "
+                " RetainTigerBeetleProcessorVpcCleanupResources=true "
             assert_contains "$joined_overrides" \
                 " VpcId=$WIREGUARD_CLEANUP_VPC_ID "
             assert_contains "$joined_overrides" \
@@ -361,7 +361,7 @@ deploy_stack_phase() {
             call_name=cleanup
             assert_contains "$joined_overrides" " EnableWireGuardGateway=false "
             assert_contains "$joined_overrides" \
-                " RetainExecutionVpcCleanupResources=false "
+                " RetainTigerBeetleProcessorVpcCleanupResources=false "
             assert_contains "$joined_overrides" \
                 " VpcId=$WIREGUARD_CLEANUP_VPC_ID "
             assert_contains "$joined_overrides" \
@@ -371,7 +371,7 @@ deploy_stack_phase() {
             call_name=reset
             assert_contains "$joined_overrides" " EnableWireGuardGateway=false "
             assert_contains "$joined_overrides" \
-                " RetainExecutionVpcCleanupResources=false "
+                " RetainTigerBeetleProcessorVpcCleanupResources=false "
             for reset_override in "${DEPLOYMENT_PARAMETER_OVERRIDES[@]}"; do
                 case "$reset_override" in
                     file://*) reset_file="${reset_override#file://}" ;;
@@ -392,7 +392,7 @@ deploy_stack_phase() {
             call_name=enabled
             assert_contains "$joined_overrides" " EnableWireGuardGateway=true "
             assert_contains "$joined_overrides" \
-                " RetainExecutionVpcCleanupResources=false "
+                " RetainTigerBeetleProcessorVpcCleanupResources=false "
             assert_contains "$joined_overrides" " VpcId=$VPC_ID "
             assert_contains "$joined_overrides" \
                 " LambdaRouteTableId=$LAMBDA_ROUTE_TABLE_ID "
@@ -464,7 +464,7 @@ test_cleanup_aws_error_keeps_retained_resources() {
     )"; then
         fail_test "detach cleanup ignored an AWS inspection error"
     fi
-    assert_contains "$cleanup_output" "could not verify execution Lambda VPC cleanup"
+    assert_contains "$cleanup_output" "could not verify TigerBeetle processor VPC cleanup"
     actual_calls="$(<"$MOCK_CALL_LOG")"
     [ "$actual_calls" = deploy:retained ] ||
         fail_test "AWS error did not leave the retained detach in place: $actual_calls"

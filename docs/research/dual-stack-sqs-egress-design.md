@@ -6,11 +6,11 @@ deployment helpers, or AWS resources.
 
 ## Decision summary
 
-The execution Lambda can send Completion messages to SQS without an SQS interface
+The TigerBeetle processor can send Completion messages to SQS without an SQS interface
 endpoint by using SQS's public dual-stack regional endpoint over IPv6:
 
 ```text
-Operations SQS -- Lambda-managed poller --> execution Lambda
+Operations SQS -- Lambda-managed poller --> TigerBeetle processor
                                                |             \
                                                | IPv4         \ IPv6 HTTPS
                                                v               v
@@ -22,10 +22,10 @@ Operations SQS -- Lambda-managed poller --> execution Lambda
                                                                v
                                                     sqs.<region>.api.aws
 
-Completion SQS -- Lambda-managed poller --> completion Lambda (not VPC-attached)
+Completion SQS -- Lambda-managed poller --> Completion processor (not VPC-attached)
 ```
 
-This preserves the application behavior: execution still receives Operations
+This preserves the application behavior: TigerBeetle processor still receives Operations
 messages through its Lambda event source mapping, communicates with TigerBeetle over the
 existing IPv4 WireGuard route, and calls `SendMessage` once for the aggregate Completion
 message. Only the final SDK call needs the new IPv6 path.
@@ -34,12 +34,12 @@ The recommended ownership boundary is:
 
 - The operator owns the existing VPC, the Lambda subnet's IPv6 CIDR association, the
   VPC's IPv6 CIDR association, and the VPC's egress-only internet gateway (EIGW).
-- SAM owns the execution-specific `::/0` route in `LambdaRouteTableId`, the execution
+- SAM owns the TigerBeetle processor `::/0` route in `LambdaRouteTableId`, the TigerBeetle processor
   Lambda's dual-stack setting, its SDK endpoint setting, and its IPv6 security-group
   egress rule.
 - The deployment helper validates the external topology before deploying and passes the
   discovered EIGW ID as an explicit stack parameter.
-- Teardown removes only the SAM-owned route and execution security group. It never
+- Teardown removes only the SAM-owned route and TigerBeetle processor security group. It never
   removes the operator-owned EIGW or IPv6 associations.
 
 This design replaces the previously considered `ExecutionSqsInterfaceEndpoint` with
@@ -50,15 +50,15 @@ guarded route and security-group cleanup.
 
 ### The source queue does not need function-subnet egress
 
-The `ExecutionFunctionTigerBeetleQueueMapping` is a Lambda event source mapping. AWS's
-Lambda-managed poller reads the TigerBeetle queue and invokes execution; the execution
+The `TigerBeetleProcessorQueueMapping` is a Lambda event source mapping. AWS's
+Lambda-managed poller reads the TigerBeetle queue and invokes TigerBeetle processor; the TigerBeetle processor
 code does not poll that queue through its VPC network. AWS documents this polling model
 in [Using Lambda with Amazon SQS](https://docs.aws.amazon.com/lambda/latest/dg/with-sqs.html).
 
-The outbound requirement appears when execution changes from updating DynamoDB to calling
+The outbound requirement appears when TigerBeetle processor changes from updating DynamoDB to calling
 `SendMessage` on `CompletionQueue`. The template grants that action and supplies
 `COMPLETION_QUEUE_URL`; the completion consumer remains outside the VPC. Consequently,
-only the execution function's Completion-queue send needs an SQS network path.
+only the TigerBeetle processor function's Completion-queue send needs an SQS network path.
 
 ### Lambda can use IPv6 from a dual-stack subnet
 
@@ -68,7 +68,7 @@ placing a Lambda in a public subnet does not give the function internet access
 ([Lambda VPC configuration](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html),
 [Lambda internet access](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc-internet.html)).
 
-The repository selects exactly one subnet for execution while the WireGuard gateway is
+The repository selects exactly one subnet for TigerBeetle processor while the WireGuard gateway is
 enabled ([current `VpcConfig`](../../template.yaml#L365-L373)). That subnet must therefore
 have both its existing IPv4 CIDR and an associated IPv6 `/64` from the VPC's IPv6
 allocation.
@@ -185,37 +185,37 @@ EgressOnlyInternetGatewayId:
   Description: ID of the existing egress-only internet gateway attached to the VPC.
 ```
 
-Require this parameter in both cases where `ExecutionVpcCleanupResourcesRetained` is
+Require this parameter in both cases where `TigerBeetleProcessorVpcCleanupResourcesRetained` is
 true:
 
 - normal WireGuard enablement; and
 - the guarded Lambda VPC-detach phase.
 
-`VpcId` remains necessary for the execution security group. `LambdaRouteTableId` remains
+`VpcId` remains necessary for the TigerBeetle processor security group. `LambdaRouteTableId` remains
 necessary for both the WireGuard route during enablement and the IPv6 default route during
 retention. `LambdaSubnetId` remains necessary during enablement, but the proposed IPv6
 route does not itself depend on the subnet ID.
 
 Rename descriptions that currently refer to a retained DynamoDB endpoint so they instead
-refer to retained execution VPC routing, the security group, and Lambda ENI cleanup
+refer to retained TigerBeetle processor VPC routing, the security group, and Lambda ENI cleanup
 resources.
 
-### Execution function configuration
+### TigerBeetle processor function configuration
 
-Add `Ipv6AllowedForDualStack: true` to the enabled branch of execution's `VpcConfig`:
+Add `Ipv6AllowedForDualStack: true` to the enabled branch of TigerBeetle processor's `VpcConfig`:
 
 ```yaml
 VpcConfig: !If
   - WireGuardGatewayEnabled
   - Ipv6AllowedForDualStack: true
     SecurityGroupIds:
-      - !Ref ExecutionLambdaSecurityGroup
+      - !Ref TigerBeetleProcessorSecurityGroup
     SubnetIds:
       - !Ref LambdaSubnetId
   - !Ref AWS::NoValue
 ```
 
-Add the SDK switch to execution's environment:
+Add the SDK switch to TigerBeetle processor's environment:
 
 ```yaml
 AWS_USE_DUALSTACK_ENDPOINT: !If
@@ -225,7 +225,7 @@ AWS_USE_DUALSTACK_ENDPOINT: !If
 ```
 
 Using a condition keeps the special endpoint selection coupled to the dual-stack VPC
-attachment. When execution is detached from the VPC, the standard endpoint remains
+attachment. When TigerBeetle processor is detached from the VPC, the standard endpoint remains
 reachable through Lambda's service-managed networking. Setting the value permanently to
 `"true"` would also work in regions where SQS advertises dual-stack support, but coupling
 the settings is easier to reason about and fails less surprisingly if this template is
@@ -240,9 +240,9 @@ and endpoint-resolution behavior.
 Replace `ExecutionDynamoDBGatewayEndpoint` with a conditional route:
 
 ```yaml
-ExecutionSqsIpv6Route:
+TigerBeetleProcessorSqsIpv6Route:
   Type: AWS::EC2::Route
-  Condition: ExecutionVpcCleanupResourcesRetained
+  Condition: TigerBeetleProcessorVpcCleanupResourcesRetained
   DeletionPolicy: Delete
   UpdateReplacePolicy: Delete
   Properties:
@@ -256,12 +256,12 @@ The CloudFormation form is documented in the
 No EIGW resource or output is needed because the gateway is operator-owned. No SQS
 endpoint output replaces the obsolete DynamoDB endpoint output.
 
-The route uses `ExecutionVpcCleanupResourcesRetained`, not only
+The route uses `TigerBeetleProcessorVpcCleanupResourcesRetained`, not only
 `WireGuardGatewayEnabled`, so it survives the first guarded detach deployment. This keeps
-the old Lambda configuration functional while CloudFormation changes execution's
+the old Lambda configuration functional while CloudFormation changes TigerBeetle processor's
 `VpcConfig` and Lambda-created ENIs and published versions finish detaching.
 
-### Execution security group
+### TigerBeetle processor security group
 
 Keep the narrowly scoped TigerBeetle rule and replace IPv4 HTTPS egress with IPv6 HTTPS
 egress:
@@ -281,8 +281,8 @@ SecurityGroupEgress:
 ```
 
 Removing the `0.0.0.0/0` TCP/443 rule is intentional. It proves that Completion sends do
-not depend on an undocumented IPv4 NAT/default route and reduces the execution ENI's
-public IPv4 egress. Do not alter the gateway instance's security group: the execution
+not depend on an undocumented IPv4 NAT/default route and reduces the TigerBeetle processor ENI's
+public IPv4 egress. Do not alter the gateway instance's security group: the TigerBeetle processor
 function's SQS traffic does not traverse that instance.
 
 There is no endpoint security group. An EIGW has no security-group attachment and no
@@ -368,7 +368,7 @@ operator-supplied subnet uses it.
 1. The operator establishes the VPC/subnet IPv6 allocations and attaches the VPC's EIGW.
 2. The helper validates the full prerequisite set and passes
    `EgressOnlyInternetGatewayId` to SAM.
-3. SAM creates the execution SG and `::/0` route, then configures execution with the SG,
+3. SAM creates the TigerBeetle processor SG and `::/0` route, then configures TigerBeetle processor with the SG,
    subnet, `Ipv6AllowedForDualStack: true`, and the SDK dual-stack switch.
 4. Existing `10.200.0.0/24` routing and the WireGuard gateway remain unchanged.
 
@@ -379,18 +379,18 @@ replace network resources beneath attached Lambda ENIs.
 ### Guarded detach phase
 
 Deploy with `EnableWireGuardGateway=false` and
-`RetainExecutionVpcCleanupResources=true`, preserving at least `VpcId`,
+`RetainTigerBeetleProcessorVpcCleanupResources=true`, preserving at least `VpcId`,
 `LambdaRouteTableId`, and `EgressOnlyInternetGatewayId`:
 
-- execution loses its `VpcConfig` and no longer requires VPC networking;
-- the execution SG remains;
-- `ExecutionSqsIpv6Route` remains;
+- TigerBeetle processor loses its `VpcConfig` and no longer requires VPC networking;
+- the TigerBeetle processor SG remains;
+- `TigerBeetleProcessorSqsIpv6Route` remains;
 - Lambda ENI-management IAM remains; and
 - the external IPv6 associations and EIGW remain untouched.
 
-As in the existing implementation, wait with bounded polling until the execution
+As in the existing implementation, wait with bounded polling until the TigerBeetle processor
 function and all published versions are detached and Lambda-created ENIs using the
-execution SG/subnet have disappeared. There are no endpoint ENIs to classify or exclude.
+TigerBeetle processor SG/subnet have disappeared. There are no endpoint ENIs to classify or exclude.
 EIGWs do not create interface endpoint ENIs.
 
 On timeout or an AWS error, stop with retention still enabled. Do not remove the route or
@@ -399,7 +399,7 @@ SG while Lambda may still use them.
 ### Final cleanup phase
 
 After detachment is proven, deploy with both feature flags false. CloudFormation removes
-the SAM-owned IPv6 route, execution SG, and conditional ENI-management IAM. Preserve the
+the SAM-owned IPv6 route, TigerBeetle processor SG, and conditional ENI-management IAM. Preserve the
 validated route-table and EIGW parameter values through this deploy so deletion is
 unambiguous; clear optional saved inputs only after the update succeeds.
 
@@ -416,14 +416,14 @@ Those resources predate or outlive the application stack and may serve other wor
 ### Properties retained
 
 - The EIGW rejects unsolicited internet-initiated IPv6 connections.
-- The execution SG allows no inbound traffic.
+- The TigerBeetle processor SG allows no inbound traffic.
 - TigerBeetle remains limited to IPv4 TCP/3000 at `10.200.0.2/32`.
 - IAM can remain limited to `sqs:SendMessage` on `CompletionQueue`.
 - Completion remains outside the VPC and needs no new networking.
 
 ### Properties weaker than an interface endpoint
 
-The SG's `::/0` TCP/443 rule permits execution code to reach any public IPv6 HTTPS
+The SG's `::/0` TCP/443 rule permits TigerBeetle processor code to reach any public IPv6 HTTPS
 destination, not only SQS. AWS does not publish an SQS managed prefix list that can be
 referenced by an SG. IAM restricts what AWS API actions the function can authorize, but it
 is not a general network destination control.
@@ -439,7 +439,7 @@ control should keep the SQS interface endpoint.
 
 ### IAM is unchanged by the route
 
-The EIGW and route require no IAM permission in the execution role. The role still needs
+The EIGW and route require no IAM permission in the TigerBeetle processor role. The role still needs
 only the existing `sqs:SendMessage` permission on `CompletionQueue` for this call. Do not
 add wildcard SQS actions or resources to compensate for network changes.
 
@@ -485,11 +485,11 @@ Update repository tests to prove:
 
 - no SQS interface endpoint, endpoint SG, endpoint policy, or endpoint output exists;
 - the obsolete DynamoDB gateway endpoint and output are gone;
-- execution's enabled `VpcConfig` contains `Ipv6AllowedForDualStack: true`;
-- execution sets `AWS_USE_DUALSTACK_ENDPOINT` to `"true"` while VPC-attached;
-- execution SG has IPv6 TCP/443 to `::/0`, retains IPv4 TCP/3000 to
+- TigerBeetle processor's enabled `VpcConfig` contains `Ipv6AllowedForDualStack: true`;
+- TigerBeetle processor sets `AWS_USE_DUALSTACK_ENDPOINT` to `"true"` while VPC-attached;
+- TigerBeetle processor SG has IPv6 TCP/443 to `::/0`, retains IPv4 TCP/3000 to
   `10.200.0.2/32`, and has no IPv4 public HTTPS rule;
-- `ExecutionSqsIpv6Route` is conditional on retained cleanup resources and targets the
+- `TigerBeetleProcessorSqsIpv6Route` is conditional on retained cleanup resources and targets the
   supplied EIGW with exactly `DestinationIpv6CidrBlock: "::/0"`;
 - Completion is not VPC-attached;
 - helper discovery rejects missing, malformed, multiple, mismatched, or detached EIGWs;
@@ -502,7 +502,7 @@ Update repository tests to prove:
 After implementation, run the repository-prescribed local checks:
 
 ```sh
-bash -n deploy.sh wireguard-gateway-setup.sh tests/*.sh
+bash -n deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh
 zig build test-deploy
 sam validate --template-file template.yaml --region ca-central-1
 sam validate --lint --template-file template.yaml --region ca-central-1
@@ -515,12 +515,12 @@ authorization. In a disposable or approved environment:
 
 1. Verify the Lambda subnet route table has no IPv4 internet/NAT default route.
 2. Enable the WireGuard deployment with the validated dual-stack prerequisites.
-3. Read back execution's VPC configuration and confirm
+3. Read back TigerBeetle processor's VPC configuration and confirm
    `Ipv6AllowedForDualStack=true`, the intended subnet, and the intended SG.
 4. Submit an Operation that reaches TigerBeetle and produces one Completion message.
-5. Confirm the completion Lambda consumes it and performs the intended DynamoDB
+5. Confirm the Completion processor consumes it and performs the intended DynamoDB
    transition.
-6. Confirm VPC Flow Logs show execution ENI IPv6 TCP/443 traffic and no dependency on
+6. Confirm VPC Flow Logs show TigerBeetle processor ENI IPv6 TCP/443 traffic and no dependency on
    IPv4 public HTTPS egress.
 7. Exercise guarded disable and verify the route/SG remain until Lambda ENIs drain, then
    disappear in the final cleanup update while the external EIGW and IPv6 allocations
@@ -535,7 +535,7 @@ operator VPC's effective NACL/routing behavior.
 ### From the existing DynamoDB endpoint
 
 Apply this design only after the completion consumer owns the DynamoDB update.
-Removing `ExecutionDynamoDBGatewayEndpoint` earlier would cut off the current execution
+Removing `ExecutionDynamoDBGatewayEndpoint` earlier would cut off the current TigerBeetle processor
 handler's DynamoDB call while it is VPC-attached.
 
 ### From an SQS interface endpoint
@@ -553,7 +553,7 @@ If an SQS endpoint has already been deployed:
 ### Roll back to PrivateLink
 
 Create and validate the SQS interface endpoint, its endpoint SG, private DNS, and endpoint
-policy before removing the IPv6 route. Restore the execution SG's IPv4/private-address
+policy before removing the IPv6 route. Restore the TigerBeetle processor SG's IPv4/private-address
 TCP/443 egress as required by the endpoint ENIs. After the endpoint path succeeds, remove
 the SAM-owned `::/0` route and SDK dual-stack requirement. Leave external IPv6 resources
 alone unless the operator separately decides they are unused.
@@ -564,8 +564,8 @@ alone unless the operator separately decides they are unused.
 
 - Remove the obsolete DynamoDB endpoint/output.
 - Add the EIGW ID parameter and enable/retention rules.
-- Enable `Ipv6AllowedForDualStack` on execution.
-- Set `AWS_USE_DUALSTACK_ENDPOINT` while execution is VPC-attached.
+- Enable `Ipv6AllowedForDualStack` on TigerBeetle processor.
+- Set `AWS_USE_DUALSTACK_ENDPOINT` while TigerBeetle processor is VPC-attached.
 - Replace IPv4 public HTTPS SG egress with IPv6 TCP/443.
 - Add the conditional SAM-owned `::/0` route to the operator-owned EIGW.
 - Add no interface endpoint, endpoint SG, endpoint policy, or endpoint output.
@@ -589,7 +589,7 @@ alone unless the operator separately decides they are unused.
 
 ### Update guarded route and SG cleanup
 
-- Retain the execution SG, IPv6 route, EIGW/route parameters, and Lambda ENI IAM during
+- Retain the TigerBeetle processor SG, IPv6 route, EIGW/route parameters, and Lambda ENI IAM during
   detach.
 - Wait only for Lambda VPC configurations, versions, and Lambda-created ENIs.
 - Remove endpoint-ENI classification because no endpoint ENIs exist.

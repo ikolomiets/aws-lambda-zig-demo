@@ -9,7 +9,7 @@ const tigerbeetle = @import("tigerbeetle");
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{
         .{
-            .scope = .execution,
+            .scope = .tiger_beetle_processor,
             .level = .debug,
         },
         .{
@@ -28,7 +28,7 @@ const record_count_max = 10;
 const tigerbeetle_addresses_default = "10.200.0.2:3000";
 const tigerbeetle_addresses_size_max = 4096;
 const tigerbeetle_cluster_id_default = "0";
-const log = std.log.scoped(.execution);
+const log = std.log.scoped(.tiger_beetle_processor);
 
 comptime {
     std.debug.assert(accounting_ledger > 0);
@@ -1071,15 +1071,15 @@ test "malformed non-SQS and oversized batch events are rejected" {
     );
 }
 
-test "execution and AWS SDK debug logging are enabled in ReleaseSafe" {
+test "tiger_beetle_processor and AWS SDK debug logging are enabled in ReleaseSafe" {
     comptime {
         if (std_options.log_level != .info) @compileError("unexpected default log level");
         if (std_options.log_scope_levels.len != 2) @compileError("unexpected log scope count");
-        if (std_options.log_scope_levels[0].scope != .execution) {
-            @compileError("unexpected execution log scope");
+        if (std_options.log_scope_levels[0].scope != .tiger_beetle_processor) {
+            @compileError("unexpected tiger_beetle_processor log scope");
         }
         if (std_options.log_scope_levels[0].level != .debug) {
-            @compileError("execution debug logging is disabled");
+            @compileError("tiger_beetle_processor debug logging is disabled");
         }
         if (std_options.log_scope_levels[1].scope != .aws_sdk) {
             @compileError("unexpected AWS SDK log scope");

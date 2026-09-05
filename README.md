@@ -4,7 +4,7 @@ A 100% Zig implementation of AWS Lambda functions and runtime, integrated with
 DynamoDB and SQS to create an asynchronous operation-processing framework backed
 by TigerBeetle over a WireGuard VPN.
 
-The project builds custom `provided.al2023` intake, query, execution, and completion Lambda
+The project builds custom `provided.al2023` intake, query, TigerBeetle processor, and Completion processor
 bootstraps and a host-native PASETO v4.public utility named `paseto`. The
 stack-aware `persistence.sh` and `queue.sh` commands manage Operations in
 DynamoDB and SQS, while `lambda_logs.sh` downloads any function's CloudWatch
@@ -17,14 +17,14 @@ Operation JSON document, derives required tenant metadata from the verified
 token subject, resolves the exact `<name>Queue` environment mapping, persists
 the Operation idempotently in DynamoDB, submits new work to that SQS queue, and
 returns the current stored output view without the body.
-The execution Lambda consumes Operations SQS batches and creates a replay-safe
+The TigerBeetle processor consumes Operations SQS batches and creates a replay-safe
 TigerBeetle account and transfer for each valid queued `SUBMITTED` Operation. It publishes
 the terminal outcomes in at most one bounded aggregate message containing only Operation IDs
-and tagged success or failure results. The completion Lambda consumes one aggregate at a
+and tagged success or failure results. The Completion processor consumes one aggregate at a
 time and owns the conditional DynamoDB transition from `SUBMITTED` to `COMPLETED`:
 
 ```text
-intake -> TigerBeetle queue -> execution/TigerBeetle -> Completion queue -> completion -> DynamoDB
+intake -> TigerBeetleQueue -> tiger-beetle-processor -> CompletionQueue -> completion-processor -> DynamoDB
 ```
 
 Definitive account or transfer rejections are terminal failures. TigerBeetle or Completion
@@ -35,7 +35,7 @@ DynamoDB uncertainty retries the single Completion queue message.
 
 - Zig 0.16.0 or newer within the supported 0.16.x line.
 - AWS CLI v2 and AWS SAM CLI for the SAM deployment flow and stack queries.
-- `jq` for the Lambda log download helper.
+- `jq` for the Lambda log helper and shell regression tests.
 - An AWS profile with permission to create Lambda, IAM, and CloudFormation
   resources.
 
@@ -45,16 +45,10 @@ The deployment docs use:
 - Region: `ca-central-1`
 - Intake function name: `intake-lambda`
 - Query function name: `query-lambda`
-- Execution function name: `execution-lambda`
-- Completion function name: `completion-lambda`
+- TigerBeetle processor name: `tiger-beetle-processor`
+- Completion processor name: `completion-processor`
 
 Adjust those values for your AWS account as needed.
-
-Before updating an existing `aws-lambda-zig-demo` stack, reuse the current
-`IntakeFunction` physical name as `IntakeFunctionName`. `deploy.sh` enforces
-that match so the existing intake Lambda and Function URL stay managed in
-place. The query Lambda and its Function URL, plus the SQS-driven execution and completion
-Lambdas, are added alongside them.
 
 ## Build the Lambda Stack
 
@@ -76,17 +70,17 @@ Verify the ARM64 Linux executables:
 ```sh
 file zig-out/bin/intake/bootstrap \
   zig-out/bin/query/bootstrap \
-  zig-out/bin/execution/bootstrap \
-  zig-out/bin/completion/bootstrap
+  zig-out/bin/tiger_beetle_processor/bootstrap \
+  zig-out/bin/completion_processor/bootstrap
 ```
 
-Intake, query, and completion are statically linked and single-threaded. Execution is
+Intake, query, and the Completion processor are statically linked and single-threaded. TigerBeetle processor is
 multithread-capable for the TigerBeetle callback thread and is a dynamically
 linked glibc executable. All four are stripped.
 
 ```text
-intake/query/completion: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
-execution:               ELF 64-bit LSB executable, ARM aarch64, dynamically linked, stripped
+intake/query/completion-processor: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
+tiger-beetle-processor:           ELF 64-bit LSB executable, ARM aarch64, dynamically linked, stripped
 ```
 
 Package the executables for Lambda when preparing artifacts manually (`deploy.sh` does this
@@ -95,8 +89,8 @@ automatically):
 ```sh
 zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
 zip -qj query-lambda.zip zig-out/bin/query/bootstrap
-zip -qj execution-lambda.zip zig-out/bin/execution/bootstrap
-zip -qj completion-lambda.zip zig-out/bin/completion/bootstrap
+zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
+zip -qj completion-processor.zip zig-out/bin/completion_processor/bootstrap
 ```
 
 All four zip archives are intentionally ignored by Git because they are generated
@@ -326,12 +320,12 @@ The AWS identity running `queue.sh` needs `sqs:SendMessage` for
 `cloudformation:DescribeStackResource`. These are caller permissions: the Lambda
 roles remain separate. The intake role is limited to table-scoped
 `dynamodb:PutItem` and TigerBeetle queue-scoped `sqs:SendMessage`; the query role has no SQS
-permissions. The execution role can poll only the TigerBeetle queue and send to only the
-Completion queue. The completion role can poll only the Completion queue and has
-table-scoped `dynamodb:UpdateItem`; execution has no DynamoDB permission.
+permissions. The TigerBeetle processor role can poll only the TigerBeetle queue and send to only the
+Completion queue. The Completion processor role can poll only the Completion queue and has
+table-scoped `dynamodb:UpdateItem`; TigerBeetle processor has no DynamoDB permission.
 Once an event source mapping is enabled, `queue.sh <queue-name> receive`
 competes with that queue's Lambda consumer. In this stack, `TigerBeetleQueue`
-feeds execution and `CompletionQueue` feeds completion.
+feeds TigerBeetle processor and `CompletionQueue` feeds the Completion processor.
 
 Both Lambda Function URLs require the token in an HTTP authorization header:
 
@@ -386,7 +380,7 @@ queue mappings or initialize an SQS client. Query DynamoDB request or
 service failures return sanitized HTTP 503; malformed items and unexpected
 failures return sanitized HTTP 500.
 
-The execution Lambda has no authentication configuration or Function URL. It
+The TigerBeetle processor has no authentication configuration or Function URL. It
 receives `COMPLETION_QUEUE_URL`, `TIGERBEETLE_CLUSTER_ID`, and
 `TIGERBEETLE_ADDRESSES`; it reuses its SQS resources and one TigerBeetle client across warm
 invocations. Lambda polls `TigerBeetleQueue` in batches of at most 10 records with no batching
@@ -417,13 +411,13 @@ stage and raw TigerBeetle status:
 Processing continues after every TigerBeetle queue record. Invalid records are acknowledged;
 TigerBeetle client/request and result-construction failures add the exact message ID to
 `batchItemFailures`. The terminal entries are encoded into at most one Completion message per
-execution invocation. Its JSON contract is `{"results":[...]}`, is bounded to 1 MiB, and gives
+TigerBeetle processor invocation. Its JSON contract is `{"results":[...]}`, is bounded to 1 MiB, and gives
 each entry only a canonical `operation_id` and a validated `result`; no Operation snapshot is
 copied. If that single send fails, every TigerBeetle queue record represented in the aggregate
 is retried.
 Account `1` must be pre-provisioned on ledger `1`; the executor never creates it.
 
-The completion Lambda also has no authentication configuration or Function URL. It is not
+The Completion processor also has no authentication configuration or Function URL. It is not
 VPC-attached and receives only `OPERATIONS_TABLE_NAME`. Its event source mapping delivers one
 Completion queue message per invocation. The handler decodes the bounded aggregate and performs
 its DynamoDB updates sequentially. Each write selects only the canonical Operation ID, requires
@@ -444,13 +438,13 @@ successful write receives its actual replay-time timestamp.
 
 `lambda_logs.sh` downloads one Lambda's CloudWatch events into a root-level
 file named after the deployed function. The stack name is fixed as
-`aws-lambda-zig-demo`; choose the explicit intake, query, execution, or completion output:
+`aws-lambda-zig-demo`; choose the explicit intake, query, TigerBeetle processor, or Completion processor output:
 
 ```sh
 ./lambda_logs.sh intake
 ./lambda_logs.sh query
-./lambda_logs.sh execution
-./lambda_logs.sh completion
+./lambda_logs.sh tiger-beetle-processor
+./lambda_logs.sh completion-processor
 ```
 
 The helper uses `AWS_PROFILE` and `AWS_REGION`, defaulting to `dev` and
@@ -494,8 +488,8 @@ sam deploy --guided \
   --parameter-overrides \
     IntakeFunctionName=intake-lambda \
     QueryFunctionName=query-lambda \
-    ExecutionFunctionName=execution-lambda \
-    CompletionFunctionName=completion-lambda \
+    TigerBeetleProcessorName=tiger-beetle-processor \
+    CompletionProcessorName=completion-processor \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -508,12 +502,13 @@ configuration. It is public key material; keep the corresponding private key
 only in the signing environment.
 
 `deploy.sh` builds and packages all four bootstraps, preserves any existing WireGuard state,
-and defaults the execution and completion names to `execution-lambda` and `completion-lambda`.
-Override them with `EXECUTION_FUNCTION_NAME`, `COMPLETION_FUNCTION_NAME`, or the matching
-`--execution-function-name` and `--completion-function-name` options. The template outputs
-`IntakeFunctionName`, `QueryFunctionName`, `ExecutionFunctionName`, and
-`CompletionFunctionName`, plus `IntakeFunctionArn`, `QueryFunctionArn`,
-`ExecutionFunctionArn`, and `CompletionFunctionArn`; only intake and query have Function URL
+and defaults the TigerBeetle processor and Completion processor names to `tiger-beetle-processor` and `completion-processor`.
+Override them with `TIGER_BEETLE_PROCESSOR_NAME`, `COMPLETION_PROCESSOR_NAME`, or the matching
+`--tiger-beetle-processor-name` and `--completion-processor-name` options. Both deployment helpers accept these options.
+The template outputs
+`IntakeFunctionName`, `QueryFunctionName`, `TigerBeetleProcessorName`, and
+`CompletionProcessorName`, plus `IntakeFunctionArn`, `QueryFunctionArn`,
+`TigerBeetleProcessorArn`, and `CompletionProcessorArn`; only intake and query have Function URL
 outputs. Resolve deployed values instead of recording them in documentation:
 
 ```sh
@@ -527,34 +522,34 @@ aws cloudformation describe-stacks \
 ### Connect to External TigerBeetle with an EC2 WireGuard Gateway
 
 `wireguard-gateway-setup.sh` enables, reconfigures, or disables the optional EC2
-WireGuard gateway and VPC-attaches only the execution Lambda so it can reach TigerBeetle on
+WireGuard gateway and VPC-attaches only the TigerBeetle processor so it can reach TigerBeetle on
 a development workstation. `deploy.sh` preserves the current gateway state during ordinary
 application deployments. The feature is disabled on a new stack and incurs EC2 and public
-IPv4/Elastic IP costs when enabled. The completion Lambda stays outside the VPC.
+IPv4/Elastic IP costs when enabled. The Completion processor stays outside the VPC.
 
-The operator supplies an existing VPC, a public gateway subnet, a distinct private execution
-subnet, and the execution subnet's effective route table. The VPC must have an active IPv6
-CIDR association, the execution subnet must have one active IPv6 `/64` contained by that VPC
+The operator supplies an existing VPC, a public gateway subnet, a distinct private TigerBeetle processor
+subnet, and the TigerBeetle processor subnet's effective route table. The VPC must have an active IPv6
+CIDR association, the TigerBeetle processor subnet must have one active IPv6 `/64` contained by that VPC
 allocation, and VPC DNS support and DNS hostnames must be enabled. The gateway subnet still
-needs an IPv4 internet-gateway default route for WireGuard, and the execution subnet's network
+needs an IPv4 internet-gateway default route for WireGuard, and the TigerBeetle processor subnet's network
 ACL must permit outbound IPv6 TCP/443 and the corresponding inbound ephemeral traffic. These
 VPC, subnet, route-table, IPv6-association, DNS, and network-ACL resources remain externally
 managed. Preflight rejects clearly incompatible ACLs, warns when an ordered ACL policy needs
 operator review, and never provisions or changes these external resources.
 
-SAM owns the VPC's one egress-only internet gateway for this deployment, the execution route
-table's `::/0` route to it, the execution security group, and the Lambda dual-stack setting.
+SAM owns the VPC's one egress-only internet gateway for this deployment, the TigerBeetle processor route
+table's `::/0` route to it, the TigerBeetle processor security group, and the Lambda dual-stack setting.
 The security group permits IPv4 TCP/3000 only toward the workstation TigerBeetle address and
 IPv6 TCP/443 to `::/0`. The AWS SDK selects the regional public SQS dual-stack endpoint, so
 Completion publishing uses outbound-only public IPv6 HTTPS. This avoids a paid SQS interface
-endpoint, but the network boundary is any public IPv6 HTTPS destination; the execution role's
+endpoint, but the network boundary is any public IPv6 HTTPS destination; the TigerBeetle processor role's
 queue-scoped `sqs:SendMessage` permission remains the service authorization boundary.
 
 Before first enablement, preflight rejects an existing unmanaged EIGW or `::/0` route. During
 reconfiguration and teardown it verifies that the attached EIGW and route are the current
-stack-owned resources. Disablement first detaches execution while retaining the EIGW, IPv6
-route, execution security group, VPC parameters, and Lambda ENI-management IAM. It removes
-them only after every execution version is detached and Lambda-created ENIs have drained;
+stack-owned resources. Disablement first detaches TigerBeetle processor while retaining the EIGW, IPv6
+route, TigerBeetle processor security group, VPC parameters, and Lambda ENI-management IAM. It removes
+them only after every TigerBeetle processor version is detached and Lambda-created ENIs have drained;
 a timeout leaves those resources retained so `wireguard-gateway-setup.sh --disable` can safely
 resume. External IPv6 associations, routes other than the stack-owned routes, and WireGuard
 key parameters are never deleted.
@@ -569,7 +564,7 @@ parameter, validation, and deployment workflow.
 
 The SAM-managed DynamoDB table and both SQS queues are mandatory. Intake receives the table
 name and TigerBeetle queue URL with table-scoped `PutItem` and queue-scoped `SendMessage`.
-Query receives only the table name and table-scoped `GetItem`. Execution receives the
+Query receives only the table name and table-scoped `GetItem`. TigerBeetle processor receives the
 Completion queue URL and TigerBeetle configuration, polls only the TigerBeetle queue, and can
 send only to the Completion queue; it has no DynamoDB access. Completion receives only the
 table name, polls only the Completion queue, and has table-scoped `UpdateItem`. Both SQS
@@ -665,7 +660,7 @@ performs no read or update after the send.
 Delivery is at least once. The standard queue, acknowledgement loss, and
 concurrent `SUBMITTED` retries can produce duplicate messages, so consumers must
 handle the Operation ID and hash idempotently. Reusing the ID for different
-work or from a different verified subject still returns `409 Conflict`. Execution performs
+work or from a different verified subject still returns `409 Conflict`. TigerBeetle processor performs
 replay-safe TigerBeetle accounting and sends terminal ID/result entries to the Completion
 queue. Completion conditionally updates only a stored `SUBMITTED` item; duplicate or stale
 entries conflict without changing it. TigerBeetle uncertainty retries only the affected
@@ -674,8 +669,8 @@ DynamoDB uncertainty replays the single aggregate Completion message as describe
 
 The template intentionally creates publicly reachable intake POST and query
 GET Function URLs for demo testing, while both Function URL handlers enforce PASETO bearer
-authentication. The execution Lambda has no Function URL and is invoked from SQS.
-The completion Lambda likewise has no Function URL and is invoked from its SQS mapping.
+authentication. The TigerBeetle processor has no Function URL and is invoked from SQS.
+The Completion processor likewise has no Function URL and is invoked from its SQS mapping.
 Production endpoints should also consider stricter infrastructure
 authorization, narrower IAM policies, or a fronting layer such as API Gateway
 or CloudFront.
@@ -684,8 +679,8 @@ or CloudFront.
 
 - `src/intake_lambda.zig`: authenticated POST intake entrypoint, named-queue routing, and handler.
 - `src/query_lambda.zig`: authenticated tenant-scoped Operation GET entrypoint and handler.
-- `src/execution_lambda.zig`: SQS-driven execution entrypoint and handler.
-- `src/completion_lambda.zig`: SQS-driven conditional completion entrypoint and handler.
+- `src/tiger_beetle_processor.zig`: SQS-driven TigerBeetle processor entrypoint and handler.
+- `src/completion_processor.zig`: SQS-driven conditional completion entrypoint and handler.
 - `src/completion_batch.zig`: bounded aggregate Completion message contract and codec.
 - `src/lambda_auth.zig`: shared bearer-token parsing and PASETO verification.
 - `src/operation.zig`: Operation JSON model, validation, and hash contract.
@@ -710,14 +705,14 @@ or CloudFront.
 Run formatting checks before committing Zig changes:
 
 ```sh
-zig fmt --check build.zig src/completion_batch.zig src/completion_lambda.zig \
-  src/execution_lambda.zig src/intake_lambda.zig src/lambda_auth.zig \
+zig fmt --check build.zig src/completion_batch.zig src/completion_processor.zig \
+  src/tiger_beetle_processor.zig src/intake_lambda.zig src/lambda_auth.zig \
   src/query_lambda.zig \
   src/operation.zig src/operation_persistence.zig src/sqs_queue.zig \
   src/persistence_cli.zig src/queue_cli.zig src/paseto.zig src/paseto_cli.zig
 ```
 
-Run only the dependency-free deployment-helper regression tests with:
+Run only the local deployment-helper regression tests with:
 
 ```sh
 zig build test-deploy

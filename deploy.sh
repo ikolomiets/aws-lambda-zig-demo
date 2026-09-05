@@ -6,8 +6,8 @@ REGION="${REGION:-ca-central-1}"
 STACK_NAME="${STACK_NAME:-aws-lambda-zig-demo}"
 INTAKE_FUNCTION_NAME="${INTAKE_FUNCTION_NAME:-intake-lambda}"
 QUERY_FUNCTION_NAME="${QUERY_FUNCTION_NAME:-query-lambda}"
-EXECUTION_FUNCTION_NAME="${EXECUTION_FUNCTION_NAME:-execution-lambda}"
-COMPLETION_FUNCTION_NAME="${COMPLETION_FUNCTION_NAME:-completion-lambda}"
+TIGER_BEETLE_PROCESSOR_NAME="${TIGER_BEETLE_PROCESSOR_NAME:-tiger-beetle-processor}"
+COMPLETION_PROCESSOR_NAME="${COMPLETION_PROCESSOR_NAME:-completion-processor}"
 TIGERBEETLE_CLUSTER_ID="${TIGERBEETLE_CLUSTER_ID:-0}"
 TIGERBEETLE_ADDRESSES="${TIGERBEETLE_ADDRESSES:-10.200.0.2:3000}"
 LAMBDA_PRINCIPAL="${LAMBDA_PRINCIPAL:-*}"
@@ -16,7 +16,6 @@ LOCAL_AWS_LAMBDA_ROOT="${LOCAL_AWS_LAMBDA_ROOT:-../aws-lambda-zig}"
 DRY_RUN=0
 CHECK_URL=1
 USE_LOCAL_LIBS=0
-MIGRATION_CHECK_ONLY=0
 DEPLOYMENT_STARTED=0
 DEPLOYMENT_ERROR_PHASE="deployment"
 DEPLOYMENT_CONTROLLER="${DEPLOYMENT_CONTROLLER:-preserve_wireguard_state}"
@@ -39,10 +38,10 @@ Options:
                          Intake Lambda name. Defaults to intake-lambda.
   --query-function-name NAME
                          Query Lambda name. Defaults to query-lambda.
-  --execution-function-name NAME
-                         Execution Lambda name. Defaults to execution-lambda.
-  --completion-function-name NAME
-                         Completion Lambda name. Defaults to completion-lambda.
+  --tiger-beetle-processor-name NAME
+                         TigerBeetle processor name. Defaults to tiger-beetle-processor.
+  --completion-processor-name NAME
+                         Completion processor name. Defaults to completion-processor.
   --tigerbeetle-cluster-id ID
                          Unsigned decimal cluster ID. Defaults to 0.
   --tigerbeetle-addresses ADDRESSES
@@ -52,13 +51,12 @@ Options:
   --use-local-libs       Use local dependency checkouts with zig build --fork.
                          aws_lambda defaults to ../aws-lambda-zig.
   --dry-run              Run local checks, build, package, and validation only.
-  --migration-check-only Validate the existing intake function name, then exit.
   --no-url-check         Skip the post-deploy Function URL HTTP status check.
   -h, --help             Show this help.
 
 Environment overrides:
   PROFILE, REGION, STACK_NAME, INTAKE_FUNCTION_NAME, QUERY_FUNCTION_NAME,
-  EXECUTION_FUNCTION_NAME, COMPLETION_FUNCTION_NAME, TIGERBEETLE_CLUSTER_ID,
+  TIGER_BEETLE_PROCESSOR_NAME, COMPLETION_PROCESSOR_NAME, TIGERBEETLE_CLUSTER_ID,
   TIGERBEETLE_ADDRESSES, LAMBDA_PRINCIPAL, PASETO_PRIVATE_KEY,
   PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT
 
@@ -94,13 +92,20 @@ need_command() {
     command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
 
-validate_completion_function_name() {
-    [ -n "$COMPLETION_FUNCTION_NAME" ] ||
-        fail "COMPLETION_FUNCTION_NAME must not be empty"
-    [ "${#COMPLETION_FUNCTION_NAME}" -le 64 ] ||
-        fail "COMPLETION_FUNCTION_NAME must be at most 64 characters"
-    [[ "$COMPLETION_FUNCTION_NAME" =~ ^[A-Za-z0-9_-]+$ ]] ||
-        fail "COMPLETION_FUNCTION_NAME must contain only letters, digits, hyphens, and underscores"
+reject_retired_processor_overrides() {
+    [ "${EXECUTION_FUNCTION_NAME+x}" != x ] ||
+        fail "EXECUTION_FUNCTION_NAME is retired; unset it and use TIGER_BEETLE_PROCESSOR_NAME"
+    [ "${COMPLETION_FUNCTION_NAME+x}" != x ] ||
+        fail "COMPLETION_FUNCTION_NAME is retired; unset it and use COMPLETION_PROCESSOR_NAME"
+}
+
+validate_completion_processor_name() {
+    [ -n "$COMPLETION_PROCESSOR_NAME" ] ||
+        fail "COMPLETION_PROCESSOR_NAME must not be empty"
+    [ "${#COMPLETION_PROCESSOR_NAME}" -le 64 ] ||
+        fail "COMPLETION_PROCESSOR_NAME must be at most 64 characters"
+    [[ "$COMPLETION_PROCESSOR_NAME" =~ ^[A-Za-z0-9_-]+$ ]] ||
+        fail "COMPLETION_PROCESSOR_NAME must contain only letters, digits, hyphens, and underscores"
 }
 
 validate_tigerbeetle_configuration() {
@@ -204,7 +209,7 @@ validate_existing_intake_name() {
 
     case "$physical_name" in
         *"does not exist"*)
-            printf '==> Stack %s does not exist; no intake-name migration is required\n' \
+            printf '==> Stack %s does not exist; ready for first deployment\n' \
                 "$STACK_NAME"
             ;;
         *) fail "could not inspect IntakeFunction in stack $STACK_NAME" ;;
@@ -219,7 +224,7 @@ load_preserved_wireguard_parameters() {
     DEPLOYMENT_PARAMETER_OVERRIDES=()
     if ! stack_parameters="$(aws cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Parameters[?ParameterKey=='EnableWireGuardGateway' || ParameterKey=='RetainExecutionVpcCleanupResources' || ParameterKey=='VpcId' || ParameterKey=='GatewayPublicSubnetId' || ParameterKey=='LambdaSubnetId' || ParameterKey=='LambdaRouteTableId' || ParameterKey=='LambdaSubnetCidr' || ParameterKey=='WireGuardPrivateKeyParameterName' || ParameterKey=='WireGuardPrivateKeyParameterVersion' || ParameterKey=='WireGuardGatewayPublicKey' || ParameterKey=='WireGuardWorkstationPublicKey' || ParameterKey=='WireGuardAmiId' || ParameterKey=='WireGuardInstanceType'].join('|', [ParameterKey,ParameterValue])" \
+        --query "Stacks[0].Parameters[?ParameterKey=='EnableWireGuardGateway' || ParameterKey=='RetainTigerBeetleProcessorVpcCleanupResources' || ParameterKey=='VpcId' || ParameterKey=='GatewayPublicSubnetId' || ParameterKey=='LambdaSubnetId' || ParameterKey=='LambdaRouteTableId' || ParameterKey=='LambdaSubnetCidr' || ParameterKey=='WireGuardPrivateKeyParameterName' || ParameterKey=='WireGuardPrivateKeyParameterVersion' || ParameterKey=='WireGuardGatewayPublicKey' || ParameterKey=='WireGuardWorkstationPublicKey' || ParameterKey=='WireGuardAmiId' || ParameterKey=='WireGuardInstanceType'].join('|', [ParameterKey,ParameterValue])" \
         --output text \
         --profile "$PROFILE" \
         --region "$REGION" \
@@ -229,7 +234,7 @@ load_preserved_wireguard_parameters() {
             *"does not exist"*)
                 DEPLOYMENT_PARAMETER_OVERRIDES=(
                     "EnableWireGuardGateway=false"
-                    "RetainExecutionVpcCleanupResources=false"
+                    "RetainTigerBeetleProcessorVpcCleanupResources=false"
                 )
                 return 0
                 ;;
@@ -252,7 +257,7 @@ load_preserved_wireguard_parameters() {
             EnableWireGuardGateway)
                 enable_wireguard_gateway="$parameter_value"
                 ;;
-            RetainExecutionVpcCleanupResources)
+            RetainTigerBeetleProcessorVpcCleanupResources)
                 retain_cleanup_resources="$parameter_value"
                 ;;
             VpcId | GatewayPublicSubnetId | LambdaSubnetId | \
@@ -280,7 +285,7 @@ load_preserved_wireguard_parameters() {
     esac
     case "$retain_cleanup_resources" in
         true | false) ;;
-        *) fail "stack returned an invalid RetainExecutionVpcCleanupResources value" ;;
+        *) fail "stack returned an invalid RetainTigerBeetleProcessorVpcCleanupResources value" ;;
     esac
 
     if [ "$enable_wireguard_gateway" = false ] &&
@@ -300,7 +305,7 @@ preserve_wireguard_state() {
             else
                 DEPLOYMENT_PARAMETER_OVERRIDES=(
                     "EnableWireGuardGateway=false"
-                    "RetainExecutionVpcCleanupResources=false"
+                    "RetainTigerBeetleProcessorVpcCleanupResources=false"
                 )
             fi
             ;;
@@ -322,8 +327,8 @@ build_sam_parameter_overrides() {
     SAM_PARAMETER_OVERRIDES=(
         "IntakeFunctionName=$INTAKE_FUNCTION_NAME"
         "QueryFunctionName=$QUERY_FUNCTION_NAME"
-        "ExecutionFunctionName=$EXECUTION_FUNCTION_NAME"
-        "CompletionFunctionName=$COMPLETION_FUNCTION_NAME"
+        "TigerBeetleProcessorName=$TIGER_BEETLE_PROCESSOR_NAME"
+        "CompletionProcessorName=$COMPLETION_PROCESSOR_NAME"
         "TigerBeetleClusterId=$TIGERBEETLE_CLUSTER_ID"
         "TigerBeetleAddresses=$TIGERBEETLE_ADDRESSES"
         "LambdaPrincipal=$LAMBDA_PRINCIPAL"
@@ -431,11 +436,11 @@ deploy_stack_and_resolve_controller_outputs() {
 validate_deployed_function_names() {
     local stack_outputs line output_key output_value
     local deployed_intake_name="" deployed_query_name=""
-    local deployed_execution_name="" deployed_completion_name=""
+    local deployed_tiger_beetle_processor_name="" deployed_completion_processor_name=""
 
     stack_outputs="$(aws cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='IntakeFunctionName' || OutputKey=='QueryFunctionName' || OutputKey=='ExecutionFunctionName' || OutputKey=='CompletionFunctionName'].join('|', [OutputKey,OutputValue])" \
+        --query "Stacks[0].Outputs[?OutputKey=='IntakeFunctionName' || OutputKey=='QueryFunctionName' || OutputKey=='TigerBeetleProcessorName' || OutputKey=='CompletionProcessorName'].join('|', [OutputKey,OutputValue])" \
         --output text \
         --profile "$PROFILE" \
         --region "$REGION")" ||
@@ -448,8 +453,8 @@ validate_deployed_function_names() {
         case "$output_key" in
             IntakeFunctionName) deployed_intake_name="$output_value" ;;
             QueryFunctionName) deployed_query_name="$output_value" ;;
-            ExecutionFunctionName) deployed_execution_name="$output_value" ;;
-            CompletionFunctionName) deployed_completion_name="$output_value" ;;
+            TigerBeetleProcessorName) deployed_tiger_beetle_processor_name="$output_value" ;;
+            CompletionProcessorName) deployed_completion_processor_name="$output_value" ;;
             *) fail "stack returned an unexpected Lambda function-name output" ;;
         esac
     done <<<"${stack_outputs//$'\t'/$'\n'}"
@@ -458,16 +463,23 @@ validate_deployed_function_names() {
         fail "stack output IntakeFunctionName does not match the requested name"
     [ "$deployed_query_name" = "$QUERY_FUNCTION_NAME" ] ||
         fail "stack output QueryFunctionName does not match the requested name"
-    [ "$deployed_execution_name" = "$EXECUTION_FUNCTION_NAME" ] ||
-        fail "stack output ExecutionFunctionName does not match the requested name"
-    [ "$deployed_completion_name" = "$COMPLETION_FUNCTION_NAME" ] ||
-        fail "stack output CompletionFunctionName does not match the requested name"
+    [ "$deployed_tiger_beetle_processor_name" = "$TIGER_BEETLE_PROCESSOR_NAME" ] ||
+        fail "stack output TigerBeetleProcessorName does not match the requested name"
+    [ "$deployed_completion_processor_name" = "$COMPLETION_PROCESSOR_NAME" ] ||
+        fail "stack output CompletionProcessorName does not match the requested name"
     printf '==> Deployed Lambda function names match requested values\n'
 }
 
 parse_deployment_options() {
+    reject_retired_processor_overrides
     while [ "$#" -gt 0 ]; do
         case "$1" in
+            --execution-function-name | --execution-function-name=*)
+                fail "--execution-function-name is retired; use --tiger-beetle-processor-name"
+                ;;
+            --completion-function-name | --completion-function-name=*)
+                fail "--completion-function-name is retired; use --completion-processor-name"
+                ;;
             --profile)
                 need_value "$1" "${2:-}"
                 PROFILE="$2"
@@ -520,26 +532,26 @@ parse_deployment_options() {
                     fail "empty value for --query-function-name"
                 shift
                 ;;
-            --execution-function-name)
+            --tiger-beetle-processor-name)
                 need_value "$1" "${2:-}"
-                EXECUTION_FUNCTION_NAME="$2"
+                TIGER_BEETLE_PROCESSOR_NAME="$2"
                 shift 2
                 ;;
-            --execution-function-name=*)
-                EXECUTION_FUNCTION_NAME="${1#*=}"
-                [ -n "$EXECUTION_FUNCTION_NAME" ] ||
-                    fail "empty value for --execution-function-name"
+            --tiger-beetle-processor-name=*)
+                TIGER_BEETLE_PROCESSOR_NAME="${1#*=}"
+                [ -n "$TIGER_BEETLE_PROCESSOR_NAME" ] ||
+                    fail "empty value for --tiger-beetle-processor-name"
                 shift
                 ;;
-            --completion-function-name)
+            --completion-processor-name)
                 need_value "$1" "${2:-}"
-                COMPLETION_FUNCTION_NAME="$2"
+                COMPLETION_PROCESSOR_NAME="$2"
                 shift 2
                 ;;
-            --completion-function-name=*)
-                COMPLETION_FUNCTION_NAME="${1#*=}"
-                [ -n "$COMPLETION_FUNCTION_NAME" ] ||
-                    fail "empty value for --completion-function-name"
+            --completion-processor-name=*)
+                COMPLETION_PROCESSOR_NAME="${1#*=}"
+                [ -n "$COMPLETION_PROCESSOR_NAME" ] ||
+                    fail "empty value for --completion-processor-name"
                 shift
                 ;;
             --tigerbeetle-cluster-id)
@@ -582,10 +594,6 @@ parse_deployment_options() {
                 DRY_RUN=1
                 shift
                 ;;
-            --migration-check-only)
-                MIGRATION_CHECK_ONLY=1
-                shift
-                ;;
             --no-url-check)
                 CHECK_URL=0
                 shift
@@ -616,12 +624,12 @@ parse_deployment_options() {
 }
 
 validate_lambda_bootstraps() {
-    local bootstrap artifact_type execution_artifact_type
+    local bootstrap artifact_type tiger_beetle_processor_artifact_type
 
     for bootstrap in \
         zig-out/bin/intake/bootstrap \
         zig-out/bin/query/bootstrap \
-        zig-out/bin/completion/bootstrap
+        zig-out/bin/completion_processor/bootstrap
     do
         artifact_type="$(file "$bootstrap")"
         case "$artifact_type" in
@@ -631,12 +639,12 @@ validate_lambda_bootstraps() {
         printf '%s\n' "$artifact_type"
     done
 
-    execution_artifact_type="$(file zig-out/bin/execution/bootstrap)"
-    case "$execution_artifact_type" in
+    tiger_beetle_processor_artifact_type="$(file zig-out/bin/tiger_beetle_processor/bootstrap)"
+    case "$tiger_beetle_processor_artifact_type" in
         *"ELF 64-bit LSB executable"*aarch64*"dynamically linked"*"stripped"*) ;;
-        *) fail "unexpected execution bootstrap artifact type: $execution_artifact_type" ;;
+        *) fail "unexpected TigerBeetle processor bootstrap artifact type: $tiger_beetle_processor_artifact_type" ;;
     esac
-    printf '%s\n' "$execution_artifact_type"
+    printf '%s\n' "$tiger_beetle_processor_artifact_type"
 }
 
 package_lambda_archives() {
@@ -645,18 +653,18 @@ package_lambda_archives() {
     rm -f \
         intake-lambda.zip \
         query-lambda.zip \
-        execution-lambda.zip \
-        completion-lambda.zip
+        tiger-beetle-processor.zip \
+        completion-processor.zip
     zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
     zip -qj query-lambda.zip zig-out/bin/query/bootstrap
-    zip -qj execution-lambda.zip zig-out/bin/execution/bootstrap
-    zip -qj completion-lambda.zip zig-out/bin/completion/bootstrap
+    zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
+    zip -qj completion-processor.zip zig-out/bin/completion_processor/bootstrap
 
     for archive in \
         intake-lambda.zip \
         query-lambda.zip \
-        execution-lambda.zip \
-        completion-lambda.zip
+        tiger-beetle-processor.zip \
+        completion-processor.zip
     do
         [ -s "$archive" ] || fail "$archive was not created or is empty"
         archive_contents="$(unzip -Z1 "$archive")"
@@ -667,29 +675,20 @@ package_lambda_archives() {
 
 run_deployment() {
     parse_deployment_options "$@"
-    validate_completion_function_name
+    validate_completion_processor_name
 
     cd "$(dirname "${BASH_SOURCE[0]}")"
     CACHE_DIR=".zig-cache-deploy"
     GLOBAL_CACHE_DIR=".zig-global-cache-deploy"
     trap deployment_cleanup EXIT
 
-    [ "$DRY_RUN" -eq 0 ] || [ "$MIGRATION_CHECK_ONLY" -eq 0 ] ||
-        fail "--dry-run and --migration-check-only cannot be combined"
-
-    if [ "$MIGRATION_CHECK_ONLY" -eq 0 ]; then
-        validate_tigerbeetle_configuration
-    fi
+    validate_tigerbeetle_configuration
 
     if [ "$DRY_RUN" -eq 0 ]; then
         need_command aws
         prepare_aws_sso_session "$PROFILE"
         ensure_stack_not_in_progress
         validate_existing_intake_name "$INTAKE_FUNCTION_NAME"
-    fi
-    if [ "$MIGRATION_CHECK_ONLY" -eq 1 ]; then
-        printf '==> Intake-name migration check complete. Skipped build and deploy.\n'
-        return 0
     fi
 
     [ -n "$PASETO_PUBLIC_KEY" ] ||
@@ -725,8 +724,8 @@ run_deployment() {
     zig fmt --check \
         build.zig \
         src/completion_batch.zig \
-        src/completion_lambda.zig \
-        src/execution_lambda.zig \
+        src/completion_processor.zig \
+        src/tiger_beetle_processor.zig \
         src/intake_lambda.zig \
         src/lambda_auth.zig \
         src/paseto.zig \

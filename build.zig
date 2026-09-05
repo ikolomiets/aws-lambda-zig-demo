@@ -66,12 +66,12 @@ fn tigerbeetle_target_unsupported(target: std.Target) noreturn {
     );
 }
 
-fn execution_lambda_target(
+fn resolve_tiger_beetle_processor_target(
     b: *std.Build,
     arch: lambda.Arch,
 ) std.Build.ResolvedTarget {
     if (arch != .arm) {
-        std.debug.panic("the TigerBeetle execution Lambda requires -Darch=arm", .{});
+        std.debug.panic("the TigerBeetle processor requires -Darch=arm", .{});
     }
     return b.resolveTargetQuery(.{
         .cpu_arch = .aarch64,
@@ -99,7 +99,7 @@ pub fn build(b: *std.Build) void {
         "Lambda CPU architecture (defaults to arm)",
     ) orelse .arm;
     const lambda_target = lambda.resolveTargetQuery(b, lambda_arch);
-    const execution_target = execution_lambda_target(b, lambda_arch);
+    const tiger_beetle_processor_target = resolve_tiger_beetle_processor_target(b, lambda_arch);
     const lambda_aws_sdk = b.dependency("aws_sdk", .{
         .target = lambda_target,
         .optimize = optimize,
@@ -162,46 +162,46 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sqs", .module = lambda_sqs },
         },
     });
-    const execution_aws_sdk = b.dependency("aws_sdk", .{
-        .target = execution_target,
+    const tiger_beetle_processor_aws_sdk = b.dependency("aws_sdk", .{
+        .target = tiger_beetle_processor_target,
         .optimize = optimize,
     });
-    const execution_aws = execution_aws_sdk.module("aws");
-    const execution_sqs = execution_aws_sdk.module("sqs");
-    const execution_runtime = b.dependency("aws_lambda", .{
-        .target = execution_target,
+    const tiger_beetle_processor_aws = tiger_beetle_processor_aws_sdk.module("aws");
+    const tiger_beetle_processor_sqs = tiger_beetle_processor_aws_sdk.module("sqs");
+    const tiger_beetle_processor_runtime = b.dependency("aws_lambda", .{
+        .target = tiger_beetle_processor_target,
     }).module("lambda");
-    const execution_operation = b.createModule(.{
-        .target = execution_target,
+    const tiger_beetle_processor_operation = b.createModule(.{
+        .target = tiger_beetle_processor_target,
         .optimize = optimize,
         .root_source_file = b.path("src/operation.zig"),
     });
-    const execution_completion_batch = b.createModule(.{
-        .target = execution_target,
+    const tiger_beetle_processor_completion_batch = b.createModule(.{
+        .target = tiger_beetle_processor_target,
         .optimize = optimize,
         .root_source_file = b.path("src/completion_batch.zig"),
         .imports = &.{
-            .{ .name = "operation", .module = execution_operation },
+            .{ .name = "operation", .module = tiger_beetle_processor_operation },
         },
     });
-    const execution_sqs_queue = b.createModule(.{
-        .target = execution_target,
+    const tiger_beetle_processor_sqs_queue = b.createModule(.{
+        .target = tiger_beetle_processor_target,
         .optimize = optimize,
         .root_source_file = b.path("src/sqs_queue.zig"),
         .imports = &.{
-            .{ .name = "aws", .module = execution_aws },
-            .{ .name = "sqs", .module = execution_sqs },
+            .{ .name = "aws", .module = tiger_beetle_processor_aws },
+            .{ .name = "sqs", .module = tiger_beetle_processor_sqs },
         },
     });
     const tigerbeetle_c_lambda = add_tigerbeetle_c_module(
         b,
         tigerbeetle_c_artifacts,
-        execution_target,
+        tiger_beetle_processor_target,
         optimize,
     );
     const tigerbeetle_lambda = add_tigerbeetle_module(
         b,
-        execution_target,
+        tiger_beetle_processor_target,
         optimize,
         tigerbeetle_c_lambda,
     );
@@ -256,10 +256,10 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&install_query_lambda.step);
 
-    const completion_lambda_mod = b.createModule(.{
+    const completion_processor_mod = b.createModule(.{
         .target = lambda_target,
         .optimize = optimize,
-        .root_source_file = b.path("src/completion_lambda.zig"),
+        .root_source_file = b.path("src/completion_processor.zig"),
         .strip = true,
         .single_threaded = true,
         .imports = &.{
@@ -270,43 +270,43 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation_persistence", .module = lambda_operation_persistence },
         },
     });
-    const completion_lambda_exe = b.addExecutable(.{
-        .name = "completion-bootstrap",
-        .root_module = completion_lambda_mod,
+    const completion_processor_exe = b.addExecutable(.{
+        .name = "completion-processor-bootstrap",
+        .root_module = completion_processor_mod,
     });
-    const install_completion_lambda = b.addInstallArtifact(completion_lambda_exe, .{
-        .dest_dir = .{ .override = .{ .custom = "bin/completion" } },
+    const install_completion_processor = b.addInstallArtifact(completion_processor_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "bin/completion_processor" } },
         .dest_sub_path = "bootstrap",
     });
-    b.getInstallStep().dependOn(&install_completion_lambda.step);
+    b.getInstallStep().dependOn(&install_completion_processor.step);
 
-    const execution_lambda_mod = b.createModule(.{
-        .target = execution_target,
+    const tiger_beetle_processor_mod = b.createModule(.{
+        .target = tiger_beetle_processor_target,
         .optimize = optimize,
-        .root_source_file = b.path("src/execution_lambda.zig"),
+        .root_source_file = b.path("src/tiger_beetle_processor.zig"),
         .strip = true,
         // TigerBeetle completes requests from its native client thread.
         .single_threaded = false,
         .imports = &.{
-            .{ .name = "aws", .module = execution_aws },
-            .{ .name = "aws-lambda", .module = execution_runtime },
-            .{ .name = "completion_batch", .module = execution_completion_batch },
-            .{ .name = "operation", .module = execution_operation },
-            .{ .name = "sqs_queue", .module = execution_sqs_queue },
+            .{ .name = "aws", .module = tiger_beetle_processor_aws },
+            .{ .name = "aws-lambda", .module = tiger_beetle_processor_runtime },
+            .{ .name = "completion_batch", .module = tiger_beetle_processor_completion_batch },
+            .{ .name = "operation", .module = tiger_beetle_processor_operation },
+            .{ .name = "sqs_queue", .module = tiger_beetle_processor_sqs_queue },
             .{ .name = tigerbeetle_import_name, .module = tigerbeetle_lambda },
         },
     });
-    const execution_lambda_exe = b.addExecutable(.{
-        .name = "execution-bootstrap",
-        .root_module = execution_lambda_mod,
+    const tiger_beetle_processor_exe = b.addExecutable(.{
+        .name = "tiger-beetle-processor-bootstrap",
+        .root_module = tiger_beetle_processor_mod,
         // Temporary workaround for the Zig stdlib hostname-connect stall.
         .zig_lib_dir = .{ .cwd_relative = "../zig/lib" },
     });
-    const install_execution_lambda = b.addInstallArtifact(execution_lambda_exe, .{
-        .dest_dir = .{ .override = .{ .custom = "bin/execution" } },
+    const install_tiger_beetle_processor = b.addInstallArtifact(tiger_beetle_processor_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "bin/tiger_beetle_processor" } },
         .dest_sub_path = "bootstrap",
     });
-    b.getInstallStep().dependOn(&install_execution_lambda.step);
+    b.getInstallStep().dependOn(&install_tiger_beetle_processor.step);
 
     const host_aws_sdk = b.dependency("aws_sdk", .{
         .target = b.graph.host,
@@ -466,10 +466,10 @@ pub fn build(b: *std.Build) void {
     });
     const run_query_tests = b.addRunArtifact(query_tests);
 
-    const execution_test_mod = b.createModule(.{
+    const tiger_beetle_processor_test_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
-        .root_source_file = b.path("src/execution_lambda.zig"),
+        .root_source_file = b.path("src/tiger_beetle_processor.zig"),
         .single_threaded = false,
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
@@ -480,15 +480,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = tigerbeetle_import_name, .module = tigerbeetle_host },
         },
     });
-    const execution_tests = b.addTest(.{
-        .root_module = execution_test_mod,
+    const tiger_beetle_processor_tests = b.addTest(.{
+        .root_module = tiger_beetle_processor_test_mod,
     });
-    const run_execution_tests = b.addRunArtifact(execution_tests);
+    const run_tiger_beetle_processor_tests = b.addRunArtifact(tiger_beetle_processor_tests);
 
-    const completion_test_mod = b.createModule(.{
+    const completion_processor_test_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
-        .root_source_file = b.path("src/completion_lambda.zig"),
+        .root_source_file = b.path("src/completion_processor.zig"),
         .single_threaded = true,
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
@@ -498,10 +498,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation_persistence", .module = host_operation_persistence },
         },
     });
-    const completion_tests = b.addTest(.{
-        .root_module = completion_test_mod,
+    const completion_processor_tests = b.addTest(.{
+        .root_module = completion_processor_test_mod,
     });
-    const run_completion_tests = b.addRunArtifact(completion_tests);
+    const run_completion_processor_tests = b.addRunArtifact(completion_processor_tests);
 
     const lambda_auth_tests = b.addTest(.{
         .root_module = host_lambda_auth,
@@ -689,6 +689,9 @@ pub fn build(b: *std.Build) void {
         b.path("tests/deploy_gateway_interface_test.sh"),
     );
 
+    const processor_interface_test = b.addSystemCommand(&.{"bash"});
+    processor_interface_test.addFileArg(b.path("tests/processor_interface_test.sh"));
+
     const deploy_test_step = b.step(
         "test-deploy",
         "Run deployment helper regression tests",
@@ -696,12 +699,13 @@ pub fn build(b: *std.Build) void {
     deploy_test_step.dependOn(&wireguard_discovery_test.step);
     deploy_test_step.dependOn(&cleanup_lifecycle_test.step);
     deploy_test_step.dependOn(&gateway_interface_test.step);
+    deploy_test_step.dependOn(&processor_interface_test.step);
 
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_lambda_auth_tests.step);
     test_step.dependOn(&run_query_tests.step);
-    test_step.dependOn(&run_execution_tests.step);
-    test_step.dependOn(&run_completion_tests.step);
+    test_step.dependOn(&run_tiger_beetle_processor_tests.step);
+    test_step.dependOn(&run_completion_processor_tests.step);
     test_step.dependOn(&run_lambda_tests.step);
     test_step.dependOn(&run_completion_batch_tests.step);
     test_step.dependOn(&run_operation_tests.step);

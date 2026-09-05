@@ -10,7 +10,7 @@ readonly stack_name="aws-lambda-zig-demo"
 
 usage() {
     cat <<'EOF'
-Usage: ./lambda_logs.sh intake|query|execution|completion
+Usage: ./lambda_logs.sh intake|query|tiger-beetle-processor|completion-processor
 
 Download one Lambda's logs and append new CloudWatch events to
 <function-name>.log in this repository.
@@ -32,9 +32,11 @@ need_command() {
 
 case "$#" in
     1) ;;
-    *) fail "specify exactly one Lambda: intake, query, execution, or completion" ;;
+    *) fail "specify exactly one Lambda: intake, query, tiger-beetle-processor, or completion-processor" ;;
 esac
 case "$1" in
+    execution) fail "execution is retired; use tiger-beetle-processor" ;;
+    completion) fail "completion is retired; use completion-processor" ;;
     -h | --help)
         usage
         exit 0
@@ -45,13 +47,13 @@ case "$1" in
     query)
         readonly function_output_key="QueryFunctionName"
         ;;
-    execution)
-        readonly function_output_key="ExecutionFunctionName"
+    tiger-beetle-processor)
+        readonly function_output_key="TigerBeetleProcessorName"
         ;;
-    completion)
-        readonly function_output_key="CompletionFunctionName"
+    completion-processor)
+        readonly function_output_key="CompletionProcessorName"
         ;;
-    *) fail "unknown Lambda: $1; expected intake, query, execution, or completion" ;;
+    *) fail "unknown Lambda: $1; expected intake, query, tiger-beetle-processor, or completion-processor" ;;
 esac
 
 need_command aws

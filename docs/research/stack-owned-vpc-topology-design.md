@@ -12,11 +12,11 @@ own:
 
 - one application VPC;
 - one IPv4 public subnet for the WireGuard EC2 gateway;
-- one dual-stack private subnet for the execution Lambda;
+- one dual-stack private subnet for the TigerBeetle processor;
 - separate public and private route tables and explicit subnet associations;
 - the VPC's internet gateway (IGW), egress-only internet gateway (EIGW), and
   their required routes; and
-- the existing execution and gateway security groups.
+- the existing TigerBeetle processor and gateway security groups.
 
 The resulting transport preserves the current design:
 
@@ -31,7 +31,7 @@ stack IGW -> public gateway subnet -> WireGuard EC2 + Elastic IP
                                       v
                               workstation TigerBeetle
 
-execution Lambda -> private dual-stack subnet
+TigerBeetle processor -> private dual-stack subnet
         |                    |
         | IPv4              | IPv6 TCP/443
         v                    v
@@ -42,7 +42,7 @@ to WireGuard EC2
 The public gateway subnet is intentionally IPv4-only. The gateway already needs
 an Elastic IP for the workstation tunnel and IPv4 internet access for bootstrap
 and Systems Manager. Giving it public IPv6 would add a second public exposure
-path with no current use. The execution subnet is dual-stack because Lambda
+path with no current use. The TigerBeetle processor subnet is dual-stack because Lambda
 requires both an IPv4 and IPv6 CIDR when `Ipv6AllowedForDualStack` is enabled;
 Lambda does not support this outbound mode from an IPv6-only subnet
 ([Lambda VPC and IPv6 behavior](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html)).
@@ -56,7 +56,7 @@ from accepting infrastructure that another owner creates and deletes.
 ## Scope and availability boundary
 
 The repository is a development/demo topology with one WireGuard EC2 instance,
-one execution subnet, and one Availability Zone. Keep both subnets in the same
+one TigerBeetle processor subnet, and one Availability Zone. Keep both subnets in the same
 AZ to preserve the current topology and avoid introducing a cross-AZ dependency.
 This is not a production high-availability design: the WireGuard instance,
 tunnel, and workstation are all single points of failure. AWS recommends using
@@ -78,7 +78,7 @@ such as `10.42.0.0/16`, and derive two `/24` subnets from it:
 | --- | --- | --- |
 | VPC IPv4 | `10.42.0.0/16` | Stack-owned private address space |
 | Public gateway subnet | `10.42.0.0/24` | WireGuard EC2, Elastic IP, IGW route |
-| Private execution subnet | `10.42.1.0/24` | Lambda Hyperplane ENIs and the WireGuard route |
+| Private TigerBeetle processor subnet | `10.42.1.0/24` | Lambda Hyperplane ENIs and the WireGuard route |
 | WireGuard tunnel | `10.200.0.0/24` | Existing out-of-VPC tunnel network; unchanged |
 | TigerBeetle peer | `10.200.0.2/32` | Existing routed destination; unchanged |
 
@@ -102,7 +102,7 @@ For IPv6, create an `AWS::EC2::VPCCidrBlock` with
 `AmazonProvidedIpv6CidrBlock: true`. AWS allocates a public `/56`; the range and
 size cannot be selected by the template
 ([`AWS::EC2::VPCCidrBlock`](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-ec2-vpccidrblock.html)).
-Derive one `/64` for the execution subnet from the first VPC IPv6 range by using
+Derive one `/64` for the TigerBeetle processor subnet from the first VPC IPv6 range by using
 the same form as AWS's CloudFormation IPv6 example:
 
 ```yaml
@@ -136,7 +136,7 @@ copying physical IDs into parameters.
 | Application VPC | `AWS::EC2::VPC` | IPv4 `/16`, `EnableDnsSupport: true`, `EnableDnsHostnames: true`, stack tags |
 | VPC IPv6 allocation | `AWS::EC2::VPCCidrBlock` | `VpcId: !Ref ApplicationVpc`, `AmazonProvidedIpv6CidrBlock: true` |
 | Public gateway subnet | `AWS::EC2::Subnet` | First derived IPv4 `/24`, selected AZ, `MapPublicIpOnLaunch: false`, no IPv6 CIDR |
-| Private execution subnet | `AWS::EC2::Subnet` | Second IPv4 `/24`, first VPC IPv6 `/64`, same AZ, no automatic public IPv4 or general IPv6 assignment |
+| Private TigerBeetle processor subnet | `AWS::EC2::Subnet` | Second IPv4 `/24`, first VPC IPv6 `/64`, same AZ, no automatic public IPv4 or general IPv6 assignment |
 | Internet gateway | `AWS::EC2::InternetGateway` | Stack tags |
 | IGW attachment | `AWS::EC2::VPCGatewayAttachment` | References the VPC and IGW |
 | Public route table | `AWS::EC2::RouteTable` | References the VPC |
@@ -147,10 +147,10 @@ copying physical IDs into parameters.
 | Egress-only internet gateway | `AWS::EC2::EgressOnlyInternetGateway` | References the VPC |
 | Private IPv6 default route | `AWS::EC2::Route` | `::/0` to the EIGW in the private route table |
 | WireGuard route | existing `AWS::EC2::Route` | `10.200.0.0/24` to the stack-owned gateway instance in the private route table |
-| Execution security group | existing `AWS::EC2::SecurityGroup` | References the VPC; IPv4 TCP/3000 to `10.200.0.2/32`, IPv6 TCP/443 to `::/0` |
+| TigerBeetle processor security group | existing `AWS::EC2::SecurityGroup` | References the VPC; IPv4 TCP/3000 to `10.200.0.2/32`, IPv6 TCP/443 to `::/0` |
 | Gateway security group | existing `AWS::EC2::SecurityGroup` | References the VPC; existing UDP/51820 and forwarded TigerBeetle rules |
 | Gateway launch template | existing `AWS::EC2::LaunchTemplate` | References the stack-owned public subnet and gateway security group |
-| Execution Lambda VPC config | existing SAM function property | References the stack-owned private subnet and execution security group; keeps `Ipv6AllowedForDualStack: true` |
+| TigerBeetle processor VPC config | existing SAM function property | References the stack-owned private subnet and TigerBeetle processor security group; keeps `Ipv6AllowedForDualStack: true` |
 
 `AWS::EC2::VPC` requires an IPv4 CIDR; its `CidrBlock` property is a
 replacement property, while its DNS attributes can update without interruption
@@ -166,7 +166,7 @@ and [routes](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateRefere
 The template should output the created VPC, subnet, and route-table IDs and the
 derived Lambda IPv4 CIDR for diagnostics and workstation configuration. Outputs
 are observability conveniences, not inputs or a second ownership path. Replace
-uses of `LambdaSubnetCidr` with `!GetAtt ExecutionLambdaSubnet.CidrBlock`,
+uses of `LambdaSubnetCidr` with `!GetAtt TigerBeetleProcessorSubnet.CidrBlock`,
 including the WireGuard security-group rule and the peer configuration output.
 
 ## Dependency and routing model
@@ -178,17 +178,17 @@ Use those implicit dependencies for most of the graph and add explicit
 `DependsOn` only where readiness is not represented by a property reference:
 
 1. `VpcIpv6CidrBlock` references `ApplicationVpc`.
-2. `ExecutionLambdaSubnet` references `ApplicationVpc` and explicitly depends
+2. `TigerBeetleProcessorSubnet` references `ApplicationVpc` and explicitly depends
    on `VpcIpv6CidrBlock` before reading `ApplicationVpc.Ipv6CidrBlocks`.
 3. `InternetGatewayAttachment` references the VPC and IGW.
 4. `GatewayPublicIpv4DefaultRoute` references the public route table and IGW,
    and explicitly depends on `InternetGatewayAttachment`. AWS uses this exact
    dependency pattern for a route to an IGW
    ([`AWS::EC2::Route` example](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-ec2-route.html#aws-resource-ec2-route--examples)).
-5. `ExecutionEgressOnlyInternetGateway` references the VPC, and
-   `ExecutionSqsIpv6Route` references both the private route table and EIGW.
+5. `TigerBeetleProcessorEgressOnlyInternetGateway` references the VPC, and
+   `TigerBeetleProcessorSqsIpv6Route` references both the private route table and EIGW.
 6. The gateway launch template references the public subnet and security group.
-7. The execution Lambda references the private subnet and execution security
+7. The TigerBeetle processor references the private subnet and TigerBeetle processor security
    group.
 8. `WireGuardLambdaRoute` references the private route table and gateway
    instance and retains its existing readiness dependency on the gateway's
@@ -233,7 +233,7 @@ Set both `EnableDnsSupport` and `EnableDnsHostnames` explicitly to `true`.
 supports Amazon-provided DNS names. The resolver is available through VPC-local
 addresses, including the VPC base address plus two
 ([Amazon VPC DNS](https://docs.aws.amazon.com/vpc/latest/userguide/AmazonDNS-concepts.html)).
-The execution SDK must retain `AWS_USE_DUALSTACK_ENDPOINT=true` while it is
+The TigerBeetle processor SDK must retain `AWS_USE_DUALSTACK_ENDPOINT=true` while it is
 VPC-attached so the SQS hostname resolves to the public dual-stack service
 endpoint used by the current implementation. SQS publishes regional endpoints that
 resolve over IPv4 and IPv6, and the standard SDK environment setting opts into dual-stack
@@ -244,7 +244,7 @@ endpoint selection
 Keep the existing least-privilege security groups rather than using the default
 security group:
 
-- execution: no ingress; outbound IPv4 TCP/3000 only to `10.200.0.2/32`; outbound
+- TigerBeetle processor: no ingress; outbound IPv4 TCP/3000 only to `10.200.0.2/32`; outbound
   IPv6 TCP/443 to `::/0`;
 - gateway: public IPv4 UDP/51820 ingress; forwarded IPv4 TCP/3000 ingress only
   from the derived Lambda subnet CIDR; existing IPv4 egress needed for package
@@ -280,23 +280,23 @@ Route 53 Resolver DNS Firewall if DNS filtering ever becomes a requirement.
 
 ## Conditions, ownership, and deletion lifecycle
 
-Reuse the existing `ExecutionVpcCleanupResourcesRetained` condition:
+Reuse the existing `TigerBeetleProcessorVpcCleanupResourcesRetained` condition:
 
 ```text
-ExecutionVpcCleanupResourcesRetained =
-    EnableWireGuardGateway OR RetainExecutionVpcCleanupResources
+TigerBeetleProcessorVpcCleanupResourcesRetained =
+    EnableWireGuardGateway OR RetainTigerBeetleProcessorVpcCleanupResources
 ```
 
 Apply it to the entire stack-owned topology: VPC, IPv6 association, both
 subnets, both route tables and associations, IGW and attachment, EIGW, default
-routes, execution security group, and any custom ACL resources. Gateway compute,
+routes, TigerBeetle processor security group, and any custom ACL resources. Gateway compute,
 Elastic IP, gateway security group, and the WireGuard route remain conditioned
 only on `EnableWireGuardGateway`. This yields three intentional states:
 
 | Gateway | Retain cleanup | Result |
 | --- | --- | --- |
-| `true` | either | Full topology and gateway are active; execution is VPC-attached |
-| `false` | `true` | Gateway is gone and execution is detached, but topology/IAM needed for ENI cleanup remain |
+| `true` | either | Full topology and gateway are active; TigerBeetle processor is VPC-attached |
+| `false` | `true` | Gateway is gone and TigerBeetle processor is detached, but topology/IAM needed for ENI cleanup remain |
 | `false` | `false` | Optional topology and cleanup IAM are deleted |
 
 Use explicit `DeletionPolicy: Delete` and `UpdateReplacePolicy: Delete` for the
@@ -311,7 +311,7 @@ The condition, not a retention policy, supplies the temporary cleanup hold.
 Keep the existing guarded-detach state machine. Lambda can take up to
 20 minutes to delete a Hyperplane ENI after VPC detachment and will not delete
 an ENI still used by another function or published version. It also needs the
-execution role's ENI permissions during cleanup
+TigerBeetle processor role's ENI permissions during cleanup
 ([Lambda ENI lifecycle](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html#configuration-vpc-enis)).
 CloudFormation waits for Lambda-created ENIs before deleting a same-stack VPC
 only when the stack operation identity has `ec2:DescribeNetworkInterfaces`
@@ -319,7 +319,7 @@ only when the stack operation identity has `ec2:DescribeNetworkInterfaces`
 
 The safe disable/delete order is therefore:
 
-1. Deploy gateway disabled with retention enabled; detach execution and delete
+1. Deploy gateway disabled with retention enabled; detach TigerBeetle processor and delete
    gateway compute while keeping the complete network and ENI-management IAM.
 2. Wait for the function configuration, all published versions, and the bounded
    set of Lambda-created ENIs to detach or disappear.
@@ -328,7 +328,7 @@ The safe disable/delete order is therefore:
 4. Clear saved optional high-level inputs only after the final update succeeds.
 
 On timeout or AWS error, leave retention enabled. Do not attempt to delete the
-VPC, subnet, route table, security group, or execution role underneath a live
+VPC, subnet, route table, security group, or TigerBeetle processor role underneath a live
 Lambda ENI. Direct stack deletion must also be tested because out-of-band ENIs,
 routes, or gateway attachments can cause `DELETE_FAILED`; that failure is safer
 than silently orphaning a dependency. AWS requires the dependent VPC resources
@@ -353,7 +353,7 @@ creates an explicit maintenance window and new gateway Elastic IP; the
 workstation WireGuard peer must be refreshed after re-enable.
 
 Always preview topology updates with a CloudFormation change set and inspect
-every `Replacement: True` or conditional deletion before execution
+every `Replacement: True` or conditional deletion before TigerBeetle processor
 ([CloudFormation change sets](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-cfn-updating-stacks-changesets.html)).
 
 ## Staged migration from the operator-owned topology
@@ -367,7 +367,7 @@ that changes Lambda and gateway references. Use this staged, reversible path:
    separately authorized deployment, verify the existing external dual-stack
    topology, WireGuard/TigerBeetle path, and SQS completion send.
 2. **Drain the old optional deployment with the existing implementation.** Use
-   the existing guarded disable. Confirm execution and all versions are
+   the existing guarded disable. Confirm TigerBeetle processor and all versions are
    detached, Lambda ENIs are gone, and the stack-owned old-VPC EIGW, routes,
    security groups, EC2 gateway, and Elastic IP have been deleted. The external
    VPC/subnets/routes/IPv6 associations remain untouched.
@@ -379,15 +379,15 @@ that changes Lambda and gateway references. Use this staged, reversible path:
    graph, gateway, and Lambda attachment in dependency order. Capture the new
    Elastic IP and regenerate/update the workstation peer configuration.
 5. **Run transport acceptance.** Verify the WireGuard handshake and
-   TigerBeetle operation, then verify execution sends the aggregate Completion
+   TigerBeetle operation, then verify TigerBeetle processor sends the aggregate Completion
    message over the SQS dual-stack endpoint and completion persists it.
 6. **Retire the old external topology separately.** If it was exclusively for
    this demo, inventory it and delete it only through an explicit,
    operator-authorized procedure. It was never in the stack, so the new template
    must not claim or delete it. If it contains any unrelated workload, leave it.
 
-This migration has an intentional WireGuard/execution maintenance window. Intake
-can continue to enqueue work, but execution should be disabled or allowed to
+This migration has an intentional WireGuard/TigerBeetle processor maintenance window. Intake
+can continue to enqueue work, but TigerBeetle processor should be disabled or allowed to
 retry rather than pointed at a half-migrated route.
 
 ### Import alternative: possible but not recommended
@@ -426,7 +426,7 @@ Rollback must distinguish application rollback from topology rollback:
   IPs, ENIs, IGWs, EIGWs, subnets, and route tables before retrying.
 - **After successful enablement:** roll application code or configuration back
   within the new VPC when possible. Do not roll the topology template backward
-  under a live execution Lambda.
+  under a live TigerBeetle processor.
 - **To return to the external topology:** guarded-disable and delete the new
   stack-owned topology first, deploy the prior disabled template, then re-enable
   with the external IDs. This is another maintenance-window operation.
@@ -448,7 +448,7 @@ implementation.
 - Remove the five external topology ID/CIDR parameters and their Rules.
 - Reference stack resources from both security groups, the launch template,
   Lambda `VpcConfig`, routes, and outputs.
-- Put the whole topology on `ExecutionVpcCleanupResourcesRetained` and preserve
+- Put the whole topology on `TigerBeetleProcessorVpcCleanupResourcesRetained` and preserve
   the narrower `WireGuardGatewayEnabled` condition for gateway compute.
 - Add explicit delete policies and tags; do not add NAT or endpoint resources.
 
@@ -491,8 +491,8 @@ sam validate --lint --template-file template.yaml --region ca-central-1
 Static/mocked tests should prove:
 
 - there are no external topology ID parameters or SAM overrides;
-- the `/24` IPv4 subnets and execution `/64` are derived from their VPC ranges;
-- the execution subnet waits for the VPC IPv6 association;
+- the `/24` IPv4 subnets and TigerBeetle processor `/64` are derived from their VPC ranges;
+- the TigerBeetle processor subnet waits for the VPC IPv6 association;
 - the public route targets the IGW only after attachment;
 - the private IPv6 route targets the stack EIGW and no private IPv4 default
   route exists;
@@ -511,7 +511,7 @@ later authorized disposable-stack exercise:
 2. Read back VPC DNS attributes, IPv4/IPv6 associations, subnet CIDRs, effective
    route tables, IGW/EIGW attachments, routes, security groups, and network ACL.
 3. Confirm `sqs.<region>.api.aws` has an IPv6 result in the supported Region and
-   that the execution Lambda can send only through the configured dual-stack
+   that the TigerBeetle processor can send only through the configured dual-stack
    path.
 4. Verify WireGuard bootstrap/SSM registration, workstation handshake,
    TigerBeetle TCP/3000 routing, the Completion SQS send, and completion

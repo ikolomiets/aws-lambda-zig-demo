@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Deploy intake, query, execution, and completion Lambdas with an optional WireGuard gateway.
+Description: Deploy intake and query Lambdas plus TigerBeetle and Completion processors with an optional WireGuard gateway.
 
 # Opt-in network parameters intentionally default to empty and are guarded by a Rule.
 Metadata:
@@ -18,20 +18,20 @@ Parameters:
     Type: String
     Default: query-lambda
     Description: Name of the operation query Lambda function.
-  ExecutionFunctionName:
+  TigerBeetleProcessorName:
     Type: String
-    Default: execution-lambda
-    Description: Name of the operation execution Lambda function.
-  CompletionFunctionName:
+    Default: tiger-beetle-processor
+    Description: Name of the TigerBeetle processor Lambda function.
+  CompletionProcessorName:
     Type: String
-    Default: completion-lambda
-    Description: Name of the operation completion Lambda function.
+    Default: completion-processor
+    Description: Name of the Completion processor Lambda function.
   TigerBeetleClusterId:
     Type: String
     Default: "0"
     AllowedPattern: '^[0-9]{1,39}$'
     ConstraintDescription: Must be an unsigned decimal 128-bit cluster ID.
-    Description: TigerBeetle cluster ID used by the execution Lambda.
+    Description: TigerBeetle cluster ID used by the TigerBeetle processor.
   TigerBeetleAddresses:
     Type: String
     Default: 10.200.0.2:3000
@@ -39,7 +39,7 @@ Parameters:
     MaxLength: 4096
     AllowedPattern: '^\S+$'
     ConstraintDescription: Must be a non-empty address list without whitespace.
-    Description: Comma-separated TigerBeetle replica addresses used by the execution Lambda.
+    Description: Comma-separated TigerBeetle replica addresses used by the TigerBeetle processor.
   LambdaPrincipal:
     Type: String
     Default: "*"
@@ -54,13 +54,13 @@ Parameters:
       - "true"
       - "false"
     Description: Whether to provision the optional EC2 WireGuard gateway.
-  RetainExecutionVpcCleanupResources:
+  RetainTigerBeetleProcessorVpcCleanupResources:
     Type: String
     Default: "false"
     AllowedValues:
       - "true"
       - "false"
-    Description: Internal deploy-helper switch retaining the stack-owned EIGW, IPv6 route, execution security group, and Lambda ENI cleanup resources during VPC detachment.
+    Description: Internal deploy-helper switch retaining the stack-owned EIGW, IPv6 route, TigerBeetle processor security group, and Lambda ENI cleanup resources during VPC detachment.
   VpcId:
     Type: String
     Default: ""
@@ -78,13 +78,13 @@ Parameters:
     Default: ""
     AllowedPattern: '^$|^subnet-([0-9a-f]{8}|[0-9a-f]{17})$'
     ConstraintDescription: Must be an EC2 subnet ID.
-    Description: ID of the existing private execution subnet; its IPv6 CIDR association remains externally managed.
+    Description: ID of the existing private TigerBeetle processor subnet; its IPv6 CIDR association remains externally managed.
   LambdaRouteTableId:
     Type: String
     Default: ""
     AllowedPattern: '^$|^rtb-([0-9a-f]{8}|[0-9a-f]{17})$'
     ConstraintDescription: Must be an EC2 route-table ID.
-    Description: ID of the external route table where SAM manages execution-specific routes.
+    Description: ID of the external route table where SAM manages TigerBeetle processor routes.
   LambdaSubnetCidr:
     Type: String
     Default: ""
@@ -147,19 +147,19 @@ Rules:
         AssertDescription: WireGuardAmiId is required when the WireGuard gateway is enabled.
       - Assert: !Not [!Equals [!Ref WireGuardInstanceType, ""]]
         AssertDescription: WireGuardInstanceType is required when the gateway is enabled.
-  ExecutionVpcCleanupInputsRequired:
-    RuleCondition: !Equals [!Ref RetainExecutionVpcCleanupResources, "true"]
+  TigerBeetleProcessorVpcCleanupInputsRequired:
+    RuleCondition: !Equals [!Ref RetainTigerBeetleProcessorVpcCleanupResources, "true"]
     Assertions:
       - Assert: !Not [!Equals [!Ref VpcId, ""]]
-        AssertDescription: VpcId is required while execution VPC cleanup resources are retained.
+        AssertDescription: VpcId is required while TigerBeetle processor VPC cleanup resources are retained.
       - Assert: !Not [!Equals [!Ref LambdaRouteTableId, ""]]
-        AssertDescription: LambdaRouteTableId is required while execution VPC cleanup resources are retained.
+        AssertDescription: LambdaRouteTableId is required while TigerBeetle processor VPC cleanup resources are retained.
 
 Conditions:
   WireGuardGatewayEnabled: !Equals [!Ref EnableWireGuardGateway, "true"]
-  ExecutionVpcCleanupResourcesRetained: !Or
+  TigerBeetleProcessorVpcCleanupResourcesRetained: !Or
     - !Condition WireGuardGatewayEnabled
-    - !Equals [!Ref RetainExecutionVpcCleanupResources, "true"]
+    - !Equals [!Ref RetainTigerBeetleProcessorVpcCleanupResources, "true"]
 
 Resources:
   OperationsTable:
@@ -304,7 +304,7 @@ Resources:
 
   # Keep this role explicit so the deploy helper can retain ENI cleanup permissions
   # only between the VPC-detach and cleanup phases.
-  ExecutionFunctionRole:
+  TigerBeetleProcessorRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -318,7 +318,7 @@ Resources:
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: ExecutionFunctionTigerBeetleQueuePoller
+        - PolicyName: TigerBeetleProcessorTigerBeetleQueuePoller
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -331,7 +331,7 @@ Resources:
                   - sqs:GetQueueAttributes
                   - sqs:ReceiveMessage
                 Resource: !GetAtt TigerBeetleQueue.Arn
-        - PolicyName: ExecutionFunctionCompletionPublisher
+        - PolicyName: TigerBeetleProcessorCompletionPublisher
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -340,8 +340,8 @@ Resources:
                   - sqs:SendMessage
                 Resource: !GetAtt CompletionQueue.Arn
         - !If
-          - ExecutionVpcCleanupResourcesRetained
-          - PolicyName: ExecutionFunctionVpcAccess
+          - TigerBeetleProcessorVpcCleanupResourcesRetained
+          - PolicyName: TigerBeetleProcessorVpcAccess
             PolicyDocument:
               Version: "2012-10-17"
               Statement:
@@ -356,19 +356,19 @@ Resources:
                   Resource: "*"
           - !Ref AWS::NoValue
 
-  ExecutionFunction:
+  TigerBeetleProcessor:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Ref ExecutionFunctionName
-      Description: SQS-driven operation execution function built with aws-lambda-zig.
-      CodeUri: execution-lambda.zip
+      FunctionName: !Ref TigerBeetleProcessorName
+      Description: SQS-driven TigerBeetle processor built with aws-lambda-zig.
+      CodeUri: tiger-beetle-processor.zip
       Runtime: provided.al2023
       Handler: bootstrap
       Architectures:
         - arm64
       MemorySize: 128
       Timeout: 15
-      Role: !GetAtt ExecutionFunctionRole.Arn
+      Role: !GetAtt TigerBeetleProcessorRole.Arn
       Environment:
         Variables:
           AWS_USE_DUALSTACK_ENDPOINT: !If
@@ -382,15 +382,15 @@ Resources:
         - WireGuardGatewayEnabled
         - Ipv6AllowedForDualStack: true
           SecurityGroupIds:
-            - !Ref ExecutionLambdaSecurityGroup
+            - !Ref TigerBeetleProcessorSecurityGroup
           SubnetIds:
             - !Ref LambdaSubnetId
         - !Ref AWS::NoValue
 
-  ExecutionFunctionTigerBeetleQueueMapping:
+  TigerBeetleProcessorQueueMapping:
     Type: AWS::Lambda::EventSourceMapping
     Properties:
-      FunctionName: !Ref ExecutionFunction
+      FunctionName: !Ref TigerBeetleProcessor
       EventSourceArn: !GetAtt TigerBeetleQueue.Arn
       Enabled: true
       BatchSize: 10
@@ -400,7 +400,7 @@ Resources:
       FunctionResponseTypes:
         - ReportBatchItemFailures
 
-  CompletionFunctionRole:
+  CompletionProcessorRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -414,7 +414,7 @@ Resources:
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: CompletionFunctionSqsPoller
+        - PolicyName: CompletionProcessorSqsPoller
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -427,7 +427,7 @@ Resources:
                   - sqs:GetQueueAttributes
                   - sqs:ReceiveMessage
                 Resource: !GetAtt CompletionQueue.Arn
-        - PolicyName: CompletionFunctionOperationUpdate
+        - PolicyName: CompletionProcessorOperationUpdate
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -436,27 +436,27 @@ Resources:
                   - dynamodb:UpdateItem
                 Resource: !GetAtt OperationsTable.Arn
 
-  CompletionFunction:
+  CompletionProcessor:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Ref CompletionFunctionName
-      Description: SQS-driven operation completion function built with aws-lambda-zig.
-      CodeUri: completion-lambda.zip
+      FunctionName: !Ref CompletionProcessorName
+      Description: SQS-driven Completion processor built with aws-lambda-zig.
+      CodeUri: completion-processor.zip
       Runtime: provided.al2023
       Handler: bootstrap
       Architectures:
         - arm64
       MemorySize: 128
       Timeout: 15
-      Role: !GetAtt CompletionFunctionRole.Arn
+      Role: !GetAtt CompletionProcessorRole.Arn
       Environment:
         Variables:
           OPERATIONS_TABLE_NAME: !Ref OperationsTable
 
-  CompletionFunctionCompletionQueueMapping:
+  CompletionProcessorQueueMapping:
     Type: AWS::Lambda::EventSourceMapping
     Properties:
-      FunctionName: !Ref CompletionFunction
+      FunctionName: !Ref CompletionProcessor
       EventSourceArn: !GetAtt CompletionQueue.Arn
       Enabled: true
       BatchSize: 1
@@ -464,9 +464,9 @@ Resources:
       FunctionResponseTypes:
         - ReportBatchItemFailures
 
-  ExecutionLambdaSecurityGroup:
+  TigerBeetleProcessorSecurityGroup:
     Type: AWS::EC2::SecurityGroup
-    Condition: ExecutionVpcCleanupResourcesRetained
+    Condition: TigerBeetleProcessorVpcCleanupResourcesRetained
     # The gateway and cleanup Rules exclude an empty VPC before this resource exists.
     Metadata:
       cfn-lint:
@@ -474,7 +474,7 @@ Resources:
           ignore_checks:
             - W1030
     Properties:
-      GroupDescription: Stack-owned execution Lambda egress to TigerBeetle and AWS APIs.
+      GroupDescription: Stack-owned TigerBeetle processor egress to TigerBeetle and AWS APIs.
       VpcId: !Ref VpcId
       SecurityGroupIngress: []
       SecurityGroupEgress:
@@ -489,25 +489,25 @@ Resources:
           ToPort: 443
           CidrIpv6: "::/0"
 
-  # SAM owns the EIGW and execution route. The supplied VPC and subnet IPv6
+  # SAM owns the EIGW and TigerBeetle processor route. The supplied VPC and subnet IPv6
   # CIDR associations are prerequisites and remain externally managed.
-  ExecutionEgressOnlyInternetGateway:
+  TigerBeetleProcessorEgressOnlyInternetGateway:
     Type: AWS::EC2::EgressOnlyInternetGateway
-    Condition: ExecutionVpcCleanupResourcesRetained
+    Condition: TigerBeetleProcessorVpcCleanupResourcesRetained
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
       VpcId: !Ref VpcId
 
-  ExecutionSqsIpv6Route:
+  TigerBeetleProcessorSqsIpv6Route:
     Type: AWS::EC2::Route
-    Condition: ExecutionVpcCleanupResourcesRetained
+    Condition: TigerBeetleProcessorVpcCleanupResourcesRetained
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
       RouteTableId: !Ref LambdaRouteTableId
       DestinationIpv6CidrBlock: "::/0"
-      EgressOnlyInternetGatewayId: !Ref ExecutionEgressOnlyInternetGateway
+      EgressOnlyInternetGatewayId: !Ref TigerBeetleProcessorEgressOnlyInternetGateway
 
   WireGuardGatewaySecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -733,18 +733,18 @@ Outputs:
   QueryFunctionUrl:
     Description: Public tenant-scoped operation query Lambda Function URL.
     Value: !GetAtt QueryFunctionUrl.FunctionUrl
-  ExecutionFunctionName:
-    Description: Deployed operation execution Lambda function name.
-    Value: !Ref ExecutionFunction
-  ExecutionFunctionArn:
-    Description: Deployed operation execution Lambda function ARN.
-    Value: !GetAtt ExecutionFunction.Arn
-  CompletionFunctionName:
-    Description: Deployed operation completion Lambda function name.
-    Value: !Ref CompletionFunction
-  CompletionFunctionArn:
-    Description: Deployed operation completion Lambda function ARN.
-    Value: !GetAtt CompletionFunction.Arn
+  TigerBeetleProcessorName:
+    Description: Deployed TigerBeetle processor Lambda function name.
+    Value: !Ref TigerBeetleProcessor
+  TigerBeetleProcessorArn:
+    Description: Deployed TigerBeetle processor Lambda function ARN.
+    Value: !GetAtt TigerBeetleProcessor.Arn
+  CompletionProcessorName:
+    Description: Deployed Completion processor Lambda function name.
+    Value: !Ref CompletionProcessor
+  CompletionProcessorArn:
+    Description: Deployed Completion processor Lambda function ARN.
+    Value: !GetAtt CompletionProcessor.Arn
   WireGuardGatewayInstanceId:
     Condition: WireGuardGatewayEnabled
     Description: EC2 instance ID of the WireGuard gateway.
