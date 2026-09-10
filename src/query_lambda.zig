@@ -1189,3 +1189,48 @@ fn testEnvironment(seed_byte: u8) !std.process.Environ.Map {
 fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, haystack, needle) == null);
 }
+
+test "authenticated query preserves full 96 KiB Result inside HTTP metadata framing" {
+    const token = try testToken(0x72);
+    defer std.testing.allocator.free(token);
+    var environment = try testEnvironment(0x72);
+    defer environment.deinit();
+    const event = try testRequestEvent(.{
+        .method = .GET,
+        .token = token,
+        .raw_path = "/00112233-4455-6677-8899-aabbccddeeff",
+    });
+    defer std.testing.allocator.free(event);
+    var stored = testOperation("lambda-test-user", .completed);
+    const payload = "a" ** (98304 - 31);
+    stored.state = .{ .completed = .{ .success = .{ .string = payload } } };
+    var fake: FakeQuery = .{ .response = stored };
+    const response = handleInvocationForTest(std.testing.allocator, event, &environment, &fake, 1000);
+    defer std.testing.allocator.free(response);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const outer = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), response, .{});
+    try std.testing.expectEqual(@as(i64, 200), outer.object.get("statusCode").?.integer);
+    const body = outer.object.get("body").?.string;
+    try std.testing.expect(body.len > 98304);
+    const decoded = try operation.parseOutputJSON(arena.allocator(), body);
+    try std.testing.expectEqualStrings(payload, decoded.state.completed.success.string);
+    try std.testing.expectEqualStrings("lambda-test-user", decoded.tenant);
+}
+
+/// Runs the authenticated query handler with a local persistence response and an empty cache.
+pub const test_support = if (@import("builtin").is_test) struct {
+    pub fn query(allocator: Allocator, stored: *const operation.Operation) ![]const u8 {
+        const token = try testTokenForSubject(0x72, stored.tenant);
+        defer std.testing.allocator.free(token);
+        var environment = try testEnvironment(0x72);
+        defer environment.deinit();
+        var uuid: [operation.uuid_string_size]u8 = undefined;
+        const path = try std.fmt.allocPrint(allocator, "/{s}", .{operation.uuidToString(stored.id, &uuid)});
+        defer allocator.free(path);
+        const event = try testRequestEvent(.{ .method = .GET, .token = token, .raw_path = path });
+        defer std.testing.allocator.free(event);
+        var fake: FakeQuery = .{ .response = stored.* };
+        return handleInvocationForTest(allocator, event, &environment, &fake, 1000);
+    }
+} else struct {};

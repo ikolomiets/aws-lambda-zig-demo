@@ -8,6 +8,8 @@ Metadata:
     config:
       ignore_checks:
         - W1030
+        # String allows an empty AMI while disabled; syntax and enablement are guarded.
+        - W2506
 
 Parameters:
   IntakeFunctionName:
@@ -115,9 +117,10 @@ Parameters:
     ConstraintDescription: Must be a padded 44-character WireGuard Base64 public key.
     Description: Public key of the development workstation WireGuard peer.
   WireGuardAmiId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
-    Description: Parameter Store path resolving to the ARM64 gateway AMI.
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^ami-([0-9a-f]{8}|[0-9a-f]{17})$'
+    Description: Pinned ARM64 gateway AMI ID; required when the gateway is enabled.
   WireGuardInstanceType:
     Type: String
     Default: t4g.nano

@@ -8,10 +8,9 @@ a development workstation. The gateway is disabled by default and is intended
 for development and controlled integration testing.
 
 The EC2 instance is a replaceable, stateless network appliance. It runs no
-application logic and stores no TigerBeetle data. The TigerBeetle processor owns a
-process-lifetime TigerBeetle client and sends its account and transfer requests
-through this path. End-to-end traffic remains a cloud acceptance test until an
-operator explicitly deploys and exercises it.
+application logic and stores no TigerBeetle data. The TigerBeetle processor sends
+its native TigerBeetle requests through this path. End-to-end traffic remains a
+cloud acceptance test until an operator explicitly deploys and exercises it.
 
 The TigerBeetle processor traffic paths are:
 
@@ -29,43 +28,12 @@ TigerBeetle processor
        -> stack-owned egress-only internet gateway
        -> regional public SQS dual-stack endpoint
        -> Completion queue
-       -> Completion processor
-       -> DynamoDB Operations table
 ```
 
-For each valid queued Operation, TigerBeetle processor creates account `Operation.id`
-(ledger/code `1`), then creates transfer `Operation.id` from that account to
-account `1` for amount `100` (ledger/code `1`). The two event types require
-separate requests. TigerBeetle processor gathers each terminal operation ID and result for
-the invocation and publishes at most one bounded aggregate Completion message.
-The Completion processor processes that message, conditionally transitions each
-matching `SUBMITTED` row to `COMPLETED`, and stores exactly:
-
-```json
-{"type":"SUCCESS","payload":{"transfer_id":"00112233-4455-6677-8899-aabbccddeeff"}}
-```
-
-Stable IDs make duplicate Operations delivery replay-safe: `created` and
-identical `exists` proceed. Definitive rejections are also published and
-persisted as `COMPLETED`, using the applicable exact result envelope:
-
-```json
-{"type":"FAILURE","payload":{"stage":"ACCOUNT","status":19}}
-```
-
-```json
-{"type":"FAILURE","payload":{"stage":"TRANSFER","status":22}}
-```
-
-TigerBeetle client/request uncertainty or failure to publish a terminal entry
-leaves the affected Operation `SUBMITTED` and is reported as a TigerBeetle queue
-partial-batch failure. After publication, Completion delivery and DynamoDB
-service uncertainty are retried through the Completion queue.
-Conditional completion conflicts are acknowledged without changing the stored
-row; completed Operations are immutable, including same-outcome refreshes.
-`SUBMITTED` and `COMPLETED` are the only lifecycle states. A completed `result`
-contains exactly uppercase `type` and non-null `payload`, and the entire compact
-envelope is limited to 4,096 bytes.
+The IPv4 tunnel carries TigerBeetle traffic; Completion publication uses the
+separate IPv6 HTTPS path. Both paths must work for the processor to finish its
+queue work. See the [TigerBeetle processor design](TIGER_BEETLE_PROCESSOR.md) for
+command schemas, execution, results, replay requirements, and retry behavior.
 
 Enabling the gateway incurs EC2 and public IPv4/Elastic IP charges. The EIGW has
 no fixed hourly or processing charge; ordinary service and data-transfer charges
@@ -85,7 +53,7 @@ The initial implementation fixes these values:
 | Routing model | Layer 3 forwarding without NAT |
 | EC2 source/destination check | Disabled |
 | Default instance type | `t4g.nano` |
-| Default AMI | ARM64 Amazon Linux 2023 through `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64` |
+| Initial AMI | Helper resolves ARM64 Amazon Linux 2023 through `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64` once, then pins the concrete ID. |
 
 The workstation sees the original Lambda-subnet source address. The gateway
 does not translate it, so the workstation WireGuard peer must accept the
@@ -171,7 +139,7 @@ interface controls the optional managed gateway:
 | `WireGuardPrivateKeyParameterVersion` | Exact positive version retrieved at bootstrap; template default is `1`. |
 | `WireGuardGatewayPublicKey` | Padded Base64 public key matching that private-key version. |
 | `WireGuardWorkstationPublicKey` | Padded Base64 public key matching the workstation-owned private key. |
-| `WireGuardAmiId` | Public SSM parameter resolving to an ARM64 AMI. |
+| `WireGuardAmiId` | Pinned concrete ARM64 AMI ID; select with `--wireguard-ami-id` or `WIREGUARD_AMI_ID`. |
 | `WireGuardInstanceType` | ARM64 EC2 instance type; defaults to `t4g.nano`. |
 
 When `EnableWireGuardGateway=true`, the `WireGuardGatewayInputsRequired`
@@ -222,8 +190,7 @@ unchanged IPv4 `10.200.0.0/24` route to the gateway instance.
 
 TigerBeetle processor polls `TigerBeetleQueue` through Lambda's managed event-source mapping
 and uses its SDK only to send to `CompletionQueue`. The Completion processor remains
-outside the VPC and updates the DynamoDB Operations table. Intake and query also
-remain outside the customer VPC. TigerBeetle processor has no VPC attachment in steady
+outside the VPC. Intake and query also remain outside the customer VPC. TigerBeetle processor has no VPC attachment in steady
 disabled state.
 
 ## 6. Security and IAM boundaries
@@ -438,11 +405,6 @@ dual-stack setting, and creates the two security groups. After success, the
 helper prints the conditional network outputs and masked peer configuration,
 then continues with the DynamoDB, SQS, and optional Function URL checks.
 
-Intake, query, and the Completion processor are stripped, statically linked executables.
-TigerBeetle processor is multithread-capable for the native TigerBeetle callback thread and
-is a stripped ARM64 glibc executable reported as dynamically linked; Amazon
-Linux 2023 provides its dynamic loader and system libraries.
-
 Routine `deploy.sh` runs preserve both enabled and disabled gateway state.
 Gateway lifecycle changes use these sequences:
 
@@ -501,7 +463,7 @@ AWS discovery, SSM inspection or generation, topology preflight, and deployment.
 It still formats, tests, builds, packages, and validates locally.
 
 Direct SAM deployment requires every gateway input to resolve to a non-empty
-value; the template supplies defaults only for the private-key version, AMI,
+value; the template supplies defaults only for the private-key version
 and instance type. It does not provide setup-script discovery, key generation,
 enabled-stack value reuse, or guarded disablement. Do not use a single direct
 SAM update to disable an enabled stack; use
@@ -627,14 +589,13 @@ After an explicitly authorized cloud deployment, validate in this order:
    effective Lambda route table, the stack-owned EIGW attachment, both route
    targets, `SourceDestCheck=false`, both security groups, and TigerBeetle processor's
    `Ipv6AllowedForDualStack` and `AWS_USE_DUALSTACK_ENDPOINT` settings.
-5. Pre-provision TigerBeetle account `1` on ledger `1` with flags compatible
-   with receiving credits. Submit a unique valid Operation and verify that
-   TigerBeetle processor creates account `Operation.id`, posts transfer `Operation.id` for
-   amount `100` from that account to account `1`, and sends the bounded result
-   to `CompletionQueue`. Verify that completion then marks the DynamoDB row
-   `COMPLETED` with the exact `SUCCESS` envelope above. A duplicate delivery
-   must replay both IDs as identical `exists` without changing balances a
-   second time or mutating the completed row.
+5. Submit a valid lookup-only Operation using the
+   [processor command contract](TIGER_BEETLE_PROCESSOR.md#body-schema) and a known
+   existing account ID in the configured cluster. Verify that the processor
+   receives the account from TigerBeetle through `10.200.0.2:3000` and publishes
+   its result to `CompletionQueue`. This exercises both the routed IPv4 tunnel
+   and IPv6 SQS egress without changing TigerBeetle balances. A handshake alone
+   does not establish that either application path works.
 6. Reboot the gateway and repeat the interface, forwarding, handshake, and
    routed-connectivity checks to verify bootstrap persistence.
 
@@ -702,6 +663,6 @@ If this path becomes production-critical, reassess managed VPN alternatives,
 redundancy, secret lifecycle, observability, and hosting TigerBeetle outside a
 developer workstation.
 
-See [the SAM deployment guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md) for complete
+See [the SAM deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md) for complete
 commands for network provisioning, key generation and rotation, deployment,
 diagnosis, and cleanup.

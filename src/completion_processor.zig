@@ -680,3 +680,11 @@ test "completion declares debug log scopes for ReleaseSafe" {
     try std.testing.expect(std_options.log_scope_levels[1].scope == .aws_sdk);
     try std.testing.expectEqual(.debug, std_options.log_scope_levels[1].level);
 }
+
+/// Cross-component tests enter the same SQS/codec/persistence boundary as the runtime.
+pub const test_support = if (@import("builtin").is_test) struct {
+    pub fn invoke(allocator: Allocator, message: []const u8, store: anytype) ![]const u8 {
+        var clock = FakeClock.init(&([_]operation.UnixSeconds{1_800_000_000} ** 10));
+        return handleInvocation(allocator, try testEvent(allocator, &.{message}), CompletionPersistence.init(store), Clock.init(&clock));
+    }
+} else struct {};

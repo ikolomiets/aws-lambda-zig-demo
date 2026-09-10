@@ -11,13 +11,84 @@ const entry_prefix = "{\"operation_id\":\"";
 const entry_middle = "\",\"result\":";
 const entry_suffix = "}";
 
+// Count one separator per entry and subtract the absent first separator from the envelope.
+const message_overhead_size = message_prefix.len + message_suffix.len - 1;
+const maximum_entry_size = std.math.add(
+    usize,
+    entry_prefix.len + operation.uuid_string_size + entry_middle.len + entry_suffix.len + 1,
+    operation.result_size_max,
+) catch unreachable;
+
+/// Number of maximum-size complete Results that fit within the transport ceiling.
+pub const maximum_result_count = @divFloor(
+    std.math.sub(usize, encoded_message_size_max, message_overhead_size) catch unreachable,
+    maximum_entry_size,
+);
+
 comptime {
+    std.debug.assert(maximum_result_count > 0);
+    std.debug.assert((maximum_results_size(maximum_result_count) catch unreachable) <=
+        encoded_message_size_max);
+    const next_count = std.math.add(usize, maximum_result_count, 1) catch unreachable;
+    std.debug.assert((maximum_results_size(next_count) catch unreachable) >
+        encoded_message_size_max);
     std.debug.assert(encoded_message_size_max == 1024 * 1024);
     std.debug.assert(encoded_message_size_max > operation.result_size_max);
     std.debug.assert(operation.uuid_string_size == 36);
     std.debug.assert(message_prefix.len > message_suffix.len);
     std.debug.assert(entry_prefix.len > entry_suffix.len);
 }
+
+/// Capacity for nonempty aggregates of maximum-size complete Results, before transport capping.
+pub fn maximum_results_size(count: usize) !usize {
+    std.debug.assert(count > 0);
+    const entries_size = try std.math.mul(usize, count, maximum_entry_size);
+    return std.math.add(usize, message_overhead_size, entries_size);
+}
+
+/// Frames trusted, already encoded complete Results without reparsing or owning a Value tree.
+/// The caller retains the buffer and may reuse it after the synchronous send returns.
+pub const Encoded = struct {
+    buffer: []u8,
+    length: usize,
+    count: usize = 0,
+
+    pub fn init(buffer: []u8) Encoded {
+        std.debug.assert(buffer.len >= message_prefix.len + message_suffix.len);
+        std.debug.assert(buffer.len <= encoded_message_size_max);
+        @memcpy(buffer[0..message_prefix.len], message_prefix);
+        @memcpy(buffer[message_prefix.len..][0..message_suffix.len], message_suffix);
+        return .{ .buffer = buffer, .length = message_prefix.len + message_suffix.len };
+    }
+
+    pub fn append(self: *Encoded, id: u128, result: []const u8) !void {
+        if (result.len > operation.result_size_max) return error.ResultTooLarge;
+        std.debug.assert(result.len > 0);
+        const separator: usize = if (self.count == 0) 0 else 1;
+        const overhead = entry_prefix.len + operation.uuid_string_size +
+            entry_middle.len + entry_suffix.len + separator;
+        const additional = std.math.add(usize, overhead, result.len) catch
+            return error.MessageTooLarge;
+        const size = std.math.add(usize, self.length, additional) catch
+            return error.MessageTooLarge;
+        if (size > self.buffer.len) return error.MessageTooLarge;
+        var writer = std.Io.Writer.fixed(self.buffer[self.length - message_suffix.len .. size]);
+        var uuid: [operation.uuid_string_size]u8 = undefined;
+        if (separator != 0) writer.writeAll(",") catch unreachable;
+        writer.writeAll(entry_prefix) catch unreachable;
+        writer.writeAll(operation.uuidToString(id, &uuid)) catch unreachable;
+        writer.writeAll(entry_middle) catch unreachable;
+        writer.writeAll(result) catch unreachable;
+        writer.writeAll(entry_suffix ++ message_suffix) catch unreachable;
+        self.length = size;
+        self.count += 1;
+    }
+
+    pub fn message(self: *const Encoded) []const u8 {
+        std.debug.assert(self.count > 0);
+        return self.buffer[0..self.length];
+    }
+};
 
 pub const Entry = struct {
     operation_id: u128,
@@ -92,13 +163,12 @@ fn calculate_encoded_size(batch: *const Batch) !usize {
         entry_middle.len + entry_suffix.len;
     var encoded_size = message_prefix.len + message_suffix.len;
     for (batch.results, 0..) |*entry, index| {
-        var result_buffer: [operation.result_size_max]u8 = undefined;
-        const result = try operation.writeCompletionJSON(&result_buffer, &entry.result);
+        const result_size = try operation.completionEncodedSize(&entry.result);
         const separator_size: usize = if (index == 0) 0 else 1;
         const additional_size = std.math.add(
             usize,
             entry_fixed_size + separator_size,
-            result.len,
+            result_size,
         ) catch return error.MessageTooLarge;
         encoded_size = std.math.add(
             usize,
@@ -121,13 +191,12 @@ fn write_batch(writer: *std.Io.Writer, batch: *const Batch) !void {
 
         var id_buffer: [operation.uuid_string_size]u8 = undefined;
         const operation_id = operation.uuidToString(entry.operation_id, &id_buffer);
-        var result_buffer: [operation.result_size_max]u8 = undefined;
-        const result = try operation.writeCompletionJSON(&result_buffer, &entry.result);
+        _ = try operation.completionEncodedSize(&entry.result);
 
         try writer.writeAll(entry_prefix);
         try writer.writeAll(operation_id);
         try writer.writeAll(entry_middle);
-        try writer.writeAll(result);
+        try std.json.Stringify.value(entry.result, .{}, writer);
         try writer.writeAll(entry_suffix);
     }
     try writer.writeAll(message_suffix);
@@ -529,7 +598,7 @@ test "completion batch rejects empty result arrays" {
 
 test "completion batch enforces the exact encoded message boundary" {
     const result_overhead = "{\"type\":\"SUCCESS\",\"payload\":\"".len + "\"}".len;
-    const entry_count = 252;
+    const entry_count = 11;
     const maximum_payload_size = operation.result_size_max - result_overhead;
     const entry_fixed_size = entry_prefix.len + operation.uuid_string_size +
         entry_middle.len + entry_suffix.len;
@@ -759,4 +828,28 @@ test "completion batch cleans up every allocation failure path" {
         test_encode_allocation_failures,
         .{},
     );
+}
+
+test "encoded framing fills derived maximum Result capacity and rejects one more" {
+    try std.testing.expectEqual(@as(usize, 10), maximum_result_count);
+    try std.testing.expectEqual(@as(usize, 983713), try maximum_results_size(10));
+    try std.testing.expectEqual(@as(usize, 1082083), try maximum_results_size(11));
+    try std.testing.expectError(error.Overflow, maximum_results_size(std.math.maxInt(usize)));
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.alloc(u8, encoded_message_size_max);
+    defer allocator.free(bytes);
+    const result = "{\"type\":\"SUCCESS\",\"payload\":\"" ++ ("a" ** (operation.result_size_max - 31)) ++ "\"}";
+    var framing = Encoded.init(bytes);
+    for (0..maximum_result_count) |index| try framing.append(@intCast(index), result);
+    try std.testing.expectEqual(@as(usize, 983713), framing.message().len);
+    try std.testing.expectError(error.MessageTooLarge, framing.append(maximum_result_count, result));
+    try std.testing.expectEqual(@as(usize, 983713), framing.message().len);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const decoded = try decode(arena.allocator(), framing.message());
+    try std.testing.expectEqual(maximum_result_count, decoded.results.len);
+    for (decoded.results, 0..) |entry, index| try expect_valid_entry(entry, @intCast(index), result);
+    framing = Encoded.init(bytes);
+    try framing.append(maximum_result_count, result);
+    try std.testing.expectError(error.ResultTooLarge, framing.append(maximum_result_count + 1, result ++ " "));
 }

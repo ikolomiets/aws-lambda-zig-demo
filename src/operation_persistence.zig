@@ -59,8 +59,9 @@ pub const Persistence = struct {
         var persisted = persistentCopy(source);
         try validateCreation(&persisted);
 
-        var request: CreateRequest = undefined;
-        try createRequestInit(&request, &persisted);
+        const request = try arena.create(CreateRequest);
+        defer arena.destroy(request);
+        try createRequestInit(request, &persisted);
         var diagnostic: dynamodb.ServiceError = undefined;
         _ = self.client.putItem(arena, .{
             .condition_expression = create_condition,
@@ -101,8 +102,9 @@ pub const Persistence = struct {
         replacement: *const operation.Operation,
     ) !operation.Operation {
         try validateUpdate(snapshot, replacement);
-        var request: UpdateRequest = undefined;
-        try updateRequestInit(&request, snapshot, replacement);
+        const request = try arena.create(UpdateRequest);
+        defer arena.destroy(request);
+        try updateRequestInit(request, snapshot, replacement);
         var diagnostic: dynamodb.ServiceError = undefined;
         const response = self.client.updateItem(arena, .{
             .condition_expression = request.condition_expression,
@@ -129,8 +131,9 @@ pub const Persistence = struct {
         completion: *const operation.Completion,
         now: operation.UnixSeconds,
     ) !void {
-        var request: CompletionRequest = undefined;
-        try completionRequestInit(&request, queued, completion, now);
+        const request = try arena.create(CompletionRequest);
+        defer arena.destroy(request);
+        try completionRequestInit(request, queued, completion, now);
         var diagnostic: dynamodb.ServiceError = undefined;
         _ = self.client.updateItem(arena, .{
             .condition_expression = completion_condition,
@@ -152,8 +155,9 @@ pub const Persistence = struct {
         completion: *const operation.Completion,
         now: operation.UnixSeconds,
     ) !void {
-        var request: CompletionByIdRequest = undefined;
-        try completionByIdRequestInit(&request, id, completion, now);
+        const request = try arena.create(CompletionByIdRequest);
+        defer arena.destroy(request);
+        try completionByIdRequestInit(request, id, completion, now);
         var diagnostic: dynamodb.ServiceError = undefined;
         _ = self.client.updateItem(arena, .{
             .condition_expression = completion_by_id_condition,
@@ -521,8 +525,9 @@ fn parseStoredCompletion(
             else => error.InvalidItem,
         };
     };
-    var canonical_buffer: [operation.result_size_max]u8 = undefined;
-    const canonical = operation.writeCompletionJSON(&canonical_buffer, &completion) catch {
+    const canonical_buffer = try arena.create([operation.result_size_max]u8);
+    defer arena.destroy(canonical_buffer);
+    const canonical = operation.writeCompletionJSON(canonical_buffer, &completion) catch {
         return error.InvalidItem;
     };
     if (!std.mem.eql(u8, result_text, canonical)) return error.InvalidItem;
@@ -562,7 +567,7 @@ fn validateUpdate(
     if (snapshot.id != replacement.id) return error.ImmutableField;
     if (!std.mem.eql(u8, snapshot.tenant, replacement.tenant)) return error.ImmutableField;
     if (!std.mem.eql(u8, snapshot.name, replacement.name)) return error.ImmutableField;
-    if (!std.mem.eql(u8, &snapshot.hash.?, &replacement.hash.?)) return error.ImmutableField;
+    if (!operation.verifyHash(snapshot, &replacement.hash.?)) return error.ImmutableField;
     try operation.validateStateTransition(&snapshot.state, &replacement.state);
     std.debug.assert(snapshot.body == null);
     std.debug.assert(replacement.body == null);
@@ -575,7 +580,7 @@ fn validateUpdateResult(
     if (updated.id != replacement.id) return error.InvalidItem;
     if (!std.mem.eql(u8, updated.tenant, replacement.tenant)) return error.InvalidItem;
     if (!std.mem.eql(u8, updated.name, replacement.name)) return error.InvalidItem;
-    if (!std.mem.eql(u8, &updated.hash.?, &replacement.hash.?)) return error.InvalidItem;
+    if (!operation.verifyHash(updated, &replacement.hash.?)) return error.InvalidItem;
     if (!try stateEqual(&updated.state, &replacement.state)) return error.InvalidItem;
     if (updated.last_updated != replacement.last_updated) return error.InvalidItem;
     if (updated.expires_at != replacement.expires_at) return error.InvalidItem;
@@ -598,7 +603,7 @@ fn createError(
     if (!std.mem.eql(u8, existing.tenant, requested.tenant)) {
         return error.OperationConflict;
     }
-    if (!std.mem.eql(u8, &existing.hash.?, &requested.hash.?)) {
+    if (!operation.verifyHash(&existing, &requested.hash.?)) {
         return error.OperationConflict;
     }
     return existing;
@@ -1012,6 +1017,7 @@ test "decoder enforces completion presence type canonical envelope and size" {
 
 test "completion envelopes round trip through canonical DynamoDB strings" {
     const inputs = [_][]const u8{
+        "{\"type\":\"SUCCESS\",\"payload\":\"" ++ ("a" ** (98304 - 31)) ++ "\"}",
         "{\"type\":\"SUCCESS\",\"payload\":true}",
         "{\"type\":\"FAILURE\",\"payload\":42}",
         "{\"type\":\"SUCCESS\",\"payload\":\"text\"}",
@@ -1178,7 +1184,7 @@ test "completion persists exact result envelopes and record timestamps without r
     }
 }
 
-test "completion request enforces the full 4096 byte envelope boundary" {
+test "completion request enforces the full 98304 byte envelope boundary" {
     var queued = testOperation(.submitted, null);
     queued.body = .{ .bool = true };
     const maximum: operation.Completion = .{
@@ -1275,7 +1281,7 @@ test "ID-only completion persists exact envelopes and caller timestamps" {
     }
 }
 
-test "ID-only completion enforces the full 4096 byte envelope boundary" {
+test "ID-only completion enforces the full 98304 byte envelope boundary" {
     const id = operation.uuidFromString(test_id) catch unreachable;
     const maximum: operation.Completion = .{
         .success = .{ .string = "a" ** (operation.result_size_max - 31) },
@@ -1656,3 +1662,60 @@ test "initialization retains valid table configuration and shared AWS configurat
         try std.testing.expectEqualStrings(table_name, persistence.table_name);
     }
 }
+
+/// Local fake executes the actual conditional request construction and stored-item codec.
+/// It models the DynamoDB condition; it does not establish the service's atomicity guarantee.
+pub const test_support = if (@import("builtin").is_test) struct {
+    pub const Store = struct {
+        entries: [3]?operation.Operation = .{null} ** 3,
+        writes: usize = 0,
+        calls: usize = 0,
+        fail_at: ?usize = null,
+
+        pub fn init(queued: *const operation.Operation) Store {
+            var store: Store = .{};
+            store.entries[0] = persistentCopy(queued);
+            return store;
+        }
+
+        pub fn completeById(self: *Store, arena: Allocator, id: u128, completion: *const operation.Completion, now: operation.UnixSeconds) !void {
+            const request = try arena.create(CompletionByIdRequest);
+            defer arena.destroy(request);
+            try completionByIdRequestInit(request, id, completion, now);
+            try std.testing.expectEqualStrings("#state = :submitted", completion_by_id_condition);
+            try std.testing.expectEqualStrings("SET #state = :completed, #result = :result, last_updated = :now, expires_at = :expires_at", completion_update);
+            const call = self.calls;
+            self.calls += 1;
+            if (self.fail_at == call) return error.TransientPersistenceFailure;
+            const key = try operation.uuidFromString(try stringValue(request.key[0].value));
+            for (&self.entries) |*slot| {
+                if (slot.*) |*entry| {
+                    if (entry.id != key) continue;
+                    const submitted = try stringValue(findAttribute(&request.values, ":submitted").?);
+                    if (!std.mem.eql(u8, operation.stateTagToString(operation.stateTag(&entry.state)), submitted)) return error.OperationConflict;
+                    try std.testing.expectEqualStrings("COMPLETED", try stringValue(findAttribute(&request.values, ":completed").?));
+                    const result = try stringValue(findAttribute(&request.values, ":result").?);
+                    entry.state = .{ .completed = try operation.parseCompletionJSON(arena, result) };
+                    entry.last_updated = try std.fmt.parseInt(i64, findAttribute(&request.values, ":now").?.n.?, 10);
+                    entry.expires_at = try std.fmt.parseInt(i64, findAttribute(&request.values, ":expires_at").?.n.?, 10);
+                    self.writes += 1;
+                    return;
+                }
+            }
+            return error.OperationConflict;
+        }
+
+        pub fn read(self: *Store, arena: Allocator, id: u128) !operation.Operation {
+            for (self.entries) |slot| {
+                if (slot) |*entry| {
+                    if (entry.id != id) continue;
+                    const request = try arena.create(CreateRequest);
+                    defer arena.destroy(request);
+                    try createRequestInit(request, entry);
+                    return decodeItem(arena, request.items[0..request.item_count]);
+                }
+            }
+            return error.OperationNotFound;
+        }
+    };
+} else struct {};

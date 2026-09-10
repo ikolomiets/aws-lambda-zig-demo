@@ -5,7 +5,7 @@ const JSONValue = std.json.Value;
 
 pub const UnixSeconds = i64;
 pub const body_size_max = 4096;
-pub const result_size_max = 4096;
+pub const result_size_max = 24 * body_size_max;
 pub const name_size_max = 64;
 pub const tenant_size_max = 64;
 pub const output_size_max = body_size_max + result_size_max + 2048;
@@ -14,8 +14,8 @@ pub const uuid_string_size = 36;
 const hash_string_size = 64;
 
 comptime {
-    std.debug.assert(body_size_max == result_size_max);
-    std.debug.assert(result_size_max == 4096);
+    std.debug.assert(body_size_max == 4096);
+    std.debug.assert(result_size_max == 98304);
     std.debug.assert(output_size_max > body_size_max + result_size_max);
     std.debug.assert(ttl_seconds == 86_400);
     std.debug.assert(uuid_string_size == 36);
@@ -245,9 +245,21 @@ pub fn parseCompletionJSON(arena: Allocator, input_json: []const u8) !Completion
         }
         return error.InvalidCompletionType;
     };
-    var buffer: [result_size_max]u8 = undefined;
-    _ = try writeCompletionJSON(&buffer, &completion);
+    _ = try completionEncodedSize(&completion);
     return completion;
+}
+
+/// Measures the complete canonical envelope without a Result-sized stack buffer.
+pub fn completionEncodedSize(completion: *const Completion) !usize {
+    switch (completion.*) {
+        .success, .failure => |payload| if (payload == .null) return error.MissingResult,
+    }
+    var buffer: [256]u8 = undefined;
+    var counter: std.Io.Writer.Discarding = .init(&buffer);
+    try writeCompletionJSONToWriter(&counter.writer, completion);
+    const size = counter.fullCount();
+    if (size > result_size_max) return error.ResultTooLarge;
+    return @intCast(size);
 }
 
 /// Serializes a completion into a compact, canonical, bounded envelope.
@@ -599,7 +611,7 @@ fn parseInputStateTag(arena: Allocator, state_json: []const u8) !StateTag {
     return state_tag;
 }
 
-fn operationHash(tenant: []const u8, name: []const u8, body: *const JSONValue) ![32]u8 {
+pub fn operationHash(tenant: []const u8, name: []const u8, body: *const JSONValue) ![32]u8 {
     var hash_buffer: [64]u8 = undefined;
     var hashing: std.Io.Writer.Hashing(std.crypto.hash.Blake3) = .init(&hash_buffer);
     try hashEnvelopeWrite(&hashing.writer, tenant, name, body);
@@ -607,6 +619,12 @@ fn operationHash(tenant: []const u8, name: []const u8, body: *const JSONValue) !
     var hash: [32]u8 = undefined;
     hashing.hasher.final(&hash);
     return hash;
+}
+
+pub fn verifyHash(source: *const Operation, expected: []const u8) bool {
+    const source_hash = source.hash orelse return false;
+    if (expected.len != source_hash.len) return false;
+    return std.mem.eql(u8, &source_hash, expected);
 }
 
 fn hashEnvelopeWrite(
@@ -671,8 +689,7 @@ fn validateView(operation: *const Operation) !void {
     if (expires_at != expected_expires_at) return error.InvalidExpiresAt;
     if (operation.hash == null) return error.MissingHash;
     if (stateCompletion(&operation.state)) |completion| {
-        var completion_buffer: [result_size_max]u8 = undefined;
-        _ = try writeCompletionJSON(&completion_buffer, completion);
+        _ = try completionEncodedSize(completion);
     }
 }
 
@@ -891,6 +908,30 @@ test "input parses an arena-owned body Value and defaults state" {
     try std.testing.expectEqual(test_now, operation.last_updated.?);
     try std.testing.expectEqual(test_now + ttl_seconds, operation.expires_at.?);
     try std.testing.expect(operation.hash != null);
+}
+
+test "hash verification requires an exact present 32-byte match" {
+    const hash = [_]u8{0xAB} ** 32;
+    var source: Operation = .{
+        .id = 1,
+        .tenant = "tenant",
+        .name = "name",
+        .state = .submitted,
+        .hash = hash,
+    };
+
+    try std.testing.expect(verifyHash(&source, &hash));
+
+    var mismatched = hash;
+    mismatched[0] ^= 1;
+    try std.testing.expect(!verifyHash(&source, &mismatched));
+    try std.testing.expect(!verifyHash(&source, hash[0 .. hash.len - 1]));
+
+    const oversized = [_]u8{0xAB} ** 33;
+    try std.testing.expect(!verifyHash(&source, &oversized));
+
+    source.hash = null;
+    try std.testing.expect(!verifyHash(&source, &hash));
 }
 
 test "input copies validated tenant metadata into the Operation arena" {
@@ -1432,7 +1473,7 @@ test "completion envelope enforces input and compact output bounds" {
 
 test "completion parser bounds compact normalization independently of input" {
     const expanding = "{\"type\":\"SUCCESS\",\"payload\":[" ++
-        ("1e20," ** 800) ++ "1e20]}";
+        ("1e20," ** 19000) ++ "1e20]}";
     comptime std.debug.assert(expanding.len <= result_size_max);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1861,4 +1902,9 @@ test "expiration calculation rejects timestamp overflow" {
         error.InvalidExpiresAt,
         expires_at_from_last_updated(std.math.maxInt(UnixSeconds)),
     );
+}
+
+test "complete Result contract is 96 KiB while Body remains 4 KiB" {
+    try std.testing.expectEqual(@as(usize, 98304), result_size_max);
+    try std.testing.expectEqual(@as(usize, 4096), body_size_max);
 }

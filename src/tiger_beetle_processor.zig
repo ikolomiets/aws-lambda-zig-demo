@@ -20,10 +20,6 @@ pub const std_options: std.Options = .{
 };
 
 const Allocator = std.mem.Allocator;
-const accounting_ledger: u32 = 1;
-const accounting_code: u16 = 1;
-const accounting_credit_account_id: u128 = 1;
-const accounting_transfer_amount: u128 = 100;
 const record_count_max = 10;
 const tigerbeetle_addresses_default = "10.200.0.2:3000";
 const tigerbeetle_addresses_size_max = 4096;
@@ -31,10 +27,6 @@ const tigerbeetle_cluster_id_default = "0";
 const log = std.log.scoped(.tiger_beetle_processor);
 
 comptime {
-    std.debug.assert(accounting_ledger > 0);
-    std.debug.assert(accounting_code > 0);
-    std.debug.assert(accounting_credit_account_id > 0);
-    std.debug.assert(accounting_transfer_amount > 0);
     std.debug.assert(record_count_max > 0);
     std.debug.assert(record_count_max <= 10);
     std.debug.assert(
@@ -116,30 +108,28 @@ const RuntimeResources = struct {
         resources.* = undefined;
     }
 
-    fn createAccount(
+    fn createAccounts(
         resources: *RuntimeResources,
-        account: *const tigerbeetle.Account,
-    ) !CreateOutcome {
-        const results = try resources.tigerbeetle_client.createAccounts(account[0..1]);
-        defer resources.tigerbeetle_client.allocator.free(results);
-        if (results.len != 1) return error.MalformedResult;
-
-        const status = results[0].status;
-        if (tigerbeetle.create_account_succeeded(status)) return .accepted;
-        return .{ .rejected = status };
+        accounts: []const tigerbeetle.Account,
+        output: []tigerbeetle.CreateAccountResult,
+    ) !usize {
+        return resources.tigerbeetle_client.createAccounts(accounts, output);
     }
 
-    fn createTransfer(
+    fn createTransfers(
         resources: *RuntimeResources,
-        transfer: *const tigerbeetle.Transfer,
-    ) !CreateOutcome {
-        const results = try resources.tigerbeetle_client.createTransfers(transfer[0..1]);
-        defer resources.tigerbeetle_client.allocator.free(results);
-        if (results.len != 1) return error.MalformedResult;
+        transfers: []const tigerbeetle.Transfer,
+        output: []tigerbeetle.CreateTransferResult,
+    ) !usize {
+        return resources.tigerbeetle_client.createTransfers(transfers, output);
+    }
 
-        const status = results[0].status;
-        if (tigerbeetle.create_transfer_succeeded(status)) return .accepted;
-        return .{ .rejected = status };
+    fn lookupAccounts(
+        resources: *RuntimeResources,
+        ids: []const u128,
+        output: []tigerbeetle.Account,
+    ) !usize {
+        return resources.tigerbeetle_client.lookupAccounts(ids, output);
     }
 
     fn sendCompletion(
@@ -185,64 +175,84 @@ const CreateOutcome = union(enum) {
     rejected: u32,
 };
 
-const FailureStage = enum {
-    account,
-    transfer,
-};
-
 const ExecutionAdapter = struct {
     context: *anyopaque,
-    create_account_fn: *const fn (
+    create_accounts_fn: *const fn (
         *anyopaque,
-        *const tigerbeetle.Account,
-    ) anyerror!CreateOutcome,
-    create_transfer_fn: *const fn (
+        []const tigerbeetle.Account,
+        []tigerbeetle.CreateAccountResult,
+    ) anyerror!usize,
+    create_transfers_fn: *const fn (
         *anyopaque,
-        *const tigerbeetle.Transfer,
-    ) anyerror!CreateOutcome,
+        []const tigerbeetle.Transfer,
+        []tigerbeetle.CreateTransferResult,
+    ) anyerror!usize,
+    lookup_accounts_fn: *const fn (*anyopaque, []const u128, []tigerbeetle.Account) anyerror!usize,
 
     fn init(pointer: anytype) ExecutionAdapter {
         const Pointer = @TypeOf(pointer);
         const pointer_info = @typeInfo(Pointer);
         comptime std.debug.assert(pointer_info == .pointer);
         comptime std.debug.assert(pointer_info.pointer.size == .one);
-
         const Adapter = struct {
-            fn createAccount(
+            fn createAccounts(
                 context: *anyopaque,
-                account: *const tigerbeetle.Account,
-            ) anyerror!CreateOutcome {
+                input: []const tigerbeetle.Account,
+                output: []tigerbeetle.CreateAccountResult,
+            ) anyerror!usize {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.createAccount(account);
+                return self.createAccounts(input, output);
             }
-
-            fn createTransfer(
+            fn createTransfers(
                 context: *anyopaque,
-                transfer: *const tigerbeetle.Transfer,
-            ) anyerror!CreateOutcome {
+                input: []const tigerbeetle.Transfer,
+                output: []tigerbeetle.CreateTransferResult,
+            ) anyerror!usize {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.createTransfer(transfer);
+                return self.createTransfers(input, output);
+            }
+            fn lookupAccounts(
+                context: *anyopaque,
+                input: []const u128,
+                output: []tigerbeetle.Account,
+            ) anyerror!usize {
+                const self: Pointer = @ptrCast(@alignCast(context));
+                return self.lookupAccounts(input, output);
             }
         };
         return .{
             .context = pointer,
-            .create_account_fn = Adapter.createAccount,
-            .create_transfer_fn = Adapter.createTransfer,
+            .create_accounts_fn = Adapter.createAccounts,
+            .create_transfers_fn = Adapter.createTransfers,
+            .lookup_accounts_fn = Adapter.lookupAccounts,
         };
     }
-
-    fn createAccount(
+    fn createAccounts(
         execution: ExecutionAdapter,
-        account: *const tigerbeetle.Account,
-    ) !CreateOutcome {
-        return execution.create_account_fn(execution.context, account);
+        input: []const tigerbeetle.Account,
+        output: []tigerbeetle.CreateAccountResult,
+    ) !usize {
+        std.debug.assert(input.len > 0);
+        std.debug.assert(output.len >= input.len);
+        return execution.create_accounts_fn(execution.context, input, output);
     }
-
-    fn createTransfer(
+    fn createTransfers(
         execution: ExecutionAdapter,
-        transfer: *const tigerbeetle.Transfer,
-    ) !CreateOutcome {
-        return execution.create_transfer_fn(execution.context, transfer);
+        input: []const tigerbeetle.Transfer,
+        output: []tigerbeetle.CreateTransferResult,
+    ) !usize {
+        std.debug.assert(input.len > 0);
+        std.debug.assert(output.len >= input.len);
+        return execution.create_transfers_fn(execution.context, input, output);
+    }
+    fn lookupAccounts(
+        execution: ExecutionAdapter,
+        input: []const u128,
+        output: []tigerbeetle.Account,
+    ) !usize {
+        std.debug.assert(input.len > 0);
+        std.debug.assert(output.len >= input.len);
+        return execution.lookup_accounts_fn(execution.context, input, output);
     }
 };
 
@@ -304,11 +314,6 @@ const RecordParseOutcome = union(enum) {
     valid: operation.Operation,
 };
 
-const ExecutionOutcome = union(enum) {
-    retry,
-    terminal: completion_batch.Entry,
-};
-
 fn handleInvocation(
     allocator: Allocator,
     event: []const u8,
@@ -321,11 +326,12 @@ fn handleInvocation(
 
     var queued_operations: [record_count_max]operation.Operation = undefined;
     var queued_record_indexes: [record_count_max]usize = undefined;
-    var entries: [record_count_max]completion_batch.Entry = undefined;
-    var represented_record_indexes: [record_count_max]usize = undefined;
+    const result_buffer = try allocator.create([operation.result_size_max]u8);
+    defer allocator.destroy(result_buffer);
+    const completion_buffer = try allocator.alloc(u8, completion_buffer_size);
+    defer allocator.free(completion_buffer);
     var retry_records = [_]bool{false} ** record_count_max;
     var queued_count: usize = 0;
-    var entry_count: usize = 0;
     for (sqs_event.records, 0..) |record, record_index| {
         log.debug("message_id={s} body={s}", .{ record.message_id, record.body });
         switch (parseRecord(allocator, record.message_id, record.body)) {
@@ -339,34 +345,81 @@ fn handleInvocation(
             },
         }
     }
-    for (queued_operations[0..queued_count], queued_record_indexes[0..queued_count]) |
-        *queued,
-        record_index,
-    | {
-        const message_id = sqs_event.records[record_index].message_id;
-        switch (executeOperation(allocator, message_id, queued, execution)) {
-            .retry => retry_records[record_index] = true,
-            .terminal => |entry| {
-                std.debug.assert(entry_count < queued_count);
-                entries[entry_count] = entry;
-                represented_record_indexes[entry_count] = record_index;
-                entry_count += 1;
-            },
-        }
-    }
-    std.debug.assert(queued_count <= sqs_event.records.len);
-    std.debug.assert(entry_count <= queued_count);
-    std.debug.assert(entry_count <= sqs_event.records.len);
-
-    publishCompletions(allocator, entries[0..entry_count], publisher) catch |err| {
-        log.debug("stage=completion_publish outcome=retry error={s}", .{@errorName(err)});
-        for (represented_record_indexes[0..entry_count]) |record_index| {
-            std.debug.assert(record_index < sqs_event.records.len);
-            retry_records[record_index] = true;
-        }
+    var plans = [_]?Planning{null} ** record_count_max;
+    defer for (plans[0..queued_count]) |planning| {
+        if (planning) |value| if (value == .admitted) {
+            allocator.free(value.admitted.commands);
+            allocator.free(value.admitted.outcomes);
+        };
     };
+    for (queued_operations[0..queued_count], 0..) |*queued, index| {
+        plans[index] = plan_body(allocator, &queued.body.?) catch null;
+    }
+    execute_phases(allocator, plans[0..queued_count], execution) catch |err| {
+        log.debug("stage=native outcome=stopped error={s}", .{@errorName(err)});
+    };
+    publish_results(allocator, queued_operations[0..queued_count], plans[0..queued_count], queued_record_indexes[0..queued_count], retry_records[0..sqs_event.records.len], result_buffer, completion_buffer, publisher);
 
     return encodeFailureResponse(allocator, sqs_event.records, &retry_records);
+}
+
+// Transport count is independent of invocation delivery and native packet capacity.
+const completion_count_max = completion_batch.maximum_result_count;
+
+fn publish_results(
+    allocator: Allocator,
+    queued: []const operation.Operation,
+    plans: []const ?Planning,
+    record_indexes: []const usize,
+    retry_records: []bool,
+    result_buffer: *[operation.result_size_max]u8,
+    completion_buffer: []u8,
+    publisher: CompletionPublisher,
+) void {
+    std.debug.assert(queued.len == plans.len);
+    std.debug.assert(queued.len == record_indexes.len);
+    var framing = completion_batch.Encoded.init(completion_buffer);
+    var represented: [completion_count_max]usize = undefined;
+    // Every valid source retries unless a successful send proves acknowledgement eligibility.
+    for (record_indexes) |index| {
+        std.debug.assert(index < retry_records.len);
+        retry_records[index] = true;
+    }
+    for (queued, plans, record_indexes) |*entry, planning, record_index| {
+        const plan = &(planning orelse continue);
+        const encoded = switch (plan.*) {
+            .rejected => |*diagnostic| write_diagnostic(result_buffer, entry.id, diagnostic),
+            .admitted => |*admitted| write_result(result_buffer, entry.id, admitted, plan_success(admitted)) catch continue,
+        };
+        if (framing.count == completion_count_max) {
+            send_results(allocator, &framing, &represented, retry_records, publisher) catch return;
+        }
+        framing.append(entry.id, encoded) catch |err| {
+            std.debug.assert(err == error.MessageTooLarge);
+            std.debug.assert(framing.count > 0);
+            send_results(allocator, &framing, &represented, retry_records, publisher) catch return;
+            // The admitted complete Result must fit in an empty production buffer.
+            framing.append(entry.id, encoded) catch unreachable;
+        };
+        represented[framing.count - 1] = record_index;
+    }
+    if (framing.count > 0) {
+        send_results(allocator, &framing, &represented, retry_records, publisher) catch return;
+    }
+}
+
+fn send_results(
+    allocator: Allocator,
+    framing: *completion_batch.Encoded,
+    represented: *const [completion_count_max]usize,
+    retry_records: []bool,
+    publisher: CompletionPublisher,
+) !void {
+    std.debug.assert(framing.count > 0);
+    std.debug.assert(framing.count <= completion_count_max);
+    try publisher.send(allocator, framing.message());
+    for (represented[0..framing.count]) |index| retry_records[index] = false;
+    framing.* = completion_batch.Encoded.init(framing.buffer);
 }
 
 fn publishCompletions(
@@ -429,140 +482,261 @@ fn parseRecord(
     return .{ .valid = queued };
 }
 
-fn executeOperation(
-    arena: Allocator,
-    message_id: []const u8,
-    queued: *const operation.Operation,
+// The independent native packet bound is deliberately unrelated to SQS delivery size.
+const native_capacity = 8189;
+const ChainRange = struct { operation_index: usize, start: usize, count: usize };
+const ChainState = enum { unfinished, accepted, rejected };
+
+fn family_offset(plan: *const Plan, family: Family) usize {
+    return switch (family) {
+        .create_accounts => 0,
+        .create_transfers => plan.counts[0],
+        .lookup_accounts => plan.counts[0] + plan.counts[1],
+    };
+}
+
+fn packet_fits(used: usize, count: usize, capacity: usize) bool {
+    std.debug.assert(capacity <= native_capacity);
+    std.debug.assert(used <= capacity);
+    std.debug.assert(count > 0 and count <= capacity);
+    return count <= capacity - used;
+}
+
+fn classify_chain(comptime family: Family, reply: anytype) !ChainState {
+    std.debug.assert(family != .lookup_accounts);
+    std.debug.assert(reply.len > 0 and reply.len <= native_capacity);
+    const created = if (family == .create_accounts) tigerbeetle.account_created else tigerbeetle.transfer_created;
+    const exists = if (family == .create_accounts) tigerbeetle.account_exists else tigerbeetle.transfer_exists;
+    const linked_failed = if (family == .create_accounts) tigerbeetle.account_linked_event_failed else tigerbeetle.transfer_linked_event_failed;
+    var created_count: usize = 0;
+    var decisive: ?usize = null;
+    for (reply, 0..) |result, index| {
+        if (result.status == created) {
+            created_count += 1;
+        } else if (result.status != linked_failed) {
+            if (decisive != null) return error.InvalidCreationReply;
+            decisive = index;
+        }
+    }
+    if (created_count == reply.len) return .accepted;
+    if (created_count != 0) return error.InvalidCreationReply;
+    const index = decisive orelse return error.InvalidCreationReply;
+    return if (index == 0 and reply[0].status == exists) .accepted else .rejected;
+}
+
+fn apply_creation_reply(
+    comptime family: Family,
+    plans: []?Planning,
+    ranges: []const ChainRange,
+    reply: anytype,
+    submitted: usize,
+) !void {
+    std.debug.assert(submitted > 0 and submitted <= native_capacity);
+    if (reply.len != submitted) return error.InvalidCreationReply;
+    var covered: usize = 0;
+    // No prefix is trustworthy until every chain in the packet has validated.
+    for (ranges) |range| {
+        std.debug.assert(range.start == covered);
+        std.debug.assert(range.count > 0 and range.count <= submitted - covered);
+        std.debug.assert(range.operation_index < plans.len);
+        const plan = &plans[range.operation_index].?.admitted;
+        std.debug.assert(range.count == plan.counts[@intFromEnum(family)]);
+        _ = try classify_chain(family, reply[range.start..][0..range.count]);
+        covered += range.count;
+    }
+    std.debug.assert(covered == submitted);
+    for (ranges) |range| {
+        const plan = &plans[range.operation_index].?.admitted;
+        const results = reply[range.start..][0..range.count];
+        const state = classify_chain(family, results) catch unreachable;
+        plan.chains[@intFromEnum(family)] = state;
+        const offset = family_offset(plan, family);
+        for (results, 0..) |result, index| plan.outcomes[offset + index] = .{ .created = result.status };
+        if (family == .create_accounts and state == .rejected) {
+            const transfer_offset = family_offset(plan, .create_transfers);
+            for (plan.outcomes[transfer_offset..][0..plan.counts[1]]) |*outcome| {
+                outcome.* = .{ .skipped = "Transfer was not submitted because account creation was rejected." };
+            }
+        }
+    }
+}
+
+fn account_fields_equal(left: *const tigerbeetle.Account, right: *const tigerbeetle.Account) bool {
+    inline for (@typeInfo(tigerbeetle.Account).@"struct".fields) |field| {
+        if (@field(left, field.name) != @field(right, field.name)) return false;
+    }
+    return true;
+}
+
+fn lookup_position_less(ids: []const u128, left: usize, right: usize) bool {
+    return ids[left] < ids[right];
+}
+
+fn lookup_account_less(_: void, left: tigerbeetle.Account, right: tigerbeetle.Account) bool {
+    return left.id < right.id;
+}
+
+fn correlate_lookup_reply(ids: []const u128, positions: []usize, reply: []tigerbeetle.Account) !void {
+    std.debug.assert(ids.len > 0 and ids.len <= native_capacity);
+    std.debug.assert(positions.len == ids.len);
+    if (reply.len > ids.len) return error.InvalidLookupReply;
+    for (positions, 0..) |*position, index| position.* = index;
+    // Heapsort is nonrecursive with bounded O(n log n) worst-case work.
+    std.sort.heap(usize, positions, ids, lookup_position_less);
+    std.sort.heap(tigerbeetle.Account, reply, {}, lookup_account_less);
+    var input_index: usize = 0;
+    var output_index: usize = 0;
+    while (input_index < positions.len) {
+        const id = ids[positions[input_index]];
+        var input_end = input_index + 1;
+        while (input_end < positions.len and ids[positions[input_end]] == id) : (input_end += 1) {}
+        if (output_index < reply.len and reply[output_index].id < id) return error.InvalidLookupReply;
+        if (output_index < reply.len and reply[output_index].id == id) {
+            var output_end = output_index + 1;
+            while (output_end < reply.len and reply[output_end].id == id) : (output_end += 1) {
+                if (!account_fields_equal(&reply[output_index], &reply[output_end])) return error.InvalidLookupReply;
+            }
+            if (output_end - output_index != input_end - input_index) return error.InvalidLookupReply;
+            output_index = output_end;
+        }
+        input_index = input_end;
+    }
+    if (output_index != reply.len) return error.InvalidLookupReply;
+}
+
+const LookupTarget = struct { operation_index: usize, command_index: usize };
+const NativeBuffers = struct {
+    accounts: []tigerbeetle.Account,
+    account_results: []tigerbeetle.CreateAccountResult,
+    transfers: []tigerbeetle.Transfer,
+    transfer_results: []tigerbeetle.CreateTransferResult,
+    ids: []u128,
+    lookup_results: []tigerbeetle.Account,
+    positions: []usize,
+    targets: []LookupTarget,
+    ranges: []ChainRange,
+
+    fn init(allocator: Allocator, capacity: usize, operation_count: usize) !NativeBuffers {
+        std.debug.assert(capacity > 0 and capacity <= native_capacity);
+        // The caller owns an arena: every allocation completes before the first native effect.
+        return .{
+            .accounts = try allocator.alloc(tigerbeetle.Account, capacity),
+            .account_results = try allocator.alloc(tigerbeetle.CreateAccountResult, capacity),
+            .transfers = try allocator.alloc(tigerbeetle.Transfer, capacity),
+            .transfer_results = try allocator.alloc(tigerbeetle.CreateTransferResult, capacity),
+            .ids = try allocator.alloc(u128, capacity),
+            .lookup_results = try allocator.alloc(tigerbeetle.Account, capacity),
+            .positions = try allocator.alloc(usize, capacity),
+            .targets = try allocator.alloc(LookupTarget, capacity),
+            .ranges = try allocator.alloc(ChainRange, @min(operation_count, capacity)),
+        };
+    }
+};
+
+fn submit_packet(
+    comptime family: Family,
+    plans: []?Planning,
     execution: ExecutionAdapter,
-) ExecutionOutcome {
-    std.debug.assert(queued.state == .submitted);
-    std.debug.assert(queued.body != null);
-
-    const account = accountingAccount(queued.id);
-    const account_outcome = execution.createAccount(&account) catch |err| {
-        log.debug("message_id={s} stage=account outcome=retry error={s}", .{
-            message_id,
-            @errorName(err),
-        });
-        return .retry;
-    };
-    switch (account_outcome) {
-        .accepted => {},
-        .rejected => |status| return processRecordRejection(
-            arena,
-            message_id,
-            queued.id,
-            .account,
-            status,
-        ),
+    buffers: *const NativeBuffers,
+    count: usize,
+    range_count: usize,
+) !void {
+    std.debug.assert(count > 0 and count <= buffers.ids.len);
+    const ranges = buffers.ranges[0..range_count];
+    switch (family) {
+        .create_accounts => {
+            const n = try execution.createAccounts(buffers.accounts[0..count], buffers.account_results[0..count]);
+            if (n != count) return error.InvalidCreationReply;
+            try apply_creation_reply(family, plans, ranges, buffers.account_results[0..n], count);
+        },
+        .create_transfers => {
+            const n = try execution.createTransfers(buffers.transfers[0..count], buffers.transfer_results[0..count]);
+            if (n != count) return error.InvalidCreationReply;
+            try apply_creation_reply(family, plans, ranges, buffers.transfer_results[0..n], count);
+        },
+        .lookup_accounts => {
+            const n = try execution.lookupAccounts(buffers.ids[0..count], buffers.lookup_results[0..count]);
+            if (n > count) return error.InvalidLookupReply;
+            const reply = buffers.lookup_results[0..n];
+            try correlate_lookup_reply(buffers.ids[0..count], buffers.positions[0..count], reply);
+            var reply_index: usize = 0;
+            for (buffers.positions[0..count]) |position| {
+                const target = buffers.targets[position];
+                const plan = &plans[target.operation_index].?.admitted;
+                const id = buffers.ids[position];
+                while (reply_index < reply.len and reply[reply_index].id < id) : (reply_index += 1) {}
+                plan.outcomes[target.command_index] = if (reply_index < reply.len and reply[reply_index].id == id)
+                    .{ .found = reply[reply_index] }
+                else
+                    .{ .missing = "Account was not found." };
+            }
+        },
     }
+}
 
-    const transfer = accountingTransfer(queued.id);
-    const transfer_outcome = execution.createTransfer(&transfer) catch |err| {
-        log.debug("message_id={s} stage=transfer outcome=retry error={s}", .{
-            message_id,
-            @errorName(err),
-        });
-        return .retry;
-    };
-    switch (transfer_outcome) {
-        .accepted => {},
-        .rejected => |status| return processRecordRejection(
-            arena,
-            message_id,
-            queued.id,
-            .transfer,
-            status,
-        ),
+fn execute_family(
+    comptime family: Family,
+    plans: []?Planning,
+    execution: ExecutionAdapter,
+    buffers: *const NativeBuffers,
+) !void {
+    var count: usize = 0;
+    var range_count: usize = 0;
+    for (plans, 0..) |*planning, operation_index| {
+        if (planning.* == null or planning.*.? != .admitted) continue;
+        const plan = &planning.*.?.admitted;
+        if (family == .create_transfers and plan.chains[0] == .rejected) continue;
+        const list_count = plan.counts[@intFromEnum(family)];
+        if (list_count == 0) continue;
+        if (!packet_fits(count, list_count, buffers.ids.len)) {
+            try submit_packet(family, plans, execution, buffers, count, range_count);
+            count = 0;
+            range_count = 0;
+        }
+        buffers.ranges[range_count] = .{ .operation_index = operation_index, .start = count, .count = list_count };
+        range_count += 1;
+        const offset = family_offset(plan, family);
+        for (plan.commands[offset..][0..list_count], 0..) |*command, index| {
+            switch (family) {
+                .create_accounts => buffers.accounts[count] = command.native.account,
+                .create_transfers => buffers.transfers[count] = command.native.transfer,
+                .lookup_accounts => {
+                    buffers.ids[count] = command.id;
+                    buffers.targets[count] = .{ .operation_index = operation_index, .command_index = offset + index };
+                },
+            }
+            count += 1;
+        }
     }
-
-    const completion = successCompletion(arena, queued.id) catch |err| {
-        log.debug("message_id={s} stage=completion_payload outcome=retry error={s}", .{
-            message_id,
-            @errorName(err),
-        });
-        return .retry;
-    };
-    log.debug("message_id={s} outcome=succeeded", .{message_id});
-    return .{ .terminal = .{ .operation_id = queued.id, .result = completion } };
+    if (count > 0) try submit_packet(family, plans, execution, buffers, count, range_count);
 }
 
-fn processRecordRejection(
-    arena: Allocator,
-    message_id: []const u8,
-    operation_id: u128,
-    stage: FailureStage,
-    status: u32,
-) ExecutionOutcome {
-    log.debug("message_id={s} stage={s} outcome=rejected status={d}", .{
-        message_id,
-        @tagName(stage),
-        status,
-    });
-    const completion = failureCompletion(arena, stage, status) catch |err| {
-        log.debug("message_id={s} stage=completion_payload outcome=retry error={s}", .{
-            message_id,
-            @errorName(err),
-        });
-        return .retry;
-    };
-    return .{ .terminal = .{ .operation_id = operation_id, .result = completion } };
-}
-
-fn successCompletion(arena: Allocator, operation_id: u128) !operation.Completion {
-    var id_buffer: [36]u8 = undefined;
-    const transfer_id = try arena.dupe(u8, operation.uuidToString(operation_id, &id_buffer));
-    var payload = try std.json.ObjectMap.init(arena, &.{}, &.{});
-    try payload.put(arena, "transfer_id", .{ .string = transfer_id });
-    std.debug.assert(payload.count() == 1);
-    return .{ .success = .{ .object = payload } };
-}
-
-fn failureCompletion(
-    arena: Allocator,
-    stage: FailureStage,
-    status: u32,
-) !operation.Completion {
-    const stage_name: []const u8 = switch (stage) {
-        .account => "ACCOUNT",
-        .transfer => "TRANSFER",
-    };
-    switch (stage) {
-        .account => std.debug.assert(!tigerbeetle.create_account_succeeded(status)),
-        .transfer => std.debug.assert(!tigerbeetle.create_transfer_succeeded(status)),
+fn execute_phases(allocator: Allocator, plans: []?Planning, execution: ExecutionAdapter) !void {
+    var command_count: usize = 0;
+    for (plans) |planning| {
+        if (planning) |value| if (value == .admitted) {
+            command_count = try std.math.add(usize, command_count, value.admitted.commands.len);
+        };
     }
-
-    const stage_owned = try arena.dupe(u8, stage_name);
-    var payload = try std.json.ObjectMap.init(arena, &.{}, &.{});
-    try payload.put(arena, "stage", .{ .string = stage_owned });
-    try payload.put(arena, "status", .{ .integer = @intCast(status) });
-    std.debug.assert(payload.count() == 2);
-    return .{ .failure = .{ .object = payload } };
+    if (command_count == 0) return;
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const buffers = try NativeBuffers.init(scratch.allocator(), @min(command_count, native_capacity), plans.len);
+    inline for (families) |family| try execute_family(family, plans, execution, &buffers);
 }
 
-fn accountingAccount(operation_id: u128) tigerbeetle.Account {
-    var account: tigerbeetle.Account = std.mem.zeroes(tigerbeetle.Account);
-    account.id = operation_id;
-    account.ledger = accounting_ledger;
-    account.code = accounting_code;
-    return account;
-}
-
-fn accountingTransfer(operation_id: u128) tigerbeetle.Transfer {
-    var transfer: tigerbeetle.Transfer = std.mem.zeroes(tigerbeetle.Transfer);
-    transfer.id = operation_id;
-    transfer.debit_account_id = operation_id;
-    transfer.credit_account_id = accounting_credit_account_id;
-    transfer.amount = accounting_transfer_amount;
-    transfer.ledger = accounting_ledger;
-    transfer.code = accounting_code;
-    return transfer;
+fn plan_success(plan: *const Plan) bool {
+    if (plan.chains[0] == .rejected or plan.chains[1] == .rejected) return false;
+    for (plan.outcomes) |outcome| if (outcome == .missing or outcome == .skipped) return false;
+    return true;
 }
 
 fn validateQueuedOperation(queued: *const operation.Operation) !void {
     if (queued.state != .submitted) return error.InvalidState;
     if (queued.body == null) return error.MissingBody;
     std.debug.assert(queued.hash != null);
+    const expected = try operation.operationHash(queued.tenant, queued.name, &queued.body.?);
+    if (!operation.verifyHash(queued, &expected)) return error.HashMismatch;
     std.debug.assert(queued.last_updated != null);
     std.debug.assert(queued.expires_at != null);
 }
@@ -570,37 +744,82 @@ fn validateQueuedOperation(queued: *const operation.Operation) !void {
 const success_outcome: CreateOutcome = .accepted;
 
 const FakeExecution = struct {
-    accounts: [record_count_max]tigerbeetle.Account = undefined,
-    transfers: [record_count_max]tigerbeetle.Transfer = undefined,
-    account_outcomes: [record_count_max]CreateOutcome = .{success_outcome} ** record_count_max,
-    transfer_outcomes: [record_count_max]CreateOutcome = .{success_outcome} ** record_count_max,
-    account_errors: [record_count_max]?anyerror = .{null} ** record_count_max,
-    transfer_errors: [record_count_max]?anyerror = .{null} ** record_count_max,
-    account_count: u8 = 0,
-    transfer_count: u8 = 0,
+    accounts: [record_count_max * command_count_max]tigerbeetle.Account = undefined,
+    transfers: [record_count_max * command_count_max]tigerbeetle.Transfer = undefined,
+    account_outcomes: [record_count_max * command_count_max]CreateOutcome = .{success_outcome} ** (record_count_max * command_count_max),
+    transfer_outcomes: [record_count_max * command_count_max]CreateOutcome = .{success_outcome} ** (record_count_max * command_count_max),
+    account_errors: [record_count_max * command_count_max]?anyerror = .{null} ** (record_count_max * command_count_max),
+    transfer_errors: [record_count_max * command_count_max]?anyerror = .{null} ** (record_count_max * command_count_max),
+    account_count: usize = 0,
+    transfer_count: usize = 0,
+    lookup_results: [record_count_max * command_count_max]tigerbeetle.Account = undefined,
+    lookup_count: usize = 0,
+    lookup_ids: [record_count_max * command_count_max]u128 = undefined,
+    lookup_error: ?anyerror = null,
+    account_reply_count: ?usize = null,
+    transfer_reply_count: ?usize = null,
+    trace: [12]Family = undefined,
+    trace_count: usize = 0,
 
-    fn createAccount(
-        fake: *FakeExecution,
-        account: *const tigerbeetle.Account,
-    ) !CreateOutcome {
-        std.debug.assert(fake.account_count < record_count_max);
-        const index = fake.account_count;
-        fake.accounts[index] = account.*;
-        fake.account_count += 1;
-        if (fake.account_errors[index]) |err| return err;
-        return fake.account_outcomes[index];
+    fn record_call(fake: *FakeExecution, family: Family) void {
+        fake.trace[fake.trace_count] = family;
+        fake.trace_count += 1;
     }
 
-    fn createTransfer(
+    fn createAccounts(
         fake: *FakeExecution,
-        transfer: *const tigerbeetle.Transfer,
-    ) !CreateOutcome {
-        std.debug.assert(fake.transfer_count < record_count_max);
-        const index = fake.transfer_count;
-        fake.transfers[index] = transfer.*;
-        fake.transfer_count += 1;
-        if (fake.transfer_errors[index]) |err| return err;
-        return fake.transfer_outcomes[index];
+        input: []const tigerbeetle.Account,
+        output: []tigerbeetle.CreateAccountResult,
+    ) !usize {
+        std.debug.assert(output.len >= input.len);
+        fake.record_call(.create_accounts);
+        std.debug.assert(fake.account_count + input.len <= record_count_max * command_count_max);
+        for (input, 0..) |value, position| {
+            const index = fake.account_count;
+            fake.accounts[index] = value;
+            fake.account_count += 1;
+            if (fake.account_errors[index]) |err| return err;
+            output[position] = std.mem.zeroes(tigerbeetle.CreateAccountResult);
+            output[position].status = switch (fake.account_outcomes[index]) {
+                .accepted => tigerbeetle.account_created,
+                .rejected => |status| status,
+            };
+        }
+        return fake.account_reply_count orelse input.len;
+    }
+    fn createTransfers(
+        fake: *FakeExecution,
+        input: []const tigerbeetle.Transfer,
+        output: []tigerbeetle.CreateTransferResult,
+    ) !usize {
+        std.debug.assert(output.len >= input.len);
+        fake.record_call(.create_transfers);
+        std.debug.assert(fake.transfer_count + input.len <= record_count_max * command_count_max);
+        for (input, 0..) |value, position| {
+            const index = fake.transfer_count;
+            fake.transfers[index] = value;
+            fake.transfer_count += 1;
+            if (fake.transfer_errors[index]) |err| return err;
+            output[position] = std.mem.zeroes(tigerbeetle.CreateTransferResult);
+            output[position].status = switch (fake.transfer_outcomes[index]) {
+                .accepted => tigerbeetle.transfer_created,
+                .rejected => |status| status,
+            };
+        }
+        return fake.transfer_reply_count orelse input.len;
+    }
+    fn lookupAccounts(
+        fake: *FakeExecution,
+        input: []const u128,
+        output: []tigerbeetle.Account,
+    ) !usize {
+        std.debug.assert(output.len >= input.len);
+        fake.record_call(.lookup_accounts);
+        @memcpy(fake.lookup_ids[0..input.len], input);
+        if (fake.lookup_error) |err| return err;
+        if (fake.lookup_count > input.len) return fake.lookup_count;
+        @memcpy(output[0..fake.lookup_count], fake.lookup_results[0..fake.lookup_count]);
+        return fake.lookup_count;
     }
 };
 
@@ -608,8 +827,8 @@ const FakePublisher = struct {
     message: []const u8 = undefined,
     execution: ?*const FakeExecution = null,
     send_error: ?anyerror = null,
-    account_count_at_send: u8 = 0,
-    transfer_count_at_send: u8 = 0,
+    account_count_at_send: usize = 0,
+    transfer_count_at_send: usize = 0,
     send_count: u8 = 0,
 
     fn sendCompletion(
@@ -617,10 +836,9 @@ const FakePublisher = struct {
         arena: Allocator,
         body: []const u8,
     ) !void {
-        _ = arena;
         std.debug.assert(fake.send_count == 0);
         std.debug.assert(body.len > 0);
-        fake.message = body;
+        fake.message = try arena.dupe(u8, body);
         if (fake.execution) |execution| {
             fake.account_count_at_send = execution.account_count;
             fake.transfer_count_at_send = execution.transfer_count;
@@ -666,77 +884,6 @@ fn testEvent(allocator: Allocator, bodies: []const []const u8) ![]u8 {
     }
     try output.writer.writeAll("]}");
     return output.toOwnedSlice();
-}
-
-test "accounting events use the exact operation contract" {
-    const id: u128 = 0x00112233445566778899aabbccddeeff;
-    var expected_account: tigerbeetle.Account = std.mem.zeroes(tigerbeetle.Account);
-    expected_account.id = id;
-    expected_account.ledger = 1;
-    expected_account.code = 1;
-    try std.testing.expectEqualDeep(expected_account, accountingAccount(id));
-
-    var expected_transfer: tigerbeetle.Transfer = std.mem.zeroes(tigerbeetle.Transfer);
-    expected_transfer.id = id;
-    expected_transfer.debit_account_id = id;
-    expected_transfer.credit_account_id = 1;
-    expected_transfer.amount = 100;
-    expected_transfer.ledger = 1;
-    expected_transfer.code = 1;
-    try std.testing.expectEqualDeep(expected_transfer, accountingTransfer(id));
-}
-
-test "success completion contains the canonical arena-owned transfer id" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const completion = try successCompletion(
-        arena.allocator(),
-        0x00112233445566778899aabbccddeeff,
-    );
-
-    try std.testing.expect(completion == .success);
-    try std.testing.expect(completion.success == .object);
-    try std.testing.expectEqualStrings(
-        "00112233-4455-6677-8899-aabbccddeeff",
-        completion.success.object.get("transfer_id").?.string,
-    );
-    try std.testing.expectError(
-        error.OutOfMemory,
-        successCompletion(std.testing.failing_allocator, 1),
-    );
-}
-
-test "failure completions contain exact arena-owned stages and raw statuses" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const cases = [_]struct {
-        stage: FailureStage,
-        status: u32,
-        expected: []const u8,
-    }{
-        .{
-            .stage = .account,
-            .status = 19,
-            .expected = "{\"type\":\"FAILURE\",\"payload\":{\"stage\":\"ACCOUNT\",\"status\":19}}",
-        },
-        .{
-            .stage = .transfer,
-            .status = 22,
-            .expected = "{\"type\":\"FAILURE\",\"payload\":{\"stage\":\"TRANSFER\",\"status\":22}}",
-        },
-    };
-    for (cases) |case| {
-        const completion = try failureCompletion(arena.allocator(), case.stage, case.status);
-        var buffer: [operation.result_size_max]u8 = undefined;
-        try std.testing.expectEqualStrings(
-            case.expected,
-            try operation.writeCompletionJSON(&buffer, &completion),
-        );
-    }
-    try std.testing.expectError(
-        error.OutOfMemory,
-        failureCompletion(std.testing.failing_allocator, .account, 19),
-    );
 }
 
 test "TigerBeetle configuration defaults and validates overrides" {
@@ -789,162 +936,6 @@ test "TigerBeetle configuration defaults and validates overrides" {
         error.InvalidConfiguration,
         tigerbeetleConfiguration(&environment),
     );
-}
-
-test "mixed source outcomes publish one exact aggregate after all execution" {
-    var messages: [6][]u8 = undefined;
-    for (&messages, 0..) |*message, index| {
-        message.* = try testMessage(std.testing.allocator, index + 2);
-    }
-    defer for (messages) |message| std.testing.allocator.free(message);
-    const bodies = [_][]const u8{
-        messages[0],
-        "{invalid",
-        messages[1],
-        messages[2],
-        messages[3],
-        messages[4],
-        messages[5],
-    };
-    const event = try testEvent(std.testing.allocator, &bodies);
-    defer std.testing.allocator.free(event);
-    var fake: FakeExecution = .{};
-    fake.account_outcomes[1] = .{ .rejected = 19 };
-    fake.account_errors[2] = error.ClientClosed;
-    fake.transfer_outcomes[1] = .{ .rejected = 22 };
-    fake.transfer_errors[2] = error.TooMuchData;
-    var publisher: FakePublisher = .{ .execution = &fake };
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const response = try handleInvocation(
-        arena.allocator(),
-        event,
-        ExecutionAdapter.init(&fake),
-        CompletionPublisher.init(&publisher),
-    );
-    try std.testing.expectEqualStrings(
-        "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-3\"}," ++
-            "{\"itemIdentifier\":\"message-5\"}]}",
-        response,
-    );
-    try std.testing.expectEqual(@as(u8, 6), fake.account_count);
-    try std.testing.expectEqual(@as(u8, 4), fake.transfer_count);
-    try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
-    try std.testing.expectEqual(fake.account_count, publisher.account_count_at_send);
-    try std.testing.expectEqual(fake.transfer_count, publisher.transfer_count_at_send);
-    try std.testing.expectEqualStrings(
-        "{\"results\":[" ++
-            "{\"operation_id\":\"00000000-0000-0000-0000-000000000002\"," ++
-            "\"result\":{\"type\":\"SUCCESS\",\"payload\":{" ++
-            "\"transfer_id\":\"00000000-0000-0000-0000-000000000002\"}}}," ++
-            "{\"operation_id\":\"00000000-0000-0000-0000-000000000003\"," ++
-            "\"result\":{\"type\":\"FAILURE\",\"payload\":{" ++
-            "\"stage\":\"ACCOUNT\",\"status\":19}}}," ++
-            "{\"operation_id\":\"00000000-0000-0000-0000-000000000005\"," ++
-            "\"result\":{\"type\":\"FAILURE\",\"payload\":{" ++
-            "\"stage\":\"TRANSFER\",\"status\":22}}}," ++
-            "{\"operation_id\":\"00000000-0000-0000-0000-000000000007\"," ++
-            "\"result\":{\"type\":\"SUCCESS\",\"payload\":{" ++
-            "\"transfer_id\":\"00000000-0000-0000-0000-000000000007\"}}}]}",
-        publisher.message,
-    );
-    try std.testing.expect(std.mem.indexOf(u8, publisher.message, "tenant") == null);
-    try std.testing.expect(std.mem.indexOf(u8, publisher.message, "state") == null);
-    try std.testing.expect(std.mem.indexOf(u8, publisher.message, "hash") == null);
-}
-
-test "no terminal results produce no aggregate send" {
-    const message = try testMessage(std.testing.allocator, 2);
-    defer std.testing.allocator.free(message);
-    const event = try testEvent(std.testing.allocator, &.{ "{invalid", message });
-    defer std.testing.allocator.free(event);
-    var fake: FakeExecution = .{};
-    fake.account_errors[0] = error.ClientClosed;
-    var publisher: FakePublisher = .{};
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const response = try handleInvocation(
-        arena.allocator(),
-        event,
-        ExecutionAdapter.init(&fake),
-        CompletionPublisher.init(&publisher),
-    );
-    try std.testing.expectEqualStrings(
-        "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-1\"}]}",
-        response,
-    );
-    try std.testing.expectEqual(@as(u8, 1), fake.account_count);
-    try std.testing.expectEqual(@as(u8, 0), fake.transfer_count);
-    try std.testing.expectEqual(@as(u8, 0), publisher.send_count);
-}
-
-test "aggregate send failure retries represented records in source order" {
-    var messages: [3][]u8 = undefined;
-    for (&messages, 0..) |*message, index| {
-        message.* = try testMessage(std.testing.allocator, index + 2);
-    }
-    defer for (messages) |message| std.testing.allocator.free(message);
-    const event = try testEvent(
-        std.testing.allocator,
-        &.{ messages[0], messages[1], "{invalid", messages[2] },
-    );
-    defer std.testing.allocator.free(event);
-    var fake: FakeExecution = .{};
-    fake.account_errors[1] = error.ClientClosed;
-    fake.account_outcomes[2] = .{ .rejected = 19 };
-    var publisher: FakePublisher = .{ .send_error = error.AWSFailure };
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const response = try handleInvocation(
-        arena.allocator(),
-        event,
-        ExecutionAdapter.init(&fake),
-        CompletionPublisher.init(&publisher),
-    );
-    try std.testing.expectEqualStrings(
-        "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}," ++
-            "{\"itemIdentifier\":\"message-1\"}," ++
-            "{\"itemIdentifier\":\"message-3\"}]}",
-        response,
-    );
-    try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
-    const decoded = try completion_batch.decode(arena.allocator(), publisher.message);
-    try std.testing.expectEqual(@as(usize, 2), decoded.results.len);
-    try std.testing.expect(decoded.results[0] == .valid);
-    try std.testing.expectEqual(@as(u128, 2), decoded.results[0].valid.operation_id);
-    try std.testing.expect(decoded.results[1] == .valid);
-    try std.testing.expectEqual(@as(u128, 4), decoded.results[1].valid.operation_id);
-}
-
-test "duplicate operations remain terminal and share one aggregate send" {
-    const message = try testMessage(std.testing.allocator, 2);
-    defer std.testing.allocator.free(message);
-    const event = try testEvent(std.testing.allocator, &.{ message, message });
-    defer std.testing.allocator.free(event);
-    var fake: FakeExecution = .{};
-    var publisher: FakePublisher = .{};
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const response = try handleInvocation(
-        arena.allocator(),
-        event,
-        ExecutionAdapter.init(&fake),
-        CompletionPublisher.init(&publisher),
-    );
-    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
-    try std.testing.expectEqual(@as(u8, 2), fake.account_count);
-    try std.testing.expectEqual(@as(u8, 2), fake.transfer_count);
-    try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
-    const decoded = try completion_batch.decode(arena.allocator(), publisher.message);
-    try std.testing.expectEqual(@as(usize, 2), decoded.results.len);
-    for (decoded.results) |result| {
-        try std.testing.expect(result == .valid);
-        try std.testing.expectEqual(@as(u128, 2), result.valid.operation_id);
-    }
 }
 
 test "unsupported queued operation schemas are acknowledged" {
@@ -1088,4 +1079,2108 @@ test "tiger_beetle_processor and AWS SDK debug logging are enabled in ReleaseSaf
             @compileError("AWS SDK debug logging is disabled");
         }
     }
+}
+
+test "execution adapter borrows all three batch outputs and preserves raw results" {
+    var fake: FakeExecution = .{};
+    const execution = ExecutionAdapter.init(&fake);
+    var accounts = [_]tigerbeetle.Account{std.mem.zeroes(tigerbeetle.Account)} ** 2;
+    accounts[0].id = 11;
+    accounts[1].id = 22;
+    var account_output: [2]tigerbeetle.CreateAccountResult = undefined;
+    fake.account_outcomes[1] = .{ .rejected = 1234 };
+    try std.testing.expectEqual(@as(usize, 2), try execution.createAccounts(
+        &accounts,
+        &account_output,
+    ));
+    try std.testing.expectEqual(tigerbeetle.account_created, account_output[0].status);
+    try std.testing.expectEqual(@as(u32, 1234), account_output[1].status);
+    try std.testing.expectEqual(@as(u128, 22), fake.accounts[1].id);
+
+    var transfers = [_]tigerbeetle.Transfer{std.mem.zeroes(tigerbeetle.Transfer)} ** 2;
+    transfers[0].id = 11;
+    transfers[1].id = 22;
+    var transfer_output: [2]tigerbeetle.CreateTransferResult = undefined;
+    try std.testing.expectEqual(@as(usize, 2), try execution.createTransfers(
+        &transfers,
+        &transfer_output,
+    ));
+    try std.testing.expectEqual(tigerbeetle.transfer_created, transfer_output[1].status);
+    fake.lookup_results[0] = accounts[1];
+    fake.lookup_count = 1;
+    var lookup_output: [2]tigerbeetle.Account = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try execution.lookupAccounts(
+        &.{ 11, 22 },
+        &lookup_output,
+    ));
+    try std.testing.expectEqual(@as(u128, 22), lookup_output[0].id);
+}
+
+test "preflight lookup plan preserves concrete IDs and repeated aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"lookup_accounts":[{"id":"1","alias":"same"},{"id":"2","alias":"same"}]}
+    , .{});
+    const result = try plan_body(arena.allocator(), &body);
+    try std.testing.expect(result == .admitted);
+    try std.testing.expectEqual(@as(u128, 1), result.admitted.commands[0].native.lookup);
+    try std.testing.expectEqual(@as(u128, 2), result.admitted.commands[1].native.lookup);
+    try std.testing.expectEqualStrings("same", result.admitted.commands[0].alias.?);
+    try std.testing.expectEqualStrings("same", result.admitted.commands[1].alias.?);
+}
+
+// Uniform admission reserves the largest complete entry for every command.
+const completion_buffer_size = completion_batch.maximum_results_size(completion_count_max) catch unreachable;
+const result_size_multiplier = 24;
+const planned_result_size_max = std.math.mul(usize, operation.body_size_max, result_size_multiplier) catch unreachable;
+const command_capacity_raw = (planned_result_size_max - 147) / 1435;
+const command_count_max = std.math.floorPowerOfTwo(usize, command_capacity_raw);
+comptime {
+    std.debug.assert(planned_result_size_max == operation.result_size_max);
+    std.debug.assert(record_count_max * command_count_max == 640);
+    std.debug.assert(completion_buffer_size == 983713);
+    std.debug.assert(completion_buffer_size <= completion_batch.encoded_message_size_max);
+    std.debug.assert(command_capacity_raw == 68);
+    std.debug.assert(command_count_max == 64);
+    std.debug.assert(147 + 1435 * command_count_max <= planned_result_size_max);
+}
+
+const Family = enum { create_accounts, create_transfers, lookup_accounts };
+const families = [_]Family{ .create_accounts, .create_transfers, .lookup_accounts };
+const NativeCommand = union(enum) {
+    account: tigerbeetle.Account,
+    transfer: tigerbeetle.Transfer,
+    lookup: u128,
+};
+const Command = struct {
+    id: u128,
+    alias: ?[]const u8,
+    native: NativeCommand,
+};
+const CommandOutcome = union(enum) {
+    unsubmitted,
+    created: u32,
+    found: tigerbeetle.Account,
+    missing: []const u8,
+    skipped: []const u8,
+};
+const Plan = struct {
+    // Invocation-owned storage; alias slices borrow the unchanged parsed Body.
+    commands: []Command,
+    outcomes: []CommandOutcome,
+    counts: [3]usize,
+    chains: [2]ChainState = .{ .unfinished, .unfinished },
+};
+const Diagnostic = struct {
+    family: ?Family = null,
+    command_index: usize = 0,
+    id: ?u128 = null,
+    alias: ?[]const u8 = null,
+    message: []const u8,
+    field: ?[]const u8 = null,
+    member_index: ?u32 = null,
+};
+const Planning = union(enum) { admitted: Plan, rejected: Diagnostic };
+
+fn decimal(value: std.json.Value, minimum: u128, maximum: u128) !u128 {
+    if (value != .string) return error.InvalidDecimal;
+    const bytes = value.string;
+    if (bytes.len == 0 or bytes.len > 39) return error.InvalidDecimal;
+    if (bytes.len > 1 and bytes[0] == '0') return error.InvalidDecimal;
+    for (bytes) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidDecimal;
+    const number = std.fmt.parseInt(u128, bytes, 10) catch return error.InvalidDecimal;
+    if (number < minimum or number > maximum) return error.InvalidDecimal;
+    return number;
+}
+
+fn small_number(value: std.json.Value, maximum: u32) !u32 {
+    // Match the pinned Value serializer, including collapsed 1.0/1e0 and retained -0.
+    var bytes: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    switch (value) {
+        .integer, .float, .number_string => {},
+        else => return error.InvalidNumber,
+    }
+    std.json.Stringify.value(value, .{}, &writer) catch return error.InvalidNumber;
+    const spelling = writer.buffered();
+    if (spelling.len == 0) return error.InvalidNumber;
+    for (spelling) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidNumber;
+    const number = std.fmt.parseInt(u32, spelling, 10) catch return error.InvalidNumber;
+    if (number > maximum) return error.InvalidNumber;
+    return number;
+}
+
+fn valid_alias(value: std.json.Value) ![]const u8 {
+    if (value != .string) return error.InvalidAlias;
+    if (value.string.len == 0 or value.string.len > 64) return error.InvalidAlias;
+    if (!std.unicode.utf8ValidateSlice(value.string)) return error.InvalidAlias;
+    return value.string;
+}
+
+fn known_field(family: ?Family, name: []const u8) bool {
+    const names: []const []const u8 = if (family) |kind| switch (kind) {
+        .create_accounts => &.{ "id", "alias", "flags", "ledger", "code" },
+        .create_transfers => &.{ "id", "alias", "flags", "pending_id", "debit_account_id", "credit_account_id", "amount", "ledger", "code", "timeout" },
+        .lookup_accounts => &.{ "id", "alias" },
+    } else &.{ "create_accounts", "create_transfers", "lookup_accounts" };
+    for (names) |known| if (std.mem.eql(u8, known, name)) return true;
+    return false;
+}
+
+fn unknown_member(object: *const std.json.ObjectMap, family: ?Family) ?u32 {
+    for (object.keys(), 0..) |name, index| {
+        if (!known_field(family, name)) return @intCast(index);
+    }
+    return null;
+}
+
+fn field_error(field: []const u8, message: []const u8) Diagnostic {
+    return .{ .field = field, .message = message };
+}
+
+const WireField = enum {
+    id,
+    alias,
+    pending_id,
+    debit_account_id,
+    credit_account_id,
+    amount,
+    ledger,
+    code,
+    timeout,
+};
+const ParsedFields = struct {
+    id: u128 = 0,
+    alias: ?[]const u8 = null,
+    pending_id: u128 = 0,
+    debit_account_id: u128 = 0,
+    credit_account_id: u128 = 0,
+    amount: u128 = 0,
+    ledger: u128 = 0,
+    code: u128 = 0,
+    timeout: u128 = 0,
+    flags: u16 = 0,
+};
+
+fn validate_command(family: Family, value: *const std.json.Value, command: *Command) ?Diagnostic {
+    if (value.* != .object) return .{ .message = "Expected a command object." };
+    const object = &value.object;
+    if (unknown_member(object, family)) |index| {
+        return .{ .member_index = index, .message = "Unknown field." };
+    }
+    var fields: ParsedFields = .{};
+    if (family != .lookup_accounts) {
+        const raw = object.get("flags") orelse return field_error("flags", "Required field is missing.");
+        fields.flags = @intCast(small_number(raw, 65535) catch
+            return field_error("flags", "Expected an unsigned u16 integer."));
+        const allowed = fields.flags == 0 or (switch (family) {
+            .create_accounts => fields.flags == tigerbeetle.account_debits_must_not_exceed_credits,
+            .create_transfers => fields.flags == tigerbeetle.transfer_pending or
+                fields.flags == tigerbeetle.transfer_post_pending_transfer,
+            .lookup_accounts => unreachable,
+        });
+        if (!allowed) return field_error("flags", "Unsupported flags.");
+    }
+    const post = family == .create_transfers and
+        fields.flags == tigerbeetle.transfer_post_pending_transfer;
+    const pending = family == .create_transfers and fields.flags == tigerbeetle.transfer_pending;
+    // Enum order is the public diagnostic precedence, independent of JSON member order.
+    inline for (@typeInfo(WireField).@"enum".fields) |field_info| {
+        const field: WireField = @enumFromInt(field_info.value);
+        const name = field_info.name;
+        if (known_field(family, name)) {
+            if (validate_field(field, object.get(name), post, pending, &fields)) |problem| {
+                return problem;
+            }
+        }
+    }
+    construct_command(family, &fields, command);
+    return null;
+}
+
+fn validate_field(
+    comptime field: WireField,
+    raw: ?std.json.Value,
+    post: bool,
+    pending: bool,
+    fields: *ParsedFields,
+) ?Diagnostic {
+    const name = @tagName(field);
+    const reference = field == .debit_account_id or field == .credit_account_id;
+    const forbidden = (field == .pending_id and !post) or (field == .timeout and !pending);
+    if (forbidden) {
+        if (raw != null) return field_error(name, "Field is forbidden in this transfer mode.");
+        return null;
+    }
+    const required = field == .id or field == .amount or (field == .pending_id and post) or
+        ((reference or field == .ledger or field == .code) and !post) or
+        (field == .timeout and pending);
+    const present = raw orelse {
+        if (required) return field_error(name, "Required field is missing.");
+        return null;
+    };
+    if (field == .alias) {
+        fields.alias = valid_alias(present) catch
+            return field_error(name, "Expected 1 to 64 bytes of UTF-8 alias text.");
+    } else if (field == .id or field == .pending_id or reference or field == .amount) {
+        const minimum: u128 = if (field == .amount or (post and reference)) 0 else 1;
+        const maximum = std.math.maxInt(u128) - @as(u128, if (field == .amount) 0 else 1);
+        @field(fields, name) = decimal(present, minimum, maximum) catch
+            return field_error(name, "Expected a canonical decimal string in the allowed range.");
+    } else {
+        const maximum: u32 = if (field == .code) 65535 else std.math.maxInt(u32);
+        @field(fields, name) = small_number(present, maximum) catch
+            return field_error(name, "Expected an unsigned integer in the allowed range.");
+        if (!post and @field(fields, name) == 0) {
+            return field_error(name, "Expected a positive integer.");
+        }
+    }
+    return null;
+}
+
+fn construct_command(family: Family, fields: *const ParsedFields, command: *Command) void {
+    std.debug.assert(fields.id > 0);
+    std.debug.assert(fields.id < std.math.maxInt(u128));
+    command.* = .{ .id = fields.id, .alias = fields.alias, .native = undefined };
+    switch (family) {
+        .lookup_accounts => command.native = .{ .lookup = fields.id },
+        .create_accounts => {
+            var account = std.mem.zeroes(tigerbeetle.Account);
+            account.id = fields.id;
+            account.ledger = @intCast(fields.ledger);
+            account.code = @intCast(fields.code);
+            account.flags = fields.flags;
+            command.native = .{ .account = account };
+        },
+        .create_transfers => {
+            var transfer = std.mem.zeroes(tigerbeetle.Transfer);
+            transfer.id = fields.id;
+            transfer.pending_id = fields.pending_id;
+            transfer.debit_account_id = fields.debit_account_id;
+            transfer.credit_account_id = fields.credit_account_id;
+            transfer.amount = fields.amount;
+            transfer.ledger = @intCast(fields.ledger);
+            transfer.code = @intCast(fields.code);
+            transfer.timeout = @intCast(fields.timeout);
+            transfer.flags = fields.flags;
+            command.native = .{ .transfer = transfer };
+        },
+    }
+}
+
+fn command_relationship(command: *const Command) ?Diagnostic {
+    if (command.native != .transfer) return null;
+    const transfer = &command.native.transfer;
+    if (transfer.flags == tigerbeetle.transfer_post_pending_transfer and transfer.id == transfer.pending_id) {
+        return field_error("pending_id", "Transfer ID and pending transfer ID must differ.");
+    }
+    if (transfer.debit_account_id != 0 and transfer.debit_account_id == transfer.credit_account_id) {
+        return field_error("credit_account_id", "Debit and credit account IDs must differ.");
+    }
+    return null;
+}
+
+fn locate_diagnostic(diagnostic: Diagnostic, family: Family, index: usize, value: *const std.json.Value) Diagnostic {
+    var located = diagnostic;
+    located.family = family;
+    located.command_index = index;
+    // Projection is independent of the first validation error, including flags/unknown members.
+    if (value.* == .object) {
+        if (value.object.get("id")) |id| located.id = decimal(id, 1, std.math.maxInt(u128) - 1) catch null;
+        if (value.object.get("alias")) |alias| located.alias = valid_alias(alias) catch null;
+    }
+    return located;
+}
+
+const ValidationId = struct {
+    id: u128,
+    command_index: usize,
+};
+
+// Even the smallest wire-valid command, {"id":"1"}, occupies ten Body bytes.
+// Generic Operation parsing enforces body_size_max before production validation.
+const validation_id_count_max = operation.body_size_max / 10;
+
+fn validation_id_less(_: void, left: ValidationId, right: ValidationId) bool {
+    if (left.id == right.id) return left.command_index < right.command_index;
+    return left.id < right.id;
+}
+
+fn first_duplicate_id(ids: []ValidationId) ?usize {
+    std.debug.assert(ids.len <= validation_id_count_max);
+    if (ids.len < 2) return null;
+    std.sort.heap(ValidationId, ids, {}, validation_id_less);
+    var first: ?usize = null;
+    for (ids[1..], ids[0 .. ids.len - 1]) |current, previous| {
+        std.debug.assert(current.command_index < ids.len);
+        if (current.id != previous.id) continue;
+        std.debug.assert(previous.command_index < current.command_index);
+        if (first == null or current.command_index < first.?) first = current.command_index;
+    }
+    return first;
+}
+
+fn validate_body(body: *const std.json.Value, counts: *[3]usize) ?Diagnostic {
+    counts.* = .{ 0, 0, 0 };
+    if (body.* != .object) return .{ .message = "Expected a Body object." };
+    if (unknown_member(&body.object, null)) |index| return .{ .member_index = index, .message = "Unknown field." };
+    var ids: [validation_id_count_max]ValidationId = undefined;
+    for (families, 0..) |family, family_index| {
+        const list = body.object.get(@tagName(family)) orelse continue;
+        if (list != .array) return field_error(@tagName(family), "Expected an array of commands.");
+        counts[family_index] = list.array.items.len;
+        var id_count: usize = 0;
+        var first_problem: ?Diagnostic = null;
+        for (list.array.items, 0..) |*value, index| {
+            var command: Command = undefined;
+            var diagnostic = validate_command(family, value, &command);
+            if (diagnostic == null) {
+                std.debug.assert(id_count == index);
+                std.debug.assert(id_count < ids.len);
+                ids[id_count] = .{ .id = command.id, .command_index = index };
+                id_count += 1;
+                diagnostic = command_relationship(&command);
+            }
+            if (diagnostic) |problem| {
+                first_problem = locate_diagnostic(problem, family, index, value);
+                break;
+            }
+        }
+        // Excluding field failures but including relationship failures preserves precedence.
+        // Only the validated prefix is sorted; the Body and execution order remain untouched.
+        if (first_duplicate_id(ids[0..id_count])) |index| {
+            std.debug.assert(index < list.array.items.len);
+            const problem = field_error("id", "This ID repeats an earlier command's ID in the same list.");
+            return locate_diagnostic(problem, family, index, &list.array.items[index]);
+        }
+        if (first_problem) |problem| return problem;
+    }
+    const count = std.math.add(usize, counts[0], counts[1]) catch unreachable;
+    const total = std.math.add(usize, count, counts[2]) catch unreachable;
+    if (total == 0) return .{ .message = "At least one command is required." };
+    if (total > command_count_max) return .{ .message = "The Body exceeds the 64-command complete Result capacity." };
+    return null;
+}
+
+fn plan_body(allocator: Allocator, body: *const std.json.Value) !Planning {
+    var counts: [3]usize = undefined;
+    if (validate_body(body, &counts)) |diagnostic| return .{ .rejected = diagnostic };
+    const total = counts[0] + counts[1] + counts[2];
+    std.debug.assert(total > 0);
+    std.debug.assert(total <= command_count_max);
+    const commands = try allocator.alloc(Command, total);
+    errdefer allocator.free(commands);
+    const outcomes = try allocator.alloc(CommandOutcome, total);
+    errdefer allocator.free(outcomes);
+    @memset(outcomes, .unsubmitted);
+    var offset: usize = 0;
+    for (families, 0..) |family, family_index| {
+        if (counts[family_index] == 0) continue;
+        const list = body.object.get(@tagName(family)).?.array.items;
+        for (list, 0..) |*value, index| {
+            const diagnostic = validate_command(family, value, &commands[offset]);
+            std.debug.assert(diagnostic == null);
+            const linked = index + 1 < list.len;
+            switch (commands[offset].native) {
+                .account => |*account| if (linked) {
+                    account.flags |= tigerbeetle.account_linked;
+                },
+                .transfer => |*transfer| if (linked) {
+                    transfer.flags |= tigerbeetle.transfer_linked;
+                },
+                .lookup => {},
+            }
+            offset += 1;
+        }
+    }
+    std.debug.assert(offset == total);
+    return .{ .admitted = .{ .commands = commands, .outcomes = outcomes, .counts = counts } };
+}
+
+test "valid hash invalid Body publishes failure and admits neighbors without demo effects" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const invalid = try test_body_message(allocator, 1, "{\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1}],\"lookup_accounts\":[null]}");
+    const valid = try test_body_message(allocator, 2, "{\"lookup_accounts\":[{\"id\":\"1\"}]}");
+    const event = try testEvent(allocator, &.{ invalid, valid, "{\"id\":\"broken\"}" });
+    var execution: FakeExecution = .{};
+    var publisher: FakePublisher = .{};
+    const response = try handleInvocation(allocator, event, ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+    try std.testing.expectEqual(@as(u8, 0), execution.account_count);
+    try std.testing.expectEqual(@as(u8, 0), execution.transfer_count);
+    try std.testing.expectEqual(@as(usize, 0), execution.lookup_count);
+    try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
+}
+
+fn test_body_message(allocator: Allocator, id: u128, body_json: []const u8) ![]u8 {
+    const body = try std.json.parseFromSliceLeaky(std.json.Value, allocator, body_json, .{ .duplicate_field_behavior = .@"error" });
+    const queued: operation.Operation = .{
+        .id = id,
+        .tenant = "tenant-a",
+        .name = "test",
+        .body = body,
+        .state = .submitted,
+        .last_updated = 1700000000,
+        .expires_at = 1700086400,
+        .hash = try operation.operationHash("tenant-a", "test", &body),
+    };
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try operation.writeOutputJSON(&output.writer, &queued);
+    return output.toOwnedSlice();
+}
+
+fn test_plan(allocator: Allocator, json: []const u8) !Planning {
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{
+        .duplicate_field_behavior = .@"error",
+        .allocate = .alloc_always,
+    });
+    return plan_body(allocator, &value);
+}
+
+test "wire grammar and diagnostic precedence table" {
+    const Case = struct { body: []const u8, family: ?Family = null, index: usize = 0, field: ?[]const u8 = null, member: ?u32 = null };
+    const cases = [_]Case{
+        .{ .body = "null" },                                                                                                                                                     .{ .body = "true" },                                                                                                           .{ .body = "[]" },                                                                                                           .{ .body = "{}" },
+        .{ .body = "{\"create_accounts\":[],\"lookup_accounts\":[]}" },                                                                                                          .{ .body = "{\"lookup_accounts\":null}", .field = "lookup_accounts" },                                                         .{ .body = "{\"lookup_accounts\":{},\"bad\":0}", .member = 1 },                                                              .{ .body = "{\"Lookup_accounts\":[]}", .member = 0 },
+        .{ .body = "{\"lookup_accounts\":[\"1\"]}", .family = .lookup_accounts },                                                                                                .{ .body = "{\"lookup_accounts\":[null]}", .family = .lookup_accounts },                                                       .{ .body = "{\"lookup_accounts\":[{}]}", .family = .lookup_accounts, .field = "id" },                                        .{ .body = "{\"lookup_accounts\":[{\"id\":\"01\",\"alias\":\"main\",\"bad\":0}]}", .family = .lookup_accounts, .member = 2 },
+        .{ .body = "{\"create_accounts\":[{\"id\":null}]}", .family = .create_accounts, .field = "flags" },                                                                      .{ .body = "{\"create_accounts\":[{\"flags\":0,\"id\":null}]}", .family = .create_accounts, .field = "id" },                   .{ .body = "{\"lookup_accounts\":[{\"id\":\"1\"},{\"id\":\"1\"}]}", .family = .lookup_accounts, .index = 1, .field = "id" }, .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"1\",\"amount\":\"0\"}]}", .family = .create_transfers, .field = "pending_id" },
+        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\",\"timeout\":0}]}", .family = .create_transfers, .field = "timeout" }, .{ .body = "{\"lookup_accounts\":false,\"create_accounts\":[{\"id\":\"1\"}]}", .family = .create_accounts, .field = "flags" },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("wire case: {s}\n", .{case.body});
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try test_plan(arena.allocator(), case.body);
+        try std.testing.expect(result == .rejected);
+        const diagnostic = result.rejected;
+        try std.testing.expectEqual(case.family, diagnostic.family);
+        try std.testing.expectEqual(case.index, diagnostic.command_index);
+        try std.testing.expectEqual(case.member, diagnostic.member_index);
+        if (case.field) |field| try std.testing.expectEqualStrings(field, diagnostic.field.?) else try std.testing.expect(diagnostic.field == null);
+    }
+}
+
+test "canonical decimal IDs amounts and reference boundaries" {
+    const invalid = [_][]const u8{ "0", "340282366920938463463374607431768211455", "340282366920938463463374607431768211456", "", "01", "+1", "-1", " 1", "1 ", "1.0", "1e0", "0x1", "١" };
+    for (invalid) |id| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const body = try std.fmt.allocPrint(arena.allocator(), "{{\"lookup_accounts\":[{{\"id\":\"{s}\"}}]}}", .{id});
+        const result = try test_plan(arena.allocator(), body);
+        try std.testing.expect(result == .rejected);
+        try std.testing.expectEqualStrings("id", result.rejected.field.?);
+    }
+    const valid = [_][]const u8{ "1", "340282366920938463463374607431768211454", "\\u0031" };
+    for (valid) |id| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const body = try std.fmt.allocPrint(arena.allocator(), "{{\"lookup_accounts\":[{{\"id\":\"{s}\"}}]}}", .{id});
+        try std.testing.expect((try test_plan(arena.allocator(), body)) == .admitted);
+    }
+    const amounts = [_][]const u8{ "0", "1", "340282366920938463463374607431768211455" };
+    for (amounts) |amount| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const body = try std.fmt.allocPrint(arena.allocator(), "{{\"create_transfers\":[{{\"id\":\"1\",\"pending_id\":\"2\",\"flags\":4,\"amount\":\"{s}\"}}]}}", .{amount});
+        const result = try test_plan(arena.allocator(), body);
+        try std.testing.expectEqual(try std.fmt.parseInt(u128, amount, 10), result.admitted.commands[0].native.transfer.amount);
+        try std.testing.expectEqual(@as(u128, 0), result.admitted.commands[0].native.transfer.debit_account_id);
+    }
+}
+
+test "normalized small numbers range and negative zero" {
+    const Case = struct { number: []const u8, accepted: bool };
+    const cases = [_]Case{
+        .{ .number = "1", .accepted = true },      .{ .number = "1.0", .accepted = true },
+        .{ .number = "1e0", .accepted = true },    .{ .number = "4294967295", .accepted = true },
+        .{ .number = "0", .accepted = false },     .{ .number = "-0", .accepted = false },
+        .{ .number = "-0.0", .accepted = false },  .{ .number = "-1", .accepted = false },
+        .{ .number = "1.5", .accepted = false },   .{ .number = "4294967296", .accepted = false },
+        .{ .number = "\"1\"", .accepted = false }, .{ .number = "null", .accepted = false },
+    };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const json = try std.fmt.allocPrint(arena.allocator(), "{{\"create_accounts\":[{{\"id\":\"1\",\"flags\":0,\"ledger\":{s},\"code\":65535}}]}}", .{case.number});
+        const queued = try test_body_message(arena.allocator(), 1, json);
+        const parsed = parseRecord(arena.allocator(), "number", queued);
+        try std.testing.expect(parsed == .valid);
+        const result = try plan_body(arena.allocator(), &parsed.valid.body.?);
+        errdefer std.debug.print("small number: {s}\n", .{case.number});
+        try std.testing.expectEqual(case.accepted, result == .admitted);
+    }
+}
+
+test "native construction preserves namespaces chain bits post defaults and original hash" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"lookup_accounts":[{"id":"1","alias":"x"}],"create_transfers":[{"id":"1","flags":2,"debit_account_id":"1","credit_account_id":"2","amount":"0","ledger":99,"code":1,"timeout":4294967295},{"id":"3","flags":4,"pending_id":"1","amount":"340282366920938463463374607431768211455"}],"create_accounts":[{"id":"1","alias":"x","flags":2,"ledger":1,"code":1},{"id":"2","flags":0,"ledger":2,"code":1}]}
+    , .{});
+    const before = try operation.operationHash("tenant", "test", &body);
+    const plan = (try plan_body(arena.allocator(), &body)).admitted;
+    try std.testing.expectEqualSlices(usize, &.{ 2, 2, 1 }, &plan.counts);
+    var expected_account = std.mem.zeroes(tigerbeetle.Account);
+    expected_account.id = 1;
+    expected_account.flags = 3;
+    expected_account.ledger = 1;
+    expected_account.code = 1;
+    try std.testing.expectEqualDeep(expected_account, plan.commands[0].native.account);
+    try std.testing.expectEqual(@as(u16, 0), plan.commands[1].native.account.flags);
+    var expected_transfer = std.mem.zeroes(tigerbeetle.Transfer);
+    expected_transfer.id = 1;
+    expected_transfer.flags = 3;
+    expected_transfer.debit_account_id = 1;
+    expected_transfer.credit_account_id = 2;
+    expected_transfer.ledger = 99;
+    expected_transfer.code = 1;
+    expected_transfer.timeout = 4294967295;
+    try std.testing.expectEqualDeep(expected_transfer, plan.commands[2].native.transfer);
+    expected_transfer = std.mem.zeroes(tigerbeetle.Transfer);
+    expected_transfer.id = 3;
+    expected_transfer.pending_id = 1;
+    expected_transfer.flags = 4;
+    expected_transfer.amount = std.math.maxInt(u128);
+    try std.testing.expectEqualDeep(expected_transfer, plan.commands[3].native.transfer);
+    try std.testing.expectEqual(@as(u128, 1), plan.commands[4].native.lookup);
+    const after = try operation.operationHash("tenant", "test", &body);
+    try std.testing.expectEqualSlices(u8, &before, &after);
+    for (plan.outcomes) |outcome| try std.testing.expect(outcome == .unsubmitted);
+}
+
+test "aliases preserve escaped UTF-8 bytes and reject invalid decoded lengths" {
+    const aliases = [_][]const u8{ "a", " " ** 64, "é" ** 32, "\\u0000", "é", "\\u0061" };
+    const decoded = [_][]const u8{ "a", " " ** 64, "é" ** 32, "\x00", "é", "a" };
+    for (aliases, decoded) |alias, expected| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const json = try std.fmt.allocPrint(arena.allocator(), "{{\"lookup_accounts\":[{{\"id\":\"1\",\"alias\":\"{s}\"}}]}}", .{alias});
+        const plan = (try test_plan(arena.allocator(), json)).admitted;
+        try std.testing.expectEqualStrings(expected, plan.commands[0].alias.?);
+    }
+    const invalid = [_][]const u8{ "", "a" ** 65, "é" ** 32 ++ "a" };
+    for (invalid) |alias| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const json = try std.fmt.allocPrint(arena.allocator(), "{{\"lookup_accounts\":[{{\"id\":\"1\",\"alias\":\"{s}\"}}]}}", .{alias});
+        const result = try test_plan(arena.allocator(), json);
+        try std.testing.expectEqualStrings("alias", result.rejected.field.?);
+        try std.testing.expect(result.rejected.alias == null);
+    }
+}
+
+fn lookup_body(allocator: Allocator, count: usize, bad_suffix: bool) ![]u8 {
+    std.debug.assert(count <= 100);
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer writer.deinit();
+    try writer.writer.writeAll("{\"lookup_accounts\":[");
+    for (0..count) |index| {
+        if (index != 0) try writer.writer.writeByte(',');
+        try writer.writer.print("{{\"id\":\"{d}\"}}", .{index + 1});
+    }
+    if (bad_suffix) try writer.writer.writeAll(",{\"id\":\"0\"}");
+    try writer.writer.writeAll("]}");
+    return writer.toOwnedSlice();
+}
+
+test "64 commands admitted 65 rejected and later wire error wins" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_]usize{ 64, 65 }) |count| {
+        const body = try lookup_body(arena.allocator(), count, false);
+        const result = try test_plan(arena.allocator(), body);
+        try std.testing.expectEqual(count == 64, result == .admitted);
+        if (result == .rejected) try std.testing.expect(result.rejected.family == null);
+    }
+    const body = try lookup_body(arena.allocator(), 65, true);
+    const result = try test_plan(arena.allocator(), body);
+    try std.testing.expectEqual(@as(usize, 65), result.rejected.command_index);
+    try std.testing.expectEqualStrings("id", result.rejected.field.?);
+}
+
+test "diagnostic prefix and independent projection have exact Result shape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try test_plan(arena.allocator(), "{\"lookup_accounts\":[{\"id\":\"1\"},{\"id\":\"01\",\"alias\":\"main\",\"unexpected\":true},{\"id\":\"3\"}]}");
+    const buffer = try arena.allocator().create([operation.result_size_max]u8);
+    const encoded = write_diagnostic(buffer, 0x00112233445566778899aabbccddeeff, &result.rejected);
+    var writer: std.Io.Writer.Allocating = .init(arena.allocator());
+    try writer.writer.writeAll(encoded);
+    try std.testing.expectEqualStrings(
+        \\{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[null,{"id":null,"error_code":null,"alias":"main","message":"Unknown field.","member_index":2}]}}
+    , writer.written());
+}
+
+test "field mode matrix rejects omissions prohibited fields and unsupported flags" {
+    const bodies = [_][]const u8{
+        "{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1}",
+        "{\"id\":\"1\",\"flags\":0,\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1}",
+        "{\"id\":\"1\",\"flags\":2,\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1,\"timeout\":1}",
+        "{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\"}",
+    };
+    for (bodies, 0..) |json, mode| {
+        const family: Family = if (mode == 0) .create_accounts else .create_transfers;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const original = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+        // Every member in these minimal mode fixtures is mandatory.
+        for (original.object.keys()) |name| {
+            var value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+            _ = value.object.orderedRemove(name);
+            var command: Command = undefined;
+            const diagnostic = validate_command(family, &value, &command).?;
+            try std.testing.expectEqualStrings(name, diagnostic.field.?);
+        }
+        const prohibited = [_][]const u8{ "user_data_128", "user_data_64", "user_data_32", "timestamp", "reserved", "debits_pending", "debits_posted", "credits_pending", "credits_posted", "linked", "mode", "unexpected" };
+        for (prohibited) |name| {
+            var value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+            try value.object.put(allocator, name, .{ .integer = 0 });
+            var command: Command = undefined;
+            const diagnostic = validate_command(family, &value, &command).?;
+            try std.testing.expectEqual(@as(?u32, @intCast(original.object.count())), diagnostic.member_index);
+        }
+        for ([_]u32{ 1, 3, 5, 6, 8, 16, 32, 64, 128, 256, 65535, 65536 }) |flags| {
+            var value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+            try value.object.put(allocator, "flags", .{ .integer = flags });
+            var command: Command = undefined;
+            const diagnostic = validate_command(family, &value, &command).?;
+            try std.testing.expectEqualStrings("flags", diagnostic.field.?);
+        }
+        // A valid required value becoming null always rejects at that same field.
+        for (original.object.keys()) |name| {
+            var value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+            try value.object.put(allocator, name, .null);
+            var command: Command = undefined;
+            try std.testing.expectEqualStrings(name, validate_command(family, &value, &command).?.field.?);
+        }
+        if (mode == 1 or mode == 2) {
+            var value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+            try value.object.put(allocator, "pending_id", .{ .string = "0" });
+            var command: Command = undefined;
+            try std.testing.expectEqualStrings("pending_id", validate_command(family, &value, &command).?.field.?);
+        }
+        if (mode == 1 or mode == 3) {
+            var value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
+            try value.object.put(allocator, "timeout", .{ .integer = 0 });
+            var command: Command = undefined;
+            try std.testing.expectEqualStrings("timeout", validate_command(family, &value, &command).?.field.?);
+        }
+    }
+}
+
+test "duplicates precede direct relationships and post references retain zero inheritance" {
+    const cases = [_]struct { body: []const u8, field: ?[]const u8 }{
+        .{ .body = "{\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1},{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1}]}", .field = "id" },
+        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\"},{\"id\":\"1\",\"flags\":4,\"pending_id\":\"1\",\"amount\":\"0\"}]}", .field = "id" },
+        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\",\"debit_account_id\":\"3\",\"credit_account_id\":\"3\"}]}", .field = "credit_account_id" },
+        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\",\"debit_account_id\":\"0\",\"credit_account_id\":\"0\",\"ledger\":0,\"code\":0}]}", .field = null },
+        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\",\"debit_account_id\":\"3\"}]}", .field = null },
+    };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try test_plan(arena.allocator(), case.body);
+        if (case.field) |field| try std.testing.expectEqualStrings(field, result.rejected.field.?) else try std.testing.expect(result == .admitted);
+    }
+}
+
+test "sorted duplicate validation preserves original diagnostic precedence" {
+    const cases = [_]struct { body: []const u8, index: usize, field: []const u8 }{
+        .{ .body =
+        \\{"lookup_accounts":[{"id":"9"},{"id":"9"},{"id":"1"},{"id":"1"},{"id":"9"}]}
+        , .index = 1, .field = "id" },
+        .{ .body =
+        \\{"lookup_accounts":[{"id":"340282366920938463463374607431768211454"},{"id":"1"},{"id":"340282366920938463463374607431768211454"}]}
+        , .index = 2, .field = "id" },
+        .{ .body =
+        \\{"lookup_accounts":[{"id":"1"},{"id":"1","alias":null}]}
+        , .index = 1, .field = "alias" },
+        .{ .body =
+        \\{"lookup_accounts":[{"id":"1"},{"id":"1"},{"id":"2","alias":null}]}
+        , .index = 1, .field = "id" },
+        .{ .body =
+        \\{"lookup_accounts":[{"id":"1","alias":null},{"id":"2"},{"id":"2"}]}
+        , .index = 0, .field = "alias" },
+        .{ .body =
+        \\{"create_transfers":[{"id":"1","flags":4,"pending_id":"1","amount":"0"},{"id":"1","flags":4,"pending_id":"2","amount":"0"}]}
+        , .index = 0, .field = "pending_id" },
+    };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try test_plan(arena.allocator(), case.body);
+        try std.testing.expect(result == .rejected);
+        try std.testing.expectEqual(case.index, result.rejected.command_index);
+        try std.testing.expectEqualStrings(case.field, result.rejected.field.?);
+    }
+}
+
+test "stack duplicate validation covers near-limit Bodies beyond admission" {
+    for (0..3) |scenario| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var body: std.Io.Writer.Allocating = .init(arena.allocator());
+        try body.writer.writeAll("{\"lookup_accounts\":[");
+        // Three hundred descending IDs exercise sorting and approach the 4 KiB boundary.
+        for (0..300) |index| {
+            if (index != 0) try body.writer.writeByte(',');
+            const id: usize = if (scenario == 1 and index == 299) 300 else 300 - index;
+            try body.writer.print("{{\"id\":\"{d}\"", .{id});
+            if (scenario == 2 and index == 299) try body.writer.writeAll(",\"alias\":null");
+            try body.writer.writeByte('}');
+        }
+        try body.writer.writeAll("]}");
+        try std.testing.expect(body.written().len > 3800);
+        try std.testing.expect(body.written().len <= operation.body_size_max);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body.written(), .{});
+        // Invalid Bodies need no allocator, including duplicate checks beyond command 64.
+        const result = try plan_body(std.testing.failing_allocator, &parsed);
+        try std.testing.expect(result == .rejected);
+        if (scenario == 0) {
+            try std.testing.expectEqualStrings("The Body exceeds the 64-command complete Result capacity.", result.rejected.message);
+        } else {
+            try std.testing.expectEqual(@as(usize, 299), result.rejected.command_index);
+            try std.testing.expectEqualStrings(if (scenario == 1) "id" else "alias", result.rejected.field.?);
+        }
+    }
+}
+
+test "invalid envelopes never salvage an ID or publish Completion" {
+    const invalid_bodies = [_][]const u8{
+        "{\"lookup_accounts\":[],\"lookup_\\u0061ccounts\":[]}",
+        "{\"lookup_accounts\":[{\"id\":\"1\",\"\\u0069d\":\"1\"}]}",
+        "{\"lookup_accounts\":[}",
+        "\"" ++ "a" ** 4097 ++ "\"",
+        "{\"lookup_accounts\":[{\"id\":\"1\",\"alias\":\"\xff\"}]}",
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    for (invalid_bodies) |body| {
+        const message = try std.fmt.allocPrint(allocator, "{{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"tenant-a\",\"name\":\"test\",\"body\":{s},\"state\":\"SUBMITTED\",\"last_updated\":1700000000,\"expires_at\":1700086400,\"hash\":\"" ++ "ab" ** 32 ++ "\"}}", .{body});
+        if (operation.parseOutputJSON(allocator, message)) |_| {
+            return error.InvalidEnvelopeWasAccepted;
+        } else |err| {
+            try std.testing.expect(err != error.OutOfMemory);
+        }
+        try std.testing.expect(parseRecord(allocator, "bad", message) == .acknowledged);
+    }
+    const mismatch = try testMessage(allocator, 1);
+    try std.testing.expect(parseRecord(allocator, "hash", mismatch) == .acknowledged);
+    const event = try testEvent(allocator, &.{mismatch});
+    var execution: FakeExecution = .{};
+    var publisher: FakePublisher = .{};
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", try handleInvocation(allocator, event, ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher)));
+    try std.testing.expectEqual(@as(u8, 0), publisher.send_count);
+    try std.testing.expectEqual(@as(u8, 0), execution.account_count);
+}
+
+test "preflight publication failure retries only represented source records" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const message = try test_body_message(allocator, 1, "true");
+    const event = try testEvent(allocator, &.{ message, "malformed", message });
+    var execution: FakeExecution = .{};
+    var publisher: FakePublisher = .{ .send_error = error.SendFailed };
+    const response = try handleInvocation(allocator, event, ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"},{\"itemIdentifier\":\"message-2\"}]}", response);
+    try std.testing.expectEqual(@as(u8, 0), execution.account_count);
+    try std.testing.expectEqual(@as(u8, 0), execution.transfer_count);
+    try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
+}
+
+fn planning_allocation_case(allocator: Allocator, body: *const std.json.Value) !void {
+    const result = try plan_body(allocator, body);
+    defer allocator.free(result.admitted.commands);
+    defer allocator.free(result.admitted.outcomes);
+    try std.testing.expectEqual(@as(usize, 1), result.admitted.commands.len);
+}
+
+test "typed command and outcome allocation failures are reachable without effects or leaks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"lookup_accounts\":[{\"id\":\"1\"}]}", .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, planning_allocation_case, .{&body});
+    const message = try test_body_message(arena.allocator(), 1, "{\"lookup_accounts\":[{\"id\":\"1\"}]}");
+    const queued = parseRecord(arena.allocator(), "valid", message).valid;
+    try std.testing.expectError(error.OutOfMemory, plan_body(std.testing.failing_allocator, &queued.body.?));
+    const invalid_message = try test_body_message(arena.allocator(), 2, "true");
+    const invalid = parseRecord(arena.allocator(), "invalid", invalid_message).valid;
+    try std.testing.expect((try plan_body(std.testing.failing_allocator, &invalid.body.?)) == .rejected);
+}
+
+test "seeded family mixes admit uniformly and preserve independent positions" {
+    const seed: u64 = 0x02ad_1155_2026;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    for (0..96) |case_index| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const count: usize = if (case_index % 2 == 0) 64 else 65;
+        var counts = [_]usize{0} ** 3;
+        if (case_index < 6) {
+            counts[case_index / 2] = count;
+        } else {
+            for (0..count) |_| counts[random.uintLessThan(usize, 3)] += 1;
+        }
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        try writer.writer.writeByte('{');
+        for (families, 0..) |family, fi| {
+            if (fi != 0) try writer.writer.writeByte(',');
+            try writer.writer.print("\"{s}\":[", .{@tagName(family)});
+            for (0..counts[fi]) |index| {
+                if (index != 0) try writer.writer.writeByte(',');
+                try writer.writer.print("{{\"id\":\"{d}\"", .{index + 1});
+                switch (family) {
+                    .create_accounts => try writer.writer.writeAll(",\"flags\":0,\"ledger\":1,\"code\":1"),
+                    .create_transfers => try writer.writer.writeAll(",\"flags\":4,\"pending_id\":\"999\",\"amount\":\"0\""),
+                    .lookup_accounts => {},
+                }
+                try writer.writer.writeByte('}');
+            }
+            try writer.writer.writeByte(']');
+        }
+        try writer.writer.writeByte('}');
+        errdefer std.debug.print("seed={x} case={d} input={s}\n", .{ seed, case_index, writer.written() });
+        try std.testing.expect(writer.written().len <= 4096);
+        const result = try test_plan(allocator, writer.written());
+        try std.testing.expectEqual(count == 64, result == .admitted);
+        if (result == .admitted) {
+            try std.testing.expectEqualSlices(usize, &counts, &result.admitted.counts);
+            var offset: usize = 0;
+            for (counts, 0..) |family_count, fi| {
+                for (0..family_count) |index| {
+                    const command = &result.admitted.commands[offset];
+                    try std.testing.expectEqual(@as(u128, index + 1), command.id);
+                    if (fi < 2) {
+                        const flags = if (fi == 0) command.native.account.flags else command.native.transfer.flags;
+                        try std.testing.expectEqual(index + 1 < family_count, flags & 1 != 0);
+                    }
+                    offset += 1;
+                }
+            }
+        }
+    }
+}
+
+test "bounded serializer fixtures establish complete Result and diagnostic size proofs" {
+    // Artificial maximal shapes reserve all escaping, not a claim about a realizable Body.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const commands = try allocator.alloc(Command, 64);
+    const outcomes = try allocator.alloc(CommandOutcome, 64);
+    for (commands, outcomes) |*command, *outcome| {
+        command.* = .{ .id = std.math.maxInt(u128) - 1, .alias = "\x00" ** 64, .native = .{ .lookup = std.math.maxInt(u128) - 1 } };
+        outcome.* = .{ .missing = "\x00" ** 160 };
+    }
+    const scratch = try allocator.create([operation.result_size_max]u8);
+    var entry_writer = std.Io.Writer.fixed(scratch);
+    try write_outcome(&entry_writer, &commands[0], &outcomes[0]);
+    try std.testing.expectEqual(@as(usize, 1434), entry_writer.buffered().len);
+    var plan: Plan = .{ .commands = commands, .outcomes = outcomes, .counts = .{ 0, 0, 64 } };
+    try std.testing.expectEqual(@as(usize, 91987), (try write_result(scratch, 1, &plan, false)).len);
+    plan = .{ .commands = commands[0..0], .outcomes = outcomes[0..0], .counts = .{ 0, 0, 0 } };
+    try std.testing.expectEqual(@as(usize, 148), (try write_result(scratch, 1, &plan, false)).len);
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    const diagnostic: Diagnostic = .{
+        .family = .lookup_accounts,
+        .command_index = 409,
+        .id = std.math.maxInt(u128) - 1,
+        .alias = "\x00" ** 64,
+        .message = "\x00" ** 160,
+        .field = "credit_account_id",
+    };
+    writer.clearRetainingCapacity();
+    const buffer = try arena.allocator().create([operation.result_size_max]u8);
+    const encoded = write_diagnostic(buffer, 0x00112233445566778899aabbccddeeff, &diagnostic);
+    try writer.writer.writeAll(encoded);
+    try std.testing.expectEqual(@as(usize, 3655), writer.written().len);
+    _ = try operation.parseCompletionJSON(arena.allocator(), writer.written());
+}
+
+test "hash normalization and explicit default identity remain unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const jsons = [_][]const u8{
+        "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\"}]}",
+        "{ \"create_transfers\" : [ {\"id\":\"\\u0031\",\"flags\":4.0,\"pending_id\":\"2\",\"amount\":\"0\"} ] }",
+        "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\",\"ledger\":0}]}",
+        "{\"create_transfers\":[{\"flags\":4,\"id\":\"1\",\"pending_id\":\"2\",\"amount\":\"0\"}]}",
+    };
+    var hashes: [4][32]u8 = undefined;
+    var records: [4]tigerbeetle.Transfer = undefined;
+    for (jsons, 0..) |json, index| {
+        const message = try test_body_message(arena.allocator(), 1, json);
+        const parsed = parseRecord(arena.allocator(), "hash", message).valid;
+        hashes[index] = parsed.hash.?;
+        records[index] = (try plan_body(arena.allocator(), &parsed.body.?)).admitted.commands[0].native.transfer;
+    }
+    try std.testing.expectEqualSlices(u8, &hashes[0], &hashes[1]);
+    try std.testing.expect(!std.mem.eql(u8, &hashes[0], &hashes[2]));
+    try std.testing.expect(!std.mem.eql(u8, &hashes[0], &hashes[3]));
+    for (records[1..]) |record| try std.testing.expectEqualDeep(records[0], record);
+}
+
+test "routed numeric boundary table covers code timeout amount and every reference" {
+    const pending = "{\"id\":\"1\",\"flags\":2,\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1,\"timeout\":1}";
+    const post = "{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\"}";
+    const Case = struct { field: []const u8, raw: []const u8, accepted: bool = false, post: bool = false };
+    const cases = [_]Case{
+        .{ .field = "code", .raw = "0" },                                                                                 .{ .field = "code", .raw = "65535", .accepted = true },
+        .{ .field = "code", .raw = "65536" },                                                                             .{ .field = "code", .raw = "-0" },
+        .{ .field = "code", .raw = "1.5" },                                                                               .{ .field = "code", .raw = "\"1\"" },
+        .{ .field = "timeout", .raw = "0" },                                                                              .{ .field = "timeout", .raw = "0.0" },
+        .{ .field = "timeout", .raw = "-0" },                                                                             .{ .field = "timeout", .raw = "-1" },
+        .{ .field = "timeout", .raw = "1.5" },                                                                            .{ .field = "timeout", .raw = "\"1\"" },
+        .{ .field = "timeout", .raw = "4294967295", .accepted = true },                                                   .{ .field = "timeout", .raw = "4294967296" },
+        .{ .field = "timeout", .raw = "1e0", .accepted = true },                                                          .{ .field = "amount", .raw = "0" },
+        .{ .field = "amount", .raw = "\"00\"" },                                                                          .{ .field = "amount", .raw = "\"340282366920938463463374607431768211456\"" },
+        .{ .field = "amount", .raw = "\"340282366920938463463374607431768211455\"", .accepted = true },                   .{ .field = "debit_account_id", .raw = "\"0\"" },
+        .{ .field = "debit_account_id", .raw = "\"340282366920938463463374607431768211454\"", .accepted = true },         .{ .field = "debit_account_id", .raw = "\"340282366920938463463374607431768211455\"" },
+        .{ .field = "credit_account_id", .raw = "3" },                                                                    .{ .field = "credit_account_id", .raw = "\"03\"" },
+        .{ .field = "credit_account_id", .raw = "\"0\"", .post = true, .accepted = true },                                .{ .field = "credit_account_id", .raw = "\"340282366920938463463374607431768211455\"", .post = true },
+        .{ .field = "pending_id", .raw = "\"0\"", .post = true },                                                         .{ .field = "pending_id", .raw = "\"340282366920938463463374607431768211455\"", .post = true },
+        .{ .field = "pending_id", .raw = "\"340282366920938463463374607431768211454\"", .post = true, .accepted = true }, .{ .field = "pending_id", .raw = "2", .post = true },
+        .{ .field = "pending_id", .raw = "\"02\"", .post = true },                                                        .{ .field = "flags", .raw = "\"2\"" },
+        .{ .field = "flags", .raw = "-0" },                                                                               .{ .field = "flags", .raw = "2.5" },
+        .{ .field = "flags", .raw = "2e0", .accepted = true },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("field={s} input={s} post={}\n", .{ case.field, case.raw, case.post });
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, if (case.post) post else pending, .{});
+        const raw = try std.json.parseFromSliceLeaky(std.json.Value, allocator, case.raw, .{});
+        try value.object.put(allocator, case.field, raw);
+        var command: Command = undefined;
+        const diagnostic = validate_command(.create_transfers, &value, &command);
+        try std.testing.expectEqual(case.accepted, diagnostic == null);
+        if (diagnostic) |problem| try std.testing.expectEqualStrings(case.field, problem.field.?);
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const rejected = try test_plan(arena.allocator(), "{\"create_accounts\":[{\"id\":\"1\",\"alias\":null,\"flags\":4,\"ledger\":1,\"code\":1}]}");
+    try std.testing.expectEqualStrings("flags", rejected.rejected.field.?);
+    try std.testing.expectEqual(@as(?u128, 1), rejected.rejected.id);
+    try std.testing.expect(rejected.rejected.alias == null);
+}
+
+test "Body-level diagnostics encode empty families and one payload error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const planning = try test_plan(arena.allocator(), "{\"lookup_accounts\":{}}");
+    const buffer = try arena.allocator().create([operation.result_size_max]u8);
+    const encoded = write_diagnostic(buffer, 0x00112233445566778899aabbccddeeff, &planning.rejected);
+    var writer: std.Io.Writer.Allocating = .init(arena.allocator());
+    try writer.writer.writeAll(encoded);
+    try std.testing.expectEqualStrings(
+        \\{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[],"error":{"message":"Expected an array of commands.","field":"lookup_accounts"}}}
+    , writer.written());
+}
+
+test "direct Result writer preserves replay positions and refuses unfinished work" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const plan = (try test_plan(arena.allocator(), "{\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1},{\"id\":\"2\",\"flags\":0,\"ledger\":1,\"code\":1}]}")).admitted;
+    const buffer = try arena.allocator().create([operation.result_size_max]u8);
+    try std.testing.expectError(error.UnfinishedOperation, write_result(buffer, 1, &plan, true));
+    plan.outcomes[0] = .{ .created = 21 };
+    plan.outcomes[1] = .{ .created = 1 };
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"SUCCESS\",\"payload\":{\"operation_id\":\"00000000-0000-0000-0000-000000000001\",\"create_accounts\":[{\"id\":\"1\",\"error_code\":21},{\"id\":\"2\",\"error_code\":1}],\"create_transfers\":[],\"lookup_accounts\":[]}}",
+        try write_result(buffer, 1, &plan, true),
+    );
+}
+
+// The executor supplies whole-chain classification; individual replay suffixes are not failures.
+fn write_result(
+    buffer: *[operation.result_size_max]u8,
+    id: u128,
+    plan: *const Plan,
+    success: bool,
+) ![]const u8 {
+    std.debug.assert(plan.commands.len <= command_count_max);
+    std.debug.assert(plan.commands.len == plan.outcomes.len);
+    std.debug.assert(plan.commands.len == plan.counts[0] + plan.counts[1] + plan.counts[2]);
+    for (plan.outcomes) |*outcome| {
+        if (outcome.* == .unsubmitted) return error.UnfinishedOperation;
+        if (outcome.* == .missing or outcome.* == .skipped) std.debug.assert(!success);
+    }
+    var writer = std.Io.Writer.fixed(buffer);
+    result_prefix(&writer, id, success) catch unreachable;
+    var offset: usize = 0;
+    for (families, 0..) |family, family_index| {
+        writer.print(",\"{s}\":[", .{@tagName(family)}) catch unreachable;
+        for (0..plan.counts[family_index]) |index| {
+            if (index != 0) writer.writeAll(",") catch unreachable;
+            write_outcome(&writer, &plan.commands[offset], &plan.outcomes[offset]) catch unreachable;
+            offset += 1;
+        }
+        writer.writeAll("]") catch unreachable;
+    }
+    writer.writeAll("}}") catch unreachable;
+    return writer.buffered();
+}
+
+fn result_prefix(writer: *std.Io.Writer, id: u128, success: bool) !void {
+    var uuid: [operation.uuid_string_size]u8 = undefined;
+    try writer.print("{{\"type\":\"{s}\",\"payload\":{{\"operation_id\":\"{s}\"", .{
+        if (success) "SUCCESS" else "FAILURE", operation.uuidToString(id, &uuid),
+    });
+}
+
+fn write_alias(writer: *std.Io.Writer, alias: ?[]const u8) !void {
+    if (alias) |text| {
+        std.debug.assert(text.len <= 64);
+        std.debug.assert(std.unicode.utf8ValidateSlice(text));
+        try writer.writeAll(",\"alias\":");
+        try std.json.Stringify.value(text, .{}, writer);
+    }
+}
+
+fn write_message(writer: *std.Io.Writer, message: []const u8) !void {
+    std.debug.assert(message.len > 0);
+    std.debug.assert(message.len <= 160);
+    std.debug.assert(std.unicode.utf8ValidateSlice(message));
+    try writer.writeAll("\"message\":");
+    try std.json.Stringify.value(message, .{}, writer);
+}
+
+fn write_outcome(writer: *std.Io.Writer, command: *const Command, outcome: *const CommandOutcome) !void {
+    std.debug.assert(command.id > 0);
+    std.debug.assert(command.id < std.math.maxInt(u128));
+    switch (outcome.*) {
+        .created => std.debug.assert(command.native != .lookup),
+        .found, .missing => std.debug.assert(command.native == .lookup),
+        .skipped => std.debug.assert(command.native == .transfer),
+        .unsubmitted => unreachable,
+    }
+    try writer.print("{{\"id\":\"{d}\",\"error_code\":", .{command.id});
+    switch (outcome.*) {
+        .unsubmitted => unreachable,
+        .created => |code| try writer.print("{d}", .{code}),
+        else => try writer.writeAll("null"),
+    }
+    try write_alias(writer, command.alias);
+    switch (outcome.*) {
+        .unsubmitted => unreachable,
+        .created => {},
+        .found => |*account| {
+            std.debug.assert(account.id == command.id);
+            try writer.writeAll(",\"account\":");
+            try write_account(writer, account);
+        },
+        .missing, .skipped => |message| {
+            try writer.writeAll(",");
+            try write_message(writer, message);
+        },
+    }
+    try writer.writeAll("}");
+}
+
+fn write_account(writer: *std.Io.Writer, account: *const tigerbeetle.Account) !void {
+    try writer.writeAll("{");
+    inline for (.{ "debits_pending", "debits_posted", "credits_pending", "credits_posted", "user_data_128", "user_data_64", "user_data_32", "reserved", "ledger", "code", "flags", "timestamp" }, 0..) |field, index| {
+        if (index != 0) try writer.writeAll(",");
+        try writer.print("\"{s}\":", .{field});
+        const value = @field(account, field);
+        if (@bitSizeOf(@TypeOf(value)) >= 64) {
+            try writer.print("\"{d}\"", .{value});
+        } else {
+            try writer.print("{d}", .{value});
+        }
+    }
+    try writer.writeAll("}");
+}
+
+fn write_diagnostic(buffer: *[operation.result_size_max]u8, id: u128, diagnostic: *const Diagnostic) []const u8 {
+    std.debug.assert(diagnostic.field == null or diagnostic.member_index == null);
+    std.debug.assert(diagnostic.command_index <= operation.body_size_max / 10);
+    var writer = std.Io.Writer.fixed(buffer);
+    result_prefix(&writer, id, false) catch unreachable;
+    for (families) |family| {
+        writer.print(",\"{s}\":[", .{@tagName(family)}) catch unreachable;
+        if (diagnostic.family == family) {
+            for (0..diagnostic.command_index) |_| writer.writeAll("null,") catch unreachable;
+            write_diagnostic_entry(&writer, diagnostic) catch unreachable;
+        }
+        writer.writeAll("]") catch unreachable;
+    }
+    if (diagnostic.family == null) {
+        writer.writeAll(",\"error\":") catch unreachable;
+        write_diagnostic_entry(&writer, diagnostic) catch unreachable;
+    }
+    writer.writeAll("}}") catch unreachable;
+    return writer.buffered();
+}
+
+fn write_diagnostic_entry(writer: *std.Io.Writer, diagnostic: *const Diagnostic) !void {
+    try writer.writeAll("{");
+    if (diagnostic.family != null) {
+        try writer.writeAll("\"id\":");
+        if (diagnostic.id) |id| try writer.print("\"{d}\"", .{id}) else try writer.writeAll("null");
+        try writer.writeAll(",\"error_code\":null");
+        try write_alias(writer, diagnostic.alias);
+        try writer.writeAll(",");
+    }
+    try write_message(writer, diagnostic.message);
+    if (diagnostic.field) |field| {
+        try writer.writeAll(",\"field\":");
+        try std.json.Stringify.value(field, .{}, writer);
+    }
+    if (diagnostic.member_index) |index| try writer.print(",\"member_index\":{d}", .{index});
+    try writer.writeAll("}");
+}
+
+test "found Account projection preserves every native width and zero field" {
+    var account = std.mem.zeroes(tigerbeetle.Account);
+    inline for (.{ "debits_pending", "debits_posted", "credits_pending", "credits_posted", "user_data_128", "user_data_64", "user_data_32", "reserved", "ledger", "code", "flags", "timestamp" }) |field| {
+        @field(account, field) = std.math.maxInt(@TypeOf(@field(account, field)));
+    }
+    var bytes: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    try write_account(&writer, &account);
+    const expected =
+        \\{"debits_pending":"340282366920938463463374607431768211455","debits_posted":"340282366920938463463374607431768211455","credits_pending":"340282366920938463463374607431768211455","credits_posted":"340282366920938463463374607431768211455","user_data_128":"340282366920938463463374607431768211455","user_data_64":"18446744073709551615","user_data_32":4294967295,"reserved":4294967295,"ledger":4294967295,"code":65535,"flags":65535,"timestamp":"18446744073709551615"}
+    ;
+    try std.testing.expectEqualStrings(expected, writer.buffered());
+    account = std.mem.zeroes(tigerbeetle.Account);
+    writer = .fixed(&bytes);
+    try write_account(&writer, &account);
+    try std.testing.expectEqualStrings(
+        \\{"debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}
+    , writer.buffered());
+}
+
+test "realizable lookup Body carries found data larger than 4 KiB through Completion" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    try body.writer.writeAll("{\"lookup_accounts\":[");
+    for (0..64) |index| {
+        if (index != 0) try body.writer.writeAll(",");
+        try body.writer.print("{{\"id\":\"{d}\",\"alias\":\"same\"}}", .{index + 1});
+    }
+    try body.writer.writeAll("]}");
+    try std.testing.expect(body.written().len < 4096);
+    const plan = (try test_plan(allocator, body.written())).admitted;
+    for (plan.outcomes, 0..) |*outcome, index| {
+        var account = std.mem.zeroes(tigerbeetle.Account);
+        account.id = index + 1;
+        account.debits_posted = std.math.maxInt(u128);
+        account.flags = 65535;
+        outcome.* = .{ .found = account };
+    }
+    plan.outcomes[63] = .{ .missing = "Account was not found." };
+    const buffer = try allocator.create([operation.result_size_max]u8);
+    const result = try write_result(buffer, 1, &plan, false);
+    try std.testing.expect(result.len > 4096);
+    const transport = try allocator.alloc(u8, completion_buffer_size);
+    var framing = completion_batch.Encoded.init(transport);
+    try framing.append(1, result);
+    const decoded = try completion_batch.decode(allocator, framing.message());
+    const entry = decoded.results[0].valid;
+    try std.testing.expectEqual(@as(u128, 1), entry.operation_id);
+    const payload = entry.result.failure.object;
+    try std.testing.expectEqualStrings("00000000-0000-0000-0000-000000000001", payload.get("operation_id").?.string);
+    const lookups = payload.get("lookup_accounts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 64), lookups.len);
+    for (lookups[0..63]) |lookup| {
+        try std.testing.expectEqualStrings("same", lookup.object.get("alias").?.string);
+        try std.testing.expectEqualStrings("340282366920938463463374607431768211455", lookup.object.get("account").?.object.get("debits_posted").?.string);
+    }
+    try std.testing.expectEqualStrings("Account was not found.", lookups[63].object.get("message").?.string);
+}
+
+fn invocation_allocation_case(allocator: Allocator, event: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var execution: FakeExecution = .{};
+    var publisher: FakePublisher = .{};
+    _ = try handleInvocation(arena.allocator(), event, ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+}
+
+test "invocation scratch and Completion storage clean up allocation failures" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const message = try test_body_message(arena.allocator(), 1, "true");
+    const event = try testEvent(arena.allocator(), &.{message});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, invocation_allocation_case, .{event});
+}
+
+test "mixed FAILURE retains writes skipped transfers found observations and aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const plan = (try test_plan(arena.allocator(),
+        \\{"create_accounts":[{"id":"1","flags":0,"ledger":1,"code":1}],"create_transfers":[{"id":"3","flags":0,"debit_account_id":"1","credit_account_id":"2","amount":"1","ledger":1,"code":1}],"lookup_accounts":[{"id":"1","alias":"same"},{"id":"2","alias":"same"}]}
+    )).admitted;
+    plan.outcomes[0] = .{ .created = 4294967295 };
+    plan.outcomes[1] = .{ .created = 22 };
+    var account = std.mem.zeroes(tigerbeetle.Account);
+    account.id = 1;
+    plan.outcomes[2] = .{ .found = account };
+    plan.outcomes[3] = .{ .missing = "Account was not found." };
+    const buffer = try arena.allocator().create([operation.result_size_max]u8);
+    const result = try write_result(buffer, 1, &plan, false);
+    try std.testing.expectEqualStrings(
+        \\{"type":"FAILURE","payload":{"operation_id":"00000000-0000-0000-0000-000000000001","create_accounts":[{"id":"1","error_code":4294967295}],"create_transfers":[{"id":"3","error_code":22}],"lookup_accounts":[{"id":"1","error_code":null,"alias":"same","account":{"debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}},{"id":"2","error_code":null,"alias":"same","message":"Account was not found."}]}}
+    , result);
+    plan.outcomes[0] = .{ .created = 2 };
+    plan.outcomes[1] = .{ .skipped = "Transfer was not submitted because account creation was rejected." };
+    const skipped = try write_result(buffer, 1, &plan, false);
+    const decoded = try operation.parseCompletionJSON(arena.allocator(), skipped);
+    const transfer = decoded.failure.object.get("create_transfers").?.array.items[0].object;
+    try std.testing.expect(transfer.get("error_code").? == .null);
+    try std.testing.expectEqualStrings("Transfer was not submitted because account creation was rejected.", transfer.get("message").?.string);
+}
+
+const execution_body =
+    \\{"create_accounts":[{"id":"1","flags":0,"ledger":1,"code":1},{"id":"2","flags":0,"ledger":1,"code":1}],"create_transfers":[{"id":"3","flags":0,"debit_account_id":"1","credit_account_id":"2","amount":"10","ledger":1,"code":1}],"lookup_accounts":[{"id":"2","alias":"credit"},{"id":"1","alias":"debit"}]}
+;
+
+fn test_invoke(allocator: Allocator, bodies: []const []const u8, fake: *FakeExecution, publisher: *FakePublisher) ![]const u8 {
+    const messages = try allocator.alloc([]const u8, bodies.len);
+    for (bodies, 0..) |body, index| messages[index] = try test_body_message(allocator, index + 1, body);
+    return handleInvocation(allocator, try testEvent(allocator, messages), ExecutionAdapter.init(fake), CompletionPublisher.init(publisher));
+}
+
+test "family barriers intact duplicate chains and sparse repeated lookup aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var fake: FakeExecution = .{};
+    fake.account_outcomes[2] = .{ .rejected = tigerbeetle.account_exists };
+    fake.account_outcomes[3] = .{ .rejected = tigerbeetle.account_linked_event_failed };
+    fake.transfer_outcomes[1] = .{ .rejected = tigerbeetle.transfer_exists };
+    var account = std.mem.zeroes(tigerbeetle.Account);
+    account.id = 1;
+    account.debits_posted = 10;
+    fake.lookup_results[0] = account;
+    fake.lookup_results[1] = account;
+    fake.lookup_count = 2;
+    var publisher: FakePublisher = .{};
+    const response = try test_invoke(arena.allocator(), &.{ execution_body, execution_body }, &fake, &publisher);
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+    try std.testing.expectEqualSlices(Family, &families, fake.trace[0..fake.trace_count]);
+    try std.testing.expectEqual(@as(usize, 4), fake.account_count);
+    try std.testing.expectEqual(@as(usize, 2), fake.transfer_count);
+    for (fake.accounts[0..4], 0..) |account_input, index| {
+        try std.testing.expectEqual(@as(u16, if (index % 2 == 0) tigerbeetle.account_linked else 0), account_input.flags);
+    }
+    for (fake.transfers[0..2]) |transfer| try std.testing.expectEqual(@as(u16, 0), transfer.flags);
+    try std.testing.expectEqualSlices(u128, &.{ 2, 1, 2, 1 }, fake.lookup_ids[0..4]);
+    const decoded = try completion_batch.decode(arena.allocator(), publisher.message);
+    try std.testing.expectEqual(@as(usize, 2), decoded.results.len);
+    for (decoded.results) |entry| {
+        const payload = entry.valid.result.failure.object;
+        const lookups = payload.get("lookup_accounts").?.array.items;
+        try std.testing.expectEqualStrings("credit", lookups[0].object.get("alias").?.string);
+        try std.testing.expect(lookups[0].object.get("account") == null);
+        try std.testing.expectEqualStrings("debit", lookups[1].object.get("alias").?.string);
+        try std.testing.expectEqualStrings("10", lookups[1].object.get("account").?.object.get("debits_posted").?.string);
+    }
+}
+
+test "account rejection skips only its transfers and lookup follows either rejection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var fake: FakeExecution = .{};
+    fake.account_outcomes[0] = .{ .rejected = 8 };
+    fake.account_outcomes[1] = .{ .rejected = tigerbeetle.account_linked_event_failed };
+    fake.transfer_outcomes[0] = .{ .rejected = 22 };
+    var publisher: FakePublisher = .{};
+    _ = try test_invoke(arena.allocator(), &.{ execution_body, execution_body }, &fake, &publisher);
+    try std.testing.expectEqualSlices(Family, &families, fake.trace[0..fake.trace_count]);
+    try std.testing.expectEqual(@as(usize, 1), fake.transfer_count);
+    const decoded = try completion_batch.decode(arena.allocator(), publisher.message);
+    const skipped = decoded.results[0].valid.result.failure.object.get("create_transfers").?.array.items[0].object;
+    try std.testing.expect(skipped.get("error_code").? == .null);
+    try std.testing.expect(skipped.get("message") != null);
+    const rejected = decoded.results[1].valid.result.failure.object.get("create_transfers").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 22), rejected.get("error_code").?.integer);
+}
+
+test "creation layouts validate entire packet before mutation for both families" {
+    inline for (.{ Family.create_accounts, Family.create_transfers }) |family| {
+        const Result = if (family == .create_accounts) tigerbeetle.CreateAccountResult else tigerbeetle.CreateTransferResult;
+        const created = if (family == .create_accounts) tigerbeetle.account_created else tigerbeetle.transfer_created;
+        const exists = if (family == .create_accounts) tigerbeetle.account_exists else tigerbeetle.transfer_exists;
+        const failed = if (family == .create_accounts) tigerbeetle.account_linked_event_failed else tigerbeetle.transfer_linked_event_failed;
+        const cases = [_]struct { statuses: [2]u32, expected: ?ChainState }{
+            .{ .statuses = .{ created, created }, .expected = .accepted },
+            .{ .statuses = .{ exists, failed }, .expected = .accepted },
+            .{ .statuses = .{ failed, exists }, .expected = .rejected },
+            .{ .statuses = .{ 123456, failed }, .expected = .rejected },
+            .{ .statuses = .{ created, failed }, .expected = null },
+            .{ .statuses = .{ failed, failed }, .expected = null },
+            .{ .statuses = .{ exists, exists }, .expected = null },
+            .{ .statuses = .{ created, exists }, .expected = null },
+        };
+        for (cases) |case| {
+            var results = [_]Result{std.mem.zeroes(Result)} ** 2;
+            for (&results, case.statuses) |*result, status| result.status = status;
+            if (case.expected) |expected| {
+                try std.testing.expectEqual(expected, try classify_chain(family, &results));
+            } else try std.testing.expectError(error.InvalidCreationReply, classify_chain(family, &results));
+        }
+        var singleton = [_]Result{std.mem.zeroes(Result)};
+        singleton[0].status = exists;
+        try std.testing.expectEqual(ChainState.accepted, try classify_chain(family, &singleton));
+    }
+    for ([_]?usize{ 0, 1, 3, 5, null }) |count| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var fake: FakeExecution = .{};
+        fake.account_reply_count = count;
+        if (count == null) fake.account_outcomes[3] = .{ .rejected = tigerbeetle.account_exists };
+        var publisher: FakePublisher = .{};
+        const response = try test_invoke(arena.allocator(), &.{ execution_body, execution_body }, &fake, &publisher);
+        try std.testing.expectEqualStrings("{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"},{\"itemIdentifier\":\"message-1\"}]}", response);
+        try std.testing.expectEqualSlices(Family, &.{.create_accounts}, fake.trace[0..fake.trace_count]);
+        try std.testing.expectEqual(@as(u8, 0), publisher.send_count);
+    }
+}
+
+test "request errors stop each phase and publish later fully determined Operations" {
+    for (families, 0..) |family, phase| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var fake: FakeExecution = .{};
+        switch (family) {
+            .create_accounts => fake.account_errors[0] = error.NativeUnavailable,
+            .create_transfers => fake.transfer_errors[0] = error.NativeUnavailable,
+            .lookup_accounts => fake.lookup_error = error.NativeUnavailable,
+        }
+        var publisher: FakePublisher = .{};
+        const account_only = "{\"create_accounts\":[{\"id\":\"9\",\"flags\":0,\"ledger\":1,\"code\":1}]}";
+        const response = try test_invoke(arena.allocator(), &.{ execution_body, account_only, "true" }, &fake, &publisher);
+        try std.testing.expectEqualSlices(Family, families[0 .. phase + 1], fake.trace[0..fake.trace_count]);
+        try std.testing.expectEqualStrings(if (phase == 0)
+            "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"},{\"itemIdentifier\":\"message-1\"}]}"
+        else
+            "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}", response);
+        const decoded = try completion_batch.decode(arena.allocator(), publisher.message);
+        try std.testing.expectEqual(@as(usize, if (phase == 0) 1 else 2), decoded.results.len);
+        if (phase > 0) try std.testing.expect(decoded.results[0].valid.result == .success);
+    }
+}
+
+test "lookup validation rejects unknown partial excess inconsistent groups before any routing" {
+    const ids = [_]u128{ 3, 1, 2, 1 };
+    const cases = [_][]const u128{ &.{ 1, 2 }, &.{ 1, 1, 1 }, &.{ 1, 1, 4 }, &.{ 1, 1, 2, 3, 3 } };
+    for (cases) |returned| {
+        var accounts: [5]tigerbeetle.Account = undefined;
+        for (returned, 0..) |id, index| {
+            accounts[index] = std.mem.zeroes(tigerbeetle.Account);
+            accounts[index].id = id;
+        }
+        var positions: [4]usize = undefined;
+        try std.testing.expectError(error.InvalidLookupReply, correlate_lookup_reply(&ids, &positions, accounts[0..returned.len]));
+    }
+    inline for (@typeInfo(tigerbeetle.Account).@"struct".fields) |field| {
+        if (comptime std.mem.eql(u8, field.name, "id")) continue;
+        var accounts = [_]tigerbeetle.Account{std.mem.zeroes(tigerbeetle.Account)} ** 2;
+        accounts[0].id = 1;
+        accounts[1].id = 1;
+        @field(accounts[1], field.name) = 1;
+        var positions: [4]usize = undefined;
+        try std.testing.expectError(error.InvalidLookupReply, correlate_lookup_reply(&ids, &positions, &accounts));
+    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var fake: FakeExecution = .{};
+    fake.lookup_count = 1;
+    fake.lookup_results[0] = std.mem.zeroes(tigerbeetle.Account);
+    fake.lookup_results[0].id = 2; // A valid-looking prefix, but only one of two required copies.
+    var publisher: FakePublisher = .{};
+    const response = try test_invoke(arena.allocator(), &.{ execution_body, execution_body }, &fake, &publisher);
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"},{\"itemIdentifier\":\"message-1\"}]}", response);
+    try std.testing.expectEqual(@as(u8, 0), publisher.send_count);
+}
+
+const PackingExecution = struct {
+    calls: usize = 0,
+    seen: usize = 0,
+    sizes: [4]usize = undefined,
+    input_address: ?usize = null,
+    output_address: ?usize = null,
+    fail_second: bool = false,
+    malformed_second: bool = false,
+
+    fn createAccounts(self: *PackingExecution, input: []const tigerbeetle.Account, output: []tigerbeetle.CreateAccountResult) !usize {
+        try std.testing.expect(input.len > 0 and input.len <= native_capacity);
+        if (self.input_address) |address| try std.testing.expectEqual(address, @intFromPtr(input.ptr));
+        if (self.output_address) |address| try std.testing.expectEqual(address, @intFromPtr(output.ptr));
+        self.input_address = @intFromPtr(input.ptr);
+        self.output_address = @intFromPtr(output.ptr);
+        self.sizes[self.calls] = input.len;
+        self.calls += 1;
+        for (input, 0..) |account, index| {
+            try std.testing.expectEqual(@as(u128, self.seen + index + 1), account.id);
+            output[index] = std.mem.zeroes(tigerbeetle.CreateAccountResult);
+            output[index].status = tigerbeetle.account_created;
+        }
+        try std.testing.expectEqual(@as(u16, 0), input[input.len - 1].flags & tigerbeetle.account_linked);
+        self.seen += input.len;
+        if (self.calls == 2 and self.fail_second) return error.NativeUnavailable;
+        if (self.calls == 2 and self.malformed_second) output[output.len - 1].status = tigerbeetle.account_exists;
+        return input.len;
+    }
+    fn createTransfers(_: *PackingExecution, _: []const tigerbeetle.Transfer, _: []tigerbeetle.CreateTransferResult) !usize {
+        return error.UnexpectedTransfer;
+    }
+    fn lookupAccounts(_: *PackingExecution, _: []const u128, _: []tigerbeetle.Account) !usize {
+        return error.UnexpectedLookup;
+    }
+};
+
+fn synthetic_plans(allocator: Allocator, counts: []const usize) ![]?Planning {
+    const plans = try allocator.alloc(?Planning, counts.len);
+    var id: u128 = 1;
+    for (plans, counts) |*planning, count| {
+        const commands = try allocator.alloc(Command, count);
+        const outcomes = try allocator.alloc(CommandOutcome, count);
+        @memset(outcomes, .unsubmitted);
+        for (commands, 0..) |*command, index| {
+            var account = std.mem.zeroes(tigerbeetle.Account);
+            account.id = id;
+            account.flags = if (index + 1 < count) tigerbeetle.account_linked else 0;
+            command.* = .{ .id = id, .alias = null, .native = .{ .account = account } };
+            id += 1;
+        }
+        planning.* = .{ .admitted = .{ .commands = commands, .outcomes = outcomes, .counts = .{ count, 0, 0 } } };
+    }
+    return plans;
+}
+
+test "exact 8189 capacity flushes next intact chain reuses buffers and preserves earlier packet facts" {
+    for (0..3) |mode| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var counts = [_]usize{64} ** 129;
+        counts[127] = 61; // 127 * 64 + 61 = 8189; the next chain remains intact.
+        const plans = try synthetic_plans(arena.allocator(), &counts);
+        var fake: PackingExecution = .{ .fail_second = mode == 1, .malformed_second = mode == 2 };
+        const result = execute_phases(arena.allocator(), plans, ExecutionAdapter.init(&fake));
+        if (mode == 1) try std.testing.expectError(error.NativeUnavailable, result) else if (mode == 2)
+            try std.testing.expectError(error.InvalidCreationReply, result)
+        else
+            try result;
+        try std.testing.expectEqualSlices(usize, &.{ 8189, 64 }, fake.sizes[0..fake.calls]);
+        for (plans[0..128]) |planning| {
+            try std.testing.expectEqual(ChainState.accepted, planning.?.admitted.chains[0]);
+            for (planning.?.admitted.outcomes) |outcome| try std.testing.expectEqual(tigerbeetle.account_created, outcome.created);
+        }
+        for (plans[128].?.admitted.outcomes) |outcome| {
+            if (mode == 0) try std.testing.expect(outcome == .created) else try std.testing.expect(outcome == .unsubmitted);
+        }
+    }
+}
+
+test "seeded whole chain packing preserves order boundaries and greedy request counts" {
+    const seed = 0x4c696e6b;
+    var random_state: std.Random.DefaultPrng = .init(seed);
+    const random = random_state.random();
+    for (0..32) |case| {
+        errdefer std.debug.print("packing seed={d} case={d}\n", .{ seed, case });
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var counts: [300]usize = undefined;
+        var expected_calls: usize = 1;
+        var remaining: usize = native_capacity;
+        for (&counts) |*count| {
+            count.* = random.intRangeAtMost(usize, 1, 64);
+            if (count.* > remaining) {
+                expected_calls += 1;
+                remaining = native_capacity;
+            }
+            remaining -= count.*;
+        }
+        const plans = try synthetic_plans(arena.allocator(), &counts);
+        var fake: PackingExecution = .{};
+        try execute_phases(arena.allocator(), plans, ExecutionAdapter.init(&fake));
+        try std.testing.expectEqual(expected_calls, fake.calls);
+        for (plans) |planning| try std.testing.expectEqual(ChainState.accepted, planning.?.admitted.chains[0]);
+    }
+}
+
+test "seeded unordered lookup copies validate and route every original position" {
+    const seed = 0x4c6f6f6b;
+    var random_state: std.Random.DefaultPrng = .init(seed);
+    const random = random_state.random();
+    for (0..32) |case| {
+        errdefer std.debug.print("lookup seed={d} case={d}\n", .{ seed, case });
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var plans: [4]?Planning = undefined;
+        var fake: FakeExecution = .{};
+        for (&plans) |*planning| {
+            var ids: [16]u128 = undefined;
+            for (&ids, 0..) |*id, index| id.* = index + 1;
+            random.shuffle(u128, &ids);
+            const commands = try allocator.alloc(Command, 16);
+            const outcomes = try allocator.alloc(CommandOutcome, 16);
+            @memset(outcomes, .unsubmitted);
+            for (commands, ids) |*command, id| {
+                command.* = .{ .id = id, .alias = "same", .native = .{ .lookup = id } };
+                if (id % 3 != 0) {
+                    var account = std.mem.zeroes(tigerbeetle.Account);
+                    account.id = id;
+                    account.credits_posted = id * 7;
+                    fake.lookup_results[fake.lookup_count] = account;
+                    fake.lookup_count += 1;
+                }
+            }
+            planning.* = .{ .admitted = .{ .commands = commands, .outcomes = outcomes, .counts = .{ 0, 0, 16 } } };
+        }
+        random.shuffle(tigerbeetle.Account, fake.lookup_results[0..fake.lookup_count]);
+        try execute_phases(allocator, &plans, ExecutionAdapter.init(&fake));
+        try std.testing.expectEqualSlices(Family, &.{.lookup_accounts}, fake.trace[0..fake.trace_count]);
+        for (plans, 0..) |planning, operation_index| {
+            const plan = planning.?.admitted;
+            for (plan.commands, plan.outcomes, 0..) |command, outcome, index| {
+                try std.testing.expectEqual(command.id, fake.lookup_ids[operation_index * 16 + index]);
+                if (command.id % 3 == 0) {
+                    try std.testing.expect(outcome == .missing);
+                } else {
+                    try std.testing.expectEqual(command.id, outcome.found.id);
+                    try std.testing.expectEqual(command.id * 7, outcome.found.credits_posted);
+                }
+            }
+        }
+    }
+}
+
+fn workspace_allocation_case(allocator: Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const planning = try test_plan(arena.allocator(), execution_body);
+    var plans = [_]?Planning{planning};
+    var fake: FakeExecution = .{};
+    execute_phases(allocator, &plans, ExecutionAdapter.init(&fake)) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), fake.trace_count);
+        for (plans[0].?.admitted.outcomes) |outcome| try std.testing.expect(outcome == .unsubmitted);
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 3), fake.trace_count);
+}
+
+test "every native workspace allocation failure precedes effects and releases scratch" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, workspace_allocation_case, .{});
+}
+
+test "maximum admitted invocation uses three native calls and one Completion send" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    try body.writer.writeAll("{\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1}],\"create_transfers\":[{\"id\":\"2\",\"flags\":0,\"debit_account_id\":\"1\",\"credit_account_id\":\"3\",\"amount\":\"1\",\"ledger\":1,\"code\":1}],\"lookup_accounts\":[");
+    for (0..62) |index| {
+        if (index > 0) try body.writer.writeAll(",");
+        try body.writer.print("{{\"id\":\"{d}\"}}", .{index + 1});
+    }
+    try body.writer.writeAll("]}");
+    try std.testing.expect(body.written().len <= operation.body_size_max);
+    const bodies = [_][]const u8{body.written()} ** record_count_max;
+    var fake: FakeExecution = .{};
+    var publisher: FakePublisher = .{};
+    var measured: std.testing.FailingAllocator = .init(allocator, .{});
+    const response = try test_invoke(measured.allocator(), &bodies, &fake, &publisher);
+    try std.testing.expect(measured.allocated_bytes < 8 * 1024 * 1024);
+    try std.testing.expect(measured.allocations < 10000);
+    std.debug.print("maximum invocation: allocated_bytes={d} allocations={d} native_calls={d} sends={d}\n", .{
+        measured.allocated_bytes, measured.allocations, fake.trace_count, publisher.send_count,
+    });
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+    try std.testing.expectEqual(@as(usize, 10), fake.account_count);
+    try std.testing.expectEqual(@as(usize, 10), fake.transfer_count);
+    try std.testing.expectEqualSlices(Family, &families, fake.trace[0..fake.trace_count]);
+    try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
+    const decoded = try completion_batch.decode(allocator, publisher.message);
+    try std.testing.expectEqual(@as(usize, 10), decoded.results.len);
+    for (decoded.results) |entry| try std.testing.expectEqual(@as(usize, 62), entry.valid.result.failure.object.get("lookup_accounts").?.array.items.len);
+}
+
+test "malformed final creation range cannot publish a valid looking prefix in either family" {
+    const account_body = "{\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1},{\"id\":\"2\",\"flags\":0,\"ledger\":1,\"code\":1}]}";
+    const transfer_body = "{\"create_transfers\":[{\"id\":\"3\",\"flags\":0,\"debit_account_id\":\"1\",\"credit_account_id\":\"2\",\"amount\":\"1\",\"ledger\":1,\"code\":1},{\"id\":\"4\",\"flags\":0,\"debit_account_id\":\"1\",\"credit_account_id\":\"2\",\"amount\":\"1\",\"ledger\":1,\"code\":1}]}";
+    for ([_][]const u8{ account_body, transfer_body }, 0..) |body, family| {
+        for ([_]?usize{ 0, 1, 3, 5, null }) |count| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            var fake: FakeExecution = .{};
+            if (family == 0) {
+                fake.account_reply_count = count;
+                if (count == null) fake.account_outcomes[3] = .{ .rejected = tigerbeetle.account_exists };
+            } else {
+                fake.transfer_reply_count = count;
+                if (count == null) fake.transfer_outcomes[3] = .{ .rejected = tigerbeetle.transfer_exists };
+            }
+            var publisher: FakePublisher = .{};
+            const response = try test_invoke(arena.allocator(), &.{ body, body }, &fake, &publisher);
+            try std.testing.expectEqualStrings("{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"},{\"itemIdentifier\":\"message-1\"}]}", response);
+            try std.testing.expectEqual(@as(usize, 1), fake.trace_count);
+            try std.testing.expectEqual(@as(u8, 0), publisher.send_count);
+        }
+    }
+}
+
+test "fully found created and replayed Operations publish SUCCESS with actual codes" {
+    for (0..2) |attempt| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var fake: FakeExecution = .{};
+        if (attempt == 1) {
+            fake.account_outcomes[0] = .{ .rejected = tigerbeetle.account_exists };
+            fake.account_outcomes[1] = .{ .rejected = tigerbeetle.account_linked_event_failed };
+            fake.transfer_outcomes[0] = .{ .rejected = tigerbeetle.transfer_exists };
+        }
+        for (0..2) |index| {
+            fake.lookup_results[index] = std.mem.zeroes(tigerbeetle.Account);
+            fake.lookup_results[index].id = index + 1;
+        }
+        fake.lookup_count = 2;
+        var publisher: FakePublisher = .{};
+        const response = try test_invoke(arena.allocator(), &.{execution_body}, &fake, &publisher);
+        try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+        const decoded = try completion_batch.decode(arena.allocator(), publisher.message);
+        const payload = decoded.results[0].valid.result.success.object;
+        const accounts = payload.get("create_accounts").?.array.items;
+        try std.testing.expectEqual(@as(i64, if (attempt == 0) tigerbeetle.account_created else tigerbeetle.account_exists), accounts[0].object.get("error_code").?.integer);
+        try std.testing.expectEqual(@as(i64, if (attempt == 0) tigerbeetle.account_created else tigerbeetle.account_linked_event_failed), accounts[1].object.get("error_code").?.integer);
+    }
+}
+
+fn executable_invocation_allocation_case(allocator: Allocator, event: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var execution: FakeExecution = .{};
+    var publisher: FakePublisher = .{};
+    const response = try handleInvocation(arena.allocator(), event, ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+    try std.testing.expect(execution.trace_count == 0 or execution.trace_count == 3);
+    if (publisher.send_count > 0) try std.testing.expectEqual(@as(usize, 3), execution.trace_count);
+    try std.testing.expect(response.len > 0);
+}
+
+test "executable invocation allocation faults include post effect publication and response cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const message = try test_body_message(arena.allocator(), 1, execution_body);
+    const event = try testEvent(arena.allocator(), &.{message});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, executable_invocation_allocation_case, .{event});
+}
+
+const SerialPublisher = struct {
+    messages: [4][]const u8 = undefined,
+    calls: usize = 0,
+    fail_at: ?usize = null,
+    ambiguous: bool = false,
+
+    fn sendCompletion(self: *SerialPublisher, allocator: Allocator, body: []const u8) !void {
+        std.debug.assert(self.calls < self.messages.len);
+        const index = self.calls;
+        self.calls += 1;
+        if (self.fail_at == index and !self.ambiguous) return error.SendFailed;
+        self.messages[index] = try allocator.dupe(u8, body);
+        if (self.fail_at == index) return error.SendFailed;
+    }
+};
+
+test "serial publication skips unfinished records and preserves successful prefix on either send failure" {
+    for ([_]?usize{ null, 0, 1, 2 }) |fail_at| {
+        for ([_]bool{ false, true }) |ambiguous| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            const terminal_count = 2 * completion_count_max + 1;
+            const queued_count = terminal_count + 1;
+            const queued = try allocator.alloc(operation.Operation, queued_count);
+            const plans = try allocator.alloc(?Planning, queued_count);
+            var indexes: [queued_count]usize = undefined;
+            var retries = [_]bool{false} ** queued_count;
+            for (queued, plans, &indexes, 0..) |*entry, *plan, *index, i| {
+                const message = try test_body_message(allocator, i + 1, "true");
+                entry.* = (parseRecord(allocator, "source", message)).valid;
+                plan.* = try plan_body(allocator, &entry.body.?);
+                index.* = i;
+            }
+            // An unfinished source must not block later terminal Results.
+            plans[completion_count_max] = null;
+            const result = try allocator.create([operation.result_size_max]u8);
+            const buffer = try allocator.alloc(u8, completion_buffer_size);
+            var publisher: SerialPublisher = .{ .fail_at = fail_at, .ambiguous = ambiguous };
+            publish_results(allocator, queued, plans, &indexes, &retries, result, buffer, CompletionPublisher.init(&publisher));
+            try std.testing.expectEqual(@as(usize, if (fail_at) |n| n + 1 else 3), publisher.calls);
+            var terminal_index: usize = 0;
+            for (retries, 0..) |retry, i| {
+                if (i == completion_count_max) {
+                    try std.testing.expect(retry);
+                    continue;
+                }
+                try std.testing.expectEqual(if (fail_at) |n| terminal_index / completion_count_max >= n else false, retry);
+                terminal_index += 1;
+            }
+            var next_id: u128 = 1;
+            const captured = if (fail_at) |n| n + @intFromBool(ambiguous) else 3;
+            for (publisher.messages[0..captured], 0..) |message, send_index| {
+                const batch = try completion_batch.decode(allocator, message);
+                try std.testing.expectEqual(@as(usize, if (send_index == 2) 1 else completion_count_max), batch.results.len);
+                for (batch.results) |entry| {
+                    if (next_id == completion_count_max + 1) next_id += 1;
+                    try std.testing.expectEqual(next_id, entry.valid.operation_id);
+                    const expected = write_diagnostic(result, next_id, &plans[@intCast(next_id - 1)].?.rejected);
+                    const actual = try allocator.create([operation.result_size_max]u8);
+                    try std.testing.expectEqualStrings(expected, try operation.writeCompletionJSON(actual, &entry.valid.result));
+                    next_id += 1;
+                }
+            }
+        }
+    }
+}
+
+test "large lookup and mixed Results traverse Completion conditional persistence and authenticated query first wins" {
+    const completion_processor = @import("completion_processor");
+    const persistence = @import("operation_persistence");
+    const query = @import("query_lambda");
+    for ([_]bool{ false, true }) |mixed| {
+        for ([_]bool{ false, true }) |reverse| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            var body: std.Io.Writer.Allocating = .init(allocator);
+            try body.writer.writeByte('{');
+            if (mixed) try body.writer.writeAll("\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1}],");
+            try body.writer.writeAll("\"lookup_accounts\":[");
+            for (0..32) |i| {
+                if (i != 0) try body.writer.writeByte(',');
+                try body.writer.print("{{\"id\":\"{d}\",\"alias\":\"same\"}}", .{i + 1});
+            }
+            try body.writer.writeAll("]}");
+            const original = try test_body_message(allocator, 1, body.written());
+            const queued = (parseRecord(allocator, "source", original)).valid;
+            var store = persistence.test_support.Store.init(&queued);
+            var messages: [2][]const u8 = undefined;
+            for (&messages, 0..) |*message, attempt| {
+                // Only the queued bytes survive invocation restart. No saved native observation.
+                var execution: FakeExecution = .{};
+                execution.lookup_count = if (attempt == 0) 32 else 31;
+                for (execution.lookup_results[0..execution.lookup_count], 0..) |*account, i| {
+                    account.* = std.mem.zeroes(tigerbeetle.Account);
+                    account.id = i + 1;
+                    account.debits_posted = if (attempt == 0) 90 else 70;
+                    account.user_data_128 = std.math.maxInt(u128);
+                }
+                if (attempt == 1) execution.account_outcomes[0] = .{ .rejected = tigerbeetle.account_exists };
+                var publisher: FakePublisher = .{};
+                const response = try handleInvocation(allocator, try testEvent(allocator, &.{original}), ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+                try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+                try std.testing.expectEqualSlices(Family, if (mixed) &.{ .create_accounts, .lookup_accounts } else &.{.lookup_accounts}, execution.trace[0..execution.trace_count]);
+                try std.testing.expect(publisher.message.len > 4096);
+                message.* = publisher.message;
+            }
+            const first: usize = @intFromBool(reverse);
+            for ([_]usize{ first, 1 - first, first }) |arrival| {
+                const response = try completion_processor.test_support.invoke(allocator, messages[arrival], &store);
+                try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+            }
+            try std.testing.expectEqual(@as(usize, 1), store.writes);
+            const stored = try store.read(allocator, 1);
+            const queried = try query.test_support.query(allocator, &stored);
+            const outer = try std.json.parseFromSliceLeaky(std.json.Value, allocator, queried, .{});
+            try std.testing.expectEqual(@as(i64, 200), outer.object.get("statusCode").?.integer);
+            const restored = try operation.parseOutputJSON(allocator, outer.object.get("body").?.string);
+            const expected = (try completion_batch.decode(allocator, messages[first])).results[0].valid.result;
+            const expected_buffer = try allocator.create([operation.result_size_max]u8);
+            const actual_buffer = try allocator.create([operation.result_size_max]u8);
+            try std.testing.expectEqualStrings(try operation.writeCompletionJSON(expected_buffer, &expected), try operation.writeCompletionJSON(actual_buffer, &restored.state.completed));
+            const payload = if (reverse) restored.state.completed.failure else restored.state.completed.success;
+            const lookups = payload.object.get("lookup_accounts").?.array.items;
+            try std.testing.expectEqual(@as(usize, 32), lookups.len);
+            try std.testing.expectEqualStrings(if (reverse) "70" else "90", lookups[0].object.get("account").?.object.get("debits_posted").?.string);
+            try std.testing.expectEqualStrings("340282366920938463463374607431768211455", lookups[0].object.get("account").?.object.get("user_data_128").?.string);
+        }
+    }
+}
+
+test "partial Completion persistence retries its aggregate while successful source publication stays acknowledged" {
+    const completion_processor = @import("completion_processor");
+    const persistence = @import("operation_persistence");
+    for ([_]bool{ false, true }) |completed_subset| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var execution: FakeExecution = .{};
+        var publisher: FakePublisher = .{};
+        const source_response = try test_invoke(allocator, &.{ "true", "true", "true" }, &execution, &publisher);
+        try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", source_response);
+        try std.testing.expectEqual(@as(usize, 0), execution.trace_count);
+        var store: persistence.test_support.Store = .{};
+        for (&store.entries, 0..) |*entry, i| {
+            entry.* = (parseRecord(allocator, "source", try test_body_message(allocator, i + 1, "true"))).valid;
+        }
+        if (completed_subset) {
+            // A different aggregate has already completed the middle entry.
+            try store.completeById(allocator, 2, &.{ .success = .{ .string = "earlier winner" } }, 1_700_000_000);
+        }
+        store.fail_at = store.calls + 2;
+        const failed = try completion_processor.test_support.invoke(allocator, publisher.message, &store);
+        try std.testing.expectEqualStrings("{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}", failed);
+        try std.testing.expectEqual(@as(usize, 2), store.writes);
+        try std.testing.expect(store.entries[2].?.state == .submitted);
+        store.fail_at = null;
+        const replayed = try completion_processor.test_support.invoke(allocator, publisher.message, &store);
+        try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", replayed);
+        try std.testing.expectEqual(@as(usize, 3), store.writes);
+        _ = try completion_processor.test_support.invoke(allocator, publisher.message, &store);
+        try std.testing.expectEqual(@as(usize, 3), store.writes);
+        const batch = try completion_batch.decode(allocator, publisher.message);
+        for (store.entries, batch.results, 0..) |slot, decoded, i| {
+            if (completed_subset and i == 1) {
+                try std.testing.expectEqualStrings("earlier winner", slot.?.state.completed.success.string);
+                try std.testing.expectEqual(@as(i64, 1_700_000_000), slot.?.last_updated.?);
+            } else {
+                const expected = try allocator.create([operation.result_size_max]u8);
+                const actual = try allocator.create([operation.result_size_max]u8);
+                try std.testing.expectEqualStrings(try operation.writeCompletionJSON(expected, &decoded.valid.result), try operation.writeCompletionJSON(actual, &slot.?.state.completed));
+            }
+        }
+    }
+}
+
+test "restarted deliveries repeat original chains after every interruption without a recovery journal" {
+    const Boundary = enum { account_error, account_malformed, after_accounts, after_transfers, rejected_lookup, before_publish, lost_ack };
+    for (std.enums.values(Boundary)) |boundary| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const original = try test_body_message(allocator, 1, execution_body);
+        const event = try testEvent(allocator, &.{original});
+        // These copies are assertions only. The restarted driver receives only original JSON.
+        var original_accounts: [2]tigerbeetle.Account = undefined;
+        var original_transfer: tigerbeetle.Transfer = undefined;
+        {
+            var invocation = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer invocation.deinit();
+            var execution: FakeExecution = .{};
+            switch (boundary) {
+                .account_error => execution.account_errors[1] = error.LostReply,
+                .account_malformed => execution.account_reply_count = 1,
+                .after_accounts => execution.transfer_errors[0] = error.Interrupted,
+                .after_transfers => execution.lookup_error = error.Interrupted,
+                .rejected_lookup => {
+                    execution.transfer_outcomes[0] = .{ .rejected = 21 };
+                    execution.lookup_error = error.Interrupted;
+                },
+                .before_publish, .lost_ack => {},
+            }
+            var publisher: FakePublisher = .{};
+            if (boundary == .before_publish) publisher.send_error = error.AmbiguousSend;
+            const response = try handleInvocation(invocation.allocator(), event, ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+            try std.testing.expectEqualStrings(if (boundary == .lost_ack) "{\"batchItemFailures\":[]}" else "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}", response);
+            const phase_count: usize = switch (boundary) {
+                .account_error, .account_malformed => 1,
+                .after_accounts => 2,
+                else => 3,
+            };
+            try std.testing.expectEqualSlices(Family, families[0..phase_count], execution.trace[0..execution.trace_count]);
+            try std.testing.expectEqual(@as(u8, if (boundary == .before_publish or boundary == .lost_ack) 1 else 0), publisher.send_count);
+            @memcpy(&original_accounts, execution.accounts[0..2]);
+            if (phase_count > 1) original_transfer = execution.transfers[0];
+        }
+        var invocation = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer invocation.deinit();
+        var execution: FakeExecution = .{};
+        execution.account_outcomes[0] = .{ .rejected = tigerbeetle.account_exists };
+        execution.account_outcomes[1] = .{ .rejected = tigerbeetle.account_linked_event_failed };
+        execution.transfer_outcomes[0] = .{ .rejected = if (boundary == .rejected_lookup) 68 else tigerbeetle.transfer_exists };
+        execution.lookup_count = 2;
+        for (execution.lookup_results[0..2], 0..) |*account, i| {
+            account.* = std.mem.zeroes(tigerbeetle.Account);
+            account.id = i + 1;
+            account.credits_posted = 70;
+        }
+        var publisher: FakePublisher = .{};
+        const response = try handleInvocation(invocation.allocator(), event, ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+        try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+        try std.testing.expectEqualSlices(Family, &families, execution.trace[0..execution.trace_count]);
+        for (original_accounts, execution.accounts[0..2]) |expected, actual| try std.testing.expectEqualDeep(expected, actual);
+        if (boundary != .account_error and boundary != .account_malformed) try std.testing.expectEqualDeep(original_transfer, execution.transfers[0]);
+        try std.testing.expectEqualSlices(u128, &.{ 2, 1 }, execution.lookup_ids[0..2]);
+        const entry = (try completion_batch.decode(invocation.allocator(), publisher.message)).results[0].valid;
+        try std.testing.expectEqual(@as(u128, 1), entry.operation_id);
+        const payload = if (boundary == .rejected_lookup) entry.result.failure else entry.result.success;
+        const transfers = payload.object.get("create_transfers").?.array.items;
+        try std.testing.expectEqual(@as(i64, if (boundary == .rejected_lookup) 68 else tigerbeetle.transfer_exists), transfers[0].object.get("error_code").?.integer);
+        const lookups = payload.object.get("lookup_accounts").?.array.items;
+        try std.testing.expectEqualStrings("credit", lookups[0].object.get("alias").?.string);
+        try std.testing.expectEqualStrings("70", lookups[0].object.get("account").?.object.get("credits_posted").?.string);
+        // Exact complete bytes are checked against independently constructed typed outcomes.
+        var expected_plan = (try test_plan(allocator, execution_body)).admitted;
+        expected_plan.chains = .{ .accepted, if (boundary == .rejected_lookup) .rejected else .accepted };
+        expected_plan.outcomes[0] = .{ .created = tigerbeetle.account_exists };
+        expected_plan.outcomes[1] = .{ .created = tigerbeetle.account_linked_event_failed };
+        expected_plan.outcomes[2] = .{ .created = if (boundary == .rejected_lookup) 68 else tigerbeetle.transfer_exists };
+        expected_plan.outcomes[3] = .{ .found = execution.lookup_results[1] };
+        expected_plan.outcomes[4] = .{ .found = execution.lookup_results[0] };
+        const expected_buffer = try allocator.create([operation.result_size_max]u8);
+        const actual_buffer = try allocator.create([operation.result_size_max]u8);
+        try std.testing.expectEqualStrings(try write_result(expected_buffer, 1, &expected_plan, boundary != .rejected_lookup), try operation.writeCompletionJSON(actual_buffer, &entry.result));
+    }
+}
+
+test "repeated unresolved deliveries never manufacture exhaustion FAILURE" {
+    for (0..5) |_| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var execution: FakeExecution = .{};
+        execution.lookup_error = error.SyntheticTermination;
+        var publisher: FakePublisher = .{};
+        const response = try test_invoke(arena.allocator(), &.{execution_body}, &execution, &publisher);
+        try std.testing.expectEqualSlices(Family, &families, execution.trace[0..execution.trace_count]);
+        try std.testing.expectEqualStrings("{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}", response);
+        try std.testing.expectEqual(@as(u8, 0), publisher.send_count);
+    }
+}
+
+test "publication byte capacity flushes intact Results before count limit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var queued: [3]operation.Operation = undefined;
+    var plans: [3]?Planning = undefined;
+    for (&queued, &plans, 0..) |*entry, *plan, i| {
+        entry.* = (parseRecord(allocator, "source", try test_body_message(allocator, i + 1, "true"))).valid;
+        plan.* = try plan_body(allocator, &entry.body.?);
+    }
+    const result = try allocator.create([operation.result_size_max]u8);
+    const buffer = try allocator.alloc(u8, completion_buffer_size);
+    var single = completion_batch.Encoded.init(buffer);
+    try single.append(1, write_diagnostic(result, 1, &plans[0].?.rejected));
+    const single_size = single.message().len;
+    var retries = [_]bool{false} ** 3;
+    var publisher: SerialPublisher = .{ .fail_at = 1, .ambiguous = true };
+    publish_results(allocator, &queued, &plans, &.{ 0, 1, 2 }, &retries, result, buffer[0..single_size], CompletionPublisher.init(&publisher));
+    try std.testing.expectEqualSlices(bool, &.{ false, true, true }, &retries);
+    try std.testing.expectEqual(@as(usize, 2), publisher.calls);
+    for (publisher.messages[0..2], 0..) |message, i| {
+        try std.testing.expectEqual(single_size, message.len);
+        const batch = try completion_batch.decode(allocator, message);
+        try std.testing.expectEqual(@as(usize, 1), batch.results.len);
+        try std.testing.expectEqual(@as(u128, i + 1), batch.results[0].valid.operation_id);
+    }
+}
+
+test "redelivery regroups only intact original chains after a lost shared reply" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const original = try test_body_message(allocator, 17, execution_body);
+    const neighbor = try test_body_message(allocator, 18, "{\"create_accounts\":[{\"id\":\"9\",\"flags\":0,\"ledger\":1,\"code\":1}]}");
+    {
+        var first = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer first.deinit();
+        var execution: FakeExecution = .{ .account_reply_count = 0 };
+        var publisher: FakePublisher = .{};
+        const response = try handleInvocation(first.allocator(), try testEvent(first.allocator(), &.{ original, neighbor }), ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+        try std.testing.expectEqualStrings("{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"},{\"itemIdentifier\":\"message-1\"}]}", response);
+        try std.testing.expectEqualSlices(Family, &.{.create_accounts}, execution.trace[0..execution.trace_count]);
+        try std.testing.expectEqual(@as(usize, 3), execution.account_count);
+        try std.testing.expectEqual(@as(u8, 0), publisher.send_count);
+    }
+    const different_neighbor = try test_body_message(allocator, 19, "{\"create_accounts\":[{\"id\":\"10\",\"flags\":0,\"ledger\":1,\"code\":1}]}");
+    var execution: FakeExecution = .{};
+    execution.account_outcomes[1] = .{ .rejected = tigerbeetle.account_exists };
+    execution.account_outcomes[2] = .{ .rejected = tigerbeetle.account_linked_event_failed };
+    var publisher: FakePublisher = .{};
+    const response = try handleInvocation(allocator, try testEvent(allocator, &.{ different_neighbor, original }), ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+    try std.testing.expectEqualSlices(Family, &families, execution.trace[0..execution.trace_count]);
+    for ([_]u128{ 10, 1, 2 }, execution.accounts[0..3], [_]u16{ 0, tigerbeetle.account_linked, 0 }) |id, account, flags| {
+        try std.testing.expectEqual(id, account.id);
+        try std.testing.expectEqual(flags, account.flags);
+    }
+    const batch = try completion_batch.decode(allocator, publisher.message);
+    try std.testing.expectEqual(@as(u128, 19), batch.results[0].valid.operation_id);
+    try std.testing.expectEqual(@as(u128, 17), batch.results[1].valid.operation_id);
+    try std.testing.expectEqual(@as(i64, tigerbeetle.account_exists), batch.results[1].valid.result.failure.object.get("create_accounts").?.array.items[0].object.get("error_code").?.integer);
+}
+
+test "pending and post replay retain original timeout interval full amount and inherited zero sentinels" {
+    const body = "{\"create_transfers\":[{\"id\":\"3\",\"flags\":2,\"debit_account_id\":\"1\",\"credit_account_id\":\"2\",\"amount\":\"10\",\"ledger\":1,\"code\":1,\"timeout\":7},{\"id\":\"4\",\"flags\":4,\"pending_id\":\"3\",\"amount\":\"340282366920938463463374607431768211455\"}]}";
+    for (0..2) |attempt| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var execution: FakeExecution = .{};
+        if (attempt == 1) {
+            execution.transfer_outcomes[0] = .{ .rejected = tigerbeetle.transfer_exists };
+            execution.transfer_outcomes[1] = .{ .rejected = tigerbeetle.transfer_linked_event_failed };
+        }
+        var publisher: FakePublisher = .{ .send_error = if (attempt == 0) error.AmbiguousSend else null };
+        const response = try test_invoke(arena.allocator(), &.{body}, &execution, &publisher);
+        try std.testing.expectEqualStrings(if (attempt == 0) "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}" else "{\"batchItemFailures\":[]}", response);
+        try std.testing.expectEqualSlices(Family, &.{.create_transfers}, execution.trace[0..execution.trace_count]);
+        const pending = execution.transfers[0];
+        const post = execution.transfers[1];
+        try std.testing.expectEqual(@as(u128, 3), pending.id);
+        try std.testing.expectEqual(@as(u32, 7), pending.timeout);
+        try std.testing.expectEqual(@as(u16, 3), pending.flags);
+        try std.testing.expectEqual(@as(u128, 4), post.id);
+        try std.testing.expectEqual(@as(u128, 3), post.pending_id);
+        try std.testing.expectEqual(std.math.maxInt(u128), post.amount);
+        try std.testing.expectEqual(@as(u128, 0), post.debit_account_id);
+        try std.testing.expectEqual(@as(u128, 0), post.credit_account_id);
+        try std.testing.expectEqual(@as(u32, 0), post.ledger);
+        try std.testing.expectEqual(@as(u16, 0), post.code);
+        try std.testing.expectEqual(@as(u32, 0), post.timeout);
+        try std.testing.expectEqual(@as(u16, 4), post.flags);
+        const result = (try completion_batch.decode(arena.allocator(), publisher.message)).results[0].valid.result;
+        try std.testing.expect(result == .success);
+    }
+}
+
+test "response allocation failure after successful publication leaves safe whole invocation redelivery" {
+    var outer = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer outer.deinit();
+    const event = try testEvent(outer.allocator(), &.{try test_body_message(outer.allocator(), 1, execution_body)});
+    var after_send: usize = 0;
+    var before_send: usize = 0;
+    var reached_success = false;
+    // Fail logical allocations above the arena, including a response that fits an existing chunk.
+    for (0..1000) |fail_index| {
+        var invocation = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer invocation.deinit();
+        var failing = std.testing.FailingAllocator.init(invocation.allocator(), .{ .fail_index = fail_index });
+        var execution: FakeExecution = .{};
+        var publisher: FakePublisher = .{};
+        const response = handleInvocation(failing.allocator(), event, ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher)) catch |err| {
+            // Allocating JSON writers report allocation failure as WriteFailed.
+            try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+            if (publisher.send_count == 1) {
+                try std.testing.expectEqualSlices(Family, &families, execution.trace[0..execution.trace_count]);
+                after_send += 1;
+            } else before_send += 1;
+            continue;
+        };
+        try std.testing.expectEqualStrings(if (publisher.send_count == 1)
+            "{\"batchItemFailures\":[]}"
+        else
+            "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}", response);
+        if (!failing.has_induced_failure) {
+            reached_success = true;
+            break;
+        }
+    }
+    try std.testing.expect(reached_success);
+    try std.testing.expect(before_send > 0);
+    try std.testing.expect(after_send > 0);
 }

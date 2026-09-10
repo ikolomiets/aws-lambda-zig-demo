@@ -30,7 +30,7 @@ All strings and collections nested in a completion payload are owned by the call
 The external and persisted result is the compact envelope
 `{"type":"SUCCESS|FAILURE","payload":<non-null JSON>}`. The envelope must contain exactly `type`
 and `payload`; the type is uppercase, and the payload may contain nested null values but cannot
-itself be null. The entire compact envelope is limited to 4,096 bytes.
+itself be null. The entire compact envelope is limited to 98,304 bytes (96 KiB).
 
 Completion is immutable. `SUBMITTED -> SUBMITTED` remains valid while an Operation is pending, and a
 submitted Operation may transition once to either completed outcome. Every transition from

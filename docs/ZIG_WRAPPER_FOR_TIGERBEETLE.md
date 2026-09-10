@@ -1,5 +1,8 @@
 # Zig 0.16 Wrapper for TigerBeetle
 
+The maintained [processor design](TIGER_BEETLE_PROCESSOR.md) owns Body validation, execution,
+replay and public Results. This reference owns native ABI, client packaging and lifetime mechanics.
+
 ## Purpose
 
 `src/tigerbeetle.zig` is the synchronous Zig boundary around the versioned TigerBeetle C client
@@ -118,31 +121,45 @@ pub const Client = struct {
     pub fn createAccounts(
         client: *Client,
         accounts: []const Account,
-    ) Error![]CreateAccountResult;
+        output: []CreateAccountResult,
+    ) Error!usize;
 
     pub fn createTransfers(
         client: *Client,
         transfers: []const Transfer,
-    ) Error![]CreateTransferResult;
+        output: []CreateTransferResult,
+    ) Error!usize;
 
     pub fn lookupAccounts(
         client: *Client,
         ids: []const u128,
-    ) Error![]Account;
+        output: []Account,
+    ) Error!usize;
 };
 ```
 
-The allocator's backing state and the `std.Io` implementation must outlive the client. Every
-returned slice belongs to the caller, including an empty slice, and must be freed with the
-allocator supplied to `Client.create`:
+The allocator's backing state and the `std.Io` implementation must outlive the client.
+Each call borrows input and output until return, including error returns. Output capacity must be
+at least the input count (an asserted caller precondition). Creation returns exactly the input
+count; lookup returns at most that count. No request allocates or shrinks result storage.
+Callers free the original allocation, never the populated prefix:
 
 ```zig
-const results = try client.createAccounts(accounts);
-defer allocator.free(results);
+const output = try allocator.alloc(tigerbeetle.Account, ids.len);
+defer allocator.free(output);
+const count = try client.lookupAccounts(ids, output);
+const found = output[0..count];
 ```
 
-`lookupAccounts` can return fewer accounts than IDs because missing IDs have no result. Callers
-must match `Account.id` values rather than assume positional correspondence.
+`lookupAccounts` omits missing IDs. Match `Account.id` values rather than assuming positional
+correspondence. Output outside the returned prefix is unspecified; capacity beyond the input count
+is untouched. On error, ignore all output. Empty input returns zero without native submission.
+
+Named `account_linked`, `account_debits_must_not_exceed_credits`, `transfer_linked`,
+`transfer_pending`, and `transfer_post_pending_transfer` flags derive from the private pinned C
+header. Each family's `created`, `exists`, and `linked_event_failed` statuses are also exported
+with `account_` or `transfer_` prefixes. Raw status values remain u32. Existing singleton success
+helpers are retained; they are insufficient to classify a linked chain.
 
 ## Error set
 
@@ -192,15 +209,17 @@ echo mode or C declarations are exposed by the public API.
 
 ## Pinned request lifetime
 
-Each public operation allocates its largest possible result slice on the calling thread, then
-creates one stack-local `Request`:
+Each public operation borrows its caller's typed result buffer and creates one stack-local `Request`:
 
 ```zig
 const Request = struct {
     io: std.Io,
     event: std.Io.Event = .unset,
+    callback_finished: std.atomic.Value(bool) = .init(false),
     client_address: usize,
     result_buffer: []u8,
+    result_alignment: usize,
+    result_element_size: usize,
     result_size: usize = 0,
     callback_error: ?Error = null,
     packet: c.tb_packet_t,
@@ -214,7 +233,7 @@ stores that address and the address of its packet; both are asserted again in th
 The request remains in scope until callback completion, so neither object moves while native code
 can refer to it.
 
-Empty inputs return an owned empty allocation before constructing or submitting a packet.
+Empty inputs return zero before constructing or submitting a packet.
 
 ## Callback and `std.Io.Event`
 
@@ -222,57 +241,37 @@ TigerBeetle invokes the completion callback from its native client thread. The c
 pointer is temporary and valid only until the callback returns, so the callback must finish the
 copy before waking the caller.
 
-The request uses a one-shot `std.Io.Event`:
+The request uses a one-shot `std.Io.Event` and a final atomic release/acquire handshake.
+The callback validates byte length, source alignment, nullable pointer and destination capacity,
+then copies ephemeral bytes and sets the event. It does not allocate or access Operation state.
+An event set before waiting remains set, so early completion cannot lose a wakeup.
 
-```zig
-fn wait(request: *Request) void {
-    request.event.waitUncancelable(request.io);
-    assert(request.event.isSet());
-}
+`Event.set` can still be executing `futexWake` after the waiter observes the event. Therefore its
+return is followed by a final release-store to `callback_finished`, the callback's last access to
+request memory. The caller waits uncancelably for the event, then observes that final store with
+an acquire-load before returning or reusing any memory. The short handshake spin has no timeout;
+like native completion itself, it requires the callback thread to make progress.
 
-fn complete(
-    request: *Request,
-    result: ?[*]const u8,
-    result_size_raw: u32,
-) void {
-    const result_size: usize = @intCast(result_size_raw);
+No callback code touches the request after that store. The pinned native client relinquishes the
+packet before invoking the callback and does not touch it afterward. Client destruction joins the
+native thread. Calls and destruction remain serialized by the application owner.
 
-    // Validate the destination bound and nullable source, then copy.
-    // Store result_size or callback_error before publishing completion.
-
-    request.event.set(request.io);
-}
-```
-
-`Event.set` publishes all preceding callback writes. `waitUncancelable` observes those writes after
-it returns. An event that is set before the caller starts waiting remains set, so early completion
-does not lose a wakeup.
-
-The callback never allocates and never retains TigerBeetle's result pointer. It only:
-
-1. recovers `Request` from `packet.user_data`;
-2. asserts the completion context, packet identity, and pinned addresses;
-3. validates and copies the temporary result bytes into preallocated storage;
-4. records callback state; and
-5. sets the event.
-
-Allocator calls remain on the calling thread, so the wrapper does not require a thread-safe
-application allocator.
+Immediate `TB_CLIENT_INVALID` submission does not acquire packet ownership or schedule a callback.
+The pinned `ClientInterface.submit` checks the magic number and live context before calling the
+submission vtable. The wrapper returns that ordinary error without waiting. Offline native tests
+exercise a closed handle; the injected submission seam also proves output reuse after this error.
 
 ## Result validation and ownership
 
-After the event is observed, the caller:
+After completion ownership ends, the caller maps the packet status, returns any callback
+validation error, and validates the populated count. Creation replies must contain exactly one
+result per input; lookup counts may be zero through input count. Extra output capacity never
+permits an oversized native reply. The returned count does not change allocation ownership.
 
-1. maps the packet status;
-2. returns any callback validation error;
-3. requires `result_size` to be a multiple of the result element size;
-4. requires the element count to be no larger than the operation's input count; and
-5. shrinks the preallocated slice to the actual element count.
-
-For `create_accounts` and `create_transfers`, one result per input event is the maximum. For
-`lookup_accounts`, the input ID count is the maximum. The current TigerBeetle default full batch is
-8189 events, but the wrapper checks the ABI byte bound and lets the native client report its
-stricter `TB_PACKET_TOO_MUCH_DATA` status.
+The current native full batch is 8,189 events. The wrapper checks the ABI u32 byte bound and lets
+the native client report its stricter `TB_PACKET_TOO_MUCH_DATA` status. Typed outputs preserve
+alignment; malformed native byte lengths, nonzero-length null pointers and misaligned source
+addresses return `MalformedResult` without unsafe typed pointer conversion.
 
 ## Single-caller and shutdown contract
 
@@ -283,17 +282,17 @@ application:
 Client.create
     |
     v
-request -> wait for callback -> consume/free result
+request -> wait for callback -> consume/reuse output
     |
     v
-next request -> wait for callback -> consume/free result
+next request -> wait for callback -> consume/reuse output
     |
     v
 Client.destroy
 ```
 
 The wrapper does not attempt to detect or coordinate concurrent callers. Violating the contract can
-race the application allocator and invalidates the documented lifetime guarantees. If a future
+race borrowed storage and invalidates the documented lifetime guarantees. If a future
 application needs concurrency, it must add an application-level owner or a separately designed
 asynchronous facade rather than weakening this wrapper's contract.
 
@@ -303,16 +302,40 @@ that request lifetime.
 
 ## Lambda integration rule
 
-The wrapper is not imported by any current Lambda in this change. A future Lambda that imports it
-must use:
+The TigerBeetle processor owns one process-lived, pointer-stable client and retains
+`.single_threaded = false` for native callbacks. The other Lambda threading settings are unchanged.
+The execution adapter and its fake expose the same three borrowed batch methods. The processor
+validates the complete Body and original Operation hash before admission. Typed plans reserve
+commands/outcomes and borrow aliases from the parsed Body.
 
-```zig
-.single_threaded = false,
-```
+Execution finishes the invocation's account phase before eligible transfers, then runs requested
+lookups. Each nonempty creation list is an intact independent chain. The executor packs whole lists
+to 8,189 events, validating the complete reply before copying any represented Operation's statuses.
+All-created and first-member matching exists with linked-failed suffixes (including singleton exists)
+are accepted; late-member exists and differing fields remain rejection. Account rejection skips only
+that Operation's transfers. Raw native codes are always preserved.
 
-TigerBeetle invokes the Zig completion callback from a native thread. Compiling that Lambda as
-single-threaded would make the wrapper's synchronization assumptions invalid. Existing Lambda
-settings remain unchanged until a Lambda actually adopts this module.
+Lookup input retains order and repeated IDs across Operations. Nonrecursive heapsort orders scratch
+positions and completed replies by ID; each requested ID needs zero or exactly its requested count
+of field-identical Accounts. Validation precedes routing into original positions and aliases. No
+prelookup, deduplication, extra native request or bytewise padding comparison is used.
+
+All typed workspace allocations finish before native effects, and packets reuse the same borrowed
+buffers after results are copied. A request error or malformed reply stops subsequent native calls;
+earlier facts survive and fully determined Operations remain publishable. The ten-record invocation
+bound needs at most three native calls and one Completion send. See
+[execution evidence](TIGERBEETLE_EXECUTION_EVIDENCE.md) for native semantics, generated properties,
+allocation instrumentation, and [complete local recovery evidence](TIGERBEETLE_RETRY_EVIDENCE.md).
+
+After execution finishes or stops, publication skips unfinished Operations and sends terminal
+Results in received order. Its ten-Result and byte bounds are independent of native packet and
+invocation capacities. Only a successful serial send clears its represented source retries; the
+first failed/ambiguous send stops publication and leaves that message and later work retryable.
+Redelivery rebuilds from the unchanged Body, with original chains, IDs, timeout intervals and
+inheritance sentinels. It retains no observation or native progress journal. Fresh observations
+and rejection reasons may differ; the first conditional Completion persistence wins. Unresolved
+work never becomes an exhaustion FAILURE. Local host tests do not prove deployed acknowledgement,
+DynamoDB atomicity, Lambda ARM64 runtime/timeout/memory, networking or framework retention.
 
 ## Offline tests
 
@@ -326,7 +349,8 @@ covers:
 - a native echo submission with byte-for-byte result comparison;
 - completion before waiting;
 - null, oversized, and element-misaligned callback results;
-- shrinking and caller ownership of result allocations; and
+- exact creation counts, allocation failure, allocation-free reuse and original-allocation cleanup;
+- delayed completion, immediate-submit-error ownership and source alignment; and
 - stable client and embedded C-client addresses through native deinitialization.
 
 Commands:
@@ -345,34 +369,28 @@ and needs no live TigerBeetle cluster.
 
 ## Live integration tests
 
-`tests/tigerbeetle_integration.zig` exercises the public wrapper against cluster ID `0` at
-`127.0.0.1:3000` by default. A test-only `TIGERBEETLE_ADDRESSES` environment variable can override
-that address (for example, for a Docker-host gateway); production Lambda configuration is not
-changed by this override. The test root also receives `tigerbeetle_c` as a test-only import so it can assert
-the exact C flags and statuses for created objects, existing accounts, linked-chain failures,
-open-ended chains, an account with ledger zero, and a transfer with a missing debit account. The
-wrapper itself does not re-export those constants, and business validation statuses remain result
-values rather than Zig transport errors.
-
-Confirm that the local cluster is reachable before running the dedicated live step:
+`tests/tigerbeetle_integration.zig` exercises the public wrapper against an explicitly owned,
+fresh cluster ID `0`. The suite refuses to run without the fixture ownership marker. Never set
+that marker for an arbitrary existing service. The local runner formats a unique temporary data
+file, starts its own replica, verifies that its child owns the listener, and waits for all clients
+before stopping that replica and deleting only its temporary directory:
 
 ```sh
-zig build test-tigerbeetle
+bash tests/tigerbeetle_isolated_test.sh /absolute/path/to/verified/tigerbeetle <verified-server-sha256>
 ```
 
-TigerBeetle requests have no client-side timeout and retry until they receive a reply or the client
-is shut down. If no cluster is listening at the documented address, a submitted test request will
-wait indefinitely. The live step is intentionally not a dependency of `zig build test`, so the
-default suite remains network-independent.
+Build the server from commit `97c7a8ef385270ebe0e1b75959d3d21d134629df` with its pinned Zig 0.14.1
+compiler and `--release=safe`; verify the checkout before computing the binary checksum. The
+runner checks that checksum, the expected version string, and the actual client package's
+provenance and payload checksums. It uses loopback port 33171 and fails if its child cannot own it.
+The client remains the pinned patched tree `e9bb4085cb18500e37df9714b3eea1cc3f7b6d4e` described
+above. Any identity mismatch requires investigation; do not substitute a newer server or client.
 
-The live test uses one long-lived, single-caller `Client`. Its baseline scenario creates two
-accounts, retries one identical account, performs account lookups with a missing ID, posts a
-transfer, and proves that a transfer rejected for a missing debit account leaves both existing
-balances unchanged.
-
-The execution-accounting preflight first looks up operator-provisioned account `1` (ledger `1`),
-creates a unique account, posts a `100`-unit transfer from it to account `1`, and replays both
-requests to verify the identical `exists` results. It never creates or modifies account `1`.
+The suite uses deterministic IDs unique within that fresh cluster, ledger 7101 and its own account
+pairs. No operator account is used. Baseline creation, singleton replay, sparse lookup, a posted
+transfer, and missing-debit rejection verify exact statuses and balances. The execution-accounting
+scenario creates its own credit account, posts 100 units and replays unchanged singleton requests.
+Native requests have no client-side timeout. The live step is separate from `zig build test`.
 
 The linked-account scenarios cover all three chain outcomes:
 
@@ -397,11 +415,11 @@ Create results are dense for the release-package client and are matched to input
 Lookup responses still omit missing IDs, so every account lookup is matched by `Account.id`, never
 by result position.
 
-Each run generates one TigerBeetle-style time-based base ID from the current Unix millisecond in
-the high 48 bits and random data in the low 80 bits. The 19 account and transfer IDs are consecutive
-values from that base, and failures print the complete set. Successful TigerBeetle records are
-immutable and intentionally are not deleted, so rerun the same live command to create a new set
-instead of cleaning up records.
+All creation histories keep their original IDs, fields and chain membership. Successful records
+are immutable; the runner disposes of the fresh cluster rather than attempting record deletion.
+The suite starts native evidence for ticket 01, and must be extended and rerun against the final
+implementation in ticket 05. See [the ticket-01 evidence record](TIGERBEETLE_NATIVE_BUFFERS_EVIDENCE.md)
+for commands, identity checks, matrix coverage and runtime limitations.
 
 ## Sources of truth
 

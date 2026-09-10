@@ -216,6 +216,11 @@ validate_existing_intake_name() {
     esac
 }
 
+validate_wireguard_ami_id() {
+    [[ "$1" =~ ^ami-([0-9a-f]{8}|[0-9a-f]{17})$ ]] ||
+        fail "WireGuard AMI must be a concrete AMI ID; use ./wireguard-gateway-setup.sh --wireguard-ami-id with the current gateway instance ImageId"
+}
+
 load_preserved_wireguard_parameters() {
     local stack_parameters line parameter_key parameter_value
     local enable_wireguard_gateway=false
@@ -269,6 +274,9 @@ load_preserved_wireguard_parameters() {
                 ;;
             *) fail "stack returned an unexpected WireGuard parameter: $parameter_key" ;;
         esac
+        if [ "$parameter_key" = WireGuardAmiId ] && [ -n "$parameter_value" ]; then
+            validate_wireguard_ami_id "$parameter_value"
+        fi
         # Omitting an empty value on update preserves that exact prior value and
         # avoids relying on SAM's shorthand parser to encode an empty string.
         if [ -n "$parameter_value" ]; then

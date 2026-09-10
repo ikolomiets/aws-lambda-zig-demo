@@ -16,7 +16,7 @@ results are parsed once with duplicate-key rejection and owned strings. Hashing 
 JSON writer serialize those Values directly. The writer preserves `body` whenever the in-memory view
 contains it. DynamoDB omits `body`, so persisted output views remain bodyless, and stores a terminal
 `result` as the compact Value serialization in an `S` attribute; reads accept only an exact compact
-reserialization no larger than 4,096 bytes.
+reserialization no larger than 98,304 bytes (96 KiB).
 
 The reference envelope
 `{"tenant":"tenant-a","name":"echo","body":{"message":"hello","count":2}}` has lowercase

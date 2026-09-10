@@ -484,6 +484,7 @@ pub fn build(b: *std.Build) void {
         .root_module = tiger_beetle_processor_test_mod,
     });
     const run_tiger_beetle_processor_tests = b.addRunArtifact(tiger_beetle_processor_tests);
+    b.step("test-tigerbeetle-processor", "Run processor parsing and invocation tests").dependOn(&run_tiger_beetle_processor_tests.step);
 
     const completion_processor_test_mod = b.createModule(.{
         .target = b.graph.host,
@@ -498,6 +499,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation_persistence", .module = host_operation_persistence },
         },
     });
+    // Existing application modules are connected only for the local full-path tests.
+    tiger_beetle_processor_test_mod.addImport("completion_processor", completion_processor_test_mod);
+    tiger_beetle_processor_test_mod.addImport("operation_persistence", host_operation_persistence);
+    tiger_beetle_processor_test_mod.addImport("query_lambda", query_test_mod);
     const completion_processor_tests = b.addTest(.{
         .root_module = completion_processor_test_mod,
     });

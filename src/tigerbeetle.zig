@@ -9,6 +9,20 @@ pub const Transfer = c.tb_transfer_t;
 pub const CreateAccountResult = c.tb_create_account_result_t;
 pub const CreateTransferResult = c.tb_create_transfer_result_t;
 
+pub const account_linked: u16 = @intCast(c.TB_ACCOUNT_LINKED);
+pub const account_debits_must_not_exceed_credits: u16 = @intCast(
+    c.TB_ACCOUNT_DEBITS_MUST_NOT_EXCEED_CREDITS,
+);
+pub const transfer_linked: u16 = @intCast(c.TB_TRANSFER_LINKED);
+pub const transfer_pending: u16 = @intCast(c.TB_TRANSFER_PENDING);
+pub const transfer_post_pending_transfer: u16 = @intCast(c.TB_TRANSFER_POST_PENDING_TRANSFER);
+pub const account_created: u32 = @intCast(c.TB_CREATE_ACCOUNT_CREATED);
+pub const account_exists: u32 = @intCast(c.TB_CREATE_ACCOUNT_EXISTS);
+pub const account_linked_event_failed: u32 = @intCast(c.TB_CREATE_ACCOUNT_LINKED_EVENT_FAILED);
+pub const transfer_created: u32 = @intCast(c.TB_CREATE_TRANSFER_CREATED);
+pub const transfer_exists: u32 = @intCast(c.TB_CREATE_TRANSFER_EXISTS);
+pub const transfer_linked_event_failed: u32 = @intCast(c.TB_CREATE_TRANSFER_LINKED_EVENT_FAILED);
+
 pub fn create_account_succeeded(status: u32) bool {
     return status == c.TB_CREATE_ACCOUNT_CREATED or
         status == c.TB_CREATE_ACCOUNT_EXISTS;
@@ -58,9 +72,9 @@ comptime {
 
 /// A synchronous, single-caller wrapper around the TigerBeetle C client.
 ///
-/// The allocator's backing state and the `std.Io` implementation must outlive the client. Returned
-/// slices belong to the caller and must be freed with that allocator. A request method, another
-/// request method, and `destroy` must never overlap for the same client.
+/// The allocator's backing state and the `std.Io` implementation must outlive the client. All
+/// output buffers are borrowed until return and must have capacity for every input. Requests and
+/// `destroy` must never overlap for the same client.
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -92,46 +106,48 @@ pub const Client = struct {
     pub fn createAccounts(
         client: *Self,
         accounts: []const Account,
-    ) Error![]CreateAccountResult {
-        if (accounts.len == 0) {
-            return client.allocator.alloc(CreateAccountResult, 0);
-        }
+        output: []CreateAccountResult,
+    ) Error!usize {
+        assert(output.len >= accounts.len);
+        if (accounts.len == 0) return 0;
 
         return client.submit(
             CreateAccountResult,
             operation_u8(c.TB_OPERATION_CREATE_ACCOUNTS),
             std.mem.sliceAsBytes(accounts),
             accounts.len,
+            output,
         );
     }
 
     pub fn createTransfers(
         client: *Self,
         transfers: []const Transfer,
-    ) Error![]CreateTransferResult {
-        if (transfers.len == 0) {
-            return client.allocator.alloc(CreateTransferResult, 0);
-        }
+        output: []CreateTransferResult,
+    ) Error!usize {
+        assert(output.len >= transfers.len);
+        if (transfers.len == 0) return 0;
 
         return client.submit(
             CreateTransferResult,
             operation_u8(c.TB_OPERATION_CREATE_TRANSFERS),
             std.mem.sliceAsBytes(transfers),
             transfers.len,
+            output,
         );
     }
 
     /// Missing IDs have no corresponding result, so callers must match returned `Account.id`s.
-    pub fn lookupAccounts(client: *Self, ids: []const u128) Error![]Account {
-        if (ids.len == 0) {
-            return client.allocator.alloc(Account, 0);
-        }
+    pub fn lookupAccounts(client: *Self, ids: []const u128, output: []Account) Error!usize {
+        assert(output.len >= ids.len);
+        if (ids.len == 0) return 0;
 
         return client.submit(
             Account,
             operation_u8(c.TB_OPERATION_LOOKUP_ACCOUNTS),
             std.mem.sliceAsBytes(ids),
             ids.len,
+            output,
         );
     }
 
@@ -202,7 +218,28 @@ pub const Client = struct {
         operation: u8,
         input: []const u8,
         result_count_max: usize,
-    ) Error![]Result {
+        results: []Result,
+    ) Error!usize {
+        return client.submit_with(
+            Result,
+            operation,
+            input,
+            result_count_max,
+            results,
+            c.tb_client_submit,
+        );
+    }
+
+    fn submit_with(
+        client: *Self,
+        comptime Result: type,
+        operation: u8,
+        input: []const u8,
+        result_count_max: usize,
+        results: []Result,
+        comptime submit_native: anytype,
+    ) Error!usize {
+        assert(results.len >= result_count_max);
         comptime assert(@sizeOf(Result) > 0);
         if (!client.initialized) {
             return error.ClientClosed;
@@ -212,24 +249,26 @@ pub const Client = struct {
         }
 
         client.assert_pinned();
-        const results = try client.allocator.alloc(Result, result_count_max);
-        errdefer client.allocator.free(results);
 
         var request: Request = .{
             .io = client.io,
             .client_address = client.pinned_client_address,
-            .result_buffer = std.mem.sliceAsBytes(results),
+            .result_buffer = std.mem.sliceAsBytes(results[0..result_count_max]),
+            .result_alignment = @alignOf(Result),
+            .result_element_size = @sizeOf(Result),
             .packet = undefined,
         };
         request.pin();
         request.prepare_packet(operation, input);
 
-        try check_client_status(c.tb_client_submit(&client.raw, &request.packet));
+        try check_client_status(submit_native(&client.raw, &request.packet));
         request.wait();
         try check_packet_status(request.packet.status);
 
         const result_count = try request.result_count(Result, result_count_max);
-        return client.allocator.realloc(results, result_count);
+        if (operation != operation_u8(c.TB_OPERATION_LOOKUP_ACCOUNTS) and
+            result_count != result_count_max) return error.MalformedResult;
+        return result_count;
     }
 
     fn deinit_native(client: *Self) void {
@@ -256,8 +295,11 @@ const InitKind = enum {
 const Request = struct {
     io: std.Io,
     event: std.Io.Event = .unset,
+    callback_finished: std.atomic.Value(bool) = .init(false),
     client_address: usize,
     result_buffer: []u8,
+    result_alignment: usize = 1,
+    result_element_size: usize = 1,
     result_size: usize = 0,
     callback_error: ?Error = null,
     packet: c.tb_packet_t,
@@ -290,6 +332,11 @@ const Request = struct {
         request.assert_pinned();
         request.event.waitUncancelable(request.io);
         assert(request.event.isSet());
+        // Event.set may still be inside futexWake after the waiter observes the event.
+        // This final release/acquire handshake keeps that event storage alive as well.
+        while (!request.callback_finished.load(.acquire)) {
+            std.atomic.spinLoopHint();
+        }
         request.assert_pinned();
     }
 
@@ -302,12 +349,18 @@ const Request = struct {
         assert(!request.event.isSet());
 
         const result_size: usize = @intCast(result_size_raw);
-        if (result_size > request.result_buffer.len) {
+        if (result_size > request.result_buffer.len or
+            result_size % request.result_element_size != 0)
+        {
             request.callback_error = error.MalformedResult;
         } else if (result_size > 0) {
             if (result) |source| {
-                @memcpy(request.result_buffer[0..result_size], source[0..result_size]);
-                request.result_size = result_size;
+                if (@intFromPtr(source) % request.result_alignment != 0) {
+                    request.callback_error = error.MalformedResult;
+                } else {
+                    @memcpy(request.result_buffer[0..result_size], source[0..result_size]);
+                    request.result_size = result_size;
+                }
             } else {
                 request.callback_error = error.MalformedResult;
             }
@@ -316,6 +369,8 @@ const Request = struct {
         }
 
         request.event.set(request.io);
+        // Last access to borrowed request memory, including the event, on the callback thread.
+        request.callback_finished.store(true, .release);
     }
 
     fn result_count(
@@ -538,7 +593,7 @@ test "transfer creation accepts only created and identical exists" {
     ));
 }
 
-test "empty public operations return owned slices without native submission" {
+test "empty public operations borrow storage without native submission" {
     var client: Client = undefined;
     client = .{
         .allocator = std.testing.allocator,
@@ -550,19 +605,16 @@ test "empty public operations return owned slices without native submission" {
         .initialized = false,
     };
 
-    const account_results = try client.createAccounts(&.{});
-    defer std.testing.allocator.free(account_results);
-    const transfer_results = try client.createTransfers(&.{});
-    defer std.testing.allocator.free(transfer_results);
-    const accounts = try client.lookupAccounts(&.{});
-    defer std.testing.allocator.free(accounts);
+    const account_results = try client.createAccounts(&.{}, &.{});
+    const transfer_results = try client.createTransfers(&.{}, &.{});
+    const accounts = try client.lookupAccounts(&.{}, &.{});
 
-    try std.testing.expectEqual(@as(usize, 0), account_results.len);
-    try std.testing.expectEqual(@as(usize, 0), transfer_results.len);
-    try std.testing.expectEqual(@as(usize, 0), accounts.len);
+    try std.testing.expectEqual(@as(usize, 0), account_results);
+    try std.testing.expectEqual(@as(usize, 0), transfer_results);
+    try std.testing.expectEqual(@as(usize, 0), accounts);
 }
 
-test "native echo completion copies and shrinks caller-owned results" {
+test "native echo completion copies into borrowed results" {
     const client = try Client.create_echo(std.testing.allocator, std.testing.io, 0, "3000");
     defer client.destroy();
 
@@ -576,13 +628,15 @@ test "native echo completion copies and shrinks caller-owned results" {
     account_b.code = 11;
     const input = [_]Account{ account_a, account_b };
 
-    const echoed = try client.submit(
+    var output: [5]Account = undefined;
+    const count = try client.submit(
         Account,
         operation_u8(c.TB_OPERATION_CREATE_ACCOUNTS),
         std.mem.sliceAsBytes(input[0..]),
-        input.len + 3,
+        input.len,
+        &output,
     );
-    defer std.testing.allocator.free(echoed);
+    const echoed = output[0..count];
 
     try std.testing.expectEqual(input.len, echoed.len);
     try std.testing.expectEqualSlices(
@@ -679,4 +733,226 @@ test "echo client remains pinned through native deinitialization" {
     client.deinit_native();
     try std.testing.expectEqual(client_address, @intFromPtr(client));
     try std.testing.expectEqual(raw_address, @intFromPtr(&client.raw));
+}
+
+// This fixture is the approved C submission seam: it never acquires ownership on error.
+const SubmitFixture = struct {
+    fn invalid(_: [*c]c.tb_client_t, _: [*c]c.tb_packet_t) callconv(.c) c.TB_CLIENT_STATUS {
+        return c.TB_CLIENT_INVALID;
+    }
+
+    fn reply(comptime byte_count: u32) type {
+        return struct {
+            fn submit(_: [*c]c.tb_client_t, packet: [*c]c.tb_packet_t) callconv(.c) c.TB_CLIENT_STATUS {
+                const request: *Request = @ptrCast(@alignCast(packet.*.user_data.?));
+                var source: [48]u8 align(16) = @splat(0);
+                on_completion(request.client_address, packet, 0, &source, byte_count);
+                @memset(&source, 255);
+                return c.TB_CLIENT_OK;
+            }
+        };
+    }
+
+    fn empty(_: [*c]c.tb_client_t, packet: [*c]c.tb_packet_t) callconv(.c) c.TB_CLIENT_STATUS {
+        const request: *Request = @ptrCast(@alignCast(packet.*.user_data.?));
+        on_completion(request.client_address, packet, 0, null, 0);
+        return c.TB_CLIENT_OK;
+    }
+};
+
+test "creation rejects an empty reply while lookup accepts missing accounts" {
+    const client = try Client.create_echo(std.testing.allocator, std.testing.io, 0, "3000");
+    defer client.destroy();
+    const input = [_]u128{42};
+    var output: [1]CreateAccountResult = undefined;
+    try std.testing.expectError(error.MalformedResult, client.submit_with(
+        CreateAccountResult,
+        operation_u8(c.TB_OPERATION_CREATE_ACCOUNTS),
+        std.mem.sliceAsBytes(&input),
+        1,
+        &output,
+        SubmitFixture.empty,
+    ));
+    var accounts: [1]Account = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try client.submit_with(
+        Account,
+        operation_u8(c.TB_OPERATION_LOOKUP_ACCOUNTS),
+        std.mem.sliceAsBytes(&input),
+        1,
+        &accounts,
+        SubmitFixture.empty,
+    ));
+}
+
+test "immediate submit error leaves output reusable for another call and deinit" {
+    const client = try Client.create_echo(std.testing.allocator, std.testing.io, 0, "3000");
+    defer client.destroy();
+    const input = [_]Account{std.mem.zeroes(Account)};
+    var output = [_]Account{std.mem.zeroes(Account)};
+    output[0].id = 99;
+    try std.testing.expectError(error.ClientInvalid, client.submit_with(
+        Account,
+        operation_u8(c.TB_OPERATION_CREATE_ACCOUNTS),
+        std.mem.sliceAsBytes(&input),
+        1,
+        &output,
+        SubmitFixture.invalid,
+    ));
+    try std.testing.expectEqual(@as(u128, 99), output[0].id);
+    try std.testing.expectEqual(@as(usize, 1), try client.submit(
+        Account,
+        operation_u8(c.TB_OPERATION_CREATE_ACCOUNTS),
+        std.mem.sliceAsBytes(&input),
+        1,
+        &output,
+    ));
+    try std.testing.expectEqual(@as(u128, 0), output[0].id);
+}
+
+const DelayedCompletion = struct {
+    fn run(request: *Request) void {
+        // Delay until the caller actually waits; no scheduling sleeps or timing oracle.
+        while (@atomicLoad(std.Io.Event, &request.event, .acquire) != .waiting) {
+            std.atomic.spinLoopHint();
+        }
+        var source = [_]u8{ 7, 8, 9, 10 };
+        request.complete(&source, source.len);
+        @memset(&source, 0);
+    }
+};
+
+test "delayed callback copies ephemeral bytes before borrowed storage can be reused" {
+    var output: [4]u8 = undefined;
+    var request: Request = .{
+        .io = std.testing.io,
+        .client_address = 1,
+        .result_buffer = &output,
+        .packet = undefined,
+    };
+    request.pin();
+    const thread = try std.Thread.spawn(.{}, DelayedCompletion.run, .{&request});
+    defer thread.join();
+    request.wait();
+    try std.testing.expect(request.callback_finished.load(.acquire));
+    try std.testing.expectEqualSlices(u8, &.{ 7, 8, 9, 10 }, &output);
+    @memset(&output, 42);
+}
+
+test "callback rejects unaligned source without modifying borrowed output" {
+    var output = [_]u8{42} ** 16;
+    var source: [17]u8 align(16) = @splat(0);
+    var request: Request = .{
+        .io = std.testing.io,
+        .client_address = 1,
+        .result_buffer = &output,
+        .result_alignment = 16,
+        .result_element_size = 16,
+        .packet = undefined,
+    };
+    request.pin();
+    request.complete(source[1..].ptr, 16);
+    request.wait();
+    try std.testing.expectError(error.MalformedResult, request.result_count(u128, 1));
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(42))), &output);
+}
+
+test "request path needs no allocator and preserves unused output capacity" {
+    const client = try Client.create_echo(std.testing.allocator, std.testing.io, 0, "3000");
+    defer client.destroy();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    client.allocator = failing.allocator();
+    defer client.allocator = std.testing.allocator;
+    const input = [_]Account{std.mem.zeroes(Account)};
+    const output = try std.testing.allocator.alloc(Account, 2);
+    defer std.testing.allocator.free(output);
+    output[1] = std.mem.zeroes(Account);
+    output[1].id = 123;
+    for (0..3) |_| {
+        try std.testing.expectEqual(@as(usize, 1), try client.submit(
+            Account,
+            operation_u8(c.TB_OPERATION_CREATE_ACCOUNTS),
+            std.mem.sliceAsBytes(&input),
+            1,
+            output,
+        ));
+    }
+    try std.testing.expectEqual(@as(u128, 123), output[1].id);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "client allocation failure releases initialization ownership" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, Client.create(
+        failing.allocator(),
+        std.testing.io,
+        0,
+        "3000",
+    ));
+}
+
+test "both creation families require exact counts including zero short and excess replies" {
+    const client = try Client.create_echo(std.testing.allocator, std.testing.io, 0, "3000");
+    defer client.destroy();
+    const input = [_]u128{ 11, 22 };
+    inline for (.{ CreateAccountResult, CreateTransferResult }) |Result| {
+        const operation = if (Result == CreateAccountResult)
+            operation_u8(c.TB_OPERATION_CREATE_ACCOUNTS)
+        else
+            operation_u8(c.TB_OPERATION_CREATE_TRANSFERS);
+        var output: [3]Result = undefined;
+        inline for (.{ 0, 1, 16, 48 }) |byte_count| {
+            try std.testing.expectError(error.MalformedResult, client.submit_with(
+                Result,
+                operation,
+                std.mem.sliceAsBytes(&input),
+                2,
+                &output,
+                SubmitFixture.reply(byte_count).submit,
+            ));
+        }
+        try std.testing.expectEqual(@as(usize, 2), try client.submit_with(
+            Result,
+            operation,
+            std.mem.sliceAsBytes(&input),
+            2,
+            &output,
+            SubmitFixture.reply(32).submit,
+        ));
+        try std.testing.expectEqual(@as(u32, 0), output[0].status);
+    }
+}
+
+test "native submit rejects a closed handle without acquiring the packet" {
+    const client = try Client.create_echo(std.testing.allocator, std.testing.io, 0, "3000");
+    defer std.testing.allocator.destroy(client);
+    client.deinit_native();
+    var packet: c.tb_packet_t = std.mem.zeroes(c.tb_packet_t);
+    packet.user_tag = 123;
+    try std.testing.expectError(error.ClientInvalid, check_client_status(
+        c.tb_client_submit(&client.raw, &packet),
+    ));
+    try std.testing.expectEqual(@as(u64, 123), packet.user_tag);
+}
+
+test "full native batch uses bounded off-stack borrowed buffers" {
+    const count = 8189;
+    const client = try Client.create_echo(std.testing.allocator, std.testing.io, 0, "3000");
+    defer client.destroy();
+    const input = try std.testing.allocator.alloc(Account, count);
+    defer std.testing.allocator.free(input);
+    for (input, 0..) |*account, index| {
+        account.* = std.mem.zeroes(Account);
+        account.id = index + 1;
+    }
+    const output = try std.testing.allocator.alloc(Account, count);
+    defer std.testing.allocator.free(output);
+    try std.testing.expectEqual(@as(usize, count), try client.submit(
+        Account,
+        operation_u8(c.TB_OPERATION_CREATE_ACCOUNTS),
+        std.mem.sliceAsBytes(input),
+        count,
+        output,
+    ));
+    try std.testing.expectEqual(@as(u128, 1), output[0].id);
+    try std.testing.expectEqual(@as(u128, 8189), output[count - 1].id);
 }

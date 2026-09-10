@@ -261,6 +261,7 @@ test_enabled_stack_fills_only_unspecified_values() (
         printf 'WireGuardPrivateKeyParameterVersion\t7\n'
         printf 'WireGuardGatewayPublicKey\tAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n'
         printf 'WireGuardWorkstationPublicKey\tBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\n'
+        printf 'WireGuardAmiId\tami-00000000000000001\n'
         printf 'WireGuardInstanceType\tt4g.nano\n'
     }
 
@@ -268,6 +269,7 @@ test_enabled_stack_fills_only_unspecified_values() (
     GATEWAY_PUBLIC_SUBNET_ID=subnet-00000001
     LAMBDA_SUBNET_ID=""
     load_prior_wireguard_configuration >/dev/null
+    [ "$WIREGUARD_PRIOR_AMI_ID" = ami-00000000000000001 ] || fail_test "saved AMI not loaded"
     [ "$VPC_ID" = vpc-00000001 ] ||
         fail_test "enabled-stack reuse overrode a supplied VPC"
     [ "$GATEWAY_PUBLIC_SUBNET_ID" = subnet-00000001 ] ||
@@ -362,7 +364,7 @@ mock_preserved_stack() {
     printf 'WireGuardPrivateKeyParameterVersion|7\t'
     printf 'WireGuardGatewayPublicKey|AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\t'
     printf 'WireGuardWorkstationPublicKey|BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\t'
-    printf 'WireGuardAmiId|/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64\t'
+    printf 'WireGuardAmiId|ami-00000000000000001\t'
     printf 'WireGuardInstanceType|t4g.nano\n'
 }
 
@@ -383,6 +385,7 @@ test_ordinary_deployment_preserves_gateway_state() (
         assert_contains "$overrides" " LambdaSubnetCidr=172.31.1.0/24 "
         assert_contains "$overrides" " WireGuardPrivateKeyParameterVersion=7 "
         assert_contains "$overrides" " WireGuardInstanceType=t4g.nano "
+        assert_contains "$overrides" " WireGuardAmiId=ami-00000000000000001 "
         [ "${#DEPLOYMENT_PARAMETER_OVERRIDES[@]}" -eq 13 ] ||
             fail_test "ordinary deployment did not preserve all 13 gateway parameters"
     done
@@ -540,6 +543,75 @@ test_failed_deployment_omits_peer_configuration() (
     assert_contains "$failure_output" "reported deployment failure"
     assert_not_contains "$failure_output" "BEGIN WIREGUARD PEER CONFIGURATION"
 )
+
+test_ordinary_deployment_rejects_legacy_ami() (
+    aws() { printf 'EnableWireGuardGateway|true\tWireGuardAmiId|/aws/service/example\n'; }
+    if output="$(load_preserved_wireguard_parameters 2>&1)"; then
+        fail_test "ordinary deployment accepted legacy path"
+    fi
+    assert_contains "$output" "--wireguard-ami-id"
+    aws() { return 1; }
+    if output="$(load_prior_wireguard_configuration 2>&1)"; then
+        fail_test "failed stack read treated as first enablement"
+    fi
+)
+
+test_ami_pinning() (
+    WIREGUARD_AMI_ID=""
+    WIREGUARD_PRIOR_AMI_ID=ami-00000000000000001
+    aws() { fail_test "preserving a pin must not query AWS"; }
+    resolve_wireguard_ami
+    [ "$WIREGUARD_AMI_ID" = "$WIREGUARD_PRIOR_AMI_ID" ] || fail_test "pin changed"
+
+    WIREGUARD_AMI_ID=""
+    WIREGUARD_PRIOR_AMI_ID=/aws/service/ami-amazon-linux-latest/example
+    if output="$(resolve_wireguard_ami 2>&1)"; then
+        fail_test "legacy path accepted without explicit override"
+    fi
+    assert_contains "$output" "--wireguard-ami-id"
+
+    aws() {
+        case "$1 $2" in
+            'ssm get-parameter') printf 'ami-00000000000000002\n' ;;
+            'ec2 describe-images') printf 'arm64\tavailable\n' ;;
+            *) fail_test "unexpected AWS call" ;;
+        esac
+    }
+    WIREGUARD_PRIOR_AMI_ID=""
+    resolve_wireguard_ami
+    [ "$WIREGUARD_AMI_ID" = ami-00000000000000002 ] || fail_test "discovery failed"
+
+    WIREGUARD_PRIOR_AMI_ID=/aws/service/ami-amazon-linux-latest/example
+    WIREGUARD_AMI_ID=ami-00000000000000001
+    parse_wireguard_options --wireguard-ami-id ami-00000000000000003
+    resolve_wireguard_ami
+    [ "$WIREGUARD_AMI_ID" = ami-00000000000000003 ] || fail_test "CLI precedence failed"
+    parse_wireguard_options --wireguard-ami-id=ami-00000000000000004
+    [ "$WIREGUARD_AMI_ID" = ami-00000000000000004 ] || fail_test "equals parsing failed"
+    ENABLE_WIREGUARD_GATEWAY=1
+    build_wireguard_parameter_overrides false
+    assert_contains "$(joined_overrides)" " WireGuardAmiId=$WIREGUARD_AMI_ID "
+
+    aws() { printf 'x86_64\tavailable\n'; }
+    if output="$(resolve_wireguard_ami 2>&1)"; then fail_test "incompatible image accepted"; fi
+    aws() { return 1; }
+    if output="$(resolve_wireguard_ami 2>&1)"; then fail_test "failed image lookup accepted"; fi
+    WIREGUARD_AMI_ID=""
+    WIREGUARD_PRIOR_AMI_ID=""
+    if output="$(resolve_wireguard_ami 2>&1)"; then fail_test "failed discovery accepted"; fi
+    WIREGUARD_AMI_ID=invalid
+    if output="$(resolve_wireguard_ami 2>&1)"; then fail_test "invalid ID accepted"; fi
+
+    WIREGUARD_AMI_ID=""
+    DRY_RUN=1
+    wireguard_gateway_controller plan >/dev/null
+    build_wireguard_parameter_reset_overrides
+    assert_contains "$(cat "$WIREGUARD_PARAMETER_RESET_FILE")" "WireGuardAmiId:"
+    rm -f "$WIREGUARD_PARAMETER_RESET_FILE"
+)
+
+test_ordinary_deployment_rejects_legacy_ami
+test_ami_pinning
 
 test_source_guards
 test_completion_processor_name_options

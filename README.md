@@ -17,19 +17,27 @@ Operation JSON document, derives required tenant metadata from the verified
 token subject, resolves the exact `<name>Queue` environment mapping, persists
 the Operation idempotently in DynamoDB, submits new work to that SQS queue, and
 returns the current stored output view without the body.
-The TigerBeetle processor consumes Operations SQS batches and creates a replay-safe
-TigerBeetle account and transfer for each valid queued `SUBMITTED` Operation. It publishes
-the terminal outcomes in at most one bounded aggregate message containing only Operation IDs
-and tagged success or failure results. The Completion processor consumes one aggregate at a
-time and owns the conditional DynamoDB transition from `SUBMITTED` to `COMPLETED`:
+The TigerBeetle processor consumes queued `SUBMITTED` Operations and validates their complete
+Bodies before executing requested account creations, transfers and account lookups. Each creation
+list is an independent linked chain. Replay safety requires callers to preserve each chain's
+Resource IDs, order and original native inputs across all writers and attempts. The processor
+publishes fully determined Results in bounded Completion aggregates. The Completion processor
+consumes one aggregate at a time and owns the conditional DynamoDB transition from `SUBMITTED` to `COMPLETED`:
 
 ```text
 intake -> TigerBeetleQueue -> tiger-beetle-processor -> CompletionQueue -> completion-processor -> DynamoDB
 ```
 
-Definitive account or transfer rejections are terminal failures. TigerBeetle or Completion
-queue uncertainty is returned through TigerBeetle queue partial-batch failures; transient
-DynamoDB uncertainty retries the single Completion queue message.
+A definite creation rejection or missing account produces FAILURE once all requested work is
+determined, including lookups after write rejection. Account rejection skips that Operation's
+transfers; successful earlier writes survive later failure. Native request uncertainty stops further
+native calls and retries unfinished Operations. Completion publication uncertainty retries the
+failed message's source records and later unpublished records; transient DynamoDB uncertainty
+retries the single Completion queue message.
+
+The maintained [TigerBeetle processor design](docs/TIGER_BEETLE_PROCESSOR.md) defines the
+Body schema, replay obligations, complete Results and retry behavior; use it for the current
+processor contract.
 
 ## Requirements for Zig on AWS Lambda
 
@@ -163,7 +171,8 @@ loading are reported separately as `dynamodb: AWS request failed`.
 
 Create an Operation by supplying required tenant metadata separately and
 sending the unchanged input JSON view on standard input. A tenant must be valid
-UTF-8 between 1 and 64 bytes:
+UTF-8 between 1 and 64 bytes. This schema-neutral persistence example stores an `echo` Operation;
+it does not enqueue work or demonstrate the TigerBeetle Body contract:
 
 ```sh
 operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
@@ -215,7 +224,7 @@ refreshed as submitted or completed once. Completed Operations are immutable:
 they cannot be reopened, changed, or refreshed with the same outcome. A
 `SUBMITTED` update requires empty standard input. A `COMPLETED` update requires
 the complete tagged result envelope on standard input; both its input and
-compact serialization must fit the 4,096-byte full-envelope limit:
+compact serialization must fit the 98,304-byte (96 KiB) full-envelope limit:
 
 ```sh
 ./persistence.sh update \
@@ -224,7 +233,7 @@ compact serialization must fit the 4,096-byte full-envelope limit:
   </dev/null
 
 printf '%s\n' \
-  '{"type":"SUCCESS","payload":{"transfer_id":"00112233-4455-6677-8899-aabbccddeeff"}}' \
+  '{"type":"SUCCESS","payload":{"message":"hello","count":2}}' \
   | ./persistence.sh update \
       --id 00112233-4455-6677-8899-aabbccddeeff \
       --state COMPLETED
@@ -264,12 +273,12 @@ queue's SAM logical resource ID, such as `TigerBeetleQueue` or
 `CompletionQueue`. It uses `PROFILE`, `REGION`, and `STACK_NAME`, defaulting to
 `dev`, `ca-central-1`, and `aws-lambda-zig-demo`. It exports temporary profile
 credentials, resolves the selected physical queue URL, and exports that URL
-under the logical resource ID expected by the CLI. Send a validated Operation
-to the TigerBeetle queue like this:
+under the logical resource ID expected by the CLI. Send a lookup-only `TigerBeetle` Operation
+with a concrete account Resource ID like this:
 
 ```sh
-operation_json='{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
-'"name":"echo","body":{"message":"hello","count":2}}'
+operation_json='{"id":"11223344-5566-7788-99aa-bbccddeeff00",'\
+'"name":"TigerBeetle","body":{"lookup_accounts":[{"id":"101"}]}}'
 printf '%s\n' "$operation_json" \
   | ./queue.sh TigerBeetleQueue send --tenant 'tenant-a'
 ```
@@ -284,7 +293,10 @@ does not include that newline. State is excluded from the existing Operation
 hash, along with `id`, timestamps, expiration, and result. This command does
 not read or update DynamoDB. `send` always produces an Operation message, so it
 must not be used with `CompletionQueue`, whose consumer expects a Completion
-batch.
+batch. For Completion to persist, the matching Operation must already exist as `SUBMITTED`
+in DynamoDB. Use authenticated intake for the complete persistence-and-enqueue flow.
+The illustrative lookup ID `101` is independent of the Operation UUID; a missing account produces
+a terminal FAILURE after a trustworthy lookup reply.
 
 Inspect all queue attributes, including attributes added by future AWS API
 versions:
@@ -388,34 +400,54 @@ delay.
 
 For every record, the handler retains the debug log containing its message ID
 and body, parses the complete Operation output, and accepts only a queued `SUBMITTED`
-Operation with a body and no result. It creates account `Operation.id` on
-ledger/code `1`, then transfer `Operation.id` from that account to account `1`
-for amount `100` on ledger/code `1`. Both `created` and an identical `exists` are
-replay-safe successes. The exact success envelope is:
+Operation with a body and no result and a matching tenant/name/Body hash. The Body contains
+`create_accounts`, `create_transfers`, and `lookup_accounts` command lists, with at most 64
+commands combined. See the maintained [Body schema](docs/TIGER_BEETLE_PROCESSOR.md#body-schema),
+[examples](docs/TIGER_BEETLE_PROCESSOR.md#body-examples) and
+[Result contract](docs/TIGER_BEETLE_PROCESSOR.md#result-and-completion-publication).
+
+A complete Result retains the original command positions, optional aliases, raw native creation
+codes and all found Account fields. For example, an accepted two-account replay preserves the
+native suffix code:
 
 ```json
-{"type":"SUCCESS","payload":{"transfer_id":"00112233-4455-6677-8899-aabbccddeeff"}}
+{"type":"SUCCESS","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[{"id":"101","error_code":21},{"id":"102","error_code":1}],"create_transfers":[],"lookup_accounts":[]}}
 ```
 
-A definitive account or transfer rejection instead produces a terminal result with its exact
-stage and raw TigerBeetle status:
+FAILURE preserves surviving writes and found observations. A missing lookup has a null native
+code and descriptive message:
 
 ```json
-{"type":"FAILURE","payload":{"stage":"ACCOUNT","status":19}}
+{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[{"id":"101","error_code":null,"message":"Account was not found."}]}}
 ```
 
-```json
-{"type":"FAILURE","payload":{"stage":"TRANSFER","status":22}}
-```
+Complete Results are bounded to 96 KiB. Completion uses `{"results":[...]}` with a canonical
+`operation_id` and complete `result` per entry, retaining the matching UUID inside the payload.
+Ten maximum-size Results occupy 983,713 bytes, within the 1 MiB transport bound; eleven require
+another message. No Operation snapshot is copied.
 
-Processing continues after every TigerBeetle queue record. Invalid records are acknowledged;
-TigerBeetle client/request and result-construction failures add the exact message ID to
-`batchItemFailures`. The terminal entries are encoded into at most one Completion message per
-TigerBeetle processor invocation. Its JSON contract is `{"results":[...]}`, is bounded to 1 MiB, and gives
-each entry only a canonical `operation_id` and a validated `result`; no Operation snapshot is
-copied. If that single send fails, every TigerBeetle queue record represented in the aggregate
-is retried.
-Account `1` must be pre-provisioned on ledger `1`; the executor never creates it.
+The processor executes all admitted account chains, then eligible transfer chains, then requested
+lookups. Each creation list remains one immutable chain, packed in received order with intact
+neighbors; account rejection skips only that Operation's transfers. First-member matching `exists`
+with a linked-failed suffix is accepted replay under the caller's immutable-chain obligation
+across all writers, with every actual native code retained. Lookups run after known rejection and retain positions/aliases, including IDs requested by other Operations.
+
+A native error or malformed reply stops subsequent native calls. Earlier trustworthy facts survive;
+fully determined Operations publish while unfinished Operations retry without a synthetic FAILURE.
+Invalid envelopes acknowledge without Completion. Publication collects terminal Results in received
+order, skips unfinished records, and sends intact aggregates serially, flushing at ten Results or
+byte capacity. A failed or ambiguous send retries its represented records and every unpublished
+suffix record; earlier successful sends remain acknowledgement-eligible. The current ten-record
+bound needs at most three native calls and one send.
+
+Redelivery revalidates the original Body and repeats its complete immutable chains, including IDs,
+order, pending timeout intervals and post inheritance sentinels. There is no recovery journal or
+native retry loop. A later lookup may observe different values or presence, and rejection reasons
+may change. The first valid Completion persisted wins even when another valid attempt differs.
+Expiry replay does not renew a pending reservation. Unresolved retries never fabricate FAILURE;
+the framework owns exhaustion and retention. The fixed 24-hour TTL does not prove every pending
+expiry/retry combination. See [complete local verification](docs/TIGERBEETLE_RETRY_EVIDENCE.md)
+for the matrix audit and deferred deployed SQS, DynamoDB and Lambda runtime guarantees.
 
 The Completion processor also has no authentication configuration or Function URL. It is not
 VPC-attached and receives only `OPERATIONS_TABLE_NAME`. Its event source mapping delivers one
@@ -604,7 +636,10 @@ token="$(
 )"
 ```
 
-POST an Operation JSON document with the same bearer token:
+POST a lookup-only Operation with the same bearer token. Replace the illustrative account ID
+`101` with an account to observe; it is independent of the Operation UUID. If it is missing,
+a trustworthy lookup produces a FAILURE Result. Use a new Operation UUID for different work,
+and preserve the original Body when retrying the same Operation:
 
 ```sh
 curl -L \
@@ -612,13 +647,14 @@ curl -L \
   -H "Content-Type: application/json" \
   --data \
     '{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
-'"name":"TigerBeetle","body":{"message":"hello","count":2}}' \
+'"name":"TigerBeetle","body":{"lookup_accounts":[{"id":"101"}]}}' \
   <IntakeFunctionUrl>
 ```
 
 For a new ID, the response has `SUBMITTED` state, the invocation timestamp, its
 24-hour expiry, verified subject as tenant, and the stable BLAKE3-256 operation
-hash. The input body is intentionally omitted:
+hash. The example below uses illustrative timestamps and the hash for the exact Body above
+with tenant `example-user`. The input body is intentionally omitted:
 
 ```json
 {
@@ -628,7 +664,7 @@ hash. The input body is intentionally omitted:
   "state": "SUBMITTED",
   "last_updated": 1700000000,
   "expires_at": 1700086400,
-  "hash": "a155fdd43dc72aafd9d8914da4af79cfde80983ce96e1eec3bd634d36ce7e80f"
+  "hash": "bbcd394c710db838cd69c3dbc7cfa53fc5017e2af707fc5c614d1dcc38f8f614"
 }
 ```
 
@@ -660,12 +696,14 @@ performs no read or update after the send.
 Delivery is at least once. The standard queue, acknowledgement loss, and
 concurrent `SUBMITTED` retries can produce duplicate messages, so consumers must
 handle the Operation ID and hash idempotently. Reusing the ID for different
-work or from a different verified subject still returns `409 Conflict`. TigerBeetle processor performs
-replay-safe TigerBeetle accounting and sends terminal ID/result entries to the Completion
-queue. Completion conditionally updates only a stored `SUBMITTED` item; duplicate or stale
-entries conflict without changing it. TigerBeetle uncertainty retries only the affected
-TigerBeetle queue record, Completion publication uncertainty retries every represented record, and
-DynamoDB uncertainty replays the single aggregate Completion message as described above.
+work or from a different verified subject still returns `409 Conflict`. The TigerBeetle processor
+replays complete creation chains under the caller obligations described above and obtains fresh
+requested lookups. It sends terminal ID/result entries to the Completion queue. Completion
+conditionally updates only a stored `SUBMITTED` item; duplicate or stale entries cannot overwrite
+its first persisted Result. A native request error stops later native calls and retries every
+unfinished Operation, including those sharing the failed request. Completion publication uncertainty
+retries the failed aggregate's source records and every later unpublished record; earlier successful
+sends remain acknowledgement-eligible. DynamoDB uncertainty replays the single Completion aggregate.
 
 The template intentionally creates publicly reachable intake POST and query
 GET Function URLs for demo testing, while both Function URL handlers enforce PASETO bearer

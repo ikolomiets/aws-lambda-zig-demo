@@ -550,7 +550,7 @@ The DynamoDB item contract enforced by `src/operation_persistence.zig` is:
 | `last_updated` | `N` | Unix epoch seconds. |
 | `expires_at` | `N` | Exactly 86,400 seconds after `last_updated`; DynamoDB TTL attribute. |
 | `hash` | `S` | 64-character lowercase BLAKE3-256 hexadecimal value. |
-| `result` | `S` | `COMPLETED` only; compact tagged envelope with exactly uppercase `type` and non-null `payload`; complete envelope at most 4,096 UTF-8 bytes. |
+| `result` | `S` | `COMPLETED` only; compact tagged envelope with exactly uppercase `type` and non-null `payload`; complete envelope at most 98,304 UTF-8 bytes (96 KiB). |
 
 The Operation hash covers only the fixed-order JSON envelope containing
 `tenant`, `name`, and `body`.
@@ -569,7 +569,7 @@ The reference envelope
 has lowercase BLAKE3-256 digest
 `d271e3bd560113d2b82e42dfc46be33fb90b43d7f4b12114f3da4888eae445d4`.
 
-Never persist `body`. The 4,096-byte full-envelope `result` bound is an application-enforced
+Never persist `body`. The 98,304-byte full-envelope `result` bound is an application-enforced
 constraint because DynamoDB and CloudFormation cannot enforce a per-attribute
 size limit. Completed result input and its compact serialization, including
 both `type` and `payload`, must fit the bound. The adapter serializes
@@ -703,8 +703,24 @@ The optional gateway parameters are:
 | `WireGuardPrivateKeyParameterVersion` | Exact positive version to retrieve; defaults to `1`. |
 | `WireGuardGatewayPublicKey` | Padded Base64 public key matching the stored gateway private key. |
 | `WireGuardWorkstationPublicKey` | Padded Base64 public key matching the workstation private key. |
-| `WireGuardAmiId` | Public SSM parameter resolving to an ARM64 Amazon Linux 2023 AMI. |
+| `WireGuardAmiId` | Concrete pinned ARM64 AMI ID; required when enabled, otherwise defaults to empty. |
 | `WireGuardInstanceType` | ARM64 gateway instance type; defaults to `t4g.nano`. |
+
+### Pin the gateway image
+
+The gateway helper accepts `--wireguard-ami-id` (or `WIREGUARD_AMI_ID`).
+Selection order is CLI, environment, saved concrete stack ID, then discovery
+of the latest Amazon Linux 2023 ARM64 image on first enablement. Discovery
+occurs only when no image is saved or supplied. Newly selected images must
+be available ARM64 images in the selected region. Dry runs defer AWS reads.
+Ordinary `./deploy.sh` preserves the saved ID; changes to the public SSM
+latest-image parameter no longer cause gateway replacement during Lambda updates.
+Direct SAM deployments must supply a concrete `WireGuardAmiId` when enabling
+the gateway. Completed teardown clears the saved pin.
+
+Use `./deploy.sh` for Lambda updates. To intentionally upgrade the
+image, run `./wireguard-gateway-setup.sh --wireguard-ami-id '<new-ami-id>'`.
+A different image causes EC2 replacement and temporary WireGuard interruption.
 
 ### Provision and validate the external dual-stack topology
 
@@ -1784,12 +1800,15 @@ different verified subject returns the static `409 Conflict` response.
 
 Delivery is at least once. The standard queue, acknowledgement loss, and
 concurrent `SUBMITTED` retries can create duplicate messages. Consumers must use the
-Operation ID and hash idempotently. TigerBeetle processor performs the replay-safe
-TigerBeetle account and transfer sequence, aggregates terminal ID/result
-entries, and acknowledges represented TigerBeetle queue records only after the
-one Completion message is published. Invalid TigerBeetle queue records are
-acknowledged; TigerBeetle uncertainty retries only the affected queue record, and
-publication uncertainty retries every record represented by the aggregate.
+Operation ID and hash idempotently. The current parsing/admission implementation is an
+intermediate, non-deployable step: it verifies the queued hash, validates the entire Body,
+and reserves a typed plan for at most 64 commands. Invalid envelopes acknowledge without
+Completion; valid-envelope Body errors publish one bounded FAILURE, acknowledging only
+after publication succeeds. Admitted work currently retries pending the family executor
+in ticket 04. The previous fixed account/transfer demonstration has been removed.
+See [the parsing contract and evidence](TIGERBEETLE_PARSING_EVIDENCE.md) for valid Body
+examples. The complete Result limit is now 96 KiB throughout the codecs, persistence,
+and reads; see [Result serialization evidence](TIGERBEETLE_RESULTS_EVIDENCE.md). Do not deploy this intermediate revision.
 
 Completion receives one aggregate message per invocation and applies its
 entries sequentially. It conditionally updates only the item selected by the
@@ -1892,7 +1911,7 @@ Read the persistent output view:
 
 `SUBMITTED` requires empty standard input. `COMPLETED` requires the full tagged
 result envelope on standard input. Both the input and compact envelope,
-including `type` and `payload`, must be no larger than 4,096 bytes:
+including `type` and `payload`, must be no larger than 98,304 bytes (96 KiB):
 
 ```sh
 ./persistence.sh update \

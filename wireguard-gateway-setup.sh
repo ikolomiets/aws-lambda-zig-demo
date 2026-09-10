@@ -16,6 +16,8 @@ WIREGUARD_PRIVATE_KEY_PARAMETER_VERSION="${WIREGUARD_PRIVATE_KEY_PARAMETER_VERSI
 WIREGUARD_GATEWAY_PUBLIC_KEY="${WIREGUARD_GATEWAY_PUBLIC_KEY:-}"
 WIREGUARD_WORKSTATION_PUBLIC_KEY="${WIREGUARD_WORKSTATION_PUBLIC_KEY:-}"
 WIREGUARD_INSTANCE_TYPE="${WIREGUARD_INSTANCE_TYPE:-}"
+WIREGUARD_AMI_ID="${WIREGUARD_AMI_ID:-}"
+WIREGUARD_PRIOR_AMI_ID=""
 WIREGUARD_KEY_DIR=""
 WIREGUARD_ACTION=enable
 WIREGUARD_ACTION_EXPLICIT=0
@@ -78,6 +80,7 @@ Options:
                          Padded Base64 public key derived from the gateway private key.
   --wireguard-workstation-public-key KEY
                          Padded Base64 public key of the workstation peer.
+  --wireguard-ami-id ID   Pin an ARM64 AMI; a different ID intentionally replaces the gateway.
   --wireguard-instance-type TYPE
                          ARM64 EC2 gateway instance type. Defaults to t4g.nano.
   --use-local-libs       Use local dependency checkouts with zig build --fork.
@@ -96,7 +99,7 @@ Environment overrides:
   LAMBDA_ROUTE_TABLE_ID, LAMBDA_SUBNET_CIDR,
   WIREGUARD_PRIVATE_KEY_PARAMETER_NAME,
   WIREGUARD_PRIVATE_KEY_PARAMETER_VERSION, WIREGUARD_GATEWAY_PUBLIC_KEY,
-  WIREGUARD_WORKSTATION_PUBLIC_KEY, WIREGUARD_INSTANCE_TYPE
+  WIREGUARD_WORKSTATION_PUBLIC_KEY, WIREGUARD_INSTANCE_TYPE, WIREGUARD_AMI_ID
 
 Authentication:
   Non-dry-run deployments require an SSO-backed AWS CLI profile. The script
@@ -106,7 +109,8 @@ Authentication:
 
 Gateway resolution:
   Values resolve from CLI, environment, a previously enabled stack, then
-  SSM/default discovery. With unique networking, first enablement needs only
+  SSM/default discovery. AMIs resolve once and remain pinned until explicitly changed.
+  With unique networking, first enablement needs only
   WIREGUARD_WORKSTATION_PUBLIC_KEY. Dry runs skip AWS discovery and key creation.
 EOF
 }
@@ -335,6 +339,7 @@ validate_wireguard_gateway_syntax() {
     [ -z "$WIREGUARD_WORKSTATION_PUBLIC_KEY" ] ||
         [[ "$WIREGUARD_WORKSTATION_PUBLIC_KEY" =~ ^[A-Za-z0-9+/]{43}=$ ]] ||
         fail "WIREGUARD_WORKSTATION_PUBLIC_KEY must be padded 44-character Base64"
+    [ -z "$WIREGUARD_AMI_ID" ] || validate_wireguard_ami_id "$WIREGUARD_AMI_ID"
     [ -z "$WIREGUARD_INSTANCE_TYPE" ] ||
         [[ "$WIREGUARD_INSTANCE_TYPE" =~ ^[a-z0-9][a-z0-9.-]*$ ]] ||
         fail "WIREGUARD_INSTANCE_TYPE must use EC2 instance-type syntax"
@@ -363,9 +368,39 @@ validate_wireguard_gateway_configuration() {
         fail "WIREGUARD_GATEWAY_PUBLIC_KEY was not resolved for the gateway"
     [ -n "$WIREGUARD_WORKSTATION_PUBLIC_KEY" ] ||
         fail "WIREGUARD_WORKSTATION_PUBLIC_KEY is required on first enablement"
+    [ -n "$WIREGUARD_AMI_ID" ] || fail "WIREGUARD_AMI_ID was not resolved for the gateway"
     [ -n "$WIREGUARD_INSTANCE_TYPE" ] ||
         fail "WIREGUARD_INSTANCE_TYPE was not resolved for the gateway"
     validate_wireguard_gateway_syntax
+}
+
+resolve_wireguard_ami() {
+    local image_details
+
+    if [ -z "$WIREGUARD_AMI_ID" ] && [ -n "$WIREGUARD_PRIOR_AMI_ID" ]; then
+        validate_wireguard_ami_id "$WIREGUARD_PRIOR_AMI_ID"
+        WIREGUARD_AMI_ID="$WIREGUARD_PRIOR_AMI_ID"
+        return 0
+    fi
+    if [ -z "$WIREGUARD_AMI_ID" ]; then
+        WIREGUARD_AMI_ID="$(aws ssm get-parameter \
+            --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 \
+            --query Parameter.Value --output text \
+            --profile "$PROFILE" --region "$REGION")" ||
+            fail "could not discover the initial WireGuard AMI"
+    fi
+    validate_wireguard_ami_id "$WIREGUARD_AMI_ID"
+    image_details="$(aws ec2 describe-images --image-ids "$WIREGUARD_AMI_ID" \
+        --query 'Images[0].[Architecture,State]' --output text \
+        --profile "$PROFILE" --region "$REGION")" ||
+        fail "could not inspect the selected WireGuard AMI"
+    [ "$image_details" = $'arm64\tavailable' ] ||
+        fail "selected WireGuard AMI must be available and ARM64 in $REGION"
+    if [ -n "$WIREGUARD_PRIOR_AMI_ID" ] &&
+        [ "$WIREGUARD_AMI_ID" != "$WIREGUARD_PRIOR_AMI_ID" ] &&
+        [[ "$WIREGUARD_PRIOR_AMI_ID" = ami-* ]]; then
+        printf '==> Intentional gateway AMI change: EC2 replacement will interrupt WireGuard connectivity\n'
+    fi
 }
 
 effective_route_table_id() {
@@ -411,11 +446,17 @@ load_prior_wireguard_configuration() {
     local prior_gateway_public_key="" prior_workstation_public_key=""
     local prior_instance_type=""
 
-    prior_parameters="$(aws cloudformation describe-stacks \
+    WIREGUARD_PRIOR_AMI_ID=""
+    if ! prior_parameters="$(aws cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
         --query 'Stacks[0].Parameters[].[ParameterKey,ParameterValue]' \
         --output text \
-        --region "$REGION" 2>/dev/null)" || return 0
+        --region "$REGION" 2>&1)"; then
+        case "$prior_parameters" in
+            *"does not exist"*) return 0 ;;
+            *) fail "could not inspect prior WireGuard configuration" ;;
+        esac
+    fi
 
     while IFS=$'\t' read -r parameter_key parameter_value; do
         case "$parameter_key" in
@@ -433,6 +474,7 @@ load_prior_wireguard_configuration() {
                 ;;
             WireGuardGatewayPublicKey) prior_gateway_public_key="$parameter_value" ;;
             WireGuardWorkstationPublicKey) prior_workstation_public_key="$parameter_value" ;;
+            WireGuardAmiId) WIREGUARD_PRIOR_AMI_ID="$parameter_value" ;;
             WireGuardInstanceType) prior_instance_type="$parameter_value" ;;
         esac
     done <<<"$prior_parameters"
@@ -1723,6 +1765,7 @@ build_wireguard_parameter_overrides() {
             "WireGuardGatewayPublicKey=$WIREGUARD_GATEWAY_PUBLIC_KEY"
             "WireGuardWorkstationPublicKey=$WIREGUARD_WORKSTATION_PUBLIC_KEY"
             "WireGuardInstanceType=$WIREGUARD_INSTANCE_TYPE"
+            "WireGuardAmiId=$WIREGUARD_AMI_ID"
         )
     else
         DEPLOYMENT_PARAMETER_OVERRIDES+=("EnableWireGuardGateway=false")
@@ -1772,7 +1815,8 @@ build_wireguard_parameter_reset_overrides() {
             'WireGuardPrivateKeyParameterVersion: 1' \
             'WireGuardGatewayPublicKey:' \
             'WireGuardWorkstationPublicKey:' \
-            'WireGuardInstanceType: t4g.nano'
+            'WireGuardInstanceType: t4g.nano' \
+            'WireGuardAmiId:'
     } >"$WIREGUARD_PARAMETER_RESET_FILE" ||
         fail "could not write the WireGuard parameter reset file"
 
@@ -1941,6 +1985,7 @@ wireguard_gateway_controller() {
             plan_wireguard_deployment
             if [ "$ENABLE_WIREGUARD_GATEWAY" -eq 1 ]; then
                 load_prior_wireguard_configuration
+                resolve_wireguard_ami
                 [ -n "$WIREGUARD_INSTANCE_TYPE" ] || WIREGUARD_INSTANCE_TYPE=t4g.nano
                 validate_wireguard_gateway_syntax
                 [ -n "$WIREGUARD_WORKSTATION_PUBLIC_KEY" ] ||
@@ -1995,7 +2040,7 @@ parse_wireguard_options() {
                 --wireguard-private-key-parameter-version | \
                 --wireguard-gateway-public-key | \
                 --wireguard-workstation-public-key | \
-                --wireguard-instance-type)
+                --wireguard-ami-id | --wireguard-instance-type)
                 need_value "$1" "${2:-}"
                 case "$1" in
                     --vpc-id) VPC_ID="$2" ;;
@@ -2015,6 +2060,7 @@ parse_wireguard_options() {
                     --wireguard-workstation-public-key)
                         WIREGUARD_WORKSTATION_PUBLIC_KEY="$2"
                         ;;
+                    --wireguard-ami-id) WIREGUARD_AMI_ID="$2" ;;
                     --wireguard-instance-type) WIREGUARD_INSTANCE_TYPE="$2" ;;
                 esac
                 shift 2
@@ -2025,7 +2071,7 @@ parse_wireguard_options() {
                 --wireguard-private-key-parameter-version=* | \
                 --wireguard-gateway-public-key=* | \
                 --wireguard-workstation-public-key=* | \
-                --wireguard-instance-type=*)
+                --wireguard-ami-id=* | --wireguard-instance-type=*)
                 option_name="${1%%=*}"
                 option_value="${1#*=}"
                 [ -n "$option_value" ] || fail "empty value for $option_name"
@@ -2047,6 +2093,7 @@ parse_wireguard_options() {
                     --wireguard-workstation-public-key)
                         WIREGUARD_WORKSTATION_PUBLIC_KEY="$option_value"
                         ;;
+                    --wireguard-ami-id) WIREGUARD_AMI_ID="$option_value" ;;
                     --wireguard-instance-type) WIREGUARD_INSTANCE_TYPE="$option_value" ;;
                 esac
                 shift

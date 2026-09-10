@@ -16,6 +16,9 @@ Use these sources in order:
 - `src/intake_lambda.zig` is the authenticated POST intake entrypoint and handler.
 - `src/query_lambda.zig` is the authenticated GET environment-query entrypoint and handler.
 - `src/tiger_beetle_processor.zig` is the SQS-driven TigerBeetle processor entrypoint and handler.
+- [`docs/TIGER_BEETLE_PROCESSOR.md`](docs/TIGER_BEETLE_PROCESSOR.md) is the maintained processor-design
+  reference. Keep processor contract changes there; `CONTEXT.md` owns vocabulary, ADRs own
+  cross-cutting decisions, and wrapper/deployment docs own their respective concerns.
 - `src/completion_processor.zig` is the SQS-driven Completion processor entrypoint and handler.
 - `src/completion_batch.zig` is the bounded ID-and-result Completion message contract.
 - `src/lambda_auth.zig` is the shared bearer-token and PASETO verification module.
@@ -132,6 +135,12 @@ environment variables in documentation. When docs need a live value, document
 the AWS CLI query that retrieves it instead of recording the value itself.
 
 ## Build and Validation
+
+A local development TigerBeetle replica is running on `0.0.0.0:3000`.
+Use this replica for native TigerBeetle tests, connecting through
+`127.0.0.1:3000` (the replica binds to all local interfaces).
+Run `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle`
+for the native live integration tests.
 
 Use these local checks:
 

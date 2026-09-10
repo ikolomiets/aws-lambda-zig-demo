@@ -4,3 +4,4 @@ zig-pkg/
 *.zip
 *.log
 .DS_Store
+.scratch

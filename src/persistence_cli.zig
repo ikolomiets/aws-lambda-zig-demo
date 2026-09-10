@@ -6,7 +6,7 @@ const operation_persistence = @import("operation_persistence");
 const Allocator = std.mem.Allocator;
 
 const argument_count_max = 8;
-const stdin_size_max = 8 * 1024;
+const stdin_size_max = operation.output_size_max;
 
 comptime {
     std.debug.assert(stdin_size_max > operation.body_size_max);
@@ -56,7 +56,7 @@ const usage =
 ;
 
 pub fn main(init: std.process.Init) u8 {
-    var stdout_buffer: [stdin_size_max]u8 = undefined;
+    var stdout_buffer: [4096]u8 = undefined;
     var stderr_buffer: [1024]u8 = undefined;
     var stdout_file = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     var stderr_file = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
@@ -68,8 +68,11 @@ pub fn main(init: std.process.Init) u8 {
     const command = parseCommand(arguments) catch {
         return finish(&stdout_file.interface, &stderr_file.interface, 2, .invocation);
     };
-    var stdin_buffer: [stdin_size_max + 1]u8 = undefined;
-    const stdin = readCommandInput(init.io, command, &stdin_buffer) catch {
+    const stdin_buffer = init.gpa.create([stdin_size_max + 1]u8) catch {
+        return finish(&stdout_file.interface, &stderr_file.interface, 2, .validation);
+    };
+    defer init.gpa.destroy(stdin_buffer);
+    const stdin = readCommandInput(init.io, command, stdin_buffer) catch {
         return finish(&stdout_file.interface, &stderr_file.interface, 2, .validation);
     };
     const context = Context{
