@@ -1970,6 +1970,45 @@ test "seeded family mixes admit uniformly and preserve independent positions" {
     }
 }
 
+test "canonical creation names fit the complete Result size bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const commands = try allocator.alloc(Command, 64);
+    const outcomes = try allocator.alloc(CommandOutcome, 64);
+    const scratch = try allocator.create([operation.result_size_max]u8);
+    inline for (.{ Family.create_accounts, Family.create_transfers }) |family| {
+        // Enumerate the pinned status range plus the separate created sentinel.
+        for (0..70) |index| {
+            const code: u32 = if (index == 69) 0xffffffff else @intCast(index);
+            const name = if (family == .create_accounts)
+                tigerbeetle.create_account_status_name(code)
+            else
+                tigerbeetle.create_transfer_status_name(code);
+            if (name == null) continue;
+            for (commands, outcomes) |*command, *outcome| {
+                command.* = .{
+                    .id = std.math.maxInt(u128) - 1,
+                    .alias = "\x00" ** 64,
+                    .native = if (family == .create_accounts)
+                        .{ .account = std.mem.zeroes(tigerbeetle.Account) }
+                    else
+                        .{ .transfer = std.mem.zeroes(tigerbeetle.Transfer) },
+                };
+                outcome.* = .{ .created = code };
+            }
+            const plan: Plan = .{
+                .commands = commands,
+                .outcomes = outcomes,
+                .counts = if (family == .create_accounts) .{ 64, 0, 0 } else .{ 0, 64, 0 },
+            };
+            const encoded = try write_result(scratch, 1, &plan, false);
+            // The existing maximal lookup/message shape still dominates creation results.
+            try std.testing.expect(encoded.len < 91987);
+        }
+    }
+}
+
 test "bounded serializer fixtures establish complete Result and diagnostic size proofs" {
     // Artificial maximal shapes reserve all escaping, not a claim about a realizable Body.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2096,7 +2135,7 @@ test "direct Result writer preserves replay positions and refuses unfinished wor
     plan.outcomes[0] = .{ .created = 21 };
     plan.outcomes[1] = .{ .created = 1 };
     try std.testing.expectEqualStrings(
-        "{\"type\":\"SUCCESS\",\"payload\":{\"operation_id\":\"00000000-0000-0000-0000-000000000001\",\"create_accounts\":[{\"id\":\"1\",\"error_code\":21},{\"id\":\"2\",\"error_code\":1}],\"create_transfers\":[],\"lookup_accounts\":[]}}",
+        "{\"type\":\"SUCCESS\",\"payload\":{\"operation_id\":\"00000000-0000-0000-0000-000000000001\",\"create_accounts\":[{\"id\":\"1\",\"error_code\":\"exists\"},{\"id\":\"2\",\"error_code\":\"linked_event_failed\"}],\"create_transfers\":[],\"lookup_accounts\":[]}}",
         try write_result(buffer, 1, &plan, true),
     );
 }
@@ -2167,7 +2206,17 @@ fn write_outcome(writer: *std.Io.Writer, command: *const Command, outcome: *cons
     try writer.print("{{\"id\":\"{d}\",\"error_code\":", .{command.id});
     switch (outcome.*) {
         .unsubmitted => unreachable,
-        .created => |code| try writer.print("{d}", .{code}),
+        .created => |code| {
+            const name = switch (command.native) {
+                .account => tigerbeetle.create_account_status_name(code),
+                .transfer => tigerbeetle.create_transfer_status_name(code),
+                .lookup => unreachable,
+            };
+            if (name == null) log.warn("unmapped creation status: family={s} status={d}", .{
+                @tagName(command.native), code,
+            });
+            try std.json.Stringify.value(name orelse "unknown", .{}, writer);
+        },
         else => try writer.writeAll("null"),
     }
     try write_alias(writer, command.alias);
@@ -2333,7 +2382,7 @@ test "mixed FAILURE retains writes skipped transfers found observations and alia
     const buffer = try arena.allocator().create([operation.result_size_max]u8);
     const result = try write_result(buffer, 1, &plan, false);
     try std.testing.expectEqualStrings(
-        \\{"type":"FAILURE","payload":{"operation_id":"00000000-0000-0000-0000-000000000001","create_accounts":[{"id":"1","error_code":4294967295}],"create_transfers":[{"id":"3","error_code":22}],"lookup_accounts":[{"id":"1","error_code":null,"alias":"same","account":{"debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}},{"id":"2","error_code":null,"alias":"same","message":"Account was not found."}]}}
+        \\{"type":"FAILURE","payload":{"operation_id":"00000000-0000-0000-0000-000000000001","create_accounts":[{"id":"1","error_code":"created"}],"create_transfers":[{"id":"3","error_code":"credit_account_not_found"}],"lookup_accounts":[{"id":"1","error_code":null,"alias":"same","account":{"debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}},{"id":"2","error_code":null,"alias":"same","message":"Account was not found."}]}}
     , result);
     plan.outcomes[0] = .{ .created = 2 };
     plan.outcomes[1] = .{ .skipped = "Transfer was not submitted because account creation was rejected." };
@@ -2406,7 +2455,7 @@ test "account rejection skips only its transfers and lookup follows either rejec
     try std.testing.expect(skipped.get("error_code").? == .null);
     try std.testing.expect(skipped.get("message") != null);
     const rejected = decoded.results[1].valid.result.failure.object.get("create_transfers").?.array.items[0].object;
-    try std.testing.expectEqual(@as(i64, 22), rejected.get("error_code").?.integer);
+    try std.testing.expectEqualStrings("credit_account_not_found", rejected.get("error_code").?.string);
 }
 
 test "creation layouts validate entire packet before mutation for both families" {
@@ -2447,6 +2496,35 @@ test "creation layouts validate entire packet before mutation for both families"
         try std.testing.expectEqualStrings("{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"},{\"itemIdentifier\":\"message-1\"}]}", response);
         try std.testing.expectEqualSlices(Family, &.{.create_accounts}, fake.trace[0..fake.trace_count]);
         try std.testing.expectEqual(@as(u8, 0), publisher.send_count);
+    }
+}
+
+test "unmapped creation statuses publish unknown without retry" {
+    inline for (.{ Family.create_accounts, Family.create_transfers }) |family| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var fake: FakeExecution = .{};
+        if (family == .create_accounts) {
+            fake.account_outcomes[2] = .{ .rejected = 123456 };
+            fake.account_outcomes[3] = .{ .rejected = tigerbeetle.account_linked_event_failed };
+        } else {
+            fake.transfer_outcomes[1] = .{ .rejected = 123456 };
+        }
+        var publisher: FakePublisher = .{};
+        const response = try test_invoke(
+            arena.allocator(),
+            &.{ execution_body, execution_body },
+            &fake,
+            &publisher,
+        );
+        try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+        try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
+        try std.testing.expectEqualSlices(Family, &families, fake.trace[0..fake.trace_count]);
+        const batch = try completion_batch.decode(arena.allocator(), publisher.message);
+        try std.testing.expectEqual(@as(usize, 2), batch.results.len);
+        const payload = batch.results[1].valid.result.failure.object;
+        const entries = payload.get(@tagName(family)).?.array.items;
+        try std.testing.expectEqualStrings("unknown", entries[0].object.get("error_code").?.string);
     }
 }
 
@@ -2756,8 +2834,8 @@ test "fully found created and replayed Operations publish SUCCESS with actual co
         const decoded = try completion_batch.decode(arena.allocator(), publisher.message);
         const payload = decoded.results[0].valid.result.success.object;
         const accounts = payload.get("create_accounts").?.array.items;
-        try std.testing.expectEqual(@as(i64, if (attempt == 0) tigerbeetle.account_created else tigerbeetle.account_exists), accounts[0].object.get("error_code").?.integer);
-        try std.testing.expectEqual(@as(i64, if (attempt == 0) tigerbeetle.account_created else tigerbeetle.account_linked_event_failed), accounts[1].object.get("error_code").?.integer);
+        try std.testing.expectEqualStrings(if (attempt == 0) "created" else "exists", accounts[0].object.get("error_code").?.string);
+        try std.testing.expectEqualStrings(if (attempt == 0) "created" else "linked_event_failed", accounts[1].object.get("error_code").?.string);
     }
 }
 
@@ -3020,7 +3098,7 @@ test "restarted deliveries repeat original chains after every interruption witho
         try std.testing.expectEqual(@as(u128, 1), entry.operation_id);
         const payload = if (boundary == .rejected_lookup) entry.result.failure else entry.result.success;
         const transfers = payload.object.get("create_transfers").?.array.items;
-        try std.testing.expectEqual(@as(i64, if (boundary == .rejected_lookup) 68 else tigerbeetle.transfer_exists), transfers[0].object.get("error_code").?.integer);
+        try std.testing.expectEqualStrings(if (boundary == .rejected_lookup) "id_already_failed" else "exists", transfers[0].object.get("error_code").?.string);
         const lookups = payload.object.get("lookup_accounts").?.array.items;
         try std.testing.expectEqualStrings("credit", lookups[0].object.get("alias").?.string);
         try std.testing.expectEqualStrings("70", lookups[0].object.get("account").?.object.get("credits_posted").?.string);
@@ -3112,7 +3190,7 @@ test "redelivery regroups only intact original chains after a lost shared reply"
     const batch = try completion_batch.decode(allocator, publisher.message);
     try std.testing.expectEqual(@as(u128, 19), batch.results[0].valid.operation_id);
     try std.testing.expectEqual(@as(u128, 17), batch.results[1].valid.operation_id);
-    try std.testing.expectEqual(@as(i64, tigerbeetle.account_exists), batch.results[1].valid.result.failure.object.get("create_accounts").?.array.items[0].object.get("error_code").?.integer);
+    try std.testing.expectEqualStrings("exists", batch.results[1].valid.result.failure.object.get("create_accounts").?.array.items[0].object.get("error_code").?.string);
 }
 
 test "pending and post replay retain original timeout interval full amount and inherited zero sentinels" {

@@ -23,6 +23,62 @@ pub const transfer_created: u32 = @intCast(c.TB_CREATE_TRANSFER_CREATED);
 pub const transfer_exists: u32 = @intCast(c.TB_CREATE_TRANSFER_EXISTS);
 pub const transfer_linked_event_failed: u32 = @intCast(c.TB_CREATE_TRANSFER_LINKED_EVENT_FAILED);
 
+/// Canonical names come from the pinned native constants, without the C family prefix.
+pub fn create_account_status_name(status: u32) ?[]const u8 {
+    return creation_status_name("TB_CREATE_ACCOUNT_", status);
+}
+
+pub fn create_transfer_status_name(status: u32) ?[]const u8 {
+    return creation_status_name("TB_CREATE_TRANSFER_", status);
+}
+
+fn creation_status_name(comptime prefix: []const u8, status: u32) ?[]const u8 {
+    @setEvalBranchQuota(100_000);
+    inline for (@typeInfo(c).@"struct".decls) |decl| {
+        if (comptime std.mem.startsWith(u8, decl.name, prefix) and
+            !std.mem.eql(u8, decl.name, prefix ++ "STATUS"))
+        {
+            if (status == @field(c, decl.name)) {
+                const name = comptime blk: {
+                    const suffix = decl.name[prefix.len..];
+                    assert(suffix.len > 0);
+                    var lowercase: [suffix.len]u8 = undefined;
+                    _ = std.ascii.lowerString(&lowercase, suffix);
+                    break :blk lowercase;
+                };
+                return &name;
+            }
+        }
+    }
+    return null;
+}
+
+test "canonical creation status names cover pinned native families" {
+    @setEvalBranchQuota(100_000);
+    inline for (.{ "TB_CREATE_ACCOUNT_", "TB_CREATE_TRANSFER_" }) |prefix| {
+        var count: usize = 0;
+        inline for (@typeInfo(c).@"struct".decls) |decl| {
+            if (comptime std.mem.startsWith(u8, decl.name, prefix) and
+                !std.mem.eql(u8, decl.name, prefix ++ "STATUS"))
+            {
+                const name = creation_status_name(prefix, @field(c, decl.name)).?;
+                try std.testing.expect(std.ascii.eqlIgnoreCase(decl.name[prefix.len..], name));
+                for (name) |byte| try std.testing.expect(!std.ascii.isUpper(byte));
+                count += 1;
+            }
+        }
+        try std.testing.expect(count > 0);
+        try std.testing.expectEqualStrings("created", creation_status_name(prefix, 0xffffffff).?);
+        try std.testing.expectEqualStrings("linked_event_failed", creation_status_name(prefix, 1).?);
+        try std.testing.expect(creation_status_name(prefix, 0) == null);
+        try std.testing.expect(creation_status_name(prefix, 123456) == null);
+    }
+    try std.testing.expectEqualStrings("exists", create_account_status_name(21).?);
+    try std.testing.expectEqualStrings("debit_account_not_found", create_transfer_status_name(21).?);
+    try std.testing.expectEqualStrings("exists", create_transfer_status_name(46).?);
+    try std.testing.expect(create_account_status_name(46) == null);
+}
+
 pub fn create_account_succeeded(status: u32) bool {
     return status == c.TB_CREATE_ACCOUNT_CREATED or
         status == c.TB_CREATE_ACCOUNT_EXISTS;

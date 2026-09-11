@@ -180,14 +180,18 @@ are empty. Serialize entry fields as id, error_code, optional alias, then messag
 
 | Entry | error_code | Remaining content |
 | --- | --- | --- |
-| Submitted creation | Actual native u32 status | Optional alias only; omit native creation timestamp/reserved. |
+| Submitted creation | Canonical native status name (JSON string) | Optional alias only; omit native creation timestamp/reserved. |
 | Transfer deliberately skipped after account rejection | null | Required explanatory message. |
 | Found account lookup | null | Full account object, no message. |
 | Missing account lookup | null | Required explanatory message, no account. |
 
-Keep family-specific status values unchanged, including created 4294967295, account exists 21,
-transfer exists 46 and linked_event_failed 1. Obtain named constants from the pinned native boundary;
-null is absence of a per-command native status, not itself failure. Do not rewrite replay suffixes.
+Serialize canonical lowercase status names from the pinned native boundary, including "created",
+"exists" (account status 21 or transfer status 46), and "linked_event_failed". This replaces the
+previous integer error_code format; consumers must accept string or null. Previously stored Results
+are not rewritten. null is absence of a per-command native status, not itself failure.
+Do not rewrite replay suffixes. If a native status has no name in the pinned definitions, serialize
+"unknown" and log its family and numeric value. Name translation does not change native outcome
+classification or introduce retries.
 
 The account object omits id because the entry already carries it. Serialize all remaining native
 fields in this order: debits_pending, debits_posted, credits_pending, credits_posted, user_data_128,
@@ -404,7 +408,7 @@ Accepted replay of a previously committed immutable account chain and singleton 
 Body requesting no lookups; raw linked-failed suffixes remain visible:
 
 ```json
-{"type":"SUCCESS","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[{"id":"101","error_code":21,"alias":"pair"},{"id":"102","error_code":1,"alias":"pair"}],"create_transfers":[{"id":"201","error_code":46}],"lookup_accounts":[]}}
+{"type":"SUCCESS","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[{"id":"101","error_code":"exists","alias":"pair"},{"id":"102","error_code":"linked_event_failed","alias":"pair"}],"create_transfers":[{"id":"201","error_code":"exists"}],"lookup_accounts":[]}}
 ```
 
 A missing lookup fails the Operation while preserving a found account and its full native fields:
@@ -434,7 +438,7 @@ For a non-array lookup family:
 Completion framing intentionally repeats the UUID outside the Result:
 
 ```json
-{"results":[{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","result":{"type":"SUCCESS","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[{"id":"104","error_code":4294967295}],"create_transfers":[],"lookup_accounts":[]}}}]}
+{"results":[{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","result":{"type":"SUCCESS","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[{"id":"104","error_code":"created"}],"create_transfers":[],"lookup_accounts":[]}}}]}
 ```
 
 ## Scope exclusions
