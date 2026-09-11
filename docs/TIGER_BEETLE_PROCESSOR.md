@@ -107,8 +107,9 @@ Choose the first diagnostic in this order:
    wins over exceeding the command cap; do not stop validation at command 65.
 
 For a command diagnostic, emit preceding null placeholders in that family's list, one diagnostic at
-its original position, and no suffix. The other lists are empty. Independently project a valid ID
-or null and a valid optional alias; do not echo invalid values. Diagnostic fields are id, error_code
+its original position, and no suffix. The other lists are empty. Independently project a valid
+optional alias; do not echo invalid values. All command diagnostics omit id and use their array
+position for request correlation. Diagnostic fields are error_code
 (null), optional alias, message, then optional field or member_index. Known field names identify
 invalid/missing/forbidden fields; unknown members use their zero-based u32 member index. Field and
 member_index are mutually exclusive. Non-object elements need neither.
@@ -176,7 +177,9 @@ in that order, plus error only for a Body-level diagnostic. Its canonical lowerc
 matches the enclosing Completion entry's operation_id. Both UUID occurrences are intentional.
 
 Complete execution lists contain one entry per original command, in original order; absent families
-are empty. Serialize entry fields as id, error_code, optional alias, then message or account:
+are empty. All command entries omit top-level id and correlate with requests by array position,
+including creation results, skipped transfers, missing-account results, and validation diagnostics.
+Serialize entry fields as error_code, optional alias, then message or account:
 
 | Entry | error_code | Remaining content |
 | --- | --- | --- |
@@ -193,8 +196,11 @@ Do not rewrite replay suffixes. If a native status has no name in the pinned def
 "unknown" and log its family and numeric value. Name translation does not change native outcome
 classification or introduce retries.
 
-The account object omits id because the entry already carries it. Serialize all remaining native
-fields in this order: debits_pending, debits_posted, credits_pending, credits_posted, user_data_128,
+The account object includes the returned native id. Top-level requested IDs are removed from all
+command results; consumers must read account.id for found accounts and use positional correlation
+for creation results and errors.
+Previously stored Results are not rewritten. Serialize all native
+fields in this order: id, debits_pending, debits_posted, credits_pending, credits_posted, user_data_128,
 user_data_64, user_data_32, reserved, ledger, code, flags, timestamp. Encode u128/u64 as canonical
 unsigned decimal strings and u32/u16 as JSON integers. Preserve every returned flag and field,
 including creation-forbidden flags and zero metadata. Timestamp is native creation time, not read time.
@@ -392,9 +398,9 @@ Rejected Body examples, each with a valid generic envelope/hash:
 | --- | --- |
 | `{}` | Payload error: no commands. |
 | `{"lookup_accounts":{}}` | Payload error, field `lookup_accounts`. |
-| `{"lookup_accounts":["101"]}` | Command 0: expected object; null ID, no field/member. |
+| `{"lookup_accounts":["101"]}` | Command 0: expected object; no ID or field/member. |
 | `{"lookup_accounts":[{"id":"101"},{"id":"101"}]}` | Command 1, field `id`; one preceding null. |
-| `{"lookup_accounts":[{"id":"01","alias":"main","unexpected":true}]}` | Command 0, member_index 2; null ID and retained alias. |
+| `{"lookup_accounts":[{"id":"01","alias":"main","unexpected":true}]}` | Command 0, member_index 2; no ID and retained alias. |
 | `{"create_transfers":[{"id":"301","debit_account_id":"101","credit_account_id":"102","amount":"3","ledger":1,"code":1,"flags":2}]}` | Command 0, field `timeout`. |
 
 Duplicate decoded JSON keys instead prevent generic envelope acceptance and produce no Completion.
@@ -408,25 +414,25 @@ Accepted replay of a previously committed immutable account chain and singleton 
 Body requesting no lookups; raw linked-failed suffixes remain visible:
 
 ```json
-{"type":"SUCCESS","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[{"id":"101","error_code":"exists","alias":"pair"},{"id":"102","error_code":"linked_event_failed","alias":"pair"}],"create_transfers":[{"id":"201","error_code":"exists"}],"lookup_accounts":[]}}
+{"type":"SUCCESS","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[{"error_code":"exists","alias":"pair"},{"error_code":"linked_event_failed","alias":"pair"}],"create_transfers":[{"error_code":"exists"}],"lookup_accounts":[]}}
 ```
 
 A missing lookup fails the Operation while preserving a found account and its full native fields:
 
 ```json
-{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[{"id":"102","error_code":null,"alias":"pair","message":"Account was not found."},{"id":"101","error_code":null,"alias":"pair","account":{"debits_pending":"0","debits_posted":"7","credits_pending":"0","credits_posted":"9","user_data_128":"123","user_data_64":"456","user_data_32":789,"reserved":0,"ledger":1,"code":1,"flags":8,"timestamp":"1790000000000000001"}}]}}
+{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[{"error_code":null,"alias":"pair","message":"Account was not found."},{"error_code":null,"alias":"pair","account":{"id":"101","debits_pending":"0","debits_posted":"7","credits_pending":"0","credits_posted":"9","user_data_128":"123","user_data_64":"456","user_data_32":789,"reserved":0,"ledger":1,"code":1,"flags":8,"timestamp":"1790000000000000001"}}]}}
 ```
 
 For the unknown-member Body above, unknown-field precedence and independent projection give:
 
 ```json
-{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[{"id":null,"error_code":null,"alias":"main","message":"Unknown field.","member_index":2}]}}
+{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[{"error_code":null,"alias":"main","message":"Unknown field.","member_index":2}]}}
 ```
 
 For the duplicate-ID Body above, no command executes and only the diagnostic prefix appears:
 
 ```json
-{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[null,{"id":"101","error_code":null,"message":"This ID repeats an earlier command's ID in the same list.","field":"id"}]}}
+{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[null,{"error_code":null,"message":"This ID repeats an earlier command's ID in the same list.","field":"id"}]}}
 ```
 
 For a non-array lookup family:
@@ -438,7 +444,7 @@ For a non-array lookup family:
 Completion framing intentionally repeats the UUID outside the Result:
 
 ```json
-{"results":[{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","result":{"type":"SUCCESS","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[{"id":"104","error_code":"created"}],"create_transfers":[],"lookup_accounts":[]}}}]}
+{"results":[{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","result":{"type":"SUCCESS","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[{"error_code":"created"}],"create_transfers":[],"lookup_accounts":[]}}}]}
 ```
 
 ## Scope exclusions

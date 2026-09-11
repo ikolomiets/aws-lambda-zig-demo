@@ -1711,7 +1711,7 @@ test "diagnostic prefix and independent projection have exact Result shape" {
     var writer: std.Io.Writer.Allocating = .init(arena.allocator());
     try writer.writer.writeAll(encoded);
     try std.testing.expectEqualStrings(
-        \\{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[null,{"id":null,"error_code":null,"alias":"main","message":"Unknown field.","member_index":2}]}}
+        \\{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[null,{"error_code":null,"alias":"main","message":"Unknown field.","member_index":2}]}}
     , writer.written());
 }
 
@@ -2023,9 +2023,9 @@ test "bounded serializer fixtures establish complete Result and diagnostic size 
     const scratch = try allocator.create([operation.result_size_max]u8);
     var entry_writer = std.Io.Writer.fixed(scratch);
     try write_outcome(&entry_writer, &commands[0], &outcomes[0]);
-    try std.testing.expectEqual(@as(usize, 1434), entry_writer.buffered().len);
+    try std.testing.expectEqual(@as(usize, 1387), entry_writer.buffered().len);
     var plan: Plan = .{ .commands = commands, .outcomes = outcomes, .counts = .{ 0, 0, 64 } };
-    try std.testing.expectEqual(@as(usize, 91987), (try write_result(scratch, 1, &plan, false)).len);
+    try std.testing.expectEqual(@as(usize, 88979), (try write_result(scratch, 1, &plan, false)).len);
     plan = .{ .commands = commands[0..0], .outcomes = outcomes[0..0], .counts = .{ 0, 0, 0 } };
     try std.testing.expectEqual(@as(usize, 148), (try write_result(scratch, 1, &plan, false)).len);
     var writer: std.Io.Writer.Allocating = .init(allocator);
@@ -2041,7 +2041,7 @@ test "bounded serializer fixtures establish complete Result and diagnostic size 
     const buffer = try arena.allocator().create([operation.result_size_max]u8);
     const encoded = write_diagnostic(buffer, 0x00112233445566778899aabbccddeeff, &diagnostic);
     try writer.writer.writeAll(encoded);
-    try std.testing.expectEqual(@as(usize, 3655), writer.written().len);
+    try std.testing.expectEqual(@as(usize, 3608), writer.written().len);
     _ = try operation.parseCompletionJSON(arena.allocator(), writer.written());
 }
 
@@ -2135,7 +2135,7 @@ test "direct Result writer preserves replay positions and refuses unfinished wor
     plan.outcomes[0] = .{ .created = 21 };
     plan.outcomes[1] = .{ .created = 1 };
     try std.testing.expectEqualStrings(
-        "{\"type\":\"SUCCESS\",\"payload\":{\"operation_id\":\"00000000-0000-0000-0000-000000000001\",\"create_accounts\":[{\"id\":\"1\",\"error_code\":\"exists\"},{\"id\":\"2\",\"error_code\":\"linked_event_failed\"}],\"create_transfers\":[],\"lookup_accounts\":[]}}",
+        "{\"type\":\"SUCCESS\",\"payload\":{\"operation_id\":\"00000000-0000-0000-0000-000000000001\",\"create_accounts\":[{\"error_code\":\"exists\"},{\"error_code\":\"linked_event_failed\"}],\"create_transfers\":[],\"lookup_accounts\":[]}}",
         try write_result(buffer, 1, &plan, true),
     );
 }
@@ -2203,7 +2203,8 @@ fn write_outcome(writer: *std.Io.Writer, command: *const Command, outcome: *cons
         .skipped => std.debug.assert(command.native == .transfer),
         .unsubmitted => unreachable,
     }
-    try writer.print("{{\"id\":\"{d}\",\"error_code\":", .{command.id});
+    try writer.writeAll("{");
+    try writer.writeAll("\"error_code\":");
     switch (outcome.*) {
         .unsubmitted => unreachable,
         .created => |code| {
@@ -2238,7 +2239,7 @@ fn write_outcome(writer: *std.Io.Writer, command: *const Command, outcome: *cons
 
 fn write_account(writer: *std.Io.Writer, account: *const tigerbeetle.Account) !void {
     try writer.writeAll("{");
-    inline for (.{ "debits_pending", "debits_posted", "credits_pending", "credits_posted", "user_data_128", "user_data_64", "user_data_32", "reserved", "ledger", "code", "flags", "timestamp" }, 0..) |field, index| {
+    inline for (.{ "id", "debits_pending", "debits_posted", "credits_pending", "credits_posted", "user_data_128", "user_data_64", "user_data_32", "reserved", "ledger", "code", "flags", "timestamp" }, 0..) |field, index| {
         if (index != 0) try writer.writeAll(",");
         try writer.print("\"{s}\":", .{field});
         const value = @field(account, field);
@@ -2275,9 +2276,7 @@ fn write_diagnostic(buffer: *[operation.result_size_max]u8, id: u128, diagnostic
 fn write_diagnostic_entry(writer: *std.Io.Writer, diagnostic: *const Diagnostic) !void {
     try writer.writeAll("{");
     if (diagnostic.family != null) {
-        try writer.writeAll("\"id\":");
-        if (diagnostic.id) |id| try writer.print("\"{d}\"", .{id}) else try writer.writeAll("null");
-        try writer.writeAll(",\"error_code\":null");
+        try writer.writeAll("\"error_code\":null");
         try write_alias(writer, diagnostic.alias);
         try writer.writeAll(",");
     }
@@ -2290,23 +2289,119 @@ fn write_diagnostic_entry(writer: *std.Io.Writer, diagnostic: *const Diagnostic)
     try writer.writeAll("}");
 }
 
+test "creation and skipped transfer results omit IDs with and without aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    for ([_]?[]const u8{ null, "same" }) |alias| {
+        for ([_]Family{ .create_accounts, .create_transfers }) |family| {
+            const command: Command = .{
+                .id = 42,
+                .alias = alias,
+                .native = if (family == .create_accounts)
+                    .{ .account = std.mem.zeroes(tigerbeetle.Account) }
+                else
+                    .{ .transfer = std.mem.zeroes(tigerbeetle.Transfer) },
+            };
+            const outcomes = [_]CommandOutcome{
+                .{ .created = 0xffffffff },
+                .{ .created = 1 },
+                .{ .skipped = "Transfer was not submitted because account creation was rejected." },
+            };
+            for (outcomes) |outcome| {
+                if (family == .create_accounts and outcome == .skipped) continue;
+                var bytes: [2048]u8 = undefined;
+                var writer = std.Io.Writer.fixed(&bytes);
+                try write_outcome(&writer, &command, &outcome);
+                const entry = (try std.json.parseFromSliceLeaky(std.json.Value, allocator, writer.buffered(), .{})).object;
+                try std.testing.expect(!entry.contains("id"));
+                try std.testing.expectEqual(alias != null, entry.contains("alias"));
+                try std.testing.expectEqual(outcome == .skipped, entry.contains("message"));
+                if (outcome == .skipped) {
+                    try std.testing.expect(entry.get("error_code").? == .null);
+                } else {
+                    try std.testing.expect(entry.get("error_code").? == .string);
+                }
+            }
+            const diagnostic: Diagnostic = .{
+                .family = family,
+                .command_index = 1,
+                .id = 42,
+                .alias = alias,
+                .message = "Unknown field.",
+                .member_index = 2,
+            };
+            var bytes: [operation.result_size_max]u8 = undefined;
+            const result = write_diagnostic(&bytes, 1, &diagnostic);
+            const decoded = try std.json.parseFromSliceLeaky(std.json.Value, allocator, result, .{});
+            const entries = decoded.object.get("payload").?.object.get(@tagName(family)).?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), entries.len);
+            try std.testing.expect(entries[0] == .null);
+            try std.testing.expect(!entries[1].object.contains("id"));
+            try std.testing.expectEqual(alias != null, entries[1].object.contains("alias"));
+        }
+    }
+}
+
+test "lookup results omit outer IDs with and without aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    for ([_]?[]const u8{ null, "same" }) |alias| {
+        const command: Command = .{ .id = 42, .alias = alias, .native = .{ .lookup = 42 } };
+        var account = std.mem.zeroes(tigerbeetle.Account);
+        account.id = 42;
+        for ([_]CommandOutcome{ .{ .found = account }, .{ .missing = "Account was not found." } }) |outcome| {
+            var bytes: [2048]u8 = undefined;
+            var writer = std.Io.Writer.fixed(&bytes);
+            try write_outcome(&writer, &command, &outcome);
+            const entry = (try std.json.parseFromSliceLeaky(std.json.Value, allocator, writer.buffered(), .{})).object;
+            try std.testing.expect(!entry.contains("id"));
+            try std.testing.expectEqual(alias != null, entry.contains("alias"));
+            try std.testing.expect(entry.get("error_code").? == .null);
+            if (outcome == .found) {
+                try std.testing.expectEqualStrings("42", entry.get("account").?.object.get("id").?.string);
+            } else {
+                try std.testing.expect(!entry.contains("account"));
+            }
+        }
+        const diagnostic: Diagnostic = .{
+            .family = .lookup_accounts,
+            .command_index = 1,
+            .id = 42,
+            .alias = alias,
+            .message = "Unknown field.",
+            .member_index = 2,
+        };
+        var bytes: [operation.result_size_max]u8 = undefined;
+        const result = write_diagnostic(&bytes, 1, &diagnostic);
+        const decoded = try std.json.parseFromSliceLeaky(std.json.Value, allocator, result, .{});
+        const entries = decoded.object.get("payload").?.object.get("lookup_accounts").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), entries.len);
+        try std.testing.expect(entries[0] == .null);
+        try std.testing.expect(!entries[1].object.contains("id"));
+        try std.testing.expect(!entries[1].object.contains("account"));
+        try std.testing.expectEqual(alias != null, entries[1].object.contains("alias"));
+    }
+}
+
 test "found Account projection preserves every native width and zero field" {
     var account = std.mem.zeroes(tigerbeetle.Account);
-    inline for (.{ "debits_pending", "debits_posted", "credits_pending", "credits_posted", "user_data_128", "user_data_64", "user_data_32", "reserved", "ledger", "code", "flags", "timestamp" }) |field| {
+    inline for (.{ "id", "debits_pending", "debits_posted", "credits_pending", "credits_posted", "user_data_128", "user_data_64", "user_data_32", "reserved", "ledger", "code", "flags", "timestamp" }) |field| {
         @field(account, field) = std.math.maxInt(@TypeOf(@field(account, field)));
     }
     var bytes: [2048]u8 = undefined;
     var writer = std.Io.Writer.fixed(&bytes);
     try write_account(&writer, &account);
     const expected =
-        \\{"debits_pending":"340282366920938463463374607431768211455","debits_posted":"340282366920938463463374607431768211455","credits_pending":"340282366920938463463374607431768211455","credits_posted":"340282366920938463463374607431768211455","user_data_128":"340282366920938463463374607431768211455","user_data_64":"18446744073709551615","user_data_32":4294967295,"reserved":4294967295,"ledger":4294967295,"code":65535,"flags":65535,"timestamp":"18446744073709551615"}
+        \\{"id":"340282366920938463463374607431768211455","debits_pending":"340282366920938463463374607431768211455","debits_posted":"340282366920938463463374607431768211455","credits_pending":"340282366920938463463374607431768211455","credits_posted":"340282366920938463463374607431768211455","user_data_128":"340282366920938463463374607431768211455","user_data_64":"18446744073709551615","user_data_32":4294967295,"reserved":4294967295,"ledger":4294967295,"code":65535,"flags":65535,"timestamp":"18446744073709551615"}
     ;
     try std.testing.expectEqualStrings(expected, writer.buffered());
     account = std.mem.zeroes(tigerbeetle.Account);
     writer = .fixed(&bytes);
     try write_account(&writer, &account);
     try std.testing.expectEqualStrings(
-        \\{"debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}
+        \\{"id":"0","debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}
     , writer.buffered());
 }
 
@@ -2344,7 +2439,9 @@ test "realizable lookup Body carries found data larger than 4 KiB through Comple
     try std.testing.expectEqualStrings("00000000-0000-0000-0000-000000000001", payload.get("operation_id").?.string);
     const lookups = payload.get("lookup_accounts").?.array.items;
     try std.testing.expectEqual(@as(usize, 64), lookups.len);
-    for (lookups[0..63]) |lookup| {
+    for (lookups[0..63], 1..) |lookup, requested_id| {
+        try std.testing.expect(!lookup.object.contains("id"));
+        try std.testing.expectEqual(requested_id, try std.fmt.parseInt(usize, lookup.object.get("account").?.object.get("id").?.string, 10));
         try std.testing.expectEqualStrings("same", lookup.object.get("alias").?.string);
         try std.testing.expectEqualStrings("340282366920938463463374607431768211455", lookup.object.get("account").?.object.get("debits_posted").?.string);
     }
@@ -2382,7 +2479,7 @@ test "mixed FAILURE retains writes skipped transfers found observations and alia
     const buffer = try arena.allocator().create([operation.result_size_max]u8);
     const result = try write_result(buffer, 1, &plan, false);
     try std.testing.expectEqualStrings(
-        \\{"type":"FAILURE","payload":{"operation_id":"00000000-0000-0000-0000-000000000001","create_accounts":[{"id":"1","error_code":"created"}],"create_transfers":[{"id":"3","error_code":"credit_account_not_found"}],"lookup_accounts":[{"id":"1","error_code":null,"alias":"same","account":{"debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}},{"id":"2","error_code":null,"alias":"same","message":"Account was not found."}]}}
+        \\{"type":"FAILURE","payload":{"operation_id":"00000000-0000-0000-0000-000000000001","create_accounts":[{"error_code":"created"}],"create_transfers":[{"error_code":"credit_account_not_found"}],"lookup_accounts":[{"error_code":null,"alias":"same","account":{"id":"1","debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}},{"error_code":null,"alias":"same","message":"Account was not found."}]}}
     , result);
     plan.outcomes[0] = .{ .created = 2 };
     plan.outcomes[1] = .{ .skipped = "Transfer was not submitted because account creation was rejected." };
