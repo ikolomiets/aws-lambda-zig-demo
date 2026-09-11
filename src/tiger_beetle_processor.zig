@@ -388,8 +388,8 @@ fn publish_results(
     for (queued, plans, record_indexes) |*entry, planning, record_index| {
         const plan = &(planning orelse continue);
         const encoded = switch (plan.*) {
-            .rejected => |*diagnostic| write_diagnostic(result_buffer, entry.id, diagnostic),
-            .admitted => |*admitted| write_result(result_buffer, entry.id, admitted, plan_success(admitted)) catch continue,
+            .rejected => |*diagnostic| write_diagnostic(result_buffer, diagnostic),
+            .admitted => |*admitted| write_result(result_buffer, admitted, plan_success(admitted)) catch continue,
         };
         if (framing.count == completion_count_max) {
             send_results(allocator, &framing, &represented, retry_records, publisher) catch return;
@@ -1134,7 +1134,7 @@ test "preflight lookup plan preserves concrete IDs and repeated aliases" {
 const completion_buffer_size = completion_batch.maximum_results_size(completion_count_max) catch unreachable;
 const result_size_multiplier = 24;
 const planned_result_size_max = std.math.mul(usize, operation.body_size_max, result_size_multiplier) catch unreachable;
-const command_capacity_raw = (planned_result_size_max - 147) / 1435;
+const command_capacity_raw = (planned_result_size_max - 93) / 1435;
 const command_count_max = std.math.floorPowerOfTwo(usize, command_capacity_raw);
 comptime {
     std.debug.assert(planned_result_size_max == operation.result_size_max);
@@ -1143,7 +1143,7 @@ comptime {
     std.debug.assert(completion_buffer_size <= completion_batch.encoded_message_size_max);
     std.debug.assert(command_capacity_raw == 68);
     std.debug.assert(command_count_max == 64);
-    std.debug.assert(147 + 1435 * command_count_max <= planned_result_size_max);
+    std.debug.assert(93 + 1435 * command_count_max <= planned_result_size_max);
 }
 
 const Family = enum { create_accounts, create_transfers, lookup_accounts };
@@ -1707,11 +1707,11 @@ test "diagnostic prefix and independent projection have exact Result shape" {
     defer arena.deinit();
     const result = try test_plan(arena.allocator(), "{\"lookup_accounts\":[{\"id\":\"1\"},{\"id\":\"01\",\"alias\":\"main\",\"unexpected\":true},{\"id\":\"3\"}]}");
     const buffer = try arena.allocator().create([operation.result_size_max]u8);
-    const encoded = write_diagnostic(buffer, 0x00112233445566778899aabbccddeeff, &result.rejected);
+    const encoded = write_diagnostic(buffer, &result.rejected);
     var writer: std.Io.Writer.Allocating = .init(arena.allocator());
     try writer.writer.writeAll(encoded);
     try std.testing.expectEqualStrings(
-        \\{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[null,{"error_code":null,"alias":"main","message":"Unknown field.","member_index":2}]}}
+        \\{"type":"FAILURE","payload":{"create_accounts":[],"create_transfers":[],"lookup_accounts":[null,{"error_code":null,"alias":"main","message":"Unknown field.","member_index":2}]}}
     , writer.written());
 }
 
@@ -2002,9 +2002,9 @@ test "canonical creation names fit the complete Result size bound" {
                 .outcomes = outcomes,
                 .counts = if (family == .create_accounts) .{ 64, 0, 0 } else .{ 0, 64, 0 },
             };
-            const encoded = try write_result(scratch, 1, &plan, false);
+            const encoded = try write_result(scratch, &plan, false);
             // The existing maximal lookup/message shape still dominates creation results.
-            try std.testing.expect(encoded.len < 91987);
+            try std.testing.expect(encoded.len < 91933);
         }
     }
 }
@@ -2025,9 +2025,9 @@ test "bounded serializer fixtures establish complete Result and diagnostic size 
     try write_outcome(&entry_writer, &commands[0], &outcomes[0]);
     try std.testing.expectEqual(@as(usize, 1387), entry_writer.buffered().len);
     var plan: Plan = .{ .commands = commands, .outcomes = outcomes, .counts = .{ 0, 0, 64 } };
-    try std.testing.expectEqual(@as(usize, 88979), (try write_result(scratch, 1, &plan, false)).len);
+    try std.testing.expectEqual(@as(usize, 88925), (try write_result(scratch, &plan, false)).len);
     plan = .{ .commands = commands[0..0], .outcomes = outcomes[0..0], .counts = .{ 0, 0, 0 } };
-    try std.testing.expectEqual(@as(usize, 148), (try write_result(scratch, 1, &plan, false)).len);
+    try std.testing.expectEqual(@as(usize, 94), (try write_result(scratch, &plan, false)).len);
     var writer: std.Io.Writer.Allocating = .init(allocator);
     const diagnostic: Diagnostic = .{
         .family = .lookup_accounts,
@@ -2039,9 +2039,9 @@ test "bounded serializer fixtures establish complete Result and diagnostic size 
     };
     writer.clearRetainingCapacity();
     const buffer = try arena.allocator().create([operation.result_size_max]u8);
-    const encoded = write_diagnostic(buffer, 0x00112233445566778899aabbccddeeff, &diagnostic);
+    const encoded = write_diagnostic(buffer, &diagnostic);
     try writer.writer.writeAll(encoded);
-    try std.testing.expectEqual(@as(usize, 3608), writer.written().len);
+    try std.testing.expectEqual(@as(usize, 3554), writer.written().len);
     _ = try operation.parseCompletionJSON(arena.allocator(), writer.written());
 }
 
@@ -2118,11 +2118,11 @@ test "Body-level diagnostics encode empty families and one payload error" {
     defer arena.deinit();
     const planning = try test_plan(arena.allocator(), "{\"lookup_accounts\":{}}");
     const buffer = try arena.allocator().create([operation.result_size_max]u8);
-    const encoded = write_diagnostic(buffer, 0x00112233445566778899aabbccddeeff, &planning.rejected);
+    const encoded = write_diagnostic(buffer, &planning.rejected);
     var writer: std.Io.Writer.Allocating = .init(arena.allocator());
     try writer.writer.writeAll(encoded);
     try std.testing.expectEqualStrings(
-        \\{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[],"error":{"message":"Expected an array of commands.","field":"lookup_accounts"}}}
+        \\{"type":"FAILURE","payload":{"create_accounts":[],"create_transfers":[],"lookup_accounts":[],"error":{"message":"Expected an array of commands.","field":"lookup_accounts"}}}
     , writer.written());
 }
 
@@ -2131,19 +2131,18 @@ test "direct Result writer preserves replay positions and refuses unfinished wor
     defer arena.deinit();
     const plan = (try test_plan(arena.allocator(), "{\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1},{\"id\":\"2\",\"flags\":0,\"ledger\":1,\"code\":1}]}")).admitted;
     const buffer = try arena.allocator().create([operation.result_size_max]u8);
-    try std.testing.expectError(error.UnfinishedOperation, write_result(buffer, 1, &plan, true));
+    try std.testing.expectError(error.UnfinishedOperation, write_result(buffer, &plan, true));
     plan.outcomes[0] = .{ .created = 21 };
     plan.outcomes[1] = .{ .created = 1 };
     try std.testing.expectEqualStrings(
-        "{\"type\":\"SUCCESS\",\"payload\":{\"operation_id\":\"00000000-0000-0000-0000-000000000001\",\"create_accounts\":[{\"error_code\":\"exists\"},{\"error_code\":\"linked_event_failed\"}],\"create_transfers\":[],\"lookup_accounts\":[]}}",
-        try write_result(buffer, 1, &plan, true),
+        "{\"type\":\"SUCCESS\",\"payload\":{\"create_accounts\":[{\"error_code\":\"exists\"},{\"error_code\":\"linked_event_failed\"}],\"create_transfers\":[],\"lookup_accounts\":[]}}",
+        try write_result(buffer, &plan, true),
     );
 }
 
 // The executor supplies whole-chain classification; individual replay suffixes are not failures.
 fn write_result(
     buffer: *[operation.result_size_max]u8,
-    id: u128,
     plan: *const Plan,
     success: bool,
 ) ![]const u8 {
@@ -2155,10 +2154,11 @@ fn write_result(
         if (outcome.* == .missing or outcome.* == .skipped) std.debug.assert(!success);
     }
     var writer = std.Io.Writer.fixed(buffer);
-    result_prefix(&writer, id, success) catch unreachable;
+    result_prefix(&writer, success) catch unreachable;
     var offset: usize = 0;
     for (families, 0..) |family, family_index| {
-        writer.print(",\"{s}\":[", .{@tagName(family)}) catch unreachable;
+        if (family_index != 0) writer.writeAll(",") catch unreachable;
+        writer.print("\"{s}\":[", .{@tagName(family)}) catch unreachable;
         for (0..plan.counts[family_index]) |index| {
             if (index != 0) writer.writeAll(",") catch unreachable;
             write_outcome(&writer, &plan.commands[offset], &plan.outcomes[offset]) catch unreachable;
@@ -2170,10 +2170,9 @@ fn write_result(
     return writer.buffered();
 }
 
-fn result_prefix(writer: *std.Io.Writer, id: u128, success: bool) !void {
-    var uuid: [operation.uuid_string_size]u8 = undefined;
-    try writer.print("{{\"type\":\"{s}\",\"payload\":{{\"operation_id\":\"{s}\"", .{
-        if (success) "SUCCESS" else "FAILURE", operation.uuidToString(id, &uuid),
+fn result_prefix(writer: *std.Io.Writer, success: bool) !void {
+    try writer.print("{{\"type\":\"{s}\",\"payload\":{{", .{
+        if (success) "SUCCESS" else "FAILURE",
     });
 }
 
@@ -2252,13 +2251,14 @@ fn write_account(writer: *std.Io.Writer, account: *const tigerbeetle.Account) !v
     try writer.writeAll("}");
 }
 
-fn write_diagnostic(buffer: *[operation.result_size_max]u8, id: u128, diagnostic: *const Diagnostic) []const u8 {
+fn write_diagnostic(buffer: *[operation.result_size_max]u8, diagnostic: *const Diagnostic) []const u8 {
     std.debug.assert(diagnostic.field == null or diagnostic.member_index == null);
     std.debug.assert(diagnostic.command_index <= operation.body_size_max / 10);
     var writer = std.Io.Writer.fixed(buffer);
-    result_prefix(&writer, id, false) catch unreachable;
-    for (families) |family| {
-        writer.print(",\"{s}\":[", .{@tagName(family)}) catch unreachable;
+    result_prefix(&writer, false) catch unreachable;
+    for (families, 0..) |family, family_index| {
+        if (family_index != 0) writer.writeAll(",") catch unreachable;
+        writer.print("\"{s}\":[", .{@tagName(family)}) catch unreachable;
         if (diagnostic.family == family) {
             for (0..diagnostic.command_index) |_| writer.writeAll("null,") catch unreachable;
             write_diagnostic_entry(&writer, diagnostic) catch unreachable;
@@ -2332,7 +2332,7 @@ test "creation and skipped transfer results omit IDs with and without aliases" {
                 .member_index = 2,
             };
             var bytes: [operation.result_size_max]u8 = undefined;
-            const result = write_diagnostic(&bytes, 1, &diagnostic);
+            const result = write_diagnostic(&bytes, &diagnostic);
             const decoded = try std.json.parseFromSliceLeaky(std.json.Value, allocator, result, .{});
             const entries = decoded.object.get("payload").?.object.get(@tagName(family)).?.array.items;
             try std.testing.expectEqual(@as(usize, 2), entries.len);
@@ -2374,7 +2374,7 @@ test "lookup results omit outer IDs with and without aliases" {
             .member_index = 2,
         };
         var bytes: [operation.result_size_max]u8 = undefined;
-        const result = write_diagnostic(&bytes, 1, &diagnostic);
+        const result = write_diagnostic(&bytes, &diagnostic);
         const decoded = try std.json.parseFromSliceLeaky(std.json.Value, allocator, result, .{});
         const entries = decoded.object.get("payload").?.object.get("lookup_accounts").?.array.items;
         try std.testing.expectEqual(@as(usize, 2), entries.len);
@@ -2427,7 +2427,7 @@ test "realizable lookup Body carries found data larger than 4 KiB through Comple
     }
     plan.outcomes[63] = .{ .missing = "Account was not found." };
     const buffer = try allocator.create([operation.result_size_max]u8);
-    const result = try write_result(buffer, 1, &plan, false);
+    const result = try write_result(buffer, &plan, false);
     try std.testing.expect(result.len > 4096);
     const transport = try allocator.alloc(u8, completion_buffer_size);
     var framing = completion_batch.Encoded.init(transport);
@@ -2436,7 +2436,7 @@ test "realizable lookup Body carries found data larger than 4 KiB through Comple
     const entry = decoded.results[0].valid;
     try std.testing.expectEqual(@as(u128, 1), entry.operation_id);
     const payload = entry.result.failure.object;
-    try std.testing.expectEqualStrings("00000000-0000-0000-0000-000000000001", payload.get("operation_id").?.string);
+    try std.testing.expect(!payload.contains("operation_id"));
     const lookups = payload.get("lookup_accounts").?.array.items;
     try std.testing.expectEqual(@as(usize, 64), lookups.len);
     for (lookups[0..63], 1..) |lookup, requested_id| {
@@ -2477,13 +2477,13 @@ test "mixed FAILURE retains writes skipped transfers found observations and alia
     plan.outcomes[2] = .{ .found = account };
     plan.outcomes[3] = .{ .missing = "Account was not found." };
     const buffer = try arena.allocator().create([operation.result_size_max]u8);
-    const result = try write_result(buffer, 1, &plan, false);
+    const result = try write_result(buffer, &plan, false);
     try std.testing.expectEqualStrings(
-        \\{"type":"FAILURE","payload":{"operation_id":"00000000-0000-0000-0000-000000000001","create_accounts":[{"error_code":"created"}],"create_transfers":[{"error_code":"credit_account_not_found"}],"lookup_accounts":[{"error_code":null,"alias":"same","account":{"id":"1","debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}},{"error_code":null,"alias":"same","message":"Account was not found."}]}}
+        \\{"type":"FAILURE","payload":{"create_accounts":[{"error_code":"created"}],"create_transfers":[{"error_code":"credit_account_not_found"}],"lookup_accounts":[{"error_code":null,"alias":"same","account":{"id":"1","debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}},{"error_code":null,"alias":"same","message":"Account was not found."}]}}
     , result);
     plan.outcomes[0] = .{ .created = 2 };
     plan.outcomes[1] = .{ .skipped = "Transfer was not submitted because account creation was rejected." };
-    const skipped = try write_result(buffer, 1, &plan, false);
+    const skipped = try write_result(buffer, &plan, false);
     const decoded = try operation.parseCompletionJSON(arena.allocator(), skipped);
     const transfer = decoded.failure.object.get("create_transfers").?.array.items[0].object;
     try std.testing.expect(transfer.get("error_code").? == .null);
@@ -3013,7 +3013,7 @@ test "serial publication skips unfinished records and preserves successful prefi
                 for (batch.results) |entry| {
                     if (next_id == completion_count_max + 1) next_id += 1;
                     try std.testing.expectEqual(next_id, entry.valid.operation_id);
-                    const expected = write_diagnostic(result, next_id, &plans[@intCast(next_id - 1)].?.rejected);
+                    const expected = write_diagnostic(result, &plans[@intCast(next_id - 1)].?.rejected);
                     const actual = try allocator.create([operation.result_size_max]u8);
                     try std.testing.expectEqualStrings(expected, try operation.writeCompletionJSON(actual, &entry.valid.result));
                     next_id += 1;
@@ -3194,6 +3194,7 @@ test "restarted deliveries repeat original chains after every interruption witho
         const entry = (try completion_batch.decode(invocation.allocator(), publisher.message)).results[0].valid;
         try std.testing.expectEqual(@as(u128, 1), entry.operation_id);
         const payload = if (boundary == .rejected_lookup) entry.result.failure else entry.result.success;
+        try std.testing.expect(!payload.object.contains("operation_id"));
         const transfers = payload.object.get("create_transfers").?.array.items;
         try std.testing.expectEqualStrings(if (boundary == .rejected_lookup) "id_already_failed" else "exists", transfers[0].object.get("error_code").?.string);
         const lookups = payload.object.get("lookup_accounts").?.array.items;
@@ -3209,7 +3210,7 @@ test "restarted deliveries repeat original chains after every interruption witho
         expected_plan.outcomes[4] = .{ .found = execution.lookup_results[0] };
         const expected_buffer = try allocator.create([operation.result_size_max]u8);
         const actual_buffer = try allocator.create([operation.result_size_max]u8);
-        try std.testing.expectEqualStrings(try write_result(expected_buffer, 1, &expected_plan, boundary != .rejected_lookup), try operation.writeCompletionJSON(actual_buffer, &entry.result));
+        try std.testing.expectEqualStrings(try write_result(expected_buffer, &expected_plan, boundary != .rejected_lookup), try operation.writeCompletionJSON(actual_buffer, &entry.result));
     }
 }
 
@@ -3240,7 +3241,7 @@ test "publication byte capacity flushes intact Results before count limit" {
     const result = try allocator.create([operation.result_size_max]u8);
     const buffer = try allocator.alloc(u8, completion_buffer_size);
     var single = completion_batch.Encoded.init(buffer);
-    try single.append(1, write_diagnostic(result, 1, &plans[0].?.rejected));
+    try single.append(1, write_diagnostic(result, &plans[0].?.rejected));
     const single_size = single.message().len;
     var retries = [_]bool{false} ** 3;
     var publisher: SerialPublisher = .{ .fail_at = 1, .ambiguous = true };

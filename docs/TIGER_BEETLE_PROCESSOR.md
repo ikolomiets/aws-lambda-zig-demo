@@ -122,11 +122,11 @@ human-readable, not an enum; do not interpolate arbitrary caller values or add p
 JSON Pointer, command indexes or a second machine-readable error taxonomy.
 
 Use one size-policy parameter: Result multiplier 24 times the 4,096-byte Body bound. Derive raw command
-capacity as floor((98,304−147)/1,435)=68 and round down to a power of two: 64 total commands across all
+capacity as floor((98,304−93)/1,435)=68 and round down to a power of two: 64 total commands across all
 families. Use checked arithmetic and compile-time assertions. The complete execution Result proof is
-148 base bytes + 64 × 1,434 maximum entry bytes + 63 separators = 91,987 bytes. It includes maximum
+94 base bytes + 64 × 1,434 maximum entry bytes + 63 separators = 91,933 bytes. It includes maximum
 integer widths and six-byte escaping for alias/message control bytes. The conservative preflight
-prefix bound is 3,655 bytes; validate both proofs against the actual writer. Never use outcome-weighted
+prefix bound is 3,601 bytes; validate both proofs against the actual writer. Never use outcome-weighted
 admission or truncate after effects. Overflow after proven admission is a programmer invariant failure.
 
 ## Execution phases and linked-chain replay
@@ -172,9 +172,9 @@ or extra request. A request error never establishes account absence.
 ## Result and Completion publication
 
 Keep the complete Result envelope with exactly type (`SUCCESS` or `FAILURE`) and non-null payload.
-The processor payload serializes operation_id, create_accounts, create_transfers, lookup_accounts
-in that order, plus error only for a Body-level diagnostic. Its canonical lowercase hyphenated UUID
-matches the enclosing Completion entry's operation_id. Both UUID occurrences are intentional.
+The processor payload serializes create_accounts, create_transfers, lookup_accounts in that order,
+plus error only for a Body-level diagnostic. The canonical lowercase hyphenated operation UUID
+appears only in the enclosing Completion entry's operation_id.
 
 Complete execution lists contain one entry per original command, in original order; absent families
 are empty. All command entries omit top-level id and correlate with requests by array position,
@@ -344,7 +344,7 @@ The capacity proof reserves worst-case widths and escaping so admission is indep
 outcomes. Maximum compact sizes are 467 bytes for a submitted creation entry, 935 for a found lookup,
 1,434 for a skip/miss, 1,462 for a command diagnostic, and 463 for the full nested Account.
 The preflight proof allows 409 preceding minimal ten-byte commands, each becoming `null,`:
-148 + 409 × 5 + 1,462 = 3,655. These are conservative structural shapes, not necessarily realizable
+94 + 409 × 5 + 1,462 = 3,601. These are conservative structural shapes, not necessarily realizable
 4 KiB Bodies. The complete Result bound applies both to sent bytes and compact parser-normalized
 bytes; outer Completion UUID/framing counts separately. Native records are 128 bytes, lookup IDs
 16 bytes, creation results 16 bytes and lookup results 128 bytes. A full native record buffer is
@@ -414,37 +414,37 @@ Accepted replay of a previously committed immutable account chain and singleton 
 Body requesting no lookups; raw linked-failed suffixes remain visible:
 
 ```json
-{"type":"SUCCESS","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[{"error_code":"exists","alias":"pair"},{"error_code":"linked_event_failed","alias":"pair"}],"create_transfers":[{"error_code":"exists"}],"lookup_accounts":[]}}
+{"type":"SUCCESS","payload":{"create_accounts":[{"error_code":"exists","alias":"pair"},{"error_code":"linked_event_failed","alias":"pair"}],"create_transfers":[{"error_code":"exists"}],"lookup_accounts":[]}}
 ```
 
 A missing lookup fails the Operation while preserving a found account and its full native fields:
 
 ```json
-{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[{"error_code":null,"alias":"pair","message":"Account was not found."},{"error_code":null,"alias":"pair","account":{"id":"101","debits_pending":"0","debits_posted":"7","credits_pending":"0","credits_posted":"9","user_data_128":"123","user_data_64":"456","user_data_32":789,"reserved":0,"ledger":1,"code":1,"flags":8,"timestamp":"1790000000000000001"}}]}}
+{"type":"FAILURE","payload":{"create_accounts":[],"create_transfers":[],"lookup_accounts":[{"error_code":null,"alias":"pair","message":"Account was not found."},{"error_code":null,"alias":"pair","account":{"id":"101","debits_pending":"0","debits_posted":"7","credits_pending":"0","credits_posted":"9","user_data_128":"123","user_data_64":"456","user_data_32":789,"reserved":0,"ledger":1,"code":1,"flags":8,"timestamp":"1790000000000000001"}}]}}
 ```
 
 For the unknown-member Body above, unknown-field precedence and independent projection give:
 
 ```json
-{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[{"error_code":null,"alias":"main","message":"Unknown field.","member_index":2}]}}
+{"type":"FAILURE","payload":{"create_accounts":[],"create_transfers":[],"lookup_accounts":[{"error_code":null,"alias":"main","message":"Unknown field.","member_index":2}]}}
 ```
 
 For the duplicate-ID Body above, no command executes and only the diagnostic prefix appears:
 
 ```json
-{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[null,{"error_code":null,"message":"This ID repeats an earlier command's ID in the same list.","field":"id"}]}}
+{"type":"FAILURE","payload":{"create_accounts":[],"create_transfers":[],"lookup_accounts":[null,{"error_code":null,"message":"This ID repeats an earlier command's ID in the same list.","field":"id"}]}}
 ```
 
 For a non-array lookup family:
 
 ```json
-{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[],"error":{"message":"Expected an array of commands.","field":"lookup_accounts"}}}
+{"type":"FAILURE","payload":{"create_accounts":[],"create_transfers":[],"lookup_accounts":[],"error":{"message":"Expected an array of commands.","field":"lookup_accounts"}}}
 ```
 
-Completion framing intentionally repeats the UUID outside the Result:
+Completion framing carries the operation UUID outside the Result:
 
 ```json
-{"results":[{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","result":{"type":"SUCCESS","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[{"error_code":"created"}],"create_transfers":[],"lookup_accounts":[]}}}]}
+{"results":[{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","result":{"type":"SUCCESS","payload":{"create_accounts":[{"error_code":"created"}],"create_transfers":[],"lookup_accounts":[]}}}]}
 ```
 
 ## Scope exclusions
