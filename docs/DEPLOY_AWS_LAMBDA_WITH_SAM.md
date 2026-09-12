@@ -107,13 +107,19 @@ profiles are unsupported. Dry runs make no AWS authentication calls.
 
 ## 2. Build and package the Zig Lambdas
 
+The TigerBeetle processor currently uses the sibling standard library at
+`../zig/lib`. Check `zig version` reports 0.16.0 and
+`test -f ../zig/lib/std/Io/net/HostName.zig` succeeds before building. File presence
+alone does not verify the workaround; see the
+[hostname-connect note](ZIG_0_16_HOSTNAME_CONNECT_STALL.md) for its status.
+
 Check Zig and shell formatting/syntax before the test graph:
 
 ```sh
-zig fmt --check build.zig src/completion_batch.zig src/completion_processor.zig \
-  src/tiger_beetle_processor.zig src/intake_lambda.zig src/lambda_auth.zig \
-  src/query_lambda.zig
-bash -n deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh
+zig build fmt-check
+for script in deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh; do
+  bash -n "$script" || exit
+done
 ```
 
 Run the full local test graph before packaging. This includes the Zig tests and
@@ -1800,15 +1806,9 @@ different verified subject returns the static `409 Conflict` response.
 
 Delivery is at least once. The standard queue, acknowledgement loss, and
 concurrent `SUBMITTED` retries can create duplicate messages. Consumers must use the
-Operation ID and hash idempotently. The current parsing/admission implementation is an
-intermediate, non-deployable step: it verifies the queued hash, validates the entire Body,
-and reserves a typed plan for at most 64 commands. Invalid envelopes acknowledge without
-Completion; valid-envelope Body errors publish one bounded FAILURE, acknowledging only
-after publication succeeds. Admitted work currently retries pending the family executor
-in ticket 04. The previous fixed account/transfer demonstration has been removed.
-See [the parsing contract and evidence](TIGERBEETLE_PARSING_EVIDENCE.md) for valid Body
-examples. The complete Result limit is now 96 KiB throughout the codecs, persistence,
-and reads; see [Result serialization evidence](TIGERBEETLE_RESULTS_EVIDENCE.md). Do not deploy this intermediate revision.
+Operation ID and hash idempotently. See the maintained
+[TigerBeetle processor design](TIGER_BEETLE_PROCESSOR.md) for the Body schema,
+validation, execution, Result limits, and recovery contract.
 
 Completion receives one aggregate message per invocation and applies its
 entries sequentially. It conditionally updates only the item selected by the

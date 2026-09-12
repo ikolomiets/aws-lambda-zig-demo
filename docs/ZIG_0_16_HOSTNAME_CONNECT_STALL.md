@@ -257,7 +257,13 @@ timeout only extends the stall.
 ## Status
 
 The issue is confirmed against Zig 0.16.0 and the repository-pinned transport.
-No Zig standard-library fix has been implemented or validated in this
-repository. Production diagnostic instrumentation was removed after evidence
+`build.zig` now selects `../zig/lib` as a temporary standard-library override
+for the TigerBeetle processor executable. That sibling checkout is external to
+this repository; its patch is not pinned or validated by the files here.
+Check `zig version` reports 0.16.0 and
+`test -f ../zig/lib/std/Io/net/HostName.zig` succeeds before building. These checks
+establish prerequisites, not that the sibling source contains a verified fix.
+
+Production diagnostic instrumentation was removed after evidence
 collection, and the deployed Lambda was restored to the uninstrumented
 artifact.

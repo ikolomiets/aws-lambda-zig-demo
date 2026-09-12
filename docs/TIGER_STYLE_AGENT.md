@@ -86,8 +86,8 @@ why in the change summary.
 - Explain why a decision exists, not merely what the code does. Write comments
   as clear sentences and describe non-obvious test goals and methodology.
 - Existing pinned dependencies are permitted. Add a dependency only when the
-  task needs it and after explicit approval; consider its security,
-  performance, and maintenance costs.
+  requested task requires it; explain its security,
+  performance, and maintenance costs in the change summary.
 
 ## Mechanical Defaults
 

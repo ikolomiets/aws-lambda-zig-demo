@@ -2,106 +2,66 @@
 
 ## Repository and Sources of Truth
 
-This repository is a small Zig 0.16.0 AWS Lambda example. The root build files
-define the intake, query, TigerBeetle processor, and Completion processor bootstrap executables,
-application code lives in `src/`, AWS
-deployment material lives in `template.yaml`, `deploy.sh`,
-`wireguard-gateway-setup.sh`, and `docs/`, while the vendored `aws_lambda`
-dependency is under `zig-pkg/`.
+This is a Zig 0.16.0 AWS Lambda example with four handlers and host-native
+`paseto`, `dynamodb`, and `sqs` CLI tools. `build.zig` and `build.zig.zon` own
+supported targets, optimization, executables, and pinned dependencies, including
+`aws_lambda`.
 
-Use these sources in order:
+Read sources relevant to the task:
 
-- `build.zig` and `build.zig.zon` define the supported Zig version, target
-  selection, dependency graph, optimization mode, and installed executable.
-- `src/intake_lambda.zig` is the authenticated POST intake entrypoint and handler.
-- `src/query_lambda.zig` is the authenticated GET environment-query entrypoint and handler.
-- `src/tiger_beetle_processor.zig` is the SQS-driven TigerBeetle processor entrypoint and handler.
-- [`docs/TIGER_BEETLE_PROCESSOR.md`](docs/TIGER_BEETLE_PROCESSOR.md) is the maintained processor-design
-  reference. Keep processor contract changes there; `CONTEXT.md` owns vocabulary, ADRs own
-  cross-cutting decisions, and wrapper/deployment docs own their respective concerns.
-- `src/completion_processor.zig` is the SQS-driven Completion processor entrypoint and handler.
-- `src/completion_batch.zig` is the bounded ID-and-result Completion message contract.
-- `src/lambda_auth.zig` is the shared bearer-token and PASETO verification module.
-- `template.yaml` defines the SAM-managed Lambdas, Function URLs, permissions,
-  memory, timeout, runtime, and architecture.
-- `deploy.sh` implements the generic, state-preserving AWS SAM deployment flow.
-- `wireguard-gateway-setup.sh` implements WireGuard gateway enablement,
-  reconfiguration, peer configuration output, and guarded teardown.
-- `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md` documents the supported deployment flow.
-- [`docs/TIGER_STYLE_AGENT.md`](docs/TIGER_STYLE_AGENT.md) is the concise,
-  recommended operational style guide for Zig changes.
-- [`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md) is the authoritative extended
-  Tiger Style philosophy, rationale, and examples.
+| Task | Sources |
+| --- | --- |
+| HTTP intake or operation query | `src/intake_lambda.zig`, `src/query_lambda.zig`, `src/lambda_auth.zig` |
+| Operation data and persistence | `src/operation.zig`, `src/operation_persistence.zig` |
+| Queue transport and Completion messages | `src/sqs_queue.zig`, `src/completion_batch.zig` |
+| SQS processors | `src/tiger_beetle_processor.zig`, `src/completion_processor.zig`, [processor contract](docs/TIGER_BEETLE_PROCESSOR.md) |
+| TigerBeetle client wrapper | `src/tigerbeetle.zig`, [wrapper design](docs/ZIG_WRAPPER_FOR_TIGERBEETLE.md) |
+| PASETO and local CLI tools | `src/paseto.zig`, `src/paseto_cli.zig`, `src/persistence_cli.zig`, `src/queue_cli.zig` |
+| Vocabulary or cross-cutting decisions | `CONTEXT.md`, relevant files in `docs/adr/` |
+| SAM resources, permissions, or function settings | `template.yaml`, relevant sections of [deployment guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md) |
+| Generic deployment flow | `deploy.sh`, relevant sections of the deployment guide |
+| WireGuard lifecycle | `wireguard-gateway-setup.sh`, relevant sections of the deployment guide |
 
-## Coding Style
+Consult related implementation files when behavior crosses these boundaries.
+Keep processor contract changes in the processor reference, vocabulary in
+`CONTEXT.md`, and cross-cutting decisions in ADRs.
 
-Before modifying Zig code, read and follow the recommendations in
-[`docs/TIGER_STYLE_AGENT.md`](docs/TIGER_STYLE_AGENT.md). Tiger Style is the
-preferred default, with safety first, then performance, then developer
-experience. It is not required when it conflicts with established codebase
-behavior, architecture, or conventions, or when compliance would require
-significant changes outside the task. Do not perform broad refactors or
-unrelated cleanup solely for style compliance.
+## Coding Style and Scope
 
-Keep the active use of assertions central to Zig changes. Assert programmer
-errors, invariants, preconditions, postconditions, results, and boundary
-assumptions; use Zig errors for expected operating failures. Assertions do not
-need to satisfy a numeric quota.
+For Zig changes, follow [Tiger Style for agents](docs/TIGER_STYLE_AGENT.md),
+which owns the project-specific defaults, compatibility exceptions, and triggers
+for consulting the extended guide. Keep assertions central: encode programmer
+invariants with assertions and handle expected operating failures with Zig errors.
 
-Read the relevant section of [`docs/TIGER_STYLE.md`](docs/TIGER_STYLE.md) when:
+Keep the project small; add modules or layers only when real behavior needs them.
+Avoid unrelated cleanup and hidden behavior changes. Add dependencies only when
+the requested task requires them; explain their security, performance, and
+maintenance costs in the change summary.
 
-- making architectural or performance-sensitive decisions;
-- introducing an abstraction;
-- changing memory-management or control-flow patterns;
-- resolving ambiguity in the concise guide; or
-- performing a dedicated design or code-quality review.
+Update affected deployment documentation when changing SAM resources, deployment
+helpers, or artifact expectations. Public Function URLs are intentionally
+demo-oriented; changes to IAM, CORS, runtime, timeout, memory, region, or profile
+assumptions must be documented with their operational effects.
 
-When a material Tiger Style recommendation is not suitable, document the
-reason in the code review or change summary and keep the exception scoped to
-the affected change.
+Only refresh Lambda zip packages when the task requires a deployable package.
+Build validation may regenerate `zig-out/`; treat its outputs as generated artifacts.
+The deployment guide owns packaging commands and artifact paths.
 
-## Architecture and Change Scope
+## Completion and Authorization
 
-Keep the project small. The application has four handlers, one shared authentication module
-used by the HTTP handlers, and one shared Completion message module used by the SQS handlers;
-do not add modules, layers, or helper packages until real behavior needs that structure.
+Complete the requested change, update affected documentation, run relevant
+validation, and fix regressions introduced by the change. Continue through these
+local steps without asking for approval at each step. Report unrelated failures
+and remaining validation gaps accurately. After checks pass, repeat or broaden
+validation only when new changes, failures, or unresolved concerns justify it.
 
-Before changing deployment behavior, read the SAM template, both deployment
-helpers, and the SAM deployment doc. Public Function URL settings are
-intentionally demo-oriented;
-do not widen IAM, CORS, runtime, timeout, memory, region, or profile assumptions
-without updating the matching documentation and calling out the operational
-effect.
+Deployment-helper tests use mocked AWS commands and require no credentials or
+network access. Live TigerBeetle tests are separately authorized against the local
+replica at `127.0.0.1:3000`; do not substitute a remote cluster.
 
-Treat generated build artifacts as artifacts:
-
-- `zig-out/bin/intake/bootstrap`, `zig-out/bin/query/bootstrap`,
-  `zig-out/bin/tiger_beetle_processor/bootstrap`, and `zig-out/bin/completion_processor/bootstrap` are produced by
-  `zig build`.
-- `intake-lambda.zip`, `query-lambda.zip`, `tiger-beetle-processor.zip`, and
-  `completion-processor.zip` package their matching bootstraps for Lambda/SAM.
-
-Only refresh artifacts when the task requires a deployable package.
-
-## Change-Impact Checklist
-
-Keep changes scoped and update only affected files:
-
-- Zig handler or build behavior: update the affected handler, `build.zig`, or `build.zig.zon`
-  as appropriate, then run formatting and build validation.
-- SAM resources, permissions, function settings, or outputs: update
-  `template.yaml` and `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md`.
-- Generic deployment helper behavior: update `deploy.sh` and
-  `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md`.
-- WireGuard lifecycle behavior: update `wireguard-gateway-setup.sh` and
-  `docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md`.
-- Deployment artifact expectations: update the affected deployment docs.
-- Any Zig code change: review it against
-  [`docs/TIGER_STYLE_AGENT.md`](docs/TIGER_STYLE_AGENT.md), subject to the
-  compatibility and change-scope exceptions above.
-
-Avoid unrelated prose rewrites, hidden behavior changes, broad refactors, and
-new dependencies unless the task explicitly needs them.
+AWS CLI and SAM deploy commands can create, modify, or expose cloud resources;
+run them only when the user explicitly requests deployment or authorizes
+cloud-side validation. Leave changes uncommitted unless a commit is requested.
 
 ## Commit Messages
 
@@ -136,37 +96,40 @@ the AWS CLI query that retrieves it instead of recording the value itself.
 
 ## Build and Validation
 
-A local development TigerBeetle replica is running on `0.0.0.0:3000`.
-Use this replica for native TigerBeetle tests, connecting through
-`127.0.0.1:3000` (the replica binds to all local interfaces).
-Run `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle`
-for the native live integration tests.
+The TigerBeetle processor build currently requires the sibling Zig standard
+library at `../zig/lib`. Before a Lambda build, check `zig version` (0.16.0) and
+`test -f ../zig/lib/std/Io/net/HostName.zig`. A missing checkout is an environment
+prerequisite failure. File presence does not verify the patch; consult the
+[hostname-connect workaround note](docs/ZIG_0_16_HOSTNAME_CONNECT_STALL.md) when
+setting up or diagnosing this build.
 
-Use these local checks:
+Select checks by the affected behavior:
 
-- `zig fmt --check build.zig src/completion_batch.zig src/completion_processor.zig src/tiger_beetle_processor.zig src/intake_lambda.zig src/lambda_auth.zig src/query_lambda.zig`:
-  verify Zig formatting.
-- `zig build test-deploy`: run only the local deployment-helper
-  regression tests; these use mocked AWS commands, require Bash and `jq`, and need
-  no credentials or network access.
-- `bash -n deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh`: verify deployment
-  helper and shell-test syntax.
-- `zig build test`: run the Zig tests and the deployment-helper regression
-  tests.
-- `zig build --release -Darch=arm`: build the stripped ReleaseSafe Linux ARM64 intake,
-  query, TigerBeetle processor, and Completion processor bootstraps. TigerBeetle processor remains multithread-capable
-  for the TigerBeetle callback thread; the other three are single-threaded.
-- `zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap` and
-  `zip -qj query-lambda.zip zig-out/bin/query/bootstrap` and
-  `zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap` and
-  `zip -qj completion-processor.zip zig-out/bin/completion_processor/bootstrap`: refresh deployable
-  packages when required.
-- `sam validate --template-file template.yaml --region ca-central-1`: validate
-  the SAM template when `template.yaml` changes.
-- `sam validate --lint --template-file template.yaml --region ca-central-1`:
-  run stricter SAM validation when `template.yaml` changes.
+| Check | Scope |
+| --- | --- |
+| `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
+| `zig build test` | Full local Zig and mocked deployment-helper suite; excludes the live replica and separate ABI checks |
+| `zig build test-deploy` | Mocked deployment regression tests; requires Bash and `jq` |
+| `zig build test-tigerbeetle-processor` | Processor parsing and invocation tests |
+| `zig build test-tigerbeetle-wrapper` | Offline wrapper tests |
+| `zig build test-tigerbeetle-c-abi` | Native C ABI smoke test on Apple Silicon macOS |
+| `zig build test-tigerbeetle-c-abi-linux test-tigerbeetle-wrapper-linux` | Compile ARM64 Linux ABI and wrapper tests; does not execute them |
+| `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` | Live integration tests against the local development replica |
+| `zig build --release -Darch=arm` | Stripped ReleaseSafe ARM64 Lambda bootstraps and host CLI tools |
+| `sam validate --template-file template.yaml --region ca-central-1` | SAM template validation when the template changes |
+| `sam validate --lint --template-file template.yaml --region ca-central-1` | Stricter SAM template validation |
 
-Prefer local validation first. AWS CLI and SAM deploy commands can create,
-modify, or expose cloud resources; run them only when the user explicitly asks
-for deployment or authorizes cloud-side validation. If cloud validation cannot
-run, report the unvalidated gap instead of implying it was completed.
+For shell changes, run `bash -n` on each affected script. To check the deployment
+helpers and shell tests together, use:
+
+```sh
+for script in deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh; do
+  bash -n "$script" || exit
+done
+```
+
+For Zig code or build changes, check formatting and build the affected targets,
+then select tests for the changed behavior. Documentation-only changes need link
+and command consistency checks rather than an application rebuild. The
+TigerBeetle processor must remain multithread-capable for its native callback
+thread; the other three Lambda bootstraps are single-threaded.

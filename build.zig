@@ -84,6 +84,13 @@ fn resolve_tiger_beetle_processor_target(
 }
 
 pub fn build(b: *std.Build) void {
+    const fmt_check = b.addFmt(.{
+        .paths = &.{ "build.zig", "build.zig.zon", "src", "tests" },
+        .check = true,
+    });
+    b.step("fmt-check", "Check formatting of project Zig sources and tests")
+        .dependOn(&fmt_check.step);
+
     const optimize = b.standardOptimizeOption(.{
         .preferred_optimize_mode = .ReleaseSafe,
     });
