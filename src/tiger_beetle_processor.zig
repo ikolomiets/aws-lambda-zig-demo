@@ -2597,6 +2597,11 @@ test "creation layouts validate entire packet before mutation for both families"
 }
 
 test "unmapped creation statuses publish unknown without retry" {
+    // These fixtures deliberately produce warnings; keep successful tests quiet.
+    const previous_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = previous_log_level;
+
     inline for (.{ Family.create_accounts, Family.create_transfers }) |family| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -2871,11 +2876,11 @@ test "maximum admitted invocation uses three native calls and one Completion sen
     var publisher: FakePublisher = .{};
     var measured: std.testing.FailingAllocator = .init(allocator, .{});
     const response = try test_invoke(measured.allocator(), &bodies, &fake, &publisher);
-    try std.testing.expect(measured.allocated_bytes < 8 * 1024 * 1024);
-    try std.testing.expect(measured.allocations < 10000);
-    std.debug.print("maximum invocation: allocated_bytes={d} allocations={d} native_calls={d} sends={d}\n", .{
+    errdefer std.debug.print("maximum invocation: allocated_bytes={d} allocations={d} native_calls={d} sends={d}\n", .{
         measured.allocated_bytes, measured.allocations, fake.trace_count, publisher.send_count,
     });
+    try std.testing.expect(measured.allocated_bytes < 8 * 1024 * 1024);
+    try std.testing.expect(measured.allocations < 10000);
     try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
     try std.testing.expectEqual(@as(usize, 10), fake.account_count);
     try std.testing.expectEqual(@as(usize, 10), fake.transfer_count);
