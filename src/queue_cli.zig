@@ -1,12 +1,13 @@
 const std = @import("std");
 const aws = @import("aws");
 const operation = @import("operation");
+const processor_message = @import("processor_message");
 const sqs_queue = @import("sqs_queue");
 
 const Allocator = std.mem.Allocator;
 
 const argument_count_max = 5;
-const stdin_size_max = 8 * 1024;
+const stdin_size_max = processor_message.encoded_size_max;
 const io_buffer_size = 4096;
 const receive_loop_is_intentionally_unbounded = true;
 
@@ -18,7 +19,7 @@ comptime {
 
 const Command = union(enum) {
     help,
-    send: SendOptions,
+    send,
     receive,
     check,
 };
@@ -26,10 +27,6 @@ const Command = union(enum) {
 const Invocation = struct {
     queue_name: ?[]const u8,
     command: Command,
-};
-
-const SendOptions = struct {
-    tenant: []const u8,
 };
 
 const Context = struct {
@@ -44,12 +41,12 @@ const CliError = error{InvalidInvocation};
 
 const usage =
     \\Usage:
-    \\  sqs <queue-name> send --tenant <tenant>
+    \\  sqs <queue-name> send
     \\  sqs <queue-name> receive
     \\  sqs <queue-name> check
     \\
     \\Commands:
-    \\  send     Read an Operation from stdin and enqueue it as SUBMITTED
+    \\  send     Read a Processor Message from stdin and enqueue it
     \\  receive  Long-poll, print, and delete messages until interrupted
     \\  check    Print all queue attributes as JSON
     \\
@@ -264,10 +261,8 @@ fn parseSend(arguments: []const []const u8) CliError!Command {
     if (arguments.len == 1) {
         if (isHelp(arguments[0])) return .help;
     }
-    if (arguments.len != 2) return error.InvalidInvocation;
-    if (!std.mem.eql(u8, arguments[0], "--tenant")) return error.InvalidInvocation;
-    operation.validateTenant(arguments[1]) catch return error.InvalidInvocation;
-    return .{ .send = .{ .tenant = arguments[1] } };
+    if (arguments.len != 0) return error.InvalidInvocation;
+    return .send;
 }
 
 fn parseNoOptions(arguments: []const []const u8, command: Command) CliError!Command {
@@ -452,6 +447,10 @@ fn classifyError(err: anyerror) Failure {
         error.UnexpectedBody,
         error.UnexpectedResult,
         error.InputTooLarge,
+        error.InvalidResultQueue,
+        error.MessageTooLarge,
+        error.SyntaxError,
+        error.UnexpectedToken,
         error.InvalidMessage,
         error.InvalidReceiptHandle,
         => .validation,
@@ -471,7 +470,7 @@ fn executeCommand(
     const backend = backend_optional orelse return error.InternalFailure;
     switch (command) {
         .help => unreachable,
-        .send => |options| try executeSend(context, backend, options),
+        .send => try executeSend(context, backend),
         .receive => unreachable,
         .check => try executeCheck(context, backend),
     }
@@ -480,19 +479,10 @@ fn executeCommand(
 fn executeSend(
     context: Context,
     backend: QueueInterface,
-    options: SendOptions,
 ) !void {
-    const parsed = try operation.parseInputJSON(context.allocator, context.stdin, .{
-        .tenant = options.tenant,
-        .now = context.now,
-    });
-
-    var serialized: std.Io.Writer.Allocating = .init(context.allocator);
-    defer serialized.deinit();
-    try operation.writeOutputJSON(&serialized.writer, &parsed);
-    const message = serialized.written();
-    std.debug.assert(parsed.state == .submitted);
-    std.debug.assert(message.len > 0);
+    const parsed = try processor_message.decode(context.allocator, context.stdin);
+    const message = try processor_message.encode(context.allocator, &parsed);
+    defer context.allocator.free(message);
 
     try backend.send(context.allocator, message);
     try context.stdout.writeAll(message);
@@ -558,8 +548,7 @@ fn executeCheck(
 }
 
 const test_input =
-    "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-    "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
+    "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":{\"message\":\"hello\",\"count\":2}}";
 const test_tigerbeetle_queue_name = "TigerBeetleQueue";
 const test_completion_queue_name = "CompletionQueue";
 
@@ -741,7 +730,7 @@ test "help works without AWS configuration and command parsing is bounded" {
         &.{ "sqs", test_tigerbeetle_queue_name, "unknown" },
         &.{ "sqs", test_tigerbeetle_queue_name, "receive", "extra" },
         &.{ "sqs", test_tigerbeetle_queue_name, "check", "extra" },
-        &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", "tenant", "extra" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "send", "extra" },
     };
     for (invalid_arguments) |arguments| {
         const result = runForTest(arguments, "", 0, &fake);
@@ -761,9 +750,9 @@ test "commands require a valid explicit queue logical resource ID" {
         "A" ** sqs_queue.environment_variable_name_size_max,
     };
     for (queue_names) |queue_name| {
-        const send = try parseCommand(&.{ "sqs", queue_name, "send", "--tenant", "tenant" });
+        const send = try parseCommand(&.{ "sqs", queue_name, "send" });
         try std.testing.expectEqualStrings(queue_name, send.queue_name.?);
-        try std.testing.expectEqualStrings("tenant", send.command.send.tenant);
+        try std.testing.expect(send.command == .send);
 
         const receive = try parseCommand(&.{ "sqs", queue_name, "receive" });
         try std.testing.expectEqualStrings(queue_name, receive.queue_name.?);
@@ -789,37 +778,11 @@ test "commands require a valid explicit queue logical resource ID" {
     }
 }
 
-test "send requires one valid bounded tenant and bounded Operation input" {
-    const valid = [_][]const u8{
-        "a",
-        "a" ** operation.tenant_size_max,
-        "é" ** (operation.tenant_size_max / 2),
-    };
-    for (valid) |tenant| {
-        const invocation = try parseCommand(
-            &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", tenant },
-        );
-        try std.testing.expectEqualStrings(tenant, invocation.command.send.tenant);
-    }
-    const invalid = [_][]const u8{
-        "",
-        "a" ** (operation.tenant_size_max + 1),
-        ("é" ** (operation.tenant_size_max / 2)) ++ "a",
-        &.{0xFF},
-    };
-    for (invalid) |tenant| {
-        try std.testing.expectError(
-            error.InvalidInvocation,
-            parseCommand(
-                &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", tenant },
-            ),
-        );
-    }
-
+test "send rejects oversized message input" {
     var fake: FakeQueue = .{};
     const oversized = "a" ** (stdin_size_max + 1);
     const result = runForTest(
-        &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", "tenant-a" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "send" },
         oversized,
         0,
         &fake,
@@ -828,27 +791,15 @@ test "send requires one valid bounded tenant and bounded Operation input" {
     try std.testing.expectEqual(@as(u8, 0), fake.send_count);
 }
 
-test "send queues and prints the same canonical SUBMITTED Operation" {
-    const expected =
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-        "\"tenant\":\"tenant-a\",\"name\":\"echo\"," ++
-        "\"body\":{\"message\":\"hello\",\"count\":2}," ++
-        "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
-        "\"expires_at\":1700086400," ++
-        "\"hash\":\"d271e3bd560113d2b82e42dfc46be33" ++
-        "fb90b43d7f4b12114f3da4888eae445d4\"}";
-    const inputs = [_][]const u8{
-        test_input,
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}," ++
-            "\"state\":\"SUBMITTED\"}",
-    };
+test "send queues and prints the same canonical Processor Message" {
+    const expected = test_input;
+    const inputs = [_][]const u8{ test_input, " {\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\", \"body\": {\"message\":\"hello\",\"count\":2}} " };
     var expected_message: ?[]u8 = null;
     defer if (expected_message) |message| std.testing.allocator.free(message);
     for (inputs) |input| {
         var fake: FakeQueue = .{};
         const result = runForTest(
-            &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", "tenant-a" },
+            &.{ "sqs", test_tigerbeetle_queue_name, "send" },
             input,
             1_700_000_000,
             &fake,
@@ -867,10 +818,10 @@ test "send queues and prints the same canonical SUBMITTED Operation" {
     }
 }
 
-test "send validates through Operation and reports AWS failures without output" {
+test "send validates Processor Messages and reports AWS failures without output" {
     var fake: FakeQueue = .{};
     const invalid = runForTest(
-        &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", "tenant-a" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "send" },
         "null",
         0,
         &fake,
@@ -888,7 +839,7 @@ test "send validates through Operation and reports AWS failures without output" 
         );
         defer std.testing.allocator.free(input);
         const invalid_state = runForTest(
-            &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", "tenant-a" },
+            &.{ "sqs", test_tigerbeetle_queue_name, "send" },
             input,
             0,
             &fake,
@@ -899,7 +850,7 @@ test "send validates through Operation and reports AWS failures without output" 
 
     fake.send_error = error.AWSFailure;
     const failed = runForTest(
-        &.{ "sqs", test_tigerbeetle_queue_name, "send", "--tenant", "tenant-a" },
+        &.{ "sqs", test_tigerbeetle_queue_name, "send" },
         test_input,
         1_700_000_000,
         &fake,

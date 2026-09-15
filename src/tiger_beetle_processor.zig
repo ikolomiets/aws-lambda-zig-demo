@@ -1,7 +1,7 @@
 const std = @import("std");
 const aws = @import("aws");
 const lambda = @import("aws-lambda");
-const completion_batch = @import("completion_batch");
+const processor_message = @import("processor_message");
 const operation = @import("operation");
 const sqs_queue = @import("sqs_queue");
 const tigerbeetle = @import("tigerbeetle");
@@ -29,10 +29,8 @@ const log = std.log.scoped(.tiger_beetle_processor);
 comptime {
     std.debug.assert(record_count_max > 0);
     std.debug.assert(record_count_max <= 10);
-    std.debug.assert(
-        record_count_max * (operation.result_size_max + operation.uuid_string_size + 64) <
-            completion_batch.encoded_message_size_max,
-    );
+    std.debug.assert(processor_message.encoded_size_max < 1024 * 1024);
+    std.debug.assert(processor_message.queue_url_size_max == sqs_queue.queue_url_size_max);
     std.debug.assert(tigerbeetle_addresses_default.len > 0);
     std.debug.assert(tigerbeetle_addresses_default.len <= tigerbeetle_addresses_size_max);
 }
@@ -135,9 +133,10 @@ const RuntimeResources = struct {
     fn sendCompletion(
         resources: *RuntimeResources,
         arena: Allocator,
+        result_queue: ?[]const u8,
         body: []const u8,
     ) !void {
-        return resources.completion_queue.send(arena, body);
+        return resources.completion_queue.sender.send(arena, result_queue orelse resources.completion_queue.queue_url, body);
     }
 };
 
@@ -258,7 +257,7 @@ const ExecutionAdapter = struct {
 
 const CompletionPublisher = struct {
     context: *anyopaque,
-    send_fn: *const fn (*anyopaque, Allocator, []const u8) anyerror!void,
+    send_fn: *const fn (*anyopaque, Allocator, ?[]const u8, []const u8) anyerror!void,
 
     fn init(pointer: anytype) CompletionPublisher {
         const Pointer = @TypeOf(pointer);
@@ -270,10 +269,11 @@ const CompletionPublisher = struct {
             fn send(
                 context: *anyopaque,
                 arena: Allocator,
+                result_queue: ?[]const u8,
                 body: []const u8,
             ) anyerror!void {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                return self.sendCompletion(arena, body);
+                return self.sendCompletion(arena, result_queue, body);
             }
         };
         return .{
@@ -282,8 +282,8 @@ const CompletionPublisher = struct {
         };
     }
 
-    fn send(publisher: CompletionPublisher, arena: Allocator, body: []const u8) !void {
-        return publisher.send_fn(publisher.context, arena, body);
+    fn send(publisher: CompletionPublisher, arena: Allocator, result_queue: ?[]const u8, body: []const u8) !void {
+        return publisher.send_fn(publisher.context, arena, result_queue, body);
     }
 };
 
@@ -311,7 +311,7 @@ fn uninstallRuntimeAdapters() void {
 const RecordParseOutcome = union(enum) {
     acknowledged,
     retry,
-    valid: operation.Operation,
+    valid: processor_message.Message,
 };
 
 fn handleInvocation(
@@ -324,7 +324,7 @@ fn handleInvocation(
     defer sqs_event.deinit(allocator);
     if (sqs_event.records.len > record_count_max) return error.TooManyRecords;
 
-    var queued_operations: [record_count_max]operation.Operation = undefined;
+    var queued_operations: [record_count_max]processor_message.Message = undefined;
     var queued_record_indexes: [record_count_max]usize = undefined;
     const result_buffer = try allocator.create([operation.result_size_max]u8);
     defer allocator.destroy(result_buffer);
@@ -353,7 +353,7 @@ fn handleInvocation(
         };
     };
     for (queued_operations[0..queued_count], 0..) |*queued, index| {
-        plans[index] = plan_body(allocator, &queued.body.?) catch null;
+        plans[index] = plan_body(allocator, &queued.body) catch null;
     }
     execute_phases(allocator, plans[0..queued_count], execution) catch |err| {
         log.debug("stage=native outcome=stopped error={s}", .{@errorName(err)});
@@ -364,11 +364,11 @@ fn handleInvocation(
 }
 
 // Transport count is independent of invocation delivery and native packet capacity.
-const completion_count_max = completion_batch.maximum_result_count;
+const completion_count_max = 1;
 
 fn publish_results(
     allocator: Allocator,
-    queued: []const operation.Operation,
+    queued: []const processor_message.Message,
     plans: []const ?Planning,
     record_indexes: []const usize,
     retry_records: []bool,
@@ -378,59 +378,18 @@ fn publish_results(
 ) void {
     std.debug.assert(queued.len == plans.len);
     std.debug.assert(queued.len == record_indexes.len);
-    var framing = completion_batch.Encoded.init(completion_buffer);
-    var represented: [completion_count_max]usize = undefined;
-    // Every valid source retries unless a successful send proves acknowledgement eligibility.
-    for (record_indexes) |index| {
-        std.debug.assert(index < retry_records.len);
-        retry_records[index] = true;
-    }
+    // A successful serial send acknowledges exactly its source, never an unsent suffix.
+    for (record_indexes) |index| retry_records[index] = true;
     for (queued, plans, record_indexes) |*entry, planning, record_index| {
         const plan = &(planning orelse continue);
-        const encoded = switch (plan.*) {
+        const body = switch (plan.*) {
             .rejected => |*diagnostic| write_diagnostic(result_buffer, diagnostic),
-            .admitted => |*admitted| write_result(result_buffer, admitted, plan_success(admitted)) catch continue,
+            .admitted => |*admitted| write_result(result_buffer, admitted) catch continue,
         };
-        if (framing.count == completion_count_max) {
-            send_results(allocator, &framing, &represented, retry_records, publisher) catch return;
-        }
-        framing.append(entry.id, encoded) catch |err| {
-            std.debug.assert(err == error.MessageTooLarge);
-            std.debug.assert(framing.count > 0);
-            send_results(allocator, &framing, &represented, retry_records, publisher) catch return;
-            // The admitted complete Result must fit in an empty production buffer.
-            framing.append(entry.id, encoded) catch unreachable;
-        };
-        represented[framing.count - 1] = record_index;
+        const message = processor_message.frame(completion_buffer, entry.operation_id, body, null) catch return;
+        publisher.send(allocator, entry.result_queue, message) catch return;
+        retry_records[record_index] = false;
     }
-    if (framing.count > 0) {
-        send_results(allocator, &framing, &represented, retry_records, publisher) catch return;
-    }
-}
-
-fn send_results(
-    allocator: Allocator,
-    framing: *completion_batch.Encoded,
-    represented: *const [completion_count_max]usize,
-    retry_records: []bool,
-    publisher: CompletionPublisher,
-) !void {
-    std.debug.assert(framing.count > 0);
-    std.debug.assert(framing.count <= completion_count_max);
-    try publisher.send(allocator, framing.message());
-    for (represented[0..framing.count]) |index| retry_records[index] = false;
-    framing.* = completion_batch.Encoded.init(framing.buffer);
-}
-
-fn publishCompletions(
-    arena: Allocator,
-    entries: []const completion_batch.Entry,
-    publisher: CompletionPublisher,
-) !void {
-    if (entries.len == 0) return;
-    std.debug.assert(entries.len <= record_count_max);
-    const message = try completion_batch.encode(arena, &.{ .results = entries });
-    try publisher.send(arena, message);
 }
 
 fn encodeFailureResponse(
@@ -458,7 +417,7 @@ fn parseRecord(
     message_id: []const u8,
     body: []const u8,
 ) RecordParseOutcome {
-    const queued = operation.parseOutputJSON(arena, body) catch |err| {
+    const queued = processor_message.decode(arena, body) catch |err| {
         if (err == error.OutOfMemory) {
             log.debug("message_id={s} stage=parse outcome=retry error={s}", .{
                 message_id,
@@ -466,13 +425,6 @@ fn parseRecord(
             });
             return .retry;
         }
-        log.debug("message_id={s} outcome=acknowledged_invalid error={s}", .{
-            message_id,
-            @errorName(err),
-        });
-        return .acknowledged;
-    };
-    validateQueuedOperation(&queued) catch |err| {
         log.debug("message_id={s} outcome=acknowledged_invalid error={s}", .{
             message_id,
             @errorName(err),
@@ -725,22 +677,6 @@ fn execute_phases(allocator: Allocator, plans: []?Planning, execution: Execution
     inline for (families) |family| try execute_family(family, plans, execution, &buffers);
 }
 
-fn plan_success(plan: *const Plan) bool {
-    if (plan.chains[0] == .rejected or plan.chains[1] == .rejected) return false;
-    for (plan.outcomes) |outcome| if (outcome == .missing or outcome == .skipped) return false;
-    return true;
-}
-
-fn validateQueuedOperation(queued: *const operation.Operation) !void {
-    if (queued.state != .submitted) return error.InvalidState;
-    if (queued.body == null) return error.MissingBody;
-    std.debug.assert(queued.hash != null);
-    const expected = try operation.operationHash(queued.tenant, queued.name, &queued.body.?);
-    if (!operation.verifyHash(queued, &expected)) return error.HashMismatch;
-    std.debug.assert(queued.last_updated != null);
-    std.debug.assert(queued.expires_at != null);
-}
-
 const success_outcome: CreateOutcome = .accepted;
 
 const FakeExecution = struct {
@@ -825,6 +761,8 @@ const FakeExecution = struct {
 
 const FakePublisher = struct {
     message: []const u8 = undefined,
+    messages: [record_count_max][]const u8 = undefined,
+    routes: [record_count_max]?[]const u8 = undefined,
     execution: ?*const FakeExecution = null,
     send_error: ?anyerror = null,
     account_count_at_send: usize = 0,
@@ -834,11 +772,14 @@ const FakePublisher = struct {
     fn sendCompletion(
         fake: *FakePublisher,
         arena: Allocator,
+        result_queue: ?[]const u8,
         body: []const u8,
     ) !void {
-        std.debug.assert(fake.send_count == 0);
+        fake.routes[fake.send_count] = result_queue;
+        std.debug.assert(fake.send_count < record_count_max);
         std.debug.assert(body.len > 0);
         fake.message = try arena.dupe(u8, body);
+        fake.messages[fake.send_count] = fake.message;
         if (fake.execution) |execution| {
             fake.account_count_at_send = execution.account_count;
             fake.transfer_count_at_send = execution.transfer_count;
@@ -848,7 +789,7 @@ const FakePublisher = struct {
     }
 };
 
-fn testMessage(allocator: Allocator, id: u128) ![]u8 {
+fn test_legacy_message(allocator: Allocator, id: u128) ![]u8 {
     const queued: operation.Operation = .{
         .id = id,
         .tenant = "tenant-a",
@@ -989,7 +930,7 @@ test "unsupported queued operation schemas are acknowledged" {
 }
 
 test "record parsing allocation failure is retryable" {
-    const message = try testMessage(std.testing.allocator, 2);
+    const message = try test_legacy_message(std.testing.allocator, 2);
     defer std.testing.allocator.free(message);
 
     const outcome = parseRecord(
@@ -998,24 +939,6 @@ test "record parsing allocation failure is retryable" {
         message,
     );
     try std.testing.expect(outcome == .retry);
-}
-
-test "aggregate encoding allocation failure occurs before send" {
-    const entries = [_]completion_batch.Entry{.{
-        .operation_id = 2,
-        .result = .{ .success = .{ .bool = true } },
-    }};
-    var publisher: FakePublisher = .{};
-
-    try std.testing.expectError(
-        error.OutOfMemory,
-        publishCompletions(
-            std.testing.failing_allocator,
-            &entries,
-            CompletionPublisher.init(&publisher),
-        ),
-    );
-    try std.testing.expectEqual(@as(u8, 0), publisher.send_count);
 }
 
 test "malformed non-SQS and oversized batch events are rejected" {
@@ -1131,7 +1054,7 @@ test "preflight lookup plan preserves concrete IDs and repeated aliases" {
 }
 
 // Uniform admission reserves the largest complete entry for every command.
-const completion_buffer_size = completion_batch.maximum_results_size(completion_count_max) catch unreachable;
+const completion_buffer_size = processor_message.encoded_size_max;
 const result_size_multiplier = 24;
 const planned_result_size_max = std.math.mul(usize, operation.body_size_max, result_size_multiplier) catch unreachable;
 const command_capacity_raw = (planned_result_size_max - 93) / 1435;
@@ -1139,8 +1062,8 @@ const command_count_max = std.math.floorPowerOfTwo(usize, command_capacity_raw);
 comptime {
     std.debug.assert(planned_result_size_max == operation.result_size_max);
     std.debug.assert(record_count_max * command_count_max == 640);
-    std.debug.assert(completion_buffer_size == 983713);
-    std.debug.assert(completion_buffer_size <= completion_batch.encoded_message_size_max);
+    std.debug.assert(completion_buffer_size > processor_message.body_size_max);
+    std.debug.assert(completion_buffer_size <= (1024 * 1024));
     std.debug.assert(command_capacity_raw == 68);
     std.debug.assert(command_count_max == 64);
     std.debug.assert(93 + 1435 * command_count_max <= planned_result_size_max);
@@ -1399,8 +1322,8 @@ const ValidationId = struct {
 };
 
 // Even the smallest wire-valid command, {"id":"1"}, occupies ten Body bytes.
-// Generic Operation parsing enforces body_size_max before production validation.
-const validation_id_count_max = operation.body_size_max / 10;
+// Processor Message decoding enforces body_size_max before production validation.
+const validation_id_count_max = processor_message.body_size_max / 10;
 
 fn validation_id_less(_: void, left: ValidationId, right: ValidationId) bool {
     if (left.id == right.id) return left.command_index < right.command_index;
@@ -1498,7 +1421,7 @@ fn plan_body(allocator: Allocator, body: *const std.json.Value) !Planning {
     return .{ .admitted = .{ .commands = commands, .outcomes = outcomes, .counts = counts } };
 }
 
-test "valid hash invalid Body publishes failure and admits neighbors without demo effects" {
+test "valid message invalid Body publishes diagnostics and admits neighbors without demo effects" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -1512,25 +1435,12 @@ test "valid hash invalid Body publishes failure and admits neighbors without dem
     try std.testing.expectEqual(@as(u8, 0), execution.account_count);
     try std.testing.expectEqual(@as(u8, 0), execution.transfer_count);
     try std.testing.expectEqual(@as(usize, 0), execution.lookup_count);
-    try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
+    try std.testing.expectEqual(@as(u8, 2), publisher.send_count);
 }
 
-fn test_body_message(allocator: Allocator, id: u128, body_json: []const u8) ![]u8 {
+fn test_body_message(allocator: Allocator, id: u128, body_json: []const u8) ![]const u8 {
     const body = try std.json.parseFromSliceLeaky(std.json.Value, allocator, body_json, .{ .duplicate_field_behavior = .@"error" });
-    const queued: operation.Operation = .{
-        .id = id,
-        .tenant = "tenant-a",
-        .name = "test",
-        .body = body,
-        .state = .submitted,
-        .last_updated = 1700000000,
-        .expires_at = 1700086400,
-        .hash = try operation.operationHash("tenant-a", "test", &body),
-    };
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
-    try operation.writeOutputJSON(&output.writer, &queued);
-    return output.toOwnedSlice();
+    return processor_message.encode(allocator, &.{ .operation_id = id, .body = body });
 }
 
 fn test_plan(allocator: Allocator, json: []const u8) !Planning {
@@ -1609,7 +1519,7 @@ test "normalized small numbers range and negative zero" {
         const queued = try test_body_message(arena.allocator(), 1, json);
         const parsed = parseRecord(arena.allocator(), "number", queued);
         try std.testing.expect(parsed == .valid);
-        const result = try plan_body(arena.allocator(), &parsed.valid.body.?);
+        const result = try plan_body(arena.allocator(), &parsed.valid.body);
         errdefer std.debug.print("small number: {s}\n", .{case.number});
         try std.testing.expectEqual(case.accepted, result == .admitted);
     }
@@ -1711,7 +1621,7 @@ test "diagnostic prefix and independent projection have exact Result shape" {
     var writer: std.Io.Writer.Allocating = .init(arena.allocator());
     try writer.writer.writeAll(encoded);
     try std.testing.expectEqualStrings(
-        \\{"type":"FAILURE","payload":{"create_accounts":[],"create_transfers":[],"lookup_accounts":[null,{"error_code":null,"alias":"main","message":"Unknown field.","member_index":2}]}}
+        \\{"create_accounts":[],"create_transfers":[],"lookup_accounts":[null,{"error_code":null,"alias":"main","message":"Unknown field.","member_index":2}]}
     , writer.written());
 }
 
@@ -1870,7 +1780,7 @@ test "invalid envelopes never salvage an ID or publish Completion" {
         }
         try std.testing.expect(parseRecord(allocator, "bad", message) == .acknowledged);
     }
-    const mismatch = try testMessage(allocator, 1);
+    const mismatch = try test_legacy_message(allocator, 1);
     try std.testing.expect(parseRecord(allocator, "hash", mismatch) == .acknowledged);
     const event = try testEvent(allocator, &.{mismatch});
     var execution: FakeExecution = .{};
@@ -1909,10 +1819,10 @@ test "typed command and outcome allocation failures are reachable without effect
     try std.testing.checkAllAllocationFailures(std.testing.allocator, planning_allocation_case, .{&body});
     const message = try test_body_message(arena.allocator(), 1, "{\"lookup_accounts\":[{\"id\":\"1\"}]}");
     const queued = parseRecord(arena.allocator(), "valid", message).valid;
-    try std.testing.expectError(error.OutOfMemory, plan_body(std.testing.failing_allocator, &queued.body.?));
+    try std.testing.expectError(error.OutOfMemory, plan_body(std.testing.failing_allocator, &queued.body));
     const invalid_message = try test_body_message(arena.allocator(), 2, "true");
     const invalid = parseRecord(arena.allocator(), "invalid", invalid_message).valid;
-    try std.testing.expect((try plan_body(std.testing.failing_allocator, &invalid.body.?)) == .rejected);
+    try std.testing.expect((try plan_body(std.testing.failing_allocator, &invalid.body)) == .rejected);
 }
 
 test "seeded family mixes admit uniformly and preserve independent positions" {
@@ -2002,7 +1912,7 @@ test "canonical creation names fit the complete Result size bound" {
                 .outcomes = outcomes,
                 .counts = if (family == .create_accounts) .{ 64, 0, 0 } else .{ 0, 64, 0 },
             };
-            const encoded = try write_result(scratch, &plan, false);
+            const encoded = try write_result(scratch, &plan);
             // The existing maximal lookup/message shape still dominates creation results.
             try std.testing.expect(encoded.len < 91933);
         }
@@ -2025,9 +1935,9 @@ test "bounded serializer fixtures establish complete Result and diagnostic size 
     try write_outcome(&entry_writer, &commands[0], &outcomes[0]);
     try std.testing.expectEqual(@as(usize, 1387), entry_writer.buffered().len);
     var plan: Plan = .{ .commands = commands, .outcomes = outcomes, .counts = .{ 0, 0, 64 } };
-    try std.testing.expectEqual(@as(usize, 88925), (try write_result(scratch, &plan, false)).len);
+    try std.testing.expectEqual(@as(usize, 88896), (try write_result(scratch, &plan)).len);
     plan = .{ .commands = commands[0..0], .outcomes = outcomes[0..0], .counts = .{ 0, 0, 0 } };
-    try std.testing.expectEqual(@as(usize, 94), (try write_result(scratch, &plan, false)).len);
+    try std.testing.expectEqual(@as(usize, 65), (try write_result(scratch, &plan)).len);
     var writer: std.Io.Writer.Allocating = .init(allocator);
     const diagnostic: Diagnostic = .{
         .family = .lookup_accounts,
@@ -2041,8 +1951,8 @@ test "bounded serializer fixtures establish complete Result and diagnostic size 
     const buffer = try arena.allocator().create([operation.result_size_max]u8);
     const encoded = write_diagnostic(buffer, &diagnostic);
     try writer.writer.writeAll(encoded);
-    try std.testing.expectEqual(@as(usize, 3554), writer.written().len);
-    _ = try operation.parseCompletionJSON(arena.allocator(), writer.written());
+    try std.testing.expectEqual(@as(usize, 3525), writer.written().len);
+    _ = try test_interpret_body(arena.allocator(), writer.written());
 }
 
 test "hash normalization and explicit default identity remain unchanged" {
@@ -2059,8 +1969,8 @@ test "hash normalization and explicit default identity remain unchanged" {
     for (jsons, 0..) |json, index| {
         const message = try test_body_message(arena.allocator(), 1, json);
         const parsed = parseRecord(arena.allocator(), "hash", message).valid;
-        hashes[index] = parsed.hash.?;
-        records[index] = (try plan_body(arena.allocator(), &parsed.body.?)).admitted.commands[0].native.transfer;
+        hashes[index] = try operation.operationHash("tenant-a", "test", &parsed.body);
+        records[index] = (try plan_body(arena.allocator(), &parsed.body)).admitted.commands[0].native.transfer;
     }
     try std.testing.expectEqualSlices(u8, &hashes[0], &hashes[1]);
     try std.testing.expect(!std.mem.eql(u8, &hashes[0], &hashes[2]));
@@ -2122,7 +2032,7 @@ test "Body-level diagnostics encode empty families and one payload error" {
     var writer: std.Io.Writer.Allocating = .init(arena.allocator());
     try writer.writer.writeAll(encoded);
     try std.testing.expectEqualStrings(
-        \\{"type":"FAILURE","payload":{"create_accounts":[],"create_transfers":[],"lookup_accounts":[],"error":{"message":"Expected an array of commands.","field":"lookup_accounts"}}}
+        \\{"create_accounts":[],"create_transfers":[],"lookup_accounts":[],"error":{"message":"Expected an array of commands.","field":"lookup_accounts"}}
     , writer.written());
 }
 
@@ -2131,30 +2041,28 @@ test "direct Result writer preserves replay positions and refuses unfinished wor
     defer arena.deinit();
     const plan = (try test_plan(arena.allocator(), "{\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1},{\"id\":\"2\",\"flags\":0,\"ledger\":1,\"code\":1}]}")).admitted;
     const buffer = try arena.allocator().create([operation.result_size_max]u8);
-    try std.testing.expectError(error.UnfinishedOperation, write_result(buffer, &plan, true));
+    try std.testing.expectError(error.UnfinishedOperation, write_result(buffer, &plan));
     plan.outcomes[0] = .{ .created = 21 };
     plan.outcomes[1] = .{ .created = 1 };
     try std.testing.expectEqualStrings(
-        "{\"type\":\"SUCCESS\",\"payload\":{\"create_accounts\":[{\"error_code\":\"exists\"},{\"error_code\":\"linked_event_failed\"}],\"create_transfers\":[],\"lookup_accounts\":[]}}",
-        try write_result(buffer, &plan, true),
+        "{\"create_accounts\":[{\"error_code\":\"exists\"},{\"error_code\":\"linked_event_failed\"}],\"create_transfers\":[],\"lookup_accounts\":[]}",
+        try write_result(buffer, &plan),
     );
 }
 
-// The executor supplies whole-chain classification; individual replay suffixes are not failures.
+// Preserve native outcomes; terminal interpretation belongs to the final processor.
 fn write_result(
     buffer: *[operation.result_size_max]u8,
     plan: *const Plan,
-    success: bool,
 ) ![]const u8 {
     std.debug.assert(plan.commands.len <= command_count_max);
     std.debug.assert(plan.commands.len == plan.outcomes.len);
     std.debug.assert(plan.commands.len == plan.counts[0] + plan.counts[1] + plan.counts[2]);
     for (plan.outcomes) |*outcome| {
         if (outcome.* == .unsubmitted) return error.UnfinishedOperation;
-        if (outcome.* == .missing or outcome.* == .skipped) std.debug.assert(!success);
     }
     var writer = std.Io.Writer.fixed(buffer);
-    result_prefix(&writer, success) catch unreachable;
+    writer.writeAll("{") catch unreachable;
     var offset: usize = 0;
     for (families, 0..) |family, family_index| {
         if (family_index != 0) writer.writeAll(",") catch unreachable;
@@ -2166,14 +2074,8 @@ fn write_result(
         }
         writer.writeAll("]") catch unreachable;
     }
-    writer.writeAll("}}") catch unreachable;
+    writer.writeAll("}") catch unreachable;
     return writer.buffered();
-}
-
-fn result_prefix(writer: *std.Io.Writer, success: bool) !void {
-    try writer.print("{{\"type\":\"{s}\",\"payload\":{{", .{
-        if (success) "SUCCESS" else "FAILURE",
-    });
 }
 
 fn write_alias(writer: *std.Io.Writer, alias: ?[]const u8) !void {
@@ -2253,9 +2155,9 @@ fn write_account(writer: *std.Io.Writer, account: *const tigerbeetle.Account) !v
 
 fn write_diagnostic(buffer: *[operation.result_size_max]u8, diagnostic: *const Diagnostic) []const u8 {
     std.debug.assert(diagnostic.field == null or diagnostic.member_index == null);
-    std.debug.assert(diagnostic.command_index <= operation.body_size_max / 10);
+    std.debug.assert(diagnostic.command_index <= processor_message.body_size_max / 10);
     var writer = std.Io.Writer.fixed(buffer);
-    result_prefix(&writer, false) catch unreachable;
+    writer.writeAll("{") catch unreachable;
     for (families, 0..) |family, family_index| {
         if (family_index != 0) writer.writeAll(",") catch unreachable;
         writer.print("\"{s}\":[", .{@tagName(family)}) catch unreachable;
@@ -2269,7 +2171,7 @@ fn write_diagnostic(buffer: *[operation.result_size_max]u8, diagnostic: *const D
         writer.writeAll(",\"error\":") catch unreachable;
         write_diagnostic_entry(&writer, diagnostic) catch unreachable;
     }
-    writer.writeAll("}}") catch unreachable;
+    writer.writeAll("}") catch unreachable;
     return writer.buffered();
 }
 
@@ -2334,7 +2236,7 @@ test "creation and skipped transfer results omit IDs with and without aliases" {
             var bytes: [operation.result_size_max]u8 = undefined;
             const result = write_diagnostic(&bytes, &diagnostic);
             const decoded = try std.json.parseFromSliceLeaky(std.json.Value, allocator, result, .{});
-            const entries = decoded.object.get("payload").?.object.get(@tagName(family)).?.array.items;
+            const entries = decoded.object.get(@tagName(family)).?.array.items;
             try std.testing.expectEqual(@as(usize, 2), entries.len);
             try std.testing.expect(entries[0] == .null);
             try std.testing.expect(!entries[1].object.contains("id"));
@@ -2376,7 +2278,7 @@ test "lookup results omit outer IDs with and without aliases" {
         var bytes: [operation.result_size_max]u8 = undefined;
         const result = write_diagnostic(&bytes, &diagnostic);
         const decoded = try std.json.parseFromSliceLeaky(std.json.Value, allocator, result, .{});
-        const entries = decoded.object.get("payload").?.object.get("lookup_accounts").?.array.items;
+        const entries = decoded.object.get("lookup_accounts").?.array.items;
         try std.testing.expectEqual(@as(usize, 2), entries.len);
         try std.testing.expect(entries[0] == .null);
         try std.testing.expect(!entries[1].object.contains("id"));
@@ -2427,12 +2329,11 @@ test "realizable lookup Body carries found data larger than 4 KiB through Comple
     }
     plan.outcomes[63] = .{ .missing = "Account was not found." };
     const buffer = try allocator.create([operation.result_size_max]u8);
-    const result = try write_result(buffer, &plan, false);
+    const result = try write_result(buffer, &plan);
     try std.testing.expect(result.len > 4096);
     const transport = try allocator.alloc(u8, completion_buffer_size);
-    var framing = completion_batch.Encoded.init(transport);
-    try framing.append(1, result);
-    const decoded = try completion_batch.decode(allocator, framing.message());
+    const message = try processor_message.frame(transport, 1, result, null);
+    const decoded = try test_results(allocator, &.{message});
     const entry = decoded.results[0].valid;
     try std.testing.expectEqual(@as(u128, 1), entry.operation_id);
     const payload = entry.result.failure.object;
@@ -2477,14 +2378,14 @@ test "mixed FAILURE retains writes skipped transfers found observations and alia
     plan.outcomes[2] = .{ .found = account };
     plan.outcomes[3] = .{ .missing = "Account was not found." };
     const buffer = try arena.allocator().create([operation.result_size_max]u8);
-    const result = try write_result(buffer, &plan, false);
+    const result = try write_result(buffer, &plan);
     try std.testing.expectEqualStrings(
-        \\{"type":"FAILURE","payload":{"create_accounts":[{"error_code":"created"}],"create_transfers":[{"error_code":"credit_account_not_found"}],"lookup_accounts":[{"error_code":null,"alias":"same","account":{"id":"1","debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}},{"error_code":null,"alias":"same","message":"Account was not found."}]}}
+        \\{"create_accounts":[{"error_code":"created"}],"create_transfers":[{"error_code":"credit_account_not_found"}],"lookup_accounts":[{"error_code":null,"alias":"same","account":{"id":"1","debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}},{"error_code":null,"alias":"same","message":"Account was not found."}]}
     , result);
     plan.outcomes[0] = .{ .created = 2 };
     plan.outcomes[1] = .{ .skipped = "Transfer was not submitted because account creation was rejected." };
-    const skipped = try write_result(buffer, &plan, false);
-    const decoded = try operation.parseCompletionJSON(arena.allocator(), skipped);
+    const skipped = try write_result(buffer, &plan);
+    const decoded = try test_interpret_body(arena.allocator(), skipped);
     const transfer = decoded.failure.object.get("create_transfers").?.array.items[0].object;
     try std.testing.expect(transfer.get("error_code").? == .null);
     try std.testing.expectEqualStrings("Transfer was not submitted because account creation was rejected.", transfer.get("message").?.string);
@@ -2524,7 +2425,7 @@ test "family barriers intact duplicate chains and sparse repeated lookup aliases
     }
     for (fake.transfers[0..2]) |transfer| try std.testing.expectEqual(@as(u16, 0), transfer.flags);
     try std.testing.expectEqualSlices(u128, &.{ 2, 1, 2, 1 }, fake.lookup_ids[0..4]);
-    const decoded = try completion_batch.decode(arena.allocator(), publisher.message);
+    const decoded = try test_results(arena.allocator(), publisher.messages[0..publisher.send_count]);
     try std.testing.expectEqual(@as(usize, 2), decoded.results.len);
     for (decoded.results) |entry| {
         const payload = entry.valid.result.failure.object;
@@ -2547,7 +2448,7 @@ test "account rejection skips only its transfers and lookup follows either rejec
     _ = try test_invoke(arena.allocator(), &.{ execution_body, execution_body }, &fake, &publisher);
     try std.testing.expectEqualSlices(Family, &families, fake.trace[0..fake.trace_count]);
     try std.testing.expectEqual(@as(usize, 1), fake.transfer_count);
-    const decoded = try completion_batch.decode(arena.allocator(), publisher.message);
+    const decoded = try test_results(arena.allocator(), publisher.messages[0..publisher.send_count]);
     const skipped = decoded.results[0].valid.result.failure.object.get("create_transfers").?.array.items[0].object;
     try std.testing.expect(skipped.get("error_code").? == .null);
     try std.testing.expect(skipped.get("message") != null);
@@ -2620,9 +2521,9 @@ test "unmapped creation statuses publish unknown without retry" {
             &publisher,
         );
         try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
-        try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
+        try std.testing.expectEqual(@as(u8, 2), publisher.send_count);
         try std.testing.expectEqualSlices(Family, &families, fake.trace[0..fake.trace_count]);
-        const batch = try completion_batch.decode(arena.allocator(), publisher.message);
+        const batch = try test_results(arena.allocator(), publisher.messages[0..publisher.send_count]);
         try std.testing.expectEqual(@as(usize, 2), batch.results.len);
         const payload = batch.results[1].valid.result.failure.object;
         const entries = payload.get(@tagName(family)).?.array.items;
@@ -2648,7 +2549,7 @@ test "request errors stop each phase and publish later fully determined Operatio
             "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"},{\"itemIdentifier\":\"message-1\"}]}"
         else
             "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}", response);
-        const decoded = try completion_batch.decode(arena.allocator(), publisher.message);
+        const decoded = try test_results(arena.allocator(), publisher.messages[0..publisher.send_count]);
         try std.testing.expectEqual(@as(usize, if (phase == 0) 1 else 2), decoded.results.len);
         if (phase > 0) try std.testing.expect(decoded.results[0].valid.result == .success);
     }
@@ -2859,7 +2760,7 @@ test "every native workspace allocation failure precedes effects and releases sc
     try std.testing.checkAllAllocationFailures(std.testing.allocator, workspace_allocation_case, .{});
 }
 
-test "maximum admitted invocation uses three native calls and one Completion send" {
+test "maximum admitted invocation uses three native calls and ten individual result sends" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2885,8 +2786,8 @@ test "maximum admitted invocation uses three native calls and one Completion sen
     try std.testing.expectEqual(@as(usize, 10), fake.account_count);
     try std.testing.expectEqual(@as(usize, 10), fake.transfer_count);
     try std.testing.expectEqualSlices(Family, &families, fake.trace[0..fake.trace_count]);
-    try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
-    const decoded = try completion_batch.decode(allocator, publisher.message);
+    try std.testing.expectEqual(@as(u8, 10), publisher.send_count);
+    const decoded = try test_results(allocator, publisher.messages[0..publisher.send_count]);
     try std.testing.expectEqual(@as(usize, 10), decoded.results.len);
     for (decoded.results) |entry| try std.testing.expectEqual(@as(usize, 62), entry.valid.result.failure.object.get("lookup_accounts").?.array.items.len);
 }
@@ -2933,7 +2834,7 @@ test "fully found created and replayed Operations publish SUCCESS with actual co
         var publisher: FakePublisher = .{};
         const response = try test_invoke(arena.allocator(), &.{execution_body}, &fake, &publisher);
         try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
-        const decoded = try completion_batch.decode(arena.allocator(), publisher.message);
+        const decoded = try test_results(arena.allocator(), publisher.messages[0..publisher.send_count]);
         const payload = decoded.results[0].valid.result.success.object;
         const accounts = payload.get("create_accounts").?.array.items;
         try std.testing.expectEqualStrings(if (attempt == 0) "created" else "exists", accounts[0].object.get("error_code").?.string);
@@ -2966,7 +2867,8 @@ const SerialPublisher = struct {
     fail_at: ?usize = null,
     ambiguous: bool = false,
 
-    fn sendCompletion(self: *SerialPublisher, allocator: Allocator, body: []const u8) !void {
+    fn sendCompletion(self: *SerialPublisher, allocator: Allocator, result_queue: ?[]const u8, body: []const u8) !void {
+        _ = result_queue;
         std.debug.assert(self.calls < self.messages.len);
         const index = self.calls;
         self.calls += 1;
@@ -2984,14 +2886,14 @@ test "serial publication skips unfinished records and preserves successful prefi
             const allocator = arena.allocator();
             const terminal_count = 2 * completion_count_max + 1;
             const queued_count = terminal_count + 1;
-            const queued = try allocator.alloc(operation.Operation, queued_count);
+            const queued = try allocator.alloc(processor_message.Message, queued_count);
             const plans = try allocator.alloc(?Planning, queued_count);
             var indexes: [queued_count]usize = undefined;
             var retries = [_]bool{false} ** queued_count;
             for (queued, plans, &indexes, 0..) |*entry, *plan, *index, i| {
                 const message = try test_body_message(allocator, i + 1, "true");
                 entry.* = (parseRecord(allocator, "source", message)).valid;
-                plan.* = try plan_body(allocator, &entry.body.?);
+                plan.* = try plan_body(allocator, &entry.body);
                 index.* = i;
             }
             // An unfinished source must not block later terminal Results.
@@ -3013,14 +2915,14 @@ test "serial publication skips unfinished records and preserves successful prefi
             var next_id: u128 = 1;
             const captured = if (fail_at) |n| n + @intFromBool(ambiguous) else 3;
             for (publisher.messages[0..captured], 0..) |message, send_index| {
-                const batch = try completion_batch.decode(allocator, message);
+                const batch = try test_results(allocator, &.{message});
                 try std.testing.expectEqual(@as(usize, if (send_index == 2) 1 else completion_count_max), batch.results.len);
                 for (batch.results) |entry| {
                     if (next_id == completion_count_max + 1) next_id += 1;
                     try std.testing.expectEqual(next_id, entry.valid.operation_id);
                     const expected = write_diagnostic(result, &plans[@intCast(next_id - 1)].?.rejected);
                     const actual = try allocator.create([operation.result_size_max]u8);
-                    try std.testing.expectEqualStrings(expected, try operation.writeCompletionJSON(actual, &entry.valid.result));
+                    try std.testing.expectEqualStrings(expected, try test_result_body(actual, &entry.valid.result));
                     next_id += 1;
                 }
             }
@@ -3029,7 +2931,7 @@ test "serial publication skips unfinished records and preserves successful prefi
 }
 
 test "large lookup and mixed Results traverse Completion conditional persistence and authenticated query first wins" {
-    const completion_processor = @import("completion_processor");
+    const tiger_beetle_completion_processor = @import("tiger_beetle_completion_processor");
     const persistence = @import("operation_persistence");
     const query = @import("query_lambda");
     for ([_]bool{ false, true }) |mixed| {
@@ -3048,7 +2950,8 @@ test "large lookup and mixed Results traverse Completion conditional persistence
             try body.writer.writeAll("]}");
             const original = try test_body_message(allocator, 1, body.written());
             const queued = (parseRecord(allocator, "source", original)).valid;
-            var store = persistence.test_support.Store.init(&queued);
+            const stored_operation = try test_stored_operation(allocator, &queued);
+            var store = persistence.test_support.Store.init(&stored_operation);
             var messages: [2][]const u8 = undefined;
             for (&messages, 0..) |*message, attempt| {
                 // Only the queued bytes survive invocation restart. No saved native observation.
@@ -3070,7 +2973,7 @@ test "large lookup and mixed Results traverse Completion conditional persistence
             }
             const first: usize = @intFromBool(reverse);
             for ([_]usize{ first, 1 - first, first }) |arrival| {
-                const response = try completion_processor.test_support.invoke(allocator, messages[arrival], &store);
+                const response = try tiger_beetle_completion_processor.test_support.invoke(allocator, messages[arrival], &store);
                 try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
             }
             try std.testing.expectEqual(@as(usize, 1), store.writes);
@@ -3079,7 +2982,7 @@ test "large lookup and mixed Results traverse Completion conditional persistence
             const outer = try std.json.parseFromSliceLeaky(std.json.Value, allocator, queried, .{});
             try std.testing.expectEqual(@as(i64, 200), outer.object.get("statusCode").?.integer);
             const restored = try operation.parseOutputJSON(allocator, outer.object.get("body").?.string);
-            const expected = (try completion_batch.decode(allocator, messages[first])).results[0].valid.result;
+            const expected = (try test_results(allocator, &.{messages[first]})).results[0].valid.result;
             const expected_buffer = try allocator.create([operation.result_size_max]u8);
             const actual_buffer = try allocator.create([operation.result_size_max]u8);
             try std.testing.expectEqualStrings(try operation.writeCompletionJSON(expected_buffer, &expected), try operation.writeCompletionJSON(actual_buffer, &restored.state.completed));
@@ -3092,8 +2995,8 @@ test "large lookup and mixed Results traverse Completion conditional persistence
     }
 }
 
-test "partial Completion persistence retries its aggregate while successful source publication stays acknowledged" {
-    const completion_processor = @import("completion_processor");
+test "individual completion retry preserves other persisted results and source acknowledgements" {
+    const tiger_beetle_completion_processor = @import("tiger_beetle_completion_processor");
     const persistence = @import("operation_persistence");
     for ([_]bool{ false, true }) |completed_subset| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3106,24 +3009,28 @@ test "partial Completion persistence retries its aggregate while successful sour
         try std.testing.expectEqual(@as(usize, 0), execution.trace_count);
         var store: persistence.test_support.Store = .{};
         for (&store.entries, 0..) |*entry, i| {
-            entry.* = (parseRecord(allocator, "source", try test_body_message(allocator, i + 1, "true"))).valid;
+            const message = (parseRecord(allocator, "source", try test_body_message(allocator, i + 1, "true"))).valid;
+            entry.* = try test_stored_operation(allocator, &message);
         }
         if (completed_subset) {
             // A different aggregate has already completed the middle entry.
             try store.completeById(allocator, 2, &.{ .success = .{ .string = "earlier winner" } }, 1_700_000_000);
         }
         store.fail_at = store.calls + 2;
-        const failed = try completion_processor.test_support.invoke(allocator, publisher.message, &store);
+        for (publisher.messages[0..2]) |message| {
+            _ = try tiger_beetle_completion_processor.test_support.invoke(allocator, message, &store);
+        }
+        const failed = try tiger_beetle_completion_processor.test_support.invoke(allocator, publisher.messages[2], &store);
         try std.testing.expectEqualStrings("{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}", failed);
         try std.testing.expectEqual(@as(usize, 2), store.writes);
         try std.testing.expect(store.entries[2].?.state == .submitted);
         store.fail_at = null;
-        const replayed = try completion_processor.test_support.invoke(allocator, publisher.message, &store);
+        const replayed = try tiger_beetle_completion_processor.test_support.invoke(allocator, publisher.messages[2], &store);
         try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", replayed);
         try std.testing.expectEqual(@as(usize, 3), store.writes);
-        _ = try completion_processor.test_support.invoke(allocator, publisher.message, &store);
+        _ = try tiger_beetle_completion_processor.test_support.invoke(allocator, publisher.message, &store);
         try std.testing.expectEqual(@as(usize, 3), store.writes);
-        const batch = try completion_batch.decode(allocator, publisher.message);
+        const batch = try test_results(allocator, publisher.messages[0..publisher.send_count]);
         for (store.entries, batch.results, 0..) |slot, decoded, i| {
             if (completed_subset and i == 1) {
                 try std.testing.expectEqualStrings("earlier winner", slot.?.state.completed.success.string);
@@ -3196,7 +3103,7 @@ test "restarted deliveries repeat original chains after every interruption witho
         for (original_accounts, execution.accounts[0..2]) |expected, actual| try std.testing.expectEqualDeep(expected, actual);
         if (boundary != .account_error and boundary != .account_malformed) try std.testing.expectEqualDeep(original_transfer, execution.transfers[0]);
         try std.testing.expectEqualSlices(u128, &.{ 2, 1 }, execution.lookup_ids[0..2]);
-        const entry = (try completion_batch.decode(invocation.allocator(), publisher.message)).results[0].valid;
+        const entry = (try test_results(invocation.allocator(), publisher.messages[0..publisher.send_count])).results[0].valid;
         try std.testing.expectEqual(@as(u128, 1), entry.operation_id);
         const payload = if (boundary == .rejected_lookup) entry.result.failure else entry.result.success;
         try std.testing.expect(!payload.object.contains("operation_id"));
@@ -3215,7 +3122,7 @@ test "restarted deliveries repeat original chains after every interruption witho
         expected_plan.outcomes[4] = .{ .found = execution.lookup_results[0] };
         const expected_buffer = try allocator.create([operation.result_size_max]u8);
         const actual_buffer = try allocator.create([operation.result_size_max]u8);
-        try std.testing.expectEqualStrings(try write_result(expected_buffer, &expected_plan, boundary != .rejected_lookup), try operation.writeCompletionJSON(actual_buffer, &entry.result));
+        try std.testing.expectEqualStrings(try write_result(expected_buffer, &expected_plan), try test_result_body(actual_buffer, &entry.result));
     }
 }
 
@@ -3233,21 +3140,20 @@ test "repeated unresolved deliveries never manufacture exhaustion FAILURE" {
     }
 }
 
-test "publication byte capacity flushes intact Results before count limit" {
+test "bounded individual publication preserves successful prefix after ambiguous send" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var queued: [3]operation.Operation = undefined;
+    var queued: [3]processor_message.Message = undefined;
     var plans: [3]?Planning = undefined;
     for (&queued, &plans, 0..) |*entry, *plan, i| {
-        entry.* = (parseRecord(allocator, "source", try test_body_message(allocator, i + 1, "true"))).valid;
-        plan.* = try plan_body(allocator, &entry.body.?);
+        const message = (parseRecord(allocator, "source", try test_body_message(allocator, i + 1, "true"))).valid;
+        entry.* = message;
+        plan.* = try plan_body(allocator, &entry.body);
     }
     const result = try allocator.create([operation.result_size_max]u8);
     const buffer = try allocator.alloc(u8, completion_buffer_size);
-    var single = completion_batch.Encoded.init(buffer);
-    try single.append(1, write_diagnostic(result, &plans[0].?.rejected));
-    const single_size = single.message().len;
+    const single_size = (try processor_message.frame(buffer, 1, write_diagnostic(result, &plans[0].?.rejected), null)).len;
     var retries = [_]bool{false} ** 3;
     var publisher: SerialPublisher = .{ .fail_at = 1, .ambiguous = true };
     publish_results(allocator, &queued, &plans, &.{ 0, 1, 2 }, &retries, result, buffer[0..single_size], CompletionPublisher.init(&publisher));
@@ -3255,7 +3161,7 @@ test "publication byte capacity flushes intact Results before count limit" {
     try std.testing.expectEqual(@as(usize, 2), publisher.calls);
     for (publisher.messages[0..2], 0..) |message, i| {
         try std.testing.expectEqual(single_size, message.len);
-        const batch = try completion_batch.decode(allocator, message);
+        const batch = try test_results(allocator, &.{message});
         try std.testing.expectEqual(@as(usize, 1), batch.results.len);
         try std.testing.expectEqual(@as(u128, i + 1), batch.results[0].valid.operation_id);
     }
@@ -3290,7 +3196,7 @@ test "redelivery regroups only intact original chains after a lost shared reply"
         try std.testing.expectEqual(id, account.id);
         try std.testing.expectEqual(flags, account.flags);
     }
-    const batch = try completion_batch.decode(allocator, publisher.message);
+    const batch = try test_results(allocator, publisher.messages[0..publisher.send_count]);
     try std.testing.expectEqual(@as(u128, 19), batch.results[0].valid.operation_id);
     try std.testing.expectEqual(@as(u128, 17), batch.results[1].valid.operation_id);
     try std.testing.expectEqualStrings("exists", batch.results[1].valid.result.failure.object.get("create_accounts").?.array.items[0].object.get("error_code").?.string);
@@ -3324,7 +3230,7 @@ test "pending and post replay retain original timeout interval full amount and i
         try std.testing.expectEqual(@as(u16, 0), post.code);
         try std.testing.expectEqual(@as(u32, 0), post.timeout);
         try std.testing.expectEqual(@as(u16, 4), post.flags);
-        const result = (try completion_batch.decode(arena.allocator(), publisher.message)).results[0].valid.result;
+        const result = (try test_results(arena.allocator(), publisher.messages[0..publisher.send_count])).results[0].valid.result;
         try std.testing.expect(result == .success);
     }
 }
@@ -3364,4 +3270,101 @@ test "response allocation failure after successful publication leaves safe whole
     try std.testing.expect(reached_success);
     try std.testing.expect(before_send > 0);
     try std.testing.expect(after_send > 0);
+}
+
+test "internal route overrides publication destination while outgoing route is absent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const input = "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":true,\"result_queue\":\"https://sqs.example.invalid/next\"}";
+    var execution: FakeExecution = .{};
+    var publisher: FakePublisher = .{};
+    const response = try handleInvocation(allocator, try testEvent(allocator, &.{input}), ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+    try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
+    try std.testing.expectEqualStrings("https://sqs.example.invalid/next", publisher.routes[0].?);
+    const result = try processor_message.decode(allocator, publisher.messages[0]);
+    try std.testing.expect(result.result_queue == null);
+    try std.testing.expect(result.body.object.contains("error"));
+    try std.testing.expect(!result.body.object.contains("type"));
+    try std.testing.expect(!result.body.object.contains("payload"));
+}
+
+// Tests observe separately published messages through the actual codec and final interpreter.
+const TestResults = struct {
+    results: []const struct { valid: struct { operation_id: u128, result: operation.Completion } },
+};
+fn test_results(allocator: Allocator, messages: []const []const u8) !TestResults {
+    const results = try allocator.alloc(@typeInfo(@TypeOf(@as(TestResults, undefined).results)).pointer.child, messages.len);
+    for (messages, results) |bytes, *entry| {
+        const message = try processor_message.decode(allocator, bytes);
+        entry.* = .{ .valid = .{
+            .operation_id = message.operation_id,
+            .result = try @import("tiger_beetle_completion_processor").test_support.interpret(&message.body),
+        } };
+    }
+    return .{ .results = results };
+}
+fn test_interpret_body(allocator: Allocator, bytes: []const u8) !operation.Completion {
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{});
+    return @import("tiger_beetle_completion_processor").test_support.interpret(&value);
+}
+fn test_result_body(buffer: []u8, result: *const operation.Completion) ![]const u8 {
+    var writer = std.Io.Writer.fixed(buffer);
+    const body = switch (result.*) {
+        .success, .failure => |value| value,
+    };
+    try std.json.Stringify.value(body, .{}, &writer);
+    return writer.buffered();
+}
+fn test_stored_operation(allocator: Allocator, message: *const processor_message.Message) !operation.Operation {
+    _ = allocator;
+    return .{ .id = message.operation_id, .tenant = "tenant-a", .name = "test", .body = null, .state = .submitted, .last_updated = 1700000000, .expires_at = 1700086400, .hash = try operation.operationHash("tenant-a", "test", &message.body) };
+}
+
+test "internal Body above public intake cap reaches admission and missing route uses default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const text = try allocator.alloc(u8, processor_message.body_size_max - 2);
+    @memset(text, 'x');
+    const input = try processor_message.encode(allocator, &.{ .operation_id = 1, .body = .{ .string = text } });
+    var execution: FakeExecution = .{};
+    var publisher: FakePublisher = .{};
+    const response = try handleInvocation(allocator, try testEvent(allocator, &.{input}), ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+    try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
+    try std.testing.expect(publisher.routes[0] == null);
+    try std.testing.expectEqual(@as(usize, 0), execution.trace_count);
+    const output = try processor_message.decode(allocator, publisher.messages[0]);
+    try std.testing.expectEqualStrings("Expected a Body object.", output.body.object.get("error").?.object.get("message").?.string);
+}
+
+test "large internal command diagnostic preserves its prefix within the output bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var body = std.Io.Writer.Allocating.init(allocator);
+    try body.writer.writeAll("{\"lookup_accounts\":[");
+    for (0..5000) |index| {
+        if (index > 0) try body.writer.writeByte(',');
+        try body.writer.print("{{\"id\":\"{d}\"}}", .{index + 1});
+    }
+    try body.writer.writeAll(",{\"id\":\"5001\",\"alias\":null}]}");
+    try std.testing.expect(body.written().len > operation.body_size_max);
+    try std.testing.expect(body.written().len <= processor_message.body_size_max);
+    var execution: FakeExecution = .{};
+    var publisher: FakePublisher = .{};
+    const response = try test_invoke(allocator, &.{body.written()}, &execution, &publisher);
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+    try std.testing.expectEqual(@as(usize, 0), execution.trace_count);
+    const message = try processor_message.decode(allocator, publisher.messages[0]);
+    const entries = message.body.object.get("lookup_accounts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 5001), entries.len);
+    for (entries[0..5000]) |entry| try std.testing.expect(entry == .null);
+    try std.testing.expectEqualStrings("alias", entries[5000].object.get("field").?.string);
+    // The final consumer can wrap the entire diagnostic without losing its prefix.
+    const result = try @import("tiger_beetle_completion_processor").test_support.interpret(&message.body);
+    try std.testing.expect(result == .failure);
+    try std.testing.expect((try operation.completionEncodedSize(&result)) <= operation.result_size_max);
 }

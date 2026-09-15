@@ -81,7 +81,22 @@ One Operation's ordered `create_accounts`, `create_transfers`, or `lookup_accoun
 creation lists are independent Linked Chains and all three lists execute in separate native phases.
 _Avoid_: Execution group, cross-family batch
 
+**Processor Message**:
+A message correlating an Operation UUID with a processor's input or output Body and an optional
+Result Queue. It carries work between processors without the Operation's lifecycle or ownership metadata.
+_Avoid_: Operation snapshot, Completion batch
+
+**Processor Body**:
+The JSON value a processor consumes or produces. One processor's output may be another's input.
+_Avoid_: Operation Result, wrapped payload
+
+**Result Queue**:
+An internal instruction identifying where the receiving processor should send its result. When absent,
+the processor's default behavior applies. Each processor independently chooses the Result Queue for
+its outgoing message; external Operation callers do not control it.
+_Avoid_: Current message destination, public callback
+
 **Completion Message**:
-One byte-bounded SQS transport envelope containing complete Operation Results. A delivered group
-of Operations may require multiple Completion Messages without splitting any Operation Result.
-_Avoid_: Native Request, Operation Result
+A Processor Message delivered to the final processor, which interprets its Body and determines the
+Operation's terminal Result.
+_Avoid_: Native Request, Operation Result, Completion batch

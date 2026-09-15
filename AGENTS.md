@@ -13,8 +13,8 @@ Read sources relevant to the task:
 | --- | --- |
 | HTTP intake or operation query | `src/intake_lambda.zig`, `src/query_lambda.zig`, `src/lambda_auth.zig` |
 | Operation data and persistence | `src/operation.zig`, `src/operation_persistence.zig` |
-| Queue transport and Completion messages | `src/sqs_queue.zig`, `src/completion_batch.zig` |
-| SQS processors | `src/tiger_beetle_processor.zig`, `src/completion_processor.zig`, [processor contract](docs/TIGER_BEETLE_PROCESSOR.md) |
+| Queue transport and Completion messages | `src/sqs_queue.zig`, `src/processor_message.zig` |
+| SQS processors | `src/tiger_beetle_processor.zig`, `src/tiger_beetle_completion_processor.zig`, [processor contract](docs/TIGER_BEETLE_PROCESSOR.md) |
 | TigerBeetle client wrapper | `src/tigerbeetle.zig`, [wrapper design](docs/ZIG_WRAPPER_FOR_TIGERBEETLE.md) |
 | PASETO and local CLI tools | `src/paseto.zig`, `src/paseto_cli.zig`, `src/persistence_cli.zig`, `src/queue_cli.zig` |
 | Vocabulary or cross-cutting decisions | `CONTEXT.md`, relevant files in `docs/adr/` |

@@ -27,3 +27,8 @@ stored tenant to match the verified PASETO subject; missing and cross-tenant ite
 response. This authorization boundary does not introduce tenant-scoped table keys. Changing the
 shared model, hash algorithm, envelope, or normalization rules requires an explicit schema migration
 or a new versioned contract.
+
+
+Processor transport is now a separate minimal message contract, as recorded in
+[Minimal processor messages](0003-minimal-processor-messages.md). This changes queued wire views,
+not the persisted Operation schema or the original-input hash algorithm.

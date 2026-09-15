@@ -21,9 +21,9 @@ for helper in deploy.sh wireguard-gateway-setup.sh; do
         retired_env=EXECUTION_FUNCTION_NAME
         replacement_env=TIGER_BEETLE_PROCESSOR_NAME
         if [ "$processor" = completion ]; then
-            replacement=completion-processor
+            replacement=tiger-beetle-completion-processor
             retired_env=COMPLETION_FUNCTION_NAME
-            replacement_env=COMPLETION_PROCESSOR_NAME
+            replacement_env=TIGER_BEETLE_COMPLETION_PROCESSOR_NAME
         fi
         for form in separate equals; do
             args=("--$processor-function-name" old-name)
@@ -40,9 +40,17 @@ for helper in deploy.sh wireguard-gateway-setup.sh; do
             contains "$output" "use $replacement_env"
         done
     done
+    if output="$(env COMPLETION_PROCESSOR_NAME=old-name bash "$REPOSITORY_ROOT/$helper" --dry-run 2>&1)"; then
+        fail_test "$helper accepted the former completion processor environment name"
+    fi
+    contains "$output" 'use TIGER_BEETLE_COMPLETION_PROCESSOR_NAME'
+    if output="$(bash "$REPOSITORY_ROOT/$helper" --completion-processor-name old-name 2>&1)"; then
+        fail_test "$helper accepted the former completion processor flag"
+    fi
+    contains "$output" 'use --tiger-beetle-completion-processor-name'
     output="$(bash "$REPOSITORY_ROOT/$helper" --help)"
     contains "$output" '--tiger-beetle-processor-name'
-    contains "$output" '--completion-processor-name'
+    contains "$output" '--tiger-beetle-completion-processor-name'
 done
 for selector in execution completion; do
     if output="$(bash "$REPOSITORY_ROOT/lambda_logs.sh" "$selector" 2>&1)"; then
@@ -54,30 +62,30 @@ done
 
 # Exercise both shared-parser forms as forwarded by the WireGuard entrypoint.
 source "$REPOSITORY_ROOT/wireguard-gateway-setup.sh"
-parse_wireguard_options --tiger-beetle-processor-name custom-tb --completion-processor-name custom-completion
+parse_wireguard_options --tiger-beetle-processor-name custom-tb --tiger-beetle-completion-processor-name custom-completion
 parse_deployment_options "${COMMON_DEPLOYMENT_ARGS[@]}"
-[ "$TIGER_BEETLE_PROCESSOR_NAME" = custom-tb ] && [ "$COMPLETION_PROCESSOR_NAME" = custom-completion ] ||
+[ "$TIGER_BEETLE_PROCESSOR_NAME" = custom-tb ] && [ "$TIGER_BEETLE_COMPLETION_PROCESSOR_NAME" = custom-completion ] ||
     fail_test "WireGuard did not forward separate processor arguments"
-parse_wireguard_options --tiger-beetle-processor-name=equal-tb --completion-processor-name=equal-completion
+parse_wireguard_options --tiger-beetle-processor-name=equal-tb --tiger-beetle-completion-processor-name=equal-completion
 parse_deployment_options "${COMMON_DEPLOYMENT_ARGS[@]}"
-[ "$TIGER_BEETLE_PROCESSOR_NAME" = equal-tb ] && [ "$COMPLETION_PROCESSOR_NAME" = equal-completion ] ||
+[ "$TIGER_BEETLE_PROCESSOR_NAME" = equal-tb ] && [ "$TIGER_BEETLE_COMPLETION_PROCESSOR_NAME" = equal-completion ] ||
     fail_test "WireGuard did not forward equals processor arguments"
 
-output="$(env TIGER_BEETLE_PROCESSOR_NAME=env-tb COMPLETION_PROCESSOR_NAME=env-completion \
+output="$(env TIGER_BEETLE_PROCESSOR_NAME=env-tb TIGER_BEETLE_COMPLETION_PROCESSOR_NAME=env-completion \
     bash -c 'source "$1/deploy.sh"; build_sam_parameter_overrides; printf "%s\n" "${SAM_PARAMETER_OVERRIDES[@]}"' \
     bash "$REPOSITORY_ROOT")"
 contains "$output" 'TigerBeetleProcessorName=env-tb'
-contains "$output" 'CompletionProcessorName=env-completion'
+contains "$output" 'TigerBeetleCompletionProcessorName=env-completion'
 
 # A deliberately failing lookup checks the selected output key without writing
 # any downloaded logs or issuing a CloudWatch request.
-for selector in tiger-beetle-processor completion-processor; do
+for selector in tiger-beetle-processor tiger-beetle-completion-processor; do
     : >"$AWS_CALLS"
     if output="$(bash "$REPOSITORY_ROOT/lambda_logs.sh" "$selector" 2>&1)"; then
         fail_test "failed stack lookup unexpectedly succeeded"
     fi
     key=TigerBeetleProcessorName
-    if [ "$selector" = completion-processor ]; then key=CompletionProcessorName; fi
+    if [ "$selector" = tiger-beetle-completion-processor ]; then key=TigerBeetleCompletionProcessorName; fi
     contains "$(cat "$AWS_CALLS")" "OutputKey=='$key'"
 done
 printf 'PASS: processor interface regression tests\n'

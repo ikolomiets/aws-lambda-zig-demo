@@ -14,10 +14,11 @@ vocabulary; the [hash ADR](adr/0001-operation-json-hash-contract.md) and
 mechanics; the [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md) owns AWS configuration and
 operations. Maintain those boundaries when changing the processor.
 
-The rules below are the accepted contract. [Reconciliation notes](#implementation-reconciliation)
-identify implementation differences; [verification evidence](#verification-evidence) records what
-was tested and what remains unverified. The [source coverage audit](TIGERBEETLE_PROCESSOR_PROMOTION_AUDIT.md)
-traces historical requirements without making scratch documents necessary to use this reference.
+The rules below are the accepted contract. The implementation lives in
+[`tiger_beetle_processor.zig`](../src/tiger_beetle_processor.zig),
+[`tiger_beetle_completion_processor.zig`](../src/tiger_beetle_completion_processor.zig), and the
+shared [`processor_message.zig`](../src/processor_message.zig) codec. See
+[repository validation commands](../AGENTS.md#build-and-validation) for local checks.
 
 ## Framework boundary
 
@@ -25,14 +26,22 @@ traces historical requirements without making scratch documents necessary to use
   Keep the Operation UUID globally scoped and use it for Operation/Completion correlation only.
 - Preserve server-owned Operation Tenant, current intake authentication and tenant-authorized
   query reads. The processor introduces no tenant-scoped native resource ownership or access policy.
-- Preserve BLAKE3-256 over the compact normalized fixed-order tenant/name/Body envelope. Verify
-  the supplied hash using the original parsed Body, never a reconstructed native plan. Object
-  member order still affects identity; whitespace and equivalent string escapes normalize.
-- Keep Body capacity at 4,096 bytes. The complete Result envelope limit is
-  98,304 bytes throughout production, Completion decoding, persistence and query output.
-  Body and Result limits are independent; the larger Result supports complete account observations.
-- The Operation name is `TigerBeetle`, routed through `TigerBeetleQueue`. There is no version
-  field, parallel legacy parser, queue migration or preservation of the former demonstration.
+- Preserve BLAKE3-256 over the compact normalized fixed-order tenant/name/Body envelope at
+  intake and persistence. Processors receive no tenant, name, hash, state or timestamps and do
+  not recompute that hash. The internal queue-producer boundary is trusted.
+- Public intake Bodies remain capped at 4,096 bytes. Internal Processor Message Bodies are
+  capped at 98,304 compact JSON bytes (96 KiB), independently of intake admission. Persisted
+  Results retain their existing 96 KiB complete-envelope limit.
+- Intake routes Operation name `TigerBeetle` through `TigerBeetleQueue`. Every internal SQS
+  record contains exactly `{operation_id, body, result_queue?}`. UUIDs are canonical lowercase
+  hyphenated strings; `body` may be any JSON value. Unknown fields and duplicate decoded keys
+  are rejected. A supplied route must be a nonempty UTF-8 string, at most 2,048 bytes, without
+  control characters; omission, rather than null, selects default behavior.
+- Incoming `result_queue` selects the destination of this processor's output, falling back to
+  `COMPLETION_QUEUE_URL`. The processor independently chooses its outgoing route; TigerBeetle
+  omits it. Public intake accepts no routing field. There is no chain orchestration here.
+- This replaces the full-Operation input and aggregate-Completion output wire contracts.
+  Drain old queued messages before switching producers and consumers; there is no legacy parser.
 
 ## Body schema
 
@@ -83,15 +92,13 @@ allowed within and across lists and Operations. Aliases never resolve references
 
 ## Validation precedence and admission
 
-First apply bounded generic queued-Operation parsing and existing metadata/UUID/name/timestamp
-validation. Require SUBMITTED, Body and a matching recomputed hash. Invalid envelopes, malformed or
-duplicate JSON, generic oversize and mismatching hashes are acknowledged and logged without native
-work or Completion. Do not salvage an ID from malformed input. The hash checks consistency under the
-trusted queue-producer boundary; it is not producer authentication.
+First apply bounded Processor Message decoding. Invalid envelopes, malformed or duplicate JSON,
+invalid UUIDs/routes and oversized Bodies are acknowledged without native work or output. Do not
+salvage an ID from a malformed envelope. Allocation failures retry.
 
-For a valid envelope/hash, invalid Body or admission produces one terminal FAILURE without any native
-submission for that Operation. Publication must succeed before acknowledging its source record.
-Allocation and other operating errors retry; they never become permanent validation failures.
+For a valid envelope, invalid Body or admission produces diagnostic output without native work.
+TigerBeetleCompletionProcessor interprets that diagnostic as FAILURE. Successful publication is
+required before acknowledging its source record. Operating errors remain retryable.
 
 Choose the first diagnostic in this order:
 
@@ -114,7 +121,7 @@ position for request correlation. Diagnostic fields are error_code
 invalid/missing/forbidden fields; unknown members use their zero-based u32 member index. Field and
 member_index are mutually exclusive. Non-object elements need neither.
 
-Body-level errors have three empty lists and a payload-level error containing message and optional
+Body-level errors have three empty lists and a body-level error containing message and optional
 field/member_index, without code. Wrong Body type, empty command set and admission have message only;
 wrong family type names the family; unknown root members use member_index. Emit exactly one error.
 Messages are processor-owned, nonempty valid UTF-8 of at most 160 decoded bytes. Their wording is
@@ -126,7 +133,7 @@ capacity as floor((98,304−93)/1,435)=68 and round down to a power of two: 64 t
 families. Use checked arithmetic and compile-time assertions. The complete execution Result proof is
 94 base bytes + 64 × 1,434 maximum entry bytes + 63 separators = 91,933 bytes. It includes maximum
 integer widths and six-byte escaping for alias/message control bytes. The conservative preflight
-prefix bound is 3,601 bytes; validate both proofs against the actual writer. Never use outcome-weighted
+prefix bound is 50,706 bytes; validate both proofs against the actual writer. Never use outcome-weighted
 admission or truncate after effects. Overflow after proven admission is a programmer invariant failure.
 
 ## Execution phases and linked-chain replay
@@ -171,10 +178,16 @@ or extra request. A request error never establishes account absence.
 
 ## Result and Completion publication
 
-Keep the complete Result envelope with exactly type (`SUCCESS` or `FAILURE`) and non-null payload.
-The processor payload serializes create_accounts, create_transfers, lookup_accounts in that order,
-plus error only for a Body-level diagnostic. The canonical lowercase hyphenated operation UUID
-appears only in the enclosing Completion entry's operation_id.
+The execution processor emits native result details directly as the outgoing `body`, without
+`type` or `payload`. Its fields are `create_accounts`, `create_transfers`, `lookup_accounts`, and
+`error` only for a Body-level diagnostic. The Operation UUID appears only as `operation_id` in
+its enclosing Processor Message. Each output occupies its own SQS message.
+
+TigerBeetleCompletionProcessor derives SUCCESS or FAILURE from these details and creates the
+existing `{type,payload}` Result only at the persistence boundary. A valid envelope with an invalid
+TigerBeetle result body becomes a deterministic failure diagnostic. If wrapping a body would exceed
+the persisted Result limit, it persists `ResultTooLarge` as the failure diagnostic. Admitted executor
+outputs reserve sufficient room for the stored wrapper, so their details are preserved in full.
 
 Complete execution lists contain one entry per original command, in original order; absent families
 are empty. All command entries omit top-level id and correlate with requests by array position,
@@ -210,17 +223,12 @@ lookup to be found. Any definite creation rejection or missing account gives FAI
 work is determined. Retain found data and surviving earlier effects. Failure does not imply rollback,
 unused transfer IDs or absence of earlier effects. Unfinished work has no terminal Result.
 
-Derive Completion packing independently from invocation delivery count. With the external 1 MiB
-transport ceiling, n maximum Results require 13 + n × (98,304 + 66) bytes: ten fit 983,713 bytes;
-eleven require 1,082,083 and another message. Keep each Result intact. Collect terminal Results in
-received order, skipping unfinished Operations; flush at the derived count and check byte capacity.
-`completion_batch.maximum_result_count` derives that count from the Result bound, framing overhead
-and transport ceiling; `maximum_results_size` derives the corresponding processor buffer size.
-
-Send messages serially. Successful sends make represented source records eligible for acknowledgement.
-Stop at the first failed or uncertain send; retry its records and every later unpublished terminal
-record, together with unfinished work. Do not resend earlier successful messages in the invocation.
-A native stop does not prevent publication. Lost handler responses can cause safe redelivery.
+Publish fully determined bodies in received order, skipping unfinished work. Frame each with its
+Operation UUID and send serially to that input's override or the default queue. A successful send
+makes exactly that source eligible for acknowledgement. Stop at the first failed or uncertain send;
+retry its source and every later unpublished source, together with unfinished work. Earlier successful
+sends stay acknowledged. The final consumer receives one message per invocation and performs one
+conditional completion write; a transient failure retries that message independently.
 
 ## Recovery and operating assumptions
 
@@ -232,7 +240,7 @@ linked-failed members are not necessarily individually consumed. Never fabricate
 Requested lookups are fresh observations from the attempt whose valid Completion first persists.
 Results may differ in statuses, values, presence or outcome across attempts and after ambiguous sends.
 No earliest/latest observation, write-time snapshot or whole-Operation snapshot is promised. The first
-successful SUBMITTED-to-COMPLETED persistence transition wins; duplicate/partial aggregate replay
+successful SUBMITTED-to-COMPLETED persistence transition wins; duplicate message replay
 cannot overwrite completed Results. Retry exhaustion never manufactures a terminal business failure.
 
 The contract requires the framework to guarantee unique Operation identity and adequate retention
@@ -279,7 +287,7 @@ The synchronous publisher borrows Completion bytes until its send returns. Sourc
 response construction retain their invocation lifetime; response-allocation failure after effects
 can still cause whole-invocation redelivery.
 
-Reuse the existing Operation hash logic. Keep Completion framing in the shared Completion codec,
+Keep Processor Message framing in the shared `processor_message` codec,
 using a bounded writer for already encoded complete Results while retaining existing structured
 consumer paths. Do not construct a second Result JSON tree or reparse generated Results merely to frame
 them. Consumers must accommodate the full bound, JSON escaping and outer framing; review their
@@ -287,9 +295,9 @@ buffers and stack placement whenever the bound changes.
 
 The existing ten-record configuration bounds invocation arrays, loops and checked allocation arithmetic;
 it admits at most 640 commands. Validate delivered count; do not add configuration interfaces. Native
-packet and Completion packing remain independently testable at larger synthetic boundaries. Current
+packet and message framing remain independently testable at larger synthetic boundaries. Current
 application storage stays within a few MiB before parser/SDK/client overhead, and normal maximum work
-requires at most three native family calls and one Completion send. These are work bounds, not finite
+requires at most three native family calls and ten individual result sends. These are work bounds, not finite
 latency guarantees; Lambda termination does not prove an outstanding write aborted.
 
 Use assertions for programmer invariants, capacities, chain/range coverage, phase/callback lifetime and
@@ -343,9 +351,10 @@ The public null-code/message shape alone need not prove that an Operation attemp
 The capacity proof reserves worst-case widths and escaping so admission is independent of native
 outcomes. Maximum compact sizes are 467 bytes for a submitted creation entry, 935 for a found lookup,
 1,434 for a skip/miss, 1,462 for a command diagnostic, and 463 for the full nested Account.
-The preflight proof allows 409 preceding minimal ten-byte commands, each becoming `null,`:
-94 + 409 × 5 + 1,462 = 3,601. These are conservative structural shapes, not necessarily realizable
-4 KiB Bodies. The complete Result bound applies both to sent bytes and compact parser-normalized
+The preflight proof permits at most 9,830 preceding minimal ten-byte commands under the internal
+96 KiB bound, each becoming `null,`: 94 + 9,830 × 5 + 1,462 = 50,706 bytes including the stored
+wrapper. These conservative structural bounds remain below 96 KiB. Executable plans still admit
+at most 64 commands; larger valid lists produce bounded admission diagnostics. The complete Result bound applies both to sent bytes and compact parser-normalized
 bytes; outer Completion UUID/framing counts separately. Native records are 128 bytes, lookup IDs
 16 bytes, creation results 16 bytes and lookup results 128 bytes. A full native record buffer is
 approximately 1 MiB, independently of the current much smaller invocation workspace.
@@ -392,7 +401,7 @@ Zero post with explicit inheritance sentinels:
 {"create_transfers":[{"id":"303","pending_id":"301","debit_account_id":"0","credit_account_id":"0","amount":"0","ledger":0,"code":0,"flags":4}]}
 ```
 
-Rejected Body examples, each with a valid generic envelope/hash:
+Rejected Body examples, each with a valid Processor Message envelope:
 
 | Body | First diagnostic |
 | --- | --- |
@@ -407,51 +416,51 @@ Duplicate decoded JSON keys instead prevent generic envelope acceptance and prod
 
 ## Result examples
 
-Examples are complete compact Results unless explicitly labelled Completion. Values and timestamps
+Examples are compact processor output bodies unless explicitly labelled Completion. Values and timestamps
 are illustrative observations, not live output or promised balances.
 
 Accepted replay of a previously committed immutable account chain and singleton transfer, for a
 Body requesting no lookups; raw linked-failed suffixes remain visible:
 
 ```json
-{"type":"SUCCESS","payload":{"create_accounts":[{"error_code":"exists","alias":"pair"},{"error_code":"linked_event_failed","alias":"pair"}],"create_transfers":[{"error_code":"exists"}],"lookup_accounts":[]}}
+{"create_accounts":[{"error_code":"exists","alias":"pair"},{"error_code":"linked_event_failed","alias":"pair"}],"create_transfers":[{"error_code":"exists"}],"lookup_accounts":[]}
 ```
 
 A missing lookup fails the Operation while preserving a found account and its full native fields:
 
 ```json
-{"type":"FAILURE","payload":{"create_accounts":[],"create_transfers":[],"lookup_accounts":[{"error_code":null,"alias":"pair","message":"Account was not found."},{"error_code":null,"alias":"pair","account":{"id":"101","debits_pending":"0","debits_posted":"7","credits_pending":"0","credits_posted":"9","user_data_128":"123","user_data_64":"456","user_data_32":789,"reserved":0,"ledger":1,"code":1,"flags":8,"timestamp":"1790000000000000001"}}]}}
+{"create_accounts":[],"create_transfers":[],"lookup_accounts":[{"error_code":null,"alias":"pair","message":"Account was not found."},{"error_code":null,"alias":"pair","account":{"id":"101","debits_pending":"0","debits_posted":"7","credits_pending":"0","credits_posted":"9","user_data_128":"123","user_data_64":"456","user_data_32":789,"reserved":0,"ledger":1,"code":1,"flags":8,"timestamp":"1790000000000000001"}}]}
 ```
 
 For the unknown-member Body above, unknown-field precedence and independent projection give:
 
 ```json
-{"type":"FAILURE","payload":{"create_accounts":[],"create_transfers":[],"lookup_accounts":[{"error_code":null,"alias":"main","message":"Unknown field.","member_index":2}]}}
+{"create_accounts":[],"create_transfers":[],"lookup_accounts":[{"error_code":null,"alias":"main","message":"Unknown field.","member_index":2}]}
 ```
 
 For the duplicate-ID Body above, no command executes and only the diagnostic prefix appears:
 
 ```json
-{"type":"FAILURE","payload":{"create_accounts":[],"create_transfers":[],"lookup_accounts":[null,{"error_code":null,"message":"This ID repeats an earlier command's ID in the same list.","field":"id"}]}}
+{"create_accounts":[],"create_transfers":[],"lookup_accounts":[null,{"error_code":null,"message":"This ID repeats an earlier command's ID in the same list.","field":"id"}]}
 ```
 
 For a non-array lookup family:
 
 ```json
-{"type":"FAILURE","payload":{"create_accounts":[],"create_transfers":[],"lookup_accounts":[],"error":{"message":"Expected an array of commands.","field":"lookup_accounts"}}}
+{"create_accounts":[],"create_transfers":[],"lookup_accounts":[],"error":{"message":"Expected an array of commands.","field":"lookup_accounts"}}
 ```
 
-Completion framing carries the operation UUID outside the Result:
+Processor Message framing carries the operation UUID outside its body:
 
 ```json
-{"results":[{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","result":{"type":"SUCCESS","payload":{"create_accounts":[{"error_code":"created"}],"create_transfers":[],"lookup_accounts":[]}}}]}
+{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","body":{"create_accounts":[{"error_code":"created"}],"create_transfers":[],"lookup_accounts":[]}}
 ```
 
 ## Scope exclusions
 
 The processor adds no resource-tenant authorization, ID-generation algorithm, durable recovery
 journal, checkpoint, lease, saved observation, chain registry, dependency scheduler, proof lookup,
-compensation, member salvage, new module/dependency or asynchronous timeout mechanism. Framework
+compensation, member salvage, third-party dependency or asynchronous timeout mechanism. Framework
 identity allocation, retention, cancellation policy and exhaustion disposition remain external.
 
 Unsupported creation features include void, balancing, closing, historical import, credit-bound or
@@ -460,8 +469,8 @@ writer, incompatible/partially overlapping creation histories, and unrestricted 
 account totals are excluded from the recovery guarantee. Such counterexamples do not imply new
 production detection or special overflow deferral behavior.
 
-Legacy preservation, dual contracts, migrations, queue drain, historical Result repair and rollback
-compatibility are not provided. This does not authorize deleting cloud/native resources or reusing
+Legacy preservation, dual parsers, automated migrations or queue draining, historical Result repair
+and rollback compatibility are not provided. The deployment guide describes the operator-led cutover. This does not authorize deleting cloud/native resources or reusing
 creation IDs incompatibly. Deployment, AWS validation, topology/IAM/CORS/runtime/timeout/memory
 changes and package refresh belong to separately authorized deployment work. Seat-reservation
 business rules, UI and unrelated APIs are outside this processor reference.

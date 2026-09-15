@@ -24,9 +24,9 @@ Parameters:
     Type: String
     Default: tiger-beetle-processor
     Description: Name of the TigerBeetle processor Lambda function.
-  CompletionProcessorName:
+  TigerBeetleCompletionProcessorName:
     Type: String
-    Default: completion-processor
+    Default: tiger-beetle-completion-processor
     Description: Name of the Completion processor Lambda function.
   TigerBeetleClusterId:
     Type: String
@@ -403,7 +403,7 @@ Resources:
       FunctionResponseTypes:
         - ReportBatchItemFailures
 
-  CompletionProcessorRole:
+  TigerBeetleCompletionProcessorRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -417,7 +417,7 @@ Resources:
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: CompletionProcessorSqsPoller
+        - PolicyName: TigerBeetleCompletionProcessorSqsPoller
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -430,7 +430,7 @@ Resources:
                   - sqs:GetQueueAttributes
                   - sqs:ReceiveMessage
                 Resource: !GetAtt CompletionQueue.Arn
-        - PolicyName: CompletionProcessorOperationUpdate
+        - PolicyName: TigerBeetleCompletionProcessorOperationUpdate
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -439,27 +439,27 @@ Resources:
                   - dynamodb:UpdateItem
                 Resource: !GetAtt OperationsTable.Arn
 
-  CompletionProcessor:
+  TigerBeetleCompletionProcessor:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Ref CompletionProcessorName
+      FunctionName: !Ref TigerBeetleCompletionProcessorName
       Description: SQS-driven Completion processor built with aws-lambda-zig.
-      CodeUri: completion-processor.zip
+      CodeUri: tiger-beetle-completion-processor.zip
       Runtime: provided.al2023
       Handler: bootstrap
       Architectures:
         - arm64
       MemorySize: 128
       Timeout: 15
-      Role: !GetAtt CompletionProcessorRole.Arn
+      Role: !GetAtt TigerBeetleCompletionProcessorRole.Arn
       Environment:
         Variables:
           OPERATIONS_TABLE_NAME: !Ref OperationsTable
 
-  CompletionProcessorQueueMapping:
+  TigerBeetleCompletionProcessorQueueMapping:
     Type: AWS::Lambda::EventSourceMapping
     Properties:
-      FunctionName: !Ref CompletionProcessor
+      FunctionName: !Ref TigerBeetleCompletionProcessor
       EventSourceArn: !GetAtt CompletionQueue.Arn
       Enabled: true
       BatchSize: 1
@@ -742,12 +742,12 @@ Outputs:
   TigerBeetleProcessorArn:
     Description: Deployed TigerBeetle processor Lambda function ARN.
     Value: !GetAtt TigerBeetleProcessor.Arn
-  CompletionProcessorName:
+  TigerBeetleCompletionProcessorName:
     Description: Deployed Completion processor Lambda function name.
-    Value: !Ref CompletionProcessor
-  CompletionProcessorArn:
+    Value: !Ref TigerBeetleCompletionProcessor
+  TigerBeetleCompletionProcessorArn:
     Description: Deployed Completion processor Lambda function ARN.
-    Value: !GetAtt CompletionProcessor.Arn
+    Value: !GetAtt TigerBeetleCompletionProcessor.Arn
   WireGuardGatewayInstanceId:
     Condition: WireGuardGatewayEnabled
     Description: EC2 instance ID of the WireGuard gateway.

@@ -54,8 +54,8 @@ Options:
                          Query Lambda name. Defaults to query-lambda.
   --tiger-beetle-processor-name NAME
                          TigerBeetle processor name. Defaults to tiger-beetle-processor.
-  --completion-processor-name NAME
-                         Completion processor name. Defaults to completion-processor.
+  --tiger-beetle-completion-processor-name NAME
+                         Completion processor name. Defaults to tiger-beetle-completion-processor.
   --tigerbeetle-cluster-id ID
                          Unsigned decimal cluster ID. Defaults to 0.
   --tigerbeetle-addresses ADDRESSES
@@ -91,7 +91,7 @@ Options:
 
 Environment overrides:
   PROFILE, REGION, STACK_NAME, INTAKE_FUNCTION_NAME, QUERY_FUNCTION_NAME,
-  TIGER_BEETLE_PROCESSOR_NAME, COMPLETION_PROCESSOR_NAME,
+  TIGER_BEETLE_PROCESSOR_NAME, TIGER_BEETLE_COMPLETION_PROCESSOR_NAME,
   TIGERBEETLE_CLUSTER_ID, TIGERBEETLE_ADDRESSES,
   LAMBDA_PRINCIPAL, PASETO_PRIVATE_KEY,
   PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT, ENABLE_WIREGUARD_GATEWAY,
@@ -2107,7 +2107,7 @@ parse_wireguard_options() {
                 case "$1" in
                     --profile | --region | --stack-name | \
                         --intake-function-name | --query-function-name | \
-                        --tiger-beetle-processor-name | --completion-processor-name | \
+                        --tiger-beetle-processor-name | --tiger-beetle-completion-processor-name | \
                         --tigerbeetle-cluster-id | \
                         --tigerbeetle-addresses | --lambda-principal)
                         need_value "$1" "${2:-}"

@@ -47,38 +47,38 @@ test_source_guards() {
         fail_test "sourcing deployment helpers produced output: $source_output"
 }
 
-test_completion_processor_name_options() (
+test_tiger_beetle_completion_processor_name_options() (
     local default_name invalid_name_output usage_output
 
-    default_name="$(env -u COMPLETION_PROCESSOR_NAME bash -c \
-        'source "$1/deploy.sh"; printf "%s\n" "$COMPLETION_PROCESSOR_NAME"' \
+    default_name="$(env -u TIGER_BEETLE_COMPLETION_PROCESSOR_NAME bash -c \
+        'source "$1/deploy.sh"; printf "%s\n" "$TIGER_BEETLE_COMPLETION_PROCESSOR_NAME"' \
         bash "$REPOSITORY_ROOT")" ||
         fail_test "default completion function name could not be resolved"
-    [ "$default_name" = completion-processor ] ||
+    [ "$default_name" = tiger-beetle-completion-processor ] ||
         fail_test "default completion function name did not match the SAM parameter"
 
-    COMPLETION_PROCESSOR_NAME=completion-processor
-    parse_deployment_options --completion-processor-name completion-custom
-    validate_completion_processor_name
-    [ "$COMPLETION_PROCESSOR_NAME" = completion-custom ] ||
+    TIGER_BEETLE_COMPLETION_PROCESSOR_NAME=tiger-beetle-completion-processor
+    parse_deployment_options --tiger-beetle-completion-processor-name completion-custom
+    validate_tiger_beetle_completion_processor_name
+    [ "$TIGER_BEETLE_COMPLETION_PROCESSOR_NAME" = completion-custom ] ||
         fail_test "separate completion function-name option was not applied"
 
-    parse_deployment_options --completion-processor-name=completion_equal
-    validate_completion_processor_name
-    [ "$COMPLETION_PROCESSOR_NAME" = completion_equal ] ||
+    parse_deployment_options --tiger-beetle-completion-processor-name=completion_equal
+    validate_tiger_beetle_completion_processor_name
+    [ "$TIGER_BEETLE_COMPLETION_PROCESSOR_NAME" = completion_equal ] ||
         fail_test "equals completion function-name option was not applied"
 
     if invalid_name_output="$({
-        parse_deployment_options --completion-processor-name ''
-        validate_completion_processor_name
+        parse_deployment_options --tiger-beetle-completion-processor-name ''
+        validate_tiger_beetle_completion_processor_name
     } 2>&1)"; then
         fail_test "empty completion function-name argument was accepted"
     fi
-    assert_contains "$invalid_name_output" "empty value for --completion-processor-name"
+    assert_contains "$invalid_name_output" "empty value for --tiger-beetle-completion-processor-name"
 
     if invalid_name_output="$({
-        parse_deployment_options --completion-processor-name completion/name
-        validate_completion_processor_name
+        parse_deployment_options --tiger-beetle-completion-processor-name completion/name
+        validate_tiger_beetle_completion_processor_name
     } 2>&1)"; then
         fail_test "invalid completion function-name argument was accepted"
     fi
@@ -86,17 +86,17 @@ test_completion_processor_name_options() (
 
     if invalid_name_output="$({
         parse_deployment_options \
-            --completion-processor-name \
+            --tiger-beetle-completion-processor-name \
             aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-        validate_completion_processor_name
+        validate_tiger_beetle_completion_processor_name
     } 2>&1)"; then
         fail_test "oversized completion function-name argument was accepted"
     fi
     assert_contains "$invalid_name_output" "must be at most 64 characters"
 
     usage_output="$(usage)"
-    assert_contains "$usage_output" "--completion-processor-name NAME"
-    assert_contains "$usage_output" "COMPLETION_PROCESSOR_NAME"
+    assert_contains "$usage_output" "--tiger-beetle-completion-processor-name NAME"
+    assert_contains "$usage_output" "TIGER_BEETLE_COMPLETION_PROCESSOR_NAME"
 )
 
 test_completion_parameter_preserves_stack_state() (
@@ -105,7 +105,7 @@ test_completion_parameter_preserves_stack_state() (
     INTAKE_FUNCTION_NAME=intake-existing
     QUERY_FUNCTION_NAME=query-existing
     TIGER_BEETLE_PROCESSOR_NAME=tiger-beetle-existing
-    COMPLETION_PROCESSOR_NAME=completion-explicit
+    TIGER_BEETLE_COMPLETION_PROCESSOR_NAME=completion-explicit
     DEPLOYMENT_PARAMETER_OVERRIDES=(
         "EnableWireGuardGateway=true"
         "VpcId=vpc-00000001"
@@ -116,7 +116,7 @@ test_completion_parameter_preserves_stack_state() (
     assert_contains "$overrides" " IntakeFunctionName=intake-existing "
     assert_contains "$overrides" " QueryFunctionName=query-existing "
     assert_contains "$overrides" " TigerBeetleProcessorName=tiger-beetle-existing "
-    assert_contains "$overrides" " CompletionProcessorName=completion-explicit "
+    assert_contains "$overrides" " TigerBeetleCompletionProcessorName=completion-explicit "
     assert_contains "$overrides" " EnableWireGuardGateway=true "
     assert_contains "$overrides" " VpcId=vpc-00000001 "
     [ "${#SAM_PARAMETER_OVERRIDES[@]}" -eq 10 ] ||
@@ -129,12 +129,12 @@ test_deployed_function_name_outputs() (
     INTAKE_FUNCTION_NAME=intake-existing
     QUERY_FUNCTION_NAME=query-existing
     TIGER_BEETLE_PROCESSOR_NAME=tiger-beetle-existing
-    COMPLETION_PROCESSOR_NAME=completion-existing
+    TIGER_BEETLE_COMPLETION_PROCESSOR_NAME=completion-existing
     aws() {
         printf 'IntakeFunctionName|intake-existing\t'
         printf 'QueryFunctionName|query-existing\t'
         printf 'TigerBeetleProcessorName|tiger-beetle-existing\t'
-        printf 'CompletionProcessorName|%s\n' "$MOCK_COMPLETION_OUTPUT"
+        printf 'TigerBeetleCompletionProcessorName|%s\n' "$MOCK_COMPLETION_OUTPUT"
     }
 
     MOCK_COMPLETION_OUTPUT=completion-existing
@@ -146,7 +146,7 @@ test_deployed_function_name_outputs() (
     if output="$(validate_deployed_function_names 2>&1)"; then
         fail_test "mismatched completion function-name output was accepted"
     fi
-    assert_contains "$output" "CompletionProcessorName does not match"
+    assert_contains "$output" "TigerBeetleCompletionProcessorName does not match"
 )
 
 test_four_lambda_artifacts() (
@@ -163,7 +163,7 @@ test_four_lambda_artifacts() (
         intake-lambda.zip \
         query-lambda.zip \
         tiger-beetle-processor.zip \
-        completion-processor.zip
+        tiger-beetle-completion-processor.zip
     do
         printf 'stale archive\n' >"$archive"
     done
@@ -177,7 +177,7 @@ test_four_lambda_artifacts() (
                 ;;
             zig-out/bin/intake/bootstrap | \
                 zig-out/bin/query/bootstrap | \
-                zig-out/bin/completion_processor/bootstrap)
+                zig-out/bin/tiger_beetle_completion_processor/bootstrap)
                 printf '%s\n' \
                     "$1: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped"
                 ;;
@@ -200,19 +200,19 @@ test_four_lambda_artifacts() (
 
     artifact_output="$(validate_lambda_bootstraps)" ||
         fail_test "four-bootstrap artifact validation failed"
-    assert_contains "$artifact_output" "zig-out/bin/completion_processor/bootstrap"
+    assert_contains "$artifact_output" "zig-out/bin/tiger_beetle_completion_processor/bootstrap"
     package_lambda_archives
 
     expected_file_calls='zig-out/bin/intake/bootstrap
 zig-out/bin/query/bootstrap
-zig-out/bin/completion_processor/bootstrap
+zig-out/bin/tiger_beetle_completion_processor/bootstrap
 zig-out/bin/tiger_beetle_processor/bootstrap'
     [ "$(<"$MOCK_FILE_CALLS")" = "$expected_file_calls" ] ||
         fail_test "bootstrap validation did not retain the four expected paths"
     expected_zip_calls='intake-lambda.zip|zig-out/bin/intake/bootstrap
 query-lambda.zip|zig-out/bin/query/bootstrap
 tiger-beetle-processor.zip|zig-out/bin/tiger_beetle_processor/bootstrap
-completion-processor.zip|zig-out/bin/completion_processor/bootstrap'
+tiger-beetle-completion-processor.zip|zig-out/bin/tiger_beetle_completion_processor/bootstrap'
     [ "$(<"$MOCK_ZIP_CALLS")" = "$expected_zip_calls" ] ||
         fail_test "packaging did not retain the four expected archive mappings"
 )
@@ -614,7 +614,7 @@ test_ordinary_deployment_rejects_legacy_ami
 test_ami_pinning
 
 test_source_guards
-test_completion_processor_name_options
+test_tiger_beetle_completion_processor_name_options
 test_completion_parameter_preserves_stack_state
 test_deployed_function_name_outputs
 test_four_lambda_artifacts

@@ -17,15 +17,15 @@ Operation JSON document, derives required tenant metadata from the verified
 token subject, resolves the exact `<name>Queue` environment mapping, persists
 the Operation idempotently in DynamoDB, submits new work to that SQS queue, and
 returns the current stored output view without the body.
-The TigerBeetle processor consumes queued `SUBMITTED` Operations and validates their complete
+The TigerBeetle processor consumes minimal Processor Messages and validates their complete
 Bodies before executing requested account creations, transfers and account lookups. Each creation
 list is an independent linked chain. Replay safety requires callers to preserve each chain's
 Resource IDs, order and original native inputs across all writers and attempts. The processor
-publishes fully determined Results in bounded Completion aggregates. The Completion processor
-consumes one aggregate at a time and owns the conditional DynamoDB transition from `SUBMITTED` to `COMPLETED`:
+publishes fully determined native result bodies as individual Processor Messages. TigerBeetleCompletionProcessor
+consumes one message at a time and owns the conditional DynamoDB transition from `SUBMITTED` to `COMPLETED`:
 
 ```text
-intake -> TigerBeetleQueue -> tiger-beetle-processor -> CompletionQueue -> completion-processor -> DynamoDB
+intake -> TigerBeetleQueue -> tiger-beetle-processor -> CompletionQueue -> tiger-beetle-completion-processor -> DynamoDB
 ```
 
 A definite creation rejection or missing account produces FAILURE once all requested work is
@@ -54,7 +54,7 @@ The deployment docs use:
 - Intake function name: `intake-lambda`
 - Query function name: `query-lambda`
 - TigerBeetle processor name: `tiger-beetle-processor`
-- Completion processor name: `completion-processor`
+- Completion processor name: `tiger-beetle-completion-processor`
 
 Adjust those values for your AWS account as needed.
 
@@ -79,7 +79,7 @@ Verify the ARM64 Linux executables:
 file zig-out/bin/intake/bootstrap \
   zig-out/bin/query/bootstrap \
   zig-out/bin/tiger_beetle_processor/bootstrap \
-  zig-out/bin/completion_processor/bootstrap
+  zig-out/bin/tiger_beetle_completion_processor/bootstrap
 ```
 
 Intake, query, and the Completion processor are statically linked and single-threaded. TigerBeetle processor is
@@ -87,7 +87,7 @@ multithread-capable for the TigerBeetle callback thread and is a dynamically
 linked glibc executable. All four are stripped.
 
 ```text
-intake/query/completion-processor: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
+intake/query/tiger-beetle-completion-processor: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
 tiger-beetle-processor:           ELF 64-bit LSB executable, ARM aarch64, dynamically linked, stripped
 ```
 
@@ -98,7 +98,7 @@ automatically):
 zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
 zip -qj query-lambda.zip zig-out/bin/query/bootstrap
 zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
-zip -qj completion-processor.zip zig-out/bin/completion_processor/bootstrap
+zip -qj tiger-beetle-completion-processor.zip zig-out/bin/tiger_beetle_completion_processor/bootstrap
 ```
 
 All four zip archives are intentionally ignored by Git because they are generated
@@ -277,24 +277,17 @@ under the logical resource ID expected by the CLI. Send a lookup-only `TigerBeet
 with a concrete account Resource ID like this:
 
 ```sh
-operation_json='{"id":"11223344-5566-7788-99aa-bbccddeeff00",'\
-'"name":"TigerBeetle","body":{"lookup_accounts":[{"id":"101"}]}}'
-printf '%s\n' "$operation_json" \
-  | ./queue.sh TigerBeetleQueue send --tenant 'tenant-a'
+message_json='{"operation_id":"11223344-5566-7788-99aa-bbccddeeff00",'\
+'"body":{"lookup_accounts":[{"id":"101"}]}}'
+printf '%s\n' "$message_json" | ./queue.sh TigerBeetleQueue send
 ```
 
-`send` parses and validates the input through the shared Operation model using
-the current Unix time. Omitted state defaults to `SUBMITTED`, while explicit state
-must be `SUBMITTED`. It validates the complete output view and serializes it once.
-The exact compact JSON bytes sent to SQS contain `id`, `tenant`, `name`,
-`body`, `state`, `last_updated`, `expires_at`, and `hash`. After `SendMessage`
-succeeds, the same bytes are printed followed by a newline; the SQS message
-does not include that newline. State is excluded from the existing Operation
-hash, along with `id`, timestamps, expiration, and result. This command does
-not read or update DynamoDB. `send` always produces an Operation message, so it
-must not be used with `CompletionQueue`, whose consumer expects a Completion
-batch. For Completion to persist, the matching Operation must already exist as `SUBMITTED`
-in DynamoDB. Use authenticated intake for the complete persistence-and-enqueue flow.
+`send` validates a minimal Processor Message with `src/processor_message.zig`, including its
+96 KiB Body bound and optional internal `result_queue`. It sends compact JSON and prints the same
+bytes followed by a newline after success. It neither accepts `--tenant` nor reads or updates
+DynamoDB. The matching Operation must already exist as `SUBMITTED` for final completion to persist.
+Use authenticated intake for the complete persistence-and-enqueue flow. CompletionQueue accepts
+the same envelope with a TigerBeetle native result body, rather than an execution command body.
 The illustrative lookup ID `101` is independent of the Operation UUID; a missing account produces
 a terminal FAILURE after a trustworthy lookup reply.
 
@@ -398,33 +391,22 @@ receives `COMPLETION_QUEUE_URL`, `TIGERBEETLE_CLUSTER_ID`, and
 invocations. Lambda polls `TigerBeetleQueue` in batches of at most 10 records with no batching
 delay.
 
-For every record, the handler retains the debug log containing its message ID
-and body, parses the complete Operation output, and accepts only a queued `SUBMITTED`
-Operation with a body and no result and a matching tenant/name/Body hash. The Body contains
+For every record, the handler decodes `{operation_id, body, result_queue?}`. Its Body contains
 `create_accounts`, `create_transfers`, and `lookup_accounts` command lists, with at most 64
-commands combined. See the maintained [Body schema](docs/TIGER_BEETLE_PROCESSOR.md#body-schema),
-[examples](docs/TIGER_BEETLE_PROCESSOR.md#body-examples) and
-[Result contract](docs/TIGER_BEETLE_PROCESSOR.md#result-and-completion-publication).
+commands combined. Public intake accepts at most 4 KiB; internal Bodies permit 96 KiB.
+See the maintained [Body schema](docs/TIGER_BEETLE_PROCESSOR.md#body-schema) and
+[output contract](docs/TIGER_BEETLE_PROCESSOR.md#result-and-completion-publication).
 
-A complete Result retains the original command positions, optional aliases, raw native creation
-codes and all found Account fields. For example, an accepted two-account replay preserves the
-native suffix code:
+Output places native details directly in `body`, without `type` or `payload`:
 
 ```json
-{"type":"SUCCESS","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[{"id":"101","error_code":21},{"id":"102","error_code":1}],"create_transfers":[],"lookup_accounts":[]}}
+{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","body":{"create_accounts":[{"error_code":"exists"},{"error_code":"linked_event_failed"}],"create_transfers":[],"lookup_accounts":[]}}
 ```
 
-FAILURE preserves surviving writes and found observations. A missing lookup has a null native
-code and descriptive message:
-
-```json
-{"type":"FAILURE","payload":{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","create_accounts":[],"create_transfers":[],"lookup_accounts":[{"id":"101","error_code":null,"message":"Account was not found."}]}}
-```
-
-Complete Results are bounded to 96 KiB. Completion uses `{"results":[...]}` with a canonical
-`operation_id` and complete `result` per entry, retaining the matching UUID inside the payload.
-Ten maximum-size Results occupy 983,713 bytes, within the 1 MiB transport bound; eleven require
-another message. No Operation snapshot is copied.
+Each SQS message carries one Operation UUID and Body. Incoming `result_queue` overrides the
+default `COMPLETION_QUEUE_URL`. TigerBeetle omits the outgoing route; another processor may choose
+its own. The public caller cannot set this internal field. The template grants sends only to
+CompletionQueue; any additional internal destination needs an explicit IAM grant.
 
 The processor executes all admitted account chains, then eligible transfer chains, then requested
 lookups. Each creation list remains one immutable chain, packed in received order with intact
@@ -435,10 +417,10 @@ across all writers, with every actual native code retained. Lookups run after kn
 A native error or malformed reply stops subsequent native calls. Earlier trustworthy facts survive;
 fully determined Operations publish while unfinished Operations retry without a synthetic FAILURE.
 Invalid envelopes acknowledge without Completion. Publication collects terminal Results in received
-order, skips unfinished records, and sends intact aggregates serially, flushing at ten Results or
-byte capacity. A failed or ambiguous send retries its represented records and every unpublished
+order, skips unfinished records, and sends individual messages serially. A failed or ambiguous send
+retries its source and every unpublished
 suffix record; earlier successful sends remain acknowledgement-eligible. The current ten-record
-bound needs at most three native calls and one send.
+bound needs at most three native calls and ten sends.
 
 Redelivery revalidates the original Body and repeats its complete immutable chains, including IDs,
 order, pending timeout intervals and post inheritance sentinels. There is no recovery journal or
@@ -446,25 +428,23 @@ native retry loop. A later lookup may observe different values or presence, and 
 may change. The first valid Completion persisted wins even when another valid attempt differs.
 Expiry replay does not renew a pending reservation. Unresolved retries never fabricate FAILURE;
 the framework owns exhaustion and retention. The fixed 24-hour TTL does not prove every pending
-expiry/retry combination. See [complete local verification](docs/TIGERBEETLE_RETRY_EVIDENCE.md)
-for the matrix audit and deferred deployed SQS, DynamoDB and Lambda runtime guarantees.
+expiry/retry combination. See [local validation commands](AGENTS.md#build-and-validation). Deployed SQS, DynamoDB and Lambda
+runtime validation remains separate from the mocked and native local checks.
 
-The Completion processor also has no authentication configuration or Function URL. It is not
-VPC-attached and receives only `OPERATIONS_TABLE_NAME`. Its event source mapping delivers one
-Completion queue message per invocation. The handler decodes the bounded aggregate and performs
-its DynamoDB updates sequentially. Each write selects only the canonical Operation ID, requires
-the stored state to be `SUBMITTED`, writes the result and `COMPLETED` state, samples a separate
-write-time `last_updated`, and derives `expires_at` exactly 86,400 seconds later. It does not read
-or compare the queued tenant, name, hash, or timestamps.
+TigerBeetleCompletionProcessor has no authentication configuration or Function URL. It is not
+VPC-attached and receives only `OPERATIONS_TABLE_NAME`. One SQS message arrives per invocation.
+It interprets creation-chain statuses, lookup observations and diagnostics to derive SUCCESS or
+FAILURE, then persists the existing `{type,payload}` Result. The stored Result retains its 96 KiB
+complete-envelope bound; invalid or unrepresentable native bodies produce failure diagnostics.
 
-Both standard queues are unordered and at least once. A missing or already completed item makes
-the ID-only state condition fail with an acknowledged Operation conflict, so duplicate
-Completion delivery cannot overwrite the first terminal result. Invalid entries with one
-trustworthy canonical ID are completed with an identifiable deterministic failure; entries
-without a trustworthy ID are acknowledged without a write. A transient write stops that
-invocation and replays the one aggregate message. On replay, earlier successful entries become
-acknowledged conflicts and processing reaches the failed and later entries; every newly
-successful write receives its actual replay-time timestamp.
+Each conditional update selects only the Operation UUID and requires stored `SUBMITTED` state.
+It writes `COMPLETED`, the Result, the actual write time and a TTL exactly 86,400 seconds later.
+A missing or already completed item is an acknowledged conflict. Malformed envelopes never select
+an item; allocation or transient DynamoDB failures retry only that message. Duplicate delivery
+cannot overwrite the first terminal Result.
+
+The wire change requires draining old full-Operation and aggregate-Completion messages before
+switching producers and consumers. See [migration and deployment effects](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#processor-message-cutover).
 
 ## Lambda Observability
 
@@ -476,7 +456,7 @@ file named after the deployed function. The stack name is fixed as
 ./lambda_logs.sh intake
 ./lambda_logs.sh query
 ./lambda_logs.sh tiger-beetle-processor
-./lambda_logs.sh completion-processor
+./lambda_logs.sh tiger-beetle-completion-processor
 ```
 
 The helper uses `AWS_PROFILE` and `AWS_REGION`, defaulting to `dev` and
@@ -521,7 +501,7 @@ sam deploy --guided \
     IntakeFunctionName=intake-lambda \
     QueryFunctionName=query-lambda \
     TigerBeetleProcessorName=tiger-beetle-processor \
-    CompletionProcessorName=completion-processor \
+    TigerBeetleCompletionProcessorName=tiger-beetle-completion-processor \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -534,13 +514,13 @@ configuration. It is public key material; keep the corresponding private key
 only in the signing environment.
 
 `deploy.sh` builds and packages all four bootstraps, preserves any existing WireGuard state,
-and defaults the TigerBeetle processor and Completion processor names to `tiger-beetle-processor` and `completion-processor`.
-Override them with `TIGER_BEETLE_PROCESSOR_NAME`, `COMPLETION_PROCESSOR_NAME`, or the matching
-`--tiger-beetle-processor-name` and `--completion-processor-name` options. Both deployment helpers accept these options.
+and defaults the TigerBeetle processor and Completion processor names to `tiger-beetle-processor` and `tiger-beetle-completion-processor`.
+Override them with `TIGER_BEETLE_PROCESSOR_NAME`, `TIGER_BEETLE_COMPLETION_PROCESSOR_NAME`, or the matching
+`--tiger-beetle-processor-name` and `--tiger-beetle-completion-processor-name` options. Both deployment helpers accept these options.
 The template outputs
 `IntakeFunctionName`, `QueryFunctionName`, `TigerBeetleProcessorName`, and
-`CompletionProcessorName`, plus `IntakeFunctionArn`, `QueryFunctionArn`,
-`TigerBeetleProcessorArn`, and `CompletionProcessorArn`; only intake and query have Function URL
+`TigerBeetleCompletionProcessorName`, plus `IntakeFunctionArn`, `QueryFunctionArn`,
+`TigerBeetleProcessorArn`, and `TigerBeetleCompletionProcessorArn`; only intake and query have Function URL
 outputs. Resolve deployed values instead of recording them in documentation:
 
 ```sh
@@ -682,10 +662,8 @@ do not. The ID comes only from the single `rawPath` segment: query strings and
 GET bodies neither provide nor alter it. A different token subject receives the
 same `404 Not Found` response as a missing Operation.
 
-For `SUBMITTED`, the handler reattaches the parsed input body only to a queued copy
-of the persisted snapshot and sends that exact compact full `SUBMITTED` Operation
-JSON to SQS without a trailing newline. It returns the unchanged bodyless
-snapshot. A matching retry whose item is still `SUBMITTED` sends it again; matching
+For `SUBMITTED`, intake sends compact `{operation_id,body}` JSON to SQS without a
+trailing newline or routing field. It returns the unchanged bodyless Operation snapshot. A matching retry whose item is still `SUBMITTED` sends it again; matching
 `COMPLETED` items are returned immediately without another SQS
 send.
 
@@ -695,15 +673,15 @@ performs no read or update after the send.
 
 Delivery is at least once. The standard queue, acknowledgement loss, and
 concurrent `SUBMITTED` retries can produce duplicate messages, so consumers must
-handle the Operation ID and hash idempotently. Reusing the ID for different
+use stable native Resource IDs for replay and the Operation UUID for correlation. Reusing the ID for different
 work or from a different verified subject still returns `409 Conflict`. The TigerBeetle processor
 replays complete creation chains under the caller obligations described above and obtains fresh
-requested lookups. It sends terminal ID/result entries to the Completion queue. Completion
+requested lookups. It sends individual ID/body messages to the Completion queue. TigerBeetleCompletionProcessor
 conditionally updates only a stored `SUBMITTED` item; duplicate or stale entries cannot overwrite
 its first persisted Result. A native request error stops later native calls and retries every
 unfinished Operation, including those sharing the failed request. Completion publication uncertainty
-retries the failed aggregate's source records and every later unpublished record; earlier successful
-sends remain acknowledgement-eligible. DynamoDB uncertainty replays the single Completion aggregate.
+retries the failed message's source record and every later unpublished record; earlier successful
+sends remain acknowledgement-eligible. DynamoDB uncertainty replays the single Completion message.
 
 The template intentionally creates publicly reachable intake POST and query
 GET Function URLs for demo testing, while both Function URL handlers enforce PASETO bearer
@@ -718,8 +696,8 @@ or CloudFront.
 - `src/intake_lambda.zig`: authenticated POST intake entrypoint, named-queue routing, and handler.
 - `src/query_lambda.zig`: authenticated tenant-scoped Operation GET entrypoint and handler.
 - `src/tiger_beetle_processor.zig`: SQS-driven TigerBeetle processor entrypoint and handler.
-- `src/completion_processor.zig`: SQS-driven conditional completion entrypoint and handler.
-- `src/completion_batch.zig`: bounded aggregate Completion message contract and codec.
+- `src/tiger_beetle_completion_processor.zig`: SQS-driven conditional completion entrypoint and handler.
+- `src/processor_message.zig`: bounded individual Processor Message contract and codec.
 - `src/lambda_auth.zig`: shared bearer-token parsing and PASETO verification.
 - `src/operation.zig`: Operation JSON model, validation, and hash contract.
 - `src/operation_persistence.zig`: DynamoDB Operation mapping and conditional writes.
@@ -743,7 +721,7 @@ or CloudFront.
 Run formatting checks before committing Zig changes:
 
 ```sh
-zig fmt --check build.zig src/completion_batch.zig src/completion_processor.zig \
+zig fmt --check build.zig src/processor_message.zig src/tiger_beetle_completion_processor.zig \
   src/tiger_beetle_processor.zig src/intake_lambda.zig src/lambda_auth.zig \
   src/query_lambda.zig \
   src/operation.zig src/operation_persistence.zig src/sqs_queue.zig \

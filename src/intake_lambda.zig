@@ -3,6 +3,7 @@ const aws = @import("aws");
 const lambda = @import("aws-lambda");
 const lambda_auth = @import("lambda_auth");
 const operation = @import("operation");
+const processor_message = @import("processor_message");
 const operation_persistence = @import("operation_persistence");
 const sqs_queue = @import("sqs_queue");
 
@@ -329,15 +330,10 @@ fn operation_message_body(
     std.debug.assert(queued.body != null);
     std.debug.assert(queued.state == .submitted);
 
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
-    try operation.writeOutputJSON(&output.writer, queued);
-    if (output.written().len > operation_message_size_max) {
-        return error.OperationMessageTooLarge;
-    }
-    std.debug.assert(output.written().len > 0);
-    std.debug.assert(output.written().len <= operation_message_size_max);
-    return output.toOwnedSlice();
+    return processor_message.encode(allocator, &.{
+        .operation_id = queued.id,
+        .body = queued.body.?,
+    });
 }
 
 fn operation_success_outcome(
@@ -717,12 +713,7 @@ test "authenticated POST persists and queues SUBMITTED then returns without its 
         "\\\"expires_at\\\":1700086400," ++
         "\\\"hash\\\":\\\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\\\"}\"}";
     const expected_message =
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-        "\"tenant\":\"lambda-test-user\",\"name\":\"echo\"," ++
-        "\"body\":{\"message\":\"hello\",\"count\":2}," ++
-        "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
-        "\"expires_at\":1700086400," ++
-        "\"hash\":\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\"}";
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":{\"message\":\"hello\",\"count\":2}}";
 
     for (inputs) |input| {
         var fake: FakeIntake = .{};
@@ -775,7 +766,7 @@ test "authenticated POST persists and queues SUBMITTED then returns without its 
     }
 }
 
-test "POST queues every JSON body variant as exact full Operation JSON" {
+test "POST queues every JSON body variant as exact minimal Processor Message JSON" {
     const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
         .seed_byte = 0x51,
         .now = 1_700_000_000,
@@ -789,36 +780,12 @@ test "POST queues every JSON body variant as exact full Operation JSON" {
 
     const bodies = [_][]const u8{ "null", "false", "42", "\"text\"", "[1]", "{\"a\":1}" };
     const messages = [_][]const u8{
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":null," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
-            "\"expires_at\":1700086400," ++
-            "\"hash\":\"fd177e1082fafe25e8ae2bc301281fc4f4a5a0776ab241d35cf9ed91a46db3b3\"}",
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":false," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
-            "\"expires_at\":1700086400," ++
-            "\"hash\":\"6e18221b306b6bfd8753e910d58beb8cf007da71923dc7b52011f107fbc51d1c\"}",
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":42," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
-            "\"expires_at\":1700086400," ++
-            "\"hash\":\"d5ccd414185af1692c3678f3cde5756d3bb12a7cbfd0f39f797610b3fa7bd235\"}",
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":\"text\"," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
-            "\"expires_at\":1700086400," ++
-            "\"hash\":\"576bfabb751a1c5df078d4d24cd5bd66c00cec5b765e898b7eb3743693a0c2bb\"}",
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":[1]," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
-            "\"expires_at\":1700086400," ++
-            "\"hash\":\"9a2a3875c2b05917ae674a0d5b6f1bfc71d6dec7b3cb71059f9c21f60709cbc9\"}",
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-            "\"tenant\":\"lambda-test-user\",\"name\":\"variants\",\"body\":{\"a\":1}," ++
-            "\"state\":\"SUBMITTED\",\"last_updated\":1700000000," ++
-            "\"expires_at\":1700086400," ++
-            "\"hash\":\"72773a3103040a8266d9052ef82f5119ea53608cc1aac4ae8844721705e292dd\"}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":null}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":false}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":42}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":\"text\"}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":[1]}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":{\"a\":1}}",
     };
 
     for (bodies, messages) |body, expected_message| {
@@ -962,7 +929,7 @@ test "matching SUBMITTED POST requeues and returns the stored snapshot" {
     try expectContains(response, "\\\"last_updated\\\":1699999000");
     try expectContains(response, "\\\"expires_at\\\":1700085400");
     try expectContains(fake.lastMessage(), "\"body\":{\"message\":\"hello\",\"count\":2}");
-    try expectContains(fake.lastMessage(), "\"last_updated\":1699999000");
+    try expectNotContains(fake.lastMessage(), "last_updated");
     try std.testing.expectEqual(@as(u8, 1), fake.send_count);
 }
 
@@ -1726,4 +1693,40 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
 
 fn expectNotContains(haystack: []const u8, needle: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, haystack, needle) == null);
+}
+
+test "public intake preserves the 4 KiB cap and rejects internal routing metadata" {
+    const allocator = std.testing.allocator;
+    const token = try lambda_auth.testing.issue_token(allocator, .{
+        .seed_byte = 0x43,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
+    defer allocator.free(token);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try lambda_auth.testing.put_public_key(&environment, 0x43);
+    try put_test_queue_url(&environment, "echo");
+    const prefix = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"name\":\"echo\",\"body\":";
+    const cases = [_]struct { input: []const u8, accepted: bool }{
+        .{ .input = prefix ++ "\"" ++ "x" ** 4094 ++ "\"}", .accepted = true },
+        .{ .input = prefix ++ "\"" ++ "x" ** 4095 ++ "\"}", .accepted = false },
+        .{ .input = prefix ++ "{},\"result_queue\":\"https://sqs.example.invalid/internal\"}", .accepted = false },
+    };
+    for (cases) |case| {
+        var fake: FakeIntake = .{};
+        const event = try test_authorization_request_event(allocator, .POST, "Authorization", "Bearer", token, case.input);
+        defer allocator.free(event);
+        const response = handleInvocationForTest(allocator, event, .{}, .{}, &environment, &fake, 1000);
+        defer allocator.free(response);
+        if (case.accepted) {
+            try expectContains(response, "\"statusCode\":200");
+            try std.testing.expectEqual(@as(u8, 1), fake.send_count);
+            try expectNotContains(fake.lastMessage(), "result_queue");
+        } else {
+            try expectBadRequest(response);
+            try std.testing.expectEqual(@as(u8, 0), fake.create_count);
+            try std.testing.expectEqual(@as(u8, 0), fake.send_count);
+        }
+    }
 }
