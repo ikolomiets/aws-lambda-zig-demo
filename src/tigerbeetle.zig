@@ -13,9 +13,14 @@ pub const account_linked: u16 = @intCast(c.TB_ACCOUNT_LINKED);
 pub const account_debits_must_not_exceed_credits: u16 = @intCast(
     c.TB_ACCOUNT_DEBITS_MUST_NOT_EXCEED_CREDITS,
 );
+pub const account_credits_must_not_exceed_debits: u16 = @intCast(
+    c.TB_ACCOUNT_CREDITS_MUST_NOT_EXCEED_DEBITS,
+);
+pub const account_history: u16 = @intCast(c.TB_ACCOUNT_HISTORY);
 pub const transfer_linked: u16 = @intCast(c.TB_TRANSFER_LINKED);
 pub const transfer_pending: u16 = @intCast(c.TB_TRANSFER_PENDING);
 pub const transfer_post_pending_transfer: u16 = @intCast(c.TB_TRANSFER_POST_PENDING_TRANSFER);
+pub const transfer_void_pending_transfer: u16 = @intCast(c.TB_TRANSFER_VOID_PENDING_TRANSFER);
 pub const account_created: u32 = @intCast(c.TB_CREATE_ACCOUNT_CREATED);
 pub const account_exists: u32 = @intCast(c.TB_CREATE_ACCOUNT_EXISTS);
 pub const account_linked_event_failed: u32 = @intCast(c.TB_CREATE_ACCOUNT_LINKED_EVENT_FAILED);

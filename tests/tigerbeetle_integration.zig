@@ -13,6 +13,29 @@ const transfer_amount: u128 = 10;
 const linked_transfer_amount_total: u128 = transfer_amount * 2;
 const unique_id_count = 21;
 
+fn fresh_base_id() !u128 {
+    var bytes: [16]u8 = undefined;
+    try std.Io.randomSecure(std.testing.io, &bytes);
+    const random = std.mem.readInt(u128, &bytes, .little);
+    return (random | (@as(u128, 1) << 127)) & ~@as(u128, 0xffff);
+}
+
+const TestNamespace = struct {
+    base: u128,
+
+    fn init() !TestNamespace {
+        return .{ .base = try fresh_base_id() };
+    }
+
+    fn id(namespace: TestNamespace, offset: u16) u128 {
+        assert(offset != std.math.maxInt(u16));
+        const result = namespace.base + offset;
+        assert(result != 0);
+        assert(result != std.math.maxInt(u128));
+        return result;
+    }
+};
+
 const account_linked_flag: u16 = @intCast(c.TB_ACCOUNT_LINKED);
 const account_created: u32 = @intCast(c.TB_CREATE_ACCOUNT_CREATED);
 const account_exists: u32 = @intCast(c.TB_CREATE_ACCOUNT_EXISTS);
@@ -81,8 +104,8 @@ const TestIds = struct {
     operation_account: u128,
     operation_credit_account: u128,
 
-    fn generate() TestIds {
-        const base_id: u128 = 0x74625f666978747572655f3100000100;
+    fn generate() !TestIds {
+        const base_id = try fresh_base_id();
 
         const ids: TestIds = .{
             .debit_account = base_id,
@@ -223,17 +246,60 @@ const AccountBalancePair = struct {
     credit_account: AccountBalance,
 };
 
-fn cluster_addresses() []const u8 {
-    return if (std.c.getenv("TIGERBEETLE_ADDRESSES")) |addresses| std.mem.span(addresses) else cluster_addresses_default;
+fn cluster_addresses() ![]const u8 {
+    const configured = std.c.getenv("TIGERBEETLE_ADDRESSES") orelse return cluster_addresses_default;
+    const address = std.mem.span(configured);
+    if (std.mem.eql(u8, address, cluster_addresses_default)) return address;
+    const owned = std.c.getenv("TIGERBEETLE_TEST_OWNED") orelse return error.LocalReplicaOwnershipRequired;
+    if (!std.mem.eql(u8, std.mem.span(owned), "fresh-local-cluster")) {
+        return error.LocalReplicaOwnershipRequired;
+    }
+    const prefix = "127.0.0.1:";
+    if (!std.mem.startsWith(u8, address, prefix)) return error.NonLocalReplicaAddress;
+    const port = std.fmt.parseInt(u16, address[prefix.len..], 10) catch
+        return error.NonLocalReplicaAddress;
+    if (port == 0) return error.NonLocalReplicaAddress;
+    return address;
+}
+
+fn local_client() !*tigerbeetle.Client {
+    const address = try cluster_addresses();
+    std.debug.print("TigerBeetle live: connect cluster 0 at {s}; native calls may wait.\n", .{address});
+    return tigerbeetle.Client.create(std.testing.allocator, std.testing.io, cluster_id, address);
+}
+
+fn logged_create_accounts(
+    client: *tigerbeetle.Client,
+    input: []const tigerbeetle.Account,
+    output: []tigerbeetle.CreateAccountResult,
+) !usize {
+    assert(input.len > 0);
+    std.debug.print("TigerBeetle live: createAccounts count={d} first_id={d}\n", .{ input.len, input[0].id });
+    return client.createAccounts(input, output);
+}
+
+fn logged_create_transfers(
+    client: *tigerbeetle.Client,
+    input: []const tigerbeetle.Transfer,
+    output: []tigerbeetle.CreateTransferResult,
+) !usize {
+    assert(input.len > 0);
+    std.debug.print("TigerBeetle live: createTransfers count={d} first_id={d}\n", .{ input.len, input[0].id });
+    return client.createTransfers(input, output);
+}
+
+fn logged_lookup_accounts(
+    client: *tigerbeetle.Client,
+    input: []const u128,
+    output: []tigerbeetle.Account,
+) !usize {
+    assert(input.len > 0);
+    std.debug.print("TigerBeetle live: lookupAccounts count={d} first_id={d}\n", .{ input.len, input[0] });
+    return client.lookupAccounts(input, output);
 }
 
 test "live account, transfer, and linked chain operations" {
-    // The local runner attests ownership before this suite may mutate its endpoint.
-    const owned = std.c.getenv("TIGERBEETLE_TEST_OWNED") orelse return error.FixtureOwnershipRequired;
-    if (!std.mem.eql(u8, std.mem.span(owned), "fresh-local-cluster")) {
-        return error.FixtureOwnershipRequired;
-    }
-    const ids = TestIds.generate();
+    const ids = try TestIds.generate();
     run_live_scenario(&ids) catch |failure| {
         ids.print_failure(failure);
         return failure;
@@ -242,12 +308,7 @@ test "live account, transfer, and linked chain operations" {
 
 fn run_live_scenario(ids: *const TestIds) !void {
     ids.assert_valid();
-    const client = try tigerbeetle.Client.create(
-        std.testing.allocator,
-        std.testing.io,
-        cluster_id,
-        cluster_addresses(),
-    );
+    const client = try local_client();
     defer client.destroy();
 
     try run_execution_accounting_workflow(client, ids);
@@ -300,7 +361,8 @@ fn run_execution_accounting_workflow(
 ) !void {
     const prerequisite_account = make_account(ids.operation_credit_account);
     var prerequisite_created: [1]tigerbeetle.CreateAccountResult = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try client.createAccounts(
+    try std.testing.expectEqual(@as(usize, 1), try logged_create_accounts(
+        client,
         &.{prerequisite_account},
         &prerequisite_created,
     ));
@@ -311,7 +373,7 @@ fn run_execution_accounting_workflow(
         prerequisite_input.len,
     );
     defer std.testing.allocator.free(prerequisite_buffer);
-    const prerequisite_count = try client.lookupAccounts(prerequisite_input, prerequisite_buffer);
+    const prerequisite_count = try logged_lookup_accounts(client, prerequisite_input, prerequisite_buffer);
     const prerequisite = prerequisite_buffer[0..prerequisite_count];
     try std.testing.expectEqual(@as(usize, 1), prerequisite.len);
     try std.testing.expectEqual(ids.operation_credit_account, prerequisite[0].id);
@@ -325,7 +387,8 @@ fn run_execution_accounting_workflow(
         account_results_input.len,
     );
     defer std.testing.allocator.free(account_results_buffer);
-    const account_results_count = try client.createAccounts(
+    const account_results_count = try logged_create_accounts(
+        client,
         account_results_input,
         account_results_buffer,
     );
@@ -340,7 +403,8 @@ fn run_execution_accounting_workflow(
         account_replay_input.len,
     );
     defer std.testing.allocator.free(account_replay_buffer);
-    const account_replay_count = try client.createAccounts(
+    const account_replay_count = try logged_create_accounts(
+        client,
         account_replay_input,
         account_replay_buffer,
     );
@@ -357,7 +421,8 @@ fn run_execution_accounting_workflow(
         transfer_results_input.len,
     );
     defer std.testing.allocator.free(transfer_results_buffer);
-    const transfer_results_count = try client.createTransfers(
+    const transfer_results_count = try logged_create_transfers(
+        client,
         transfer_results_input,
         transfer_results_buffer,
     );
@@ -372,7 +437,8 @@ fn run_execution_accounting_workflow(
         transfer_replay_input.len,
     );
     defer std.testing.allocator.free(transfer_replay_buffer);
-    const transfer_replay_count = try client.createTransfers(
+    const transfer_replay_count = try logged_create_transfers(
+        client,
         transfer_replay_input,
         transfer_replay_buffer,
     );
@@ -412,7 +478,7 @@ fn create_accounts(
         accounts.len,
     );
     defer std.testing.allocator.free(results_buffer);
-    const results_count = try client.createAccounts(accounts, results_buffer);
+    const results_count = try logged_create_accounts(client, accounts, results_buffer);
     const results = results_buffer[0..results_count];
 
     try std.testing.expectEqual(@as(usize, 2), results.len);
@@ -427,7 +493,7 @@ fn resubmit_account(client: *tigerbeetle.Client, account: tigerbeetle.Account) !
         results_input.len,
     );
     defer std.testing.allocator.free(results_buffer);
-    const results_count = try client.createAccounts(results_input, results_buffer);
+    const results_count = try logged_create_accounts(client, results_input, results_buffer);
     const results = results_buffer[0..results_count];
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
@@ -445,7 +511,7 @@ fn verify_initial_lookup(client: *tigerbeetle.Client, ids: *const TestIds) !void
         lookup_ids.len,
     );
     defer std.testing.allocator.free(accounts_buffer);
-    const accounts_count = try client.lookupAccounts(&lookup_ids, accounts_buffer);
+    const accounts_count = try logged_lookup_accounts(client, &lookup_ids, accounts_buffer);
     const accounts = accounts_buffer[0..accounts_count];
 
     try std.testing.expectEqual(@as(usize, 2), accounts.len);
@@ -466,7 +532,7 @@ fn create_posted_transfer(client: *tigerbeetle.Client, ids: *const TestIds) !voi
         results_input.len,
     );
     defer std.testing.allocator.free(results_buffer);
-    const results_count = try client.createTransfers(results_input, results_buffer);
+    const results_count = try logged_create_transfers(client, results_input, results_buffer);
     const results = results_buffer[0..results_count];
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
@@ -488,7 +554,7 @@ fn reject_missing_debit_transfer(
         results_input.len,
     );
     defer std.testing.allocator.free(results_buffer);
-    const results_count = try client.createTransfers(results_input, results_buffer);
+    const results_count = try logged_create_transfers(client, results_input, results_buffer);
     const results = results_buffer[0..results_count];
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
@@ -510,7 +576,7 @@ fn create_linked_accounts_successfully(
         account_events.len,
     );
     defer std.testing.allocator.free(results_buffer);
-    const results_count = try client.createAccounts(&account_events, results_buffer);
+    const results_count = try logged_create_accounts(client, &account_events, results_buffer);
     const results = results_buffer[0..results_count];
 
     try std.testing.expectEqual(@as(usize, 2), results.len);
@@ -526,7 +592,8 @@ fn create_linked_accounts_successfully(
         lookup_ids.len,
     );
     defer std.testing.allocator.free(stored_accounts_buffer);
-    const stored_accounts_count = try client.lookupAccounts(
+    const stored_accounts_count = try logged_lookup_accounts(
+        client,
         &lookup_ids,
         stored_accounts_buffer,
     );
@@ -551,7 +618,7 @@ fn roll_back_linked_accounts(
         accounts.len,
     );
     defer std.testing.allocator.free(results_buffer);
-    const results_count = try client.createAccounts(&accounts, results_buffer);
+    const results_count = try logged_create_accounts(client, &accounts, results_buffer);
     const results = results_buffer[0..results_count];
 
     try std.testing.expectEqual(@as(usize, 2), results.len);
@@ -564,7 +631,8 @@ fn roll_back_linked_accounts(
         lookup_ids.len,
     );
     defer std.testing.allocator.free(stored_accounts_buffer);
-    const stored_accounts_count = try client.lookupAccounts(
+    const stored_accounts_count = try logged_lookup_accounts(
+        client,
         &lookup_ids,
         stored_accounts_buffer,
     );
@@ -587,7 +655,7 @@ fn reject_open_account_chain(
         results_input.len,
     );
     defer std.testing.allocator.free(results_buffer);
-    const results_count = try client.createAccounts(results_input, results_buffer);
+    const results_count = try logged_create_accounts(client, results_input, results_buffer);
     const results = results_buffer[0..results_count];
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
@@ -599,7 +667,7 @@ fn reject_open_account_chain(
         accounts_input.len,
     );
     defer std.testing.allocator.free(accounts_buffer);
-    const accounts_count = try client.lookupAccounts(accounts_input, accounts_buffer);
+    const accounts_count = try logged_lookup_accounts(client, accounts_input, accounts_buffer);
     const accounts = accounts_buffer[0..accounts_count];
 
     try std.testing.expectEqual(@as(usize, 0), accounts.len);
@@ -629,7 +697,7 @@ fn create_linked_transfers_successfully(
         transfers.len,
     );
     defer std.testing.allocator.free(results_buffer);
-    const results_count = try client.createTransfers(&transfers, results_buffer);
+    const results_count = try logged_create_transfers(client, &transfers, results_buffer);
     const results = results_buffer[0..results_count];
 
     try std.testing.expectEqual(@as(usize, 2), results.len);
@@ -671,7 +739,7 @@ fn roll_back_linked_transfers(
         transfers.len,
     );
     defer std.testing.allocator.free(results_buffer);
-    const results_count = try client.createTransfers(&transfers, results_buffer);
+    const results_count = try logged_create_transfers(client, &transfers, results_buffer);
     const results = results_buffer[0..results_count];
 
     try std.testing.expectEqual(@as(usize, 2), results.len);
@@ -707,7 +775,7 @@ fn reject_open_transfer_chain(
         results_input.len,
     );
     defer std.testing.allocator.free(results_buffer);
-    const results_count = try client.createTransfers(results_input, results_buffer);
+    const results_count = try logged_create_transfers(client, results_input, results_buffer);
     const results = results_buffer[0..results_count];
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
@@ -764,7 +832,7 @@ fn lookup_account_balances(
         lookup_ids.len,
     );
     defer std.testing.allocator.free(accounts_buffer);
-    const accounts_count = try client.lookupAccounts(&lookup_ids, accounts_buffer);
+    const accounts_count = try logged_lookup_accounts(client, &lookup_ids, accounts_buffer);
     const accounts = accounts_buffer[0..accounts_count];
 
     try std.testing.expectEqual(@as(usize, 2), accounts.len);
@@ -839,17 +907,11 @@ fn make_transfer(id: u128, debit_account_id: u128, credit_account_id: u128) tige
     };
 }
 
-fn owned_client() !*tigerbeetle.Client {
-    const owned = std.c.getenv("TIGERBEETLE_TEST_OWNED") orelse return error.FixtureOwnershipRequired;
-    if (!std.mem.eql(u8, std.mem.span(owned), "fresh-local-cluster")) return error.FixtureOwnershipRequired;
-    return tigerbeetle.Client.create(std.testing.allocator, std.testing.io, cluster_id, cluster_addresses());
-}
-
 fn expect_accounts(client: *tigerbeetle.Client, input: []const tigerbeetle.Account, statuses: []const u32) !void {
     assert(input.len > 0 and input.len <= 16);
     assert(input.len == statuses.len);
     var output: [16]tigerbeetle.CreateAccountResult = undefined;
-    try std.testing.expectEqual(input.len, try client.createAccounts(input, output[0..input.len]));
+    try std.testing.expectEqual(input.len, try logged_create_accounts(client, input, output[0..input.len]));
     for (statuses, output[0..input.len], 0..) |status, result, index| {
         errdefer std.debug.print("account id={d} index={d} expected={d} actual={d}\n", .{ input[index].id, index, status, result.status });
         try std.testing.expectEqual(status, result.status);
@@ -860,7 +922,7 @@ fn expect_transfers(client: *tigerbeetle.Client, input: []const tigerbeetle.Tran
     assert(input.len > 0 and input.len <= 16);
     assert(input.len == statuses.len);
     var output: [16]tigerbeetle.CreateTransferResult = undefined;
-    try std.testing.expectEqual(input.len, try client.createTransfers(input, output[0..input.len]));
+    try std.testing.expectEqual(input.len, try logged_create_transfers(client, input, output[0..input.len]));
     for (statuses, output[0..input.len], 0..) |status, result, index| {
         errdefer std.debug.print("transfer id={d} index={d} expected={d} actual={d}\n", .{ input[index].id, index, status, result.status });
         try std.testing.expectEqual(status, result.status);
@@ -869,65 +931,67 @@ fn expect_transfers(client: *tigerbeetle.Client, input: []const tigerbeetle.Tran
 
 fn observe(client: *tigerbeetle.Client, id: u128) !tigerbeetle.Account {
     var output: [1]tigerbeetle.Account = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try client.lookupAccounts(&.{id}, &output));
+    try std.testing.expectEqual(@as(usize, 1), try logged_lookup_accounts(client, &.{id}, &output));
     try std.testing.expectEqual(id, output[0].id);
     return output[0];
 }
 
 test "native immutable account chains duplicate regroup and reject different fields independently" {
-    const client = try owned_client();
+    const ns = try TestNamespace.init();
+    const client = try local_client();
     defer client.destroy();
-    var chain = [_]tigerbeetle.Account{ make_account(1001), make_account(1002) };
+    var chain = [_]tigerbeetle.Account{ make_account(ns.id(1001)), make_account(ns.id(1002)) };
     chain[0].flags |= account_linked_flag;
-    const neighbor = make_account(1003);
+    const neighbor = make_account(ns.id(1003));
     try expect_accounts(client, &.{ chain[0], chain[1], chain[0], chain[1], neighbor }, &.{ account_created, account_created, account_exists, account_linked_event_failed, account_created });
     // Subset redelivery with changed neighbors retains each complete original chain.
     try expect_accounts(client, &.{ neighbor, chain[0], chain[1] }, &.{ account_exists, account_exists, account_linked_event_failed });
     var conflict = neighbor;
     conflict.code = 2;
-    try expect_accounts(client, &.{ conflict, make_account(1004) }, &.{ c.TB_CREATE_ACCOUNT_EXISTS_WITH_DIFFERENT_CODE, account_created });
+    try expect_accounts(client, &.{ conflict, make_account(ns.id(1004)) }, &.{ c.TB_CREATE_ACCOUNT_EXISTS_WITH_DIFFERENT_CODE, account_created });
     var output: [5]tigerbeetle.Account = undefined;
-    const n = try client.lookupAccounts(&.{ 1002, 1099, 1001, 1002, 1003 }, &output);
+    const n = try logged_lookup_accounts(client, &.{ ns.id(1002), ns.id(1099), ns.id(1001), ns.id(1002), ns.id(1003) }, &output);
     try std.testing.expectEqual(@as(usize, 4), n);
     var copies: usize = 0;
     for (output[0..n]) |*account| {
-        try std.testing.expect(account.id == 1001 or account.id == 1002 or account.id == 1003);
-        if (account.id == 1002) {
+        try std.testing.expect(account.id == ns.id(1001) or account.id == ns.id(1002) or account.id == ns.id(1003));
+        if (account.id == ns.id(1002)) {
             copies += 1;
             try std.testing.expectEqual(@as(u16, 1), account.code);
         }
     }
     try std.testing.expectEqual(@as(usize, 2), copies);
-    try std.testing.expectEqual(@as(u16, 1), (try observe(client, 1003)).code);
+    try std.testing.expectEqual(@as(u16, 1), (try observe(client, ns.id(1003))).code);
 }
 
 test "native linked transfers replay regroup shared accounts consumed IDs and fresh rejection reasons" {
-    const client = try owned_client();
+    const ns = try TestNamespace.init();
+    const client = try local_client();
     defer client.destroy();
-    try expect_accounts(client, &.{ make_account(2001), make_account(2002) }, &.{ account_created, account_created });
-    var chain = [_]tigerbeetle.Transfer{ make_transfer(2011, 2001, 2002), make_transfer(2012, 2001, 2002) };
+    try expect_accounts(client, &.{ make_account(ns.id(2001)), make_account(ns.id(2002)) }, &.{ account_created, account_created });
+    var chain = [_]tigerbeetle.Transfer{ make_transfer(ns.id(2011), ns.id(2001), ns.id(2002)), make_transfer(ns.id(2012), ns.id(2001), ns.id(2002)) };
     chain[0].flags |= transfer_linked_flag;
-    const neighbor = make_transfer(2013, 2001, 2002);
+    const neighbor = make_transfer(ns.id(2013), ns.id(2001), ns.id(2002));
     try expect_transfers(client, &.{ chain[0], chain[1], chain[0], chain[1], neighbor }, &.{ transfer_created, transfer_created, transfer_exists, transfer_linked_event_failed, transfer_created });
     try expect_transfers(client, &.{ neighbor, chain[0], chain[1] }, &.{ transfer_exists, transfer_exists, transfer_linked_event_failed });
-    try std.testing.expectEqual(@as(u128, 30), (try observe(client, 2001)).debits_posted);
+    try std.testing.expectEqual(@as(u128, 30), (try observe(client, ns.id(2001))).debits_posted);
     var conflict = neighbor;
     conflict.amount = 11;
     try expect_transfers(client, &.{conflict}, &.{c.TB_CREATE_TRANSFER_EXISTS_WITH_DIFFERENT_AMOUNT});
-    var rejected = [_]tigerbeetle.Transfer{ make_transfer(2021, 2001, 2002), make_transfer(2022, 2099, 2002) };
+    var rejected = [_]tigerbeetle.Transfer{ make_transfer(ns.id(2021), ns.id(2001), ns.id(2002)), make_transfer(ns.id(2022), ns.id(2099), ns.id(2002)) };
     rejected[0].flags |= transfer_linked_flag;
     try expect_transfers(client, &rejected, &.{ transfer_linked_event_failed, debit_account_not_found });
     try expect_transfers(client, &rejected, &.{ transfer_linked_event_failed, c.TB_CREATE_TRANSFER_ID_ALREADY_FAILED });
-    try std.testing.expectEqual(@as(u128, 30), (try observe(client, 2001)).debits_posted);
+    try std.testing.expectEqual(@as(u128, 30), (try observe(client, ns.id(2001))).debits_posted);
     // The linked-failed prefix was rolled back, not consumed: its failure remains at member 2.
     // Separate singleton rejection demonstrates that repairing a reference cannot revive its ID.
-    const missing = make_transfer(2031, 2098, 2002);
+    const missing = make_transfer(ns.id(2031), ns.id(2098), ns.id(2002));
     try expect_transfers(client, &.{missing}, &.{debit_account_not_found});
-    try expect_accounts(client, &.{make_account(2098)}, &.{account_created});
+    try expect_accounts(client, &.{make_account(ns.id(2098))}, &.{account_created});
     try expect_transfers(client, &.{missing}, &.{c.TB_CREATE_TRANSFER_ID_ALREADY_FAILED});
-    const independent = make_transfer(2032, 2001, 2002);
+    const independent = make_transfer(ns.id(2032), ns.id(2001), ns.id(2002));
     try expect_transfers(client, &.{ missing, independent }, &.{ c.TB_CREATE_TRANSFER_ID_ALREADY_FAILED, transfer_created });
-    try std.testing.expectEqual(@as(u128, 40), (try observe(client, 2001)).debits_posted);
+    try std.testing.expectEqual(@as(u128, 40), (try observe(client, ns.id(2001))).debits_posted);
 }
 
 fn post_transfer(id: u128, pending_id: u128, amount: u128) tigerbeetle.Transfer {
@@ -940,44 +1004,45 @@ fn post_transfer(id: u128, pending_id: u128, amount: u128) tigerbeetle.Transfer 
 }
 
 test "native zero partial full post inheritance replay and native mismatch rejection" {
-    const client = try owned_client();
+    const ns = try TestNamespace.init();
+    const client = try local_client();
     defer client.destroy();
-    try expect_accounts(client, &.{ make_account(3001), make_account(3002) }, &.{ account_created, account_created });
+    try expect_accounts(client, &.{ make_account(ns.id(3001)), make_account(ns.id(3002)) }, &.{ account_created, account_created });
     const amounts = [_]u128{ 0, 4, std.math.maxInt(u128) };
     const posted = [_]u128{ 0, 4, 14 };
     for (amounts, 0..) |amount, index| {
-        var pending = make_transfer(3010 + index, 3001, 3002);
+        var pending = make_transfer(ns.id(3010) + index, ns.id(3001), ns.id(3002));
         pending.flags = tigerbeetle.transfer_pending;
         pending.timeout = 60;
         try expect_transfers(client, &.{pending}, &.{transfer_created});
-        try std.testing.expectEqual(@as(u128, 10), (try observe(client, 3001)).debits_pending);
-        var post = post_transfer(3020 + index, pending.id, amount);
+        try std.testing.expectEqual(@as(u128, 10), (try observe(client, ns.id(3001))).debits_pending);
+        var post = post_transfer(ns.id(3020) + index, pending.id, amount);
         if (index == 1) { // Explicit matching inheritance fields and zero defaults both work.
-            post.debit_account_id = 3001;
-            post.credit_account_id = 3002;
+            post.debit_account_id = ns.id(3001);
+            post.credit_account_id = ns.id(3002);
             post.ledger = ledger;
             post.code = transfer_code;
         }
         try expect_transfers(client, &.{post}, &.{transfer_created});
         try expect_transfers(client, &.{ pending, post }, &.{ transfer_exists, transfer_exists });
-        const account = try observe(client, 3001);
+        const account = try observe(client, ns.id(3001));
         try std.testing.expectEqual(@as(u128, 0), account.debits_pending);
         try std.testing.expectEqual(posted[index], account.debits_posted);
     }
-    var pending = make_transfer(3030, 3001, 3002);
+    var pending = make_transfer(ns.id(3030), ns.id(3001), ns.id(3002));
     pending.flags = tigerbeetle.transfer_pending;
     pending.timeout = 60;
     try expect_transfers(client, &.{pending}, &.{transfer_created});
-    var mismatch = post_transfer(3031, pending.id, 1);
+    var mismatch = post_transfer(ns.id(3031), pending.id, 1);
     mismatch.ledger = ledger + 1;
     try expect_transfers(client, &.{mismatch}, &.{c.TB_CREATE_TRANSFER_PENDING_TRANSFER_HAS_DIFFERENT_LEDGER});
-    const excessive = post_transfer(3032, pending.id, 11);
+    const excessive = post_transfer(ns.id(3032), pending.id, 11);
     try expect_transfers(client, &.{excessive}, &.{c.TB_CREATE_TRANSFER_EXCEEDS_PENDING_TRANSFER_AMOUNT});
     // Distinct posts share the pending reference: only the first can resolve it.
-    const first = post_transfer(3033, pending.id, 1);
-    const second = post_transfer(3034, pending.id, 1);
+    const first = post_transfer(ns.id(3033), pending.id, 1);
+    const second = post_transfer(ns.id(3034), pending.id, 1);
     try expect_transfers(client, &.{ first, second }, &.{ transfer_created, c.TB_CREATE_TRANSFER_PENDING_TRANSFER_ALREADY_POSTED });
-    try std.testing.expectEqual(@as(u128, 15), (try observe(client, 3001)).debits_posted);
+    try std.testing.expectEqual(@as(u128, 15), (try observe(client, ns.id(3001))).debits_posted);
 }
 
 fn wait_pending_cleanup(client: *tigerbeetle.Client, id: u128) !void {
@@ -990,40 +1055,42 @@ fn wait_pending_cleanup(client: *tigerbeetle.Client, id: u128) !void {
 }
 
 test "native pending expiry cleanup replay does not renew and first late post rejects" {
-    const client = try owned_client();
+    const ns = try TestNamespace.init();
+    const client = try local_client();
     defer client.destroy();
-    try expect_accounts(client, &.{ make_account(4001), make_account(4002) }, &.{ account_created, account_created });
-    var pending = make_transfer(4011, 4001, 4002);
+    try expect_accounts(client, &.{ make_account(ns.id(4001)), make_account(ns.id(4002)) }, &.{ account_created, account_created });
+    var pending = make_transfer(ns.id(4011), ns.id(4001), ns.id(4002));
     pending.flags = tigerbeetle.transfer_pending;
     pending.timeout = 1;
     try expect_transfers(client, &.{pending}, &.{transfer_created});
-    try std.testing.expectEqual(@as(u128, 10), (try observe(client, 4001)).debits_pending);
-    try wait_pending_cleanup(client, 4001);
+    try std.testing.expectEqual(@as(u128, 10), (try observe(client, ns.id(4001))).debits_pending);
+    try wait_pending_cleanup(client, ns.id(4001));
     try expect_transfers(client, &.{pending}, &.{transfer_exists});
-    try std.testing.expectEqual(@as(u128, 0), (try observe(client, 4001)).debits_pending);
-    const post = post_transfer(4012, pending.id, 1);
+    try std.testing.expectEqual(@as(u128, 0), (try observe(client, ns.id(4001))).debits_pending);
+    const post = post_transfer(ns.id(4012), pending.id, 1);
     try expect_transfers(client, &.{post}, &.{c.TB_CREATE_TRANSFER_PENDING_TRANSFER_EXPIRED});
     // Expiry is nontransient in the pinned status table: it does not consume this post ID.
     try expect_transfers(client, &.{post}, &.{c.TB_CREATE_TRANSFER_PENDING_TRANSFER_EXPIRED});
-    const account = try observe(client, 4001);
+    const account = try observe(client, ns.id(4001));
     try std.testing.expectEqual(@as(u128, 0), account.debits_pending);
     try std.testing.expectEqual(@as(u128, 0), account.debits_posted);
 }
 
 test "native fresh missing to found observations and discarded reply replay preserve effects" {
-    const client = try owned_client();
+    const ns = try TestNamespace.init();
+    const client = try local_client();
     defer client.destroy();
     var output: [1]tigerbeetle.Account = undefined;
-    try std.testing.expectEqual(@as(usize, 0), try client.lookupAccounts(&.{5001}, &output));
-    try expect_accounts(client, &.{ make_account(5001), make_account(5002) }, &.{ account_created, account_created });
-    try std.testing.expectEqual(@as(u128, 0), (try observe(client, 5001)).debits_posted);
-    const transfer = make_transfer(5011, 5001, 5002);
+    try std.testing.expectEqual(@as(usize, 0), try logged_lookup_accounts(client, &.{ns.id(5001)}, &output));
+    try expect_accounts(client, &.{ make_account(ns.id(5001)), make_account(ns.id(5002)) }, &.{ account_created, account_created });
+    try std.testing.expectEqual(@as(u128, 0), (try observe(client, ns.id(5001))).debits_posted);
+    const transfer = make_transfer(ns.id(5011), ns.id(5001), ns.id(5002));
     var discarded: [1]tigerbeetle.CreateTransferResult = undefined;
-    _ = try client.createTransfers(&.{transfer}, &discarded); // Models a lost application reply, not process death.
-    try std.testing.expectEqual(@as(u128, 10), (try observe(client, 5001)).debits_posted);
-    const other = make_transfer(5012, 5001, 5002);
+    _ = try logged_create_transfers(client, &.{transfer}, &discarded); // Models a lost application reply, not process death.
+    try std.testing.expectEqual(@as(u128, 10), (try observe(client, ns.id(5001))).debits_posted);
+    const other = make_transfer(ns.id(5012), ns.id(5001), ns.id(5002));
     try expect_transfers(client, &.{ other, transfer }, &.{ transfer_created, transfer_exists });
-    try std.testing.expectEqual(@as(u128, 20), (try observe(client, 5001)).debits_posted);
+    try std.testing.expectEqual(@as(u128, 20), (try observe(client, ns.id(5001))).debits_posted);
 }
 
 const ConcurrentDuplicate = struct {
@@ -1037,7 +1104,7 @@ const ConcurrentDuplicate = struct {
     fn run(self: *ConcurrentDuplicate) void {
         _ = self.ready.fetchAdd(1, .release);
         self.start.waitUncancelable(std.testing.io);
-        const count = self.client.createTransfers(self.input, &self.output) catch |err| {
+        const count = logged_create_transfers(self.client, self.input, &self.output) catch |err| {
             self.failure = err;
             return;
         };
@@ -1046,12 +1113,13 @@ const ConcurrentDuplicate = struct {
 };
 
 test "native concurrent duplicate clients create one immutable chain effect" {
-    const first = try owned_client();
+    const ns = try TestNamespace.init();
+    const first = try local_client();
     defer first.destroy();
-    const second = try owned_client();
+    const second = try local_client();
     defer second.destroy();
-    try expect_accounts(first, &.{ make_account(6001), make_account(6002) }, &.{ account_created, account_created });
-    var input = [_]tigerbeetle.Transfer{ make_transfer(6011, 6001, 6002), make_transfer(6012, 6001, 6002) };
+    try expect_accounts(first, &.{ make_account(ns.id(6001)), make_account(ns.id(6002)) }, &.{ account_created, account_created });
+    var input = [_]tigerbeetle.Transfer{ make_transfer(ns.id(6011), ns.id(6001), ns.id(6002)), make_transfer(ns.id(6012), ns.id(6001), ns.id(6002)) };
     input[0].flags |= transfer_linked_flag;
     var ready: std.atomic.Value(u32) = .init(0);
     var start: std.Io.Event = .unset;
@@ -1088,27 +1156,86 @@ test "native concurrent duplicate clients create one immutable chain effect" {
     try std.testing.expectEqual(transfer_created, created_reply[1].status);
     try std.testing.expectEqual(transfer_exists, replay_reply[0].status);
     try std.testing.expectEqual(transfer_linked_event_failed, replay_reply[1].status);
-    try std.testing.expectEqual(@as(u128, 20), (try observe(first, 6001)).debits_posted);
+    try std.testing.expectEqual(@as(u128, 20), (try observe(first, ns.id(6001))).debits_posted);
 }
 
 test "native discarded shared account reply replays intact subset with new neighbor before transfers" {
-    const client = try owned_client();
+    const ns = try TestNamespace.init();
+    const client = try local_client();
     defer client.destroy();
-    var first = [_]tigerbeetle.Account{ make_account(7001), make_account(7002), make_account(7003) };
+    var first = [_]tigerbeetle.Account{ make_account(ns.id(7001)), make_account(ns.id(7002)), make_account(ns.id(7003)) };
     first[0].flags = account_linked_flag;
     var discarded: [3]tigerbeetle.CreateAccountResult = undefined;
-    _ = try client.createAccounts(&first, &discarded);
+    _ = try logged_create_accounts(client, &first, &discarded);
     // Deliberately discard the application reply, then inspect durable native facts.
     // This does not simulate process termination or establish that termination aborts a write.
-    const before = try observe(client, 7001);
+    const before = try observe(client, ns.id(7001));
     try std.testing.expectEqual(@as(u128, 0), before.debits_posted);
-    try expect_accounts(client, &.{ make_account(7004), first[0], first[1] }, &.{ account_created, account_exists, account_linked_event_failed });
-    const after = try observe(client, 7001);
+    try expect_accounts(client, &.{ make_account(ns.id(7004)), first[0], first[1] }, &.{ account_created, account_exists, account_linked_event_failed });
+    const after = try observe(client, ns.id(7001));
     try std.testing.expectEqualDeep(before, after);
-    const transfer = make_transfer(7010, 7001, 7002);
+    const transfer = make_transfer(ns.id(7010), ns.id(7001), ns.id(7002));
     try expect_transfers(client, &.{transfer}, &.{transfer_created});
-    try std.testing.expectEqual(@as(u128, 10), (try observe(client, 7001)).debits_posted);
+    try std.testing.expectEqual(@as(u128, 10), (try observe(client, ns.id(7001))).debits_posted);
     try expect_accounts(client, first[0..2], &.{ account_exists, account_linked_event_failed });
     try expect_transfers(client, &.{transfer}, &.{transfer_exists});
-    try std.testing.expectEqual(@as(u128, 10), (try observe(client, 7001)).debits_posted);
+    try std.testing.expectEqual(@as(u128, 10), (try observe(client, ns.id(7001))).debits_posted);
+}
+
+test "native account flags void balances and complete linked replay" {
+    const ns = try TestNamespace.init();
+    const client = try local_client();
+    defer client.destroy();
+
+    const flags = [_]u16{ 0, 2, 4, 8, 10, 12 };
+    var accounts: [flags.len]tigerbeetle.Account = undefined;
+    for (flags, 0..) |flag, index| {
+        accounts[index] = make_account(ns.id(@intCast(8001 + index)));
+        accounts[index].flags = flag;
+    }
+    try expect_accounts(client, &accounts, &.{ account_created, account_created, account_created, account_created, account_created, account_created });
+    for (accounts) |item| {
+        try std.testing.expectEqual(item.flags, (try observe(client, item.id)).flags);
+    }
+
+    const debit_id = accounts[0].id;
+    const credit_id = ns.id(8007);
+    try expect_accounts(client, &.{make_account(credit_id)}, &.{account_created});
+    const initial = try lookup_account_balances(client, debit_id, credit_id);
+    var pending = make_transfer(ns.id(8011), debit_id, credit_id);
+    pending.flags = tigerbeetle.transfer_pending;
+    pending.timeout = 60;
+    try expect_transfers(client, &.{pending}, &.{transfer_created});
+    const reserved = try lookup_account_balances(client, debit_id, credit_id);
+    try std.testing.expectEqual(
+        initial.debit_account.debits_pending + transfer_amount,
+        reserved.debit_account.debits_pending,
+    );
+    try std.testing.expectEqual(
+        initial.credit_account.credits_pending + transfer_amount,
+        reserved.credit_account.credits_pending,
+    );
+    try std.testing.expectEqual(initial.debit_account.debits_posted, reserved.debit_account.debits_posted);
+    try std.testing.expectEqual(initial.credit_account.credits_posted, reserved.credit_account.credits_posted);
+    const voided = void_transfer(ns.id(8012), pending.id);
+    try expect_transfers(client, &.{voided}, &.{transfer_created});
+    try std.testing.expectEqualDeep(initial, try lookup_account_balances(client, debit_id, credit_id));
+
+    pending.id = ns.id(8013);
+    pending.flags |= tigerbeetle.transfer_linked;
+    const linked_void = void_transfer(ns.id(8014), pending.id);
+    const chain = [_]tigerbeetle.Transfer{ pending, linked_void };
+    try expect_transfers(client, &chain, &.{ transfer_created, transfer_created });
+    const committed = try lookup_account_balances(client, debit_id, credit_id);
+    try std.testing.expectEqualDeep(initial, committed);
+    try expect_transfers(client, &chain, &.{ transfer_exists, transfer_linked_event_failed });
+    try std.testing.expectEqualDeep(committed, try lookup_account_balances(client, debit_id, credit_id));
+}
+
+fn void_transfer(id: u128, pending_id: u128) tigerbeetle.Transfer {
+    var transfer = std.mem.zeroes(tigerbeetle.Transfer);
+    transfer.id = id;
+    transfer.pending_id = pending_id;
+    transfer.flags = tigerbeetle.transfer_void_pending_transfer;
+    return transfer;
 }

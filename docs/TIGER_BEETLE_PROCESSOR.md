@@ -61,15 +61,16 @@ allowed within and across lists and Operations. Aliases never resolve references
 
 | Command | Required fields beyond id | Optional fields beyond alias | Native construction |
 | --- | --- | --- | --- |
-| Account creation | ledger, code, flags | None | Nonzero ledger/code; flags exactly 0 or debit-bound 2. |
+| Account creation | ledger, code, flags | None | Nonzero ledger/code; flags 0, debit-bound 2, credit-bound 4, history 8, or history with one bound (10 or 12). |
 | Immediate transfer | debit_account_id, credit_account_id, amount, ledger, code, flags | None | Flags 0; concrete account references; nonzero ledger/code; reject pending_id and timeout even zero. |
 | Pending transfer | debit_account_id, credit_account_id, amount, ledger, code, flags, timeout | None | Flags 2; concrete references; nonzero ledger/code; positive timeout; reject pending_id even zero. |
 | Post-pending transfer | pending_id, amount, flags | debit_account_id, credit_account_id, ledger, code | Flags 4; concrete pending ID; omitted optional fields default to native zero inheritance; reject timeout even zero. |
+| Void-pending transfer | pending_id, amount, flags | debit_account_id, credit_account_id, ledger, code | Flags 8; concrete pending ID; omitted optional fields default to native zero inheritance; reject timeout even zero. |
 | Account lookup | None | None | Submit the concrete account ID. |
 
 - ID/reference/amount strings use `0|[1-9][0-9]*`, with checked conversion and no floats, coercion,
   whitespace, signs, leading zeros, exponents or alternative radices. Amount admits the full u128
-  range including zero and maximum. Post account references additionally admit zero inheritance.
+  range including zero and maximum. Post and void account references additionally admit zero inheritance.
 - Ledger and timeout use unsigned JSON integers within u32; code and flags within u16. Apply mode
   constraints from the table. Validate the existing normalized Zig 0.16 Body: original `1.0`/`1e0`
   may already be `1`; reject remaining fractions, negative zero, negatives and overflow. Add no
@@ -78,12 +79,17 @@ allowed within and across lists and Operations. Aliases never resolve references
   Resubmit its original interval on retry. Native creation time starts expiry; cleanup is best
   effort and need not occur at the exact expiry instant.
 - Post amount zero posts zero; partial amount posts that amount and releases the remainder;
-  maximum requests the full pending amount. Omitted or explicit-zero post account/ledger/code
+  maximum requests the full pending amount. Void always cancels the entire pending amount:
+  zero is its native full-amount sentinel, while a nonzero amount is an expectation checked for
+  exact equality by TigerBeetle. The maximum has no special void meaning. Omitted or
+  explicit-zero post/void account/ledger/code
   fields inherit; supplied nonzero fields must match native state. Preserve these sentinels.
-- Reject equal immediate/pending debit and credit IDs, post ID equal to pending ID, and equal
-  nonzero post debit and credit IDs. Either or both post account references may be zero.
-- Reject caller linked bits, combined transfer modes, void, balancing, closing, imported,
-  credit-bound/history account creation, user-data input, timestamps, reserved fields and balance
+- Reject equal immediate/pending debit and credit IDs, resolution ID equal to pending ID, and equal
+  nonzero post/void debit and credit IDs. Either or both resolution account references may be zero.
+- Account flags use an allowed-bit mask for 2, 4 and 8, excluding simultaneous debit and credit
+  bounds. Transfer flags must be exactly 0, 2, 4 or 8. Reject caller linked bits, combined transfer
+  modes, balancing, closing, imported,
+  user-data input, timestamps, reserved fields and balance
   counters, including supplied zeros. Derive linked bits; zero processor-owned native fields.
   Post zero user data may inherit metadata from the pending transfer.
 - Leave existence, ledger compatibility, balances, pending lifecycle, inheritance matching and
@@ -250,8 +256,8 @@ Participating accounts must not be closed by any writer. Pending and cumulative 
 including intermediate execution, remain small under the accepted operating assumption; unrestricted
 u128-boundary recovery and special overflow-code deferral are not requirements. No new numeric
 admission cap is implied by the small-total operating assumption.
-Expired pending creation may replay successfully without renewing a reservation; a first post after
-expiry may reject, while replay can establish an already committed post.
+Expired pending creation may replay successfully without renewing a reservation; a first post or
+void after expiry may reject, while replay can establish an already committed resolution.
 
 ## Interfaces and memory ownership
 
@@ -318,10 +324,11 @@ commands coincide. Equivalent JSON escapes normalize before validation; numeric 
 trimmed or rewritten. Small-number normalization can lose original spelling or precision before
 the processor sees the Body; this design adds no arbitrary-precision intake guarantee.
 
-Mandatory positive pending timeout gives abandoned pending transfers an automatic expiry because
-this surface has no void command. A zero-amount transfer still requests a recorded native event.
-Posting resolves a pending transfer once; zero posting releases its reservation while posting zero,
-and partial posting releases the unused remainder. State-dependent timeout overflow uses the
+Mandatory positive pending timeout gives abandoned pending transfers an automatic expiry if callers
+do not post or void them. A zero-amount transfer still requests a recorded native event.
+Posting or voiding resolves a pending transfer once. Zero posting releases its reservation while
+posting zero; zero voiding releases the reservation without posting. Partial posting releases the
+unused remainder. State-dependent timeout overflow uses the
 server-assigned timestamp and remains a native check.
 
 The first-member replay proof is conditional: matching exists establishes that the first record
@@ -344,9 +351,17 @@ ready Completions from publishing.
 The full Account projection preserves returned fields that input deliberately forbids. Creation
 result timestamp/reserved are intentionally omitted because those entries report statuses, while
 lookup timestamp is account creation time in nanoseconds since Unix epoch, not observation time.
+The history flag retains native balance history for an account; this processor does not expose a
+history query.
+
 Preflight null placeholders mean no execution result. They do not mean success; omitted suffixes and
 empty neighboring lists in that diagnostic do not mean the corresponding commands were unrequested.
 The public null-code/message shape alone need not prove that an Operation attempted no writes.
+
+The live `zig build test-tigerbeetle` suite includes account flag, void balance, and linked replay
+checks against an already running local cluster 0 replica at `127.0.0.1:3000`. It logs native calls,
+uses fresh random nonreserved IDs on every run, and leaves created records in the replica. A call may
+wait if the replica is unavailable. The optional isolated runner retains its separate ownership check.
 
 The capacity proof reserves worst-case widths and escaping so admission is independent of native
 outcomes. Maximum compact sizes are 467 bytes for a submitted creation entry, 935 for a found lookup,
@@ -399,6 +414,19 @@ Zero post with explicit inheritance sentinels:
 
 ```json
 {"create_transfers":[{"id":"303","pending_id":"301","debit_account_id":"0","credit_account_id":"0","amount":"0","ledger":0,"code":0,"flags":4}]}
+```
+
+Full void using the zero amount sentinel and omitted inheritance fields (as an alternative to
+posting pending transfer 301):
+
+```json
+{"create_transfers":[{"id":"304","pending_id":"301","amount":"0","flags":8}]}
+```
+
+History with a credit bound:
+
+```json
+{"create_accounts":[{"id":"104","ledger":1,"code":1,"flags":12}]}
 ```
 
 Rejected Body examples, each with a valid Processor Message envelope:
@@ -463,8 +491,8 @@ journal, checkpoint, lease, saved observation, chain registry, dependency schedu
 compensation, member salvage, third-party dependency or asynchronous timeout mechanism. Framework
 identity allocation, retention, cancellation policy and exhaustion disposition remain external.
 
-Unsupported creation features include void, balancing, closing, historical import, credit-bound or
-history accounts, user-data input and non-expiring pending transfers. Closure by any participating
+Unsupported creation features include balancing, closing, historical import, history queries,
+caller-controlled linking, user-data input and non-expiring pending transfers. Closure by any participating
 writer, incompatible/partially overlapping creation histories, and unrestricted numeric-boundary
 account totals are excluded from the recovery guarantee. Such counterexamples do not imply new
 production detection or special overflow deferral behavior.

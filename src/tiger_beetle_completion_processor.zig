@@ -468,6 +468,11 @@ test "completion derives success and failure from native bodies and preserves de
         .{ .body = "{\"create_accounts\":[{\"error_code\":\"created\"}],\"create_transfers\":[],\"lookup_accounts\":[]}", .success = true },
         .{ .body = "{\"create_accounts\":[{\"error_code\":\"exists\"},{\"error_code\":\"linked_event_failed\"}],\"create_transfers\":[],\"lookup_accounts\":[]}", .success = true },
         .{ .body = "{\"create_accounts\":[],\"create_transfers\":[],\"lookup_accounts\":[{\"error_code\":null,\"message\":\"Account was not found.\"}]}", .success = false },
+        .{ .body = "{\"create_accounts\":[],\"create_transfers\":[{\"error_code\":\"exists\"},{\"error_code\":\"linked_event_failed\"}],\"lookup_accounts\":[]}", .success = true },
+        .{ .body = "{\"create_accounts\":[],\"create_transfers\":[{\"error_code\":\"pending_transfer_has_different_amount\"}],\"lookup_accounts\":[]}", .success = false },
+        .{ .body = "{\"create_accounts\":[],\"create_transfers\":[{\"error_code\":\"pending_transfer_already_posted\"}],\"lookup_accounts\":[]}", .success = false },
+        .{ .body = "{\"create_accounts\":[],\"create_transfers\":[{\"error_code\":\"pending_transfer_already_voided\"}],\"lookup_accounts\":[]}", .success = false },
+        .{ .body = "{\"create_accounts\":[],\"create_transfers\":[{\"error_code\":\"pending_transfer_expired\"}],\"lookup_accounts\":[]}", .success = false },
         .{ .body = "{\"create_accounts\":[{\"error_code\":\"linked_event_failed\"},{\"error_code\":\"exists\"}],\"create_transfers\":[],\"lookup_accounts\":[]}", .success = false },
         .{ .body = "{\"create_accounts\":[],\"create_transfers\":[],\"lookup_accounts\":[],\"error\":{\"message\":\"Invalid Body.\"}}", .success = false },
     };

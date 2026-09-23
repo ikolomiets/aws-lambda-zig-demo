@@ -369,11 +369,19 @@ and needs no live TigerBeetle cluster.
 
 ## Live integration tests
 
-`tests/tigerbeetle_integration.zig` exercises the public wrapper against an explicitly owned,
-fresh cluster ID `0`. The suite refuses to run without the fixture ownership marker. Never set
-that marker for an arbitrary existing service. The local runner formats a unique temporary data
-file, starts its own replica, verifies that its child owns the listener, and waits for all clients
-before stopping that replica and deleting only its temporary directory:
+`tests/tigerbeetle_integration.zig` exercises the public wrapper against the existing development
+cluster ID `0` at `127.0.0.1:3000`. Each test uses a fresh random ID namespace, so repeated runs
+leave their records in the cluster without colliding with earlier test runs. The suite logs before
+native calls; a call can wait if the replica is unavailable. Run it with:
+
+```sh
+zig build test-tigerbeetle
+```
+
+An optional isolated runner formats a unique temporary data file, starts its own replica, verifies
+that its child owns the listener, and waits for all clients before stopping that replica and
+deleting only its temporary directory. Its nondefault loopback port requires the runner's fixture
+ownership marker; never set that marker for an arbitrary existing service:
 
 ```sh
 bash tests/tigerbeetle_isolated_test.sh /absolute/path/to/verified/tigerbeetle <verified-server-sha256>
@@ -386,8 +394,8 @@ provenance and payload checksums. It uses loopback port 33171 and fails if its c
 The client remains the pinned patched tree `e9bb4085cb18500e37df9714b3eea1cc3f7b6d4e` described
 above. Any identity mismatch requires investigation; do not substitute a newer server or client.
 
-The suite uses deterministic IDs unique within that fresh cluster, ledger 7101 and its own account
-pairs. No operator account is used. Baseline creation, singleton replay, sparse lookup, a posted
+The suite uses fresh random ID namespaces with stable offsets within each test, ledger 7101 and its
+own account pairs. No operator account is used. Baseline creation, singleton replay, sparse lookup, a posted
 transfer, and missing-debit rejection verify exact statuses and balances. The execution-accounting
 scenario creates its own credit account, posts 100 units and replays unchanged singleton requests.
 Native requests have no client-side timeout. The live step is separate from `zig build test`.
@@ -416,7 +424,8 @@ Lookup responses still omit missing IDs, so every account lookup is matched by `
 by result position.
 
 All creation histories keep their original IDs, fields and chain membership. Successful records
-are immutable; the runner disposes of the fresh cluster rather than attempting record deletion.
+are immutable; regular development runs leave them in place, while the isolated runner disposes of
+only its own temporary cluster rather than attempting record deletion.
 The suite starts native evidence for ticket 01, and must be extended and rerun against the final
 implementation in ticket 05. See [the ticket-01 evidence record](TIGERBEETLE_NATIVE_BUFFERS_EVIDENCE.md)
 for commands, identity checks, matrix coverage and runtime limitations.

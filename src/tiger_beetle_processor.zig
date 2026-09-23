@@ -1197,23 +1197,29 @@ fn validate_command(family: Family, value: *const std.json.Value, command: *Comm
         const raw = object.get("flags") orelse return field_error("flags", "Required field is missing.");
         fields.flags = @intCast(small_number(raw, 65535) catch
             return field_error("flags", "Expected an unsigned u16 integer."));
+        const account_bounds = tigerbeetle.account_debits_must_not_exceed_credits |
+            tigerbeetle.account_credits_must_not_exceed_debits;
+        const account_allowed = account_bounds | tigerbeetle.account_history;
         const allowed = fields.flags == 0 or (switch (family) {
-            .create_accounts => fields.flags == tigerbeetle.account_debits_must_not_exceed_credits,
+            .create_accounts => fields.flags & ~account_allowed == 0 and
+                fields.flags & account_bounds != account_bounds,
             .create_transfers => fields.flags == tigerbeetle.transfer_pending or
-                fields.flags == tigerbeetle.transfer_post_pending_transfer,
+                fields.flags == tigerbeetle.transfer_post_pending_transfer or
+                fields.flags == tigerbeetle.transfer_void_pending_transfer,
             .lookup_accounts => unreachable,
         });
         if (!allowed) return field_error("flags", "Unsupported flags.");
     }
-    const post = family == .create_transfers and
-        fields.flags == tigerbeetle.transfer_post_pending_transfer;
+    const resolution = family == .create_transfers and
+        (fields.flags == tigerbeetle.transfer_post_pending_transfer or
+            fields.flags == tigerbeetle.transfer_void_pending_transfer);
     const pending = family == .create_transfers and fields.flags == tigerbeetle.transfer_pending;
     // Enum order is the public diagnostic precedence, independent of JSON member order.
     inline for (@typeInfo(WireField).@"enum".fields) |field_info| {
         const field: WireField = @enumFromInt(field_info.value);
         const name = field_info.name;
         if (known_field(family, name)) {
-            if (validate_field(field, object.get(name), post, pending, &fields)) |problem| {
+            if (validate_field(field, object.get(name), resolution, pending, &fields)) |problem| {
                 return problem;
             }
         }
@@ -1225,19 +1231,19 @@ fn validate_command(family: Family, value: *const std.json.Value, command: *Comm
 fn validate_field(
     comptime field: WireField,
     raw: ?std.json.Value,
-    post: bool,
+    resolution: bool,
     pending: bool,
     fields: *ParsedFields,
 ) ?Diagnostic {
     const name = @tagName(field);
     const reference = field == .debit_account_id or field == .credit_account_id;
-    const forbidden = (field == .pending_id and !post) or (field == .timeout and !pending);
+    const forbidden = (field == .pending_id and !resolution) or (field == .timeout and !pending);
     if (forbidden) {
         if (raw != null) return field_error(name, "Field is forbidden in this transfer mode.");
         return null;
     }
-    const required = field == .id or field == .amount or (field == .pending_id and post) or
-        ((reference or field == .ledger or field == .code) and !post) or
+    const required = field == .id or field == .amount or (field == .pending_id and resolution) or
+        ((reference or field == .ledger or field == .code) and !resolution) or
         (field == .timeout and pending);
     const present = raw orelse {
         if (required) return field_error(name, "Required field is missing.");
@@ -1247,7 +1253,7 @@ fn validate_field(
         fields.alias = valid_alias(present) catch
             return field_error(name, "Expected 1 to 64 bytes of UTF-8 alias text.");
     } else if (field == .id or field == .pending_id or reference or field == .amount) {
-        const minimum: u128 = if (field == .amount or (post and reference)) 0 else 1;
+        const minimum: u128 = if (field == .amount or (resolution and reference)) 0 else 1;
         const maximum = std.math.maxInt(u128) - @as(u128, if (field == .amount) 0 else 1);
         @field(fields, name) = decimal(present, minimum, maximum) catch
             return field_error(name, "Expected a canonical decimal string in the allowed range.");
@@ -1255,7 +1261,7 @@ fn validate_field(
         const maximum: u32 = if (field == .code) 65535 else std.math.maxInt(u32);
         @field(fields, name) = small_number(present, maximum) catch
             return field_error(name, "Expected an unsigned integer in the allowed range.");
-        if (!post and @field(fields, name) == 0) {
+        if (!resolution and @field(fields, name) == 0) {
             return field_error(name, "Expected a positive integer.");
         }
     }
@@ -1295,7 +1301,9 @@ fn construct_command(family: Family, fields: *const ParsedFields, command: *Comm
 fn command_relationship(command: *const Command) ?Diagnostic {
     if (command.native != .transfer) return null;
     const transfer = &command.native.transfer;
-    if (transfer.flags == tigerbeetle.transfer_post_pending_transfer and transfer.id == transfer.pending_id) {
+    const resolution = transfer.flags == tigerbeetle.transfer_post_pending_transfer or
+        transfer.flags == tigerbeetle.transfer_void_pending_transfer;
+    if (resolution and transfer.id == transfer.pending_id) {
         return field_error("pending_id", "Transfer ID and pending transfer ID must differ.");
     }
     if (transfer.debit_account_id != 0 and transfer.debit_account_id == transfer.credit_account_id) {
@@ -1562,6 +1570,31 @@ test "native construction preserves namespaces chain bits post defaults and orig
     for (plan.outcomes) |outcome| try std.testing.expect(outcome == .unsubmitted);
 }
 
+test "void chain construction and lost-reply replay retain original native requests" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const body =
+        \\{"create_transfers":[{"id":"11","flags":2,"debit_account_id":"1","credit_account_id":"2","amount":"9","ledger":1,"code":1,"timeout":60},{"id":"12","flags":8,"pending_id":"11","amount":"0"}]}
+    ;
+    const first = (try test_plan(arena.allocator(), body)).admitted;
+    const replay = (try test_plan(arena.allocator(), body)).admitted;
+    try std.testing.expectEqualDeep(first.commands[0].native.transfer, replay.commands[0].native.transfer);
+    try std.testing.expectEqualDeep(first.commands[1].native.transfer, replay.commands[1].native.transfer);
+    try std.testing.expectEqual(@as(u16, tigerbeetle.transfer_pending | tigerbeetle.transfer_linked), first.commands[0].native.transfer.flags);
+    try std.testing.expectEqual(@as(u16, tigerbeetle.transfer_void_pending_transfer), first.commands[1].native.transfer.flags);
+    try std.testing.expectEqual(@as(u128, 0), first.commands[1].native.transfer.amount);
+    const Result = tigerbeetle.CreateTransferResult;
+    var statuses = [_]Result{std.mem.zeroes(Result)} ** 2;
+    statuses[0].status = tigerbeetle.transfer_exists;
+    statuses[1].status = tigerbeetle.transfer_linked_event_failed;
+    try std.testing.expectEqual(ChainState.accepted, try classify_chain(.create_transfers, &statuses));
+    statuses[0].status = tigerbeetle.transfer_linked_event_failed;
+    statuses[1].status = tigerbeetle.transfer_exists;
+    try std.testing.expectEqual(ChainState.rejected, try classify_chain(.create_transfers, &statuses));
+    statuses[1].status = 123456;
+    try std.testing.expectEqual(ChainState.rejected, try classify_chain(.create_transfers, &statuses));
+}
+
 test "aliases preserve escaped UTF-8 bytes and reject invalid decoded lengths" {
     const aliases = [_][]const u8{ "a", " " ** 64, "é" ** 32, "\\u0000", "é", "\\u0061" };
     const decoded = [_][]const u8{ "a", " " ** 64, "é" ** 32, "\x00", "é", "a" };
@@ -1631,6 +1664,7 @@ test "field mode matrix rejects omissions prohibited fields and unsupported flag
         "{\"id\":\"1\",\"flags\":0,\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1}",
         "{\"id\":\"1\",\"flags\":2,\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1,\"timeout\":1}",
         "{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\"}",
+        "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"2\",\"amount\":\"0\"}",
     };
     for (bodies, 0..) |json, mode| {
         const family: Family = if (mode == 0) .create_accounts else .create_transfers;
@@ -1654,7 +1688,11 @@ test "field mode matrix rejects omissions prohibited fields and unsupported flag
             const diagnostic = validate_command(family, &value, &command).?;
             try std.testing.expectEqual(@as(?u32, @intCast(original.object.count())), diagnostic.member_index);
         }
-        for ([_]u32{ 1, 3, 5, 6, 8, 16, 32, 64, 128, 256, 65535, 65536 }) |flags| {
+        const invalid_flags: []const u32 = if (family == .create_accounts)
+            &.{ 1, 3, 5, 6, 7, 9, 11, 13, 14, 15, 16, 32, 64, 128, 256, 65535, 65536 }
+        else
+            &.{ 1, 3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128, 256, 65535, 65536 };
+        for (invalid_flags) |flags| {
             var value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
             try value.object.put(allocator, "flags", .{ .integer = flags });
             var command: Command = undefined;
@@ -1674,11 +1712,64 @@ test "field mode matrix rejects omissions prohibited fields and unsupported flag
             var command: Command = undefined;
             try std.testing.expectEqualStrings("pending_id", validate_command(family, &value, &command).?.field.?);
         }
-        if (mode == 1 or mode == 3) {
+        if (mode == 1 or mode == 3 or mode == 4) {
             var value = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
             try value.object.put(allocator, "timeout", .{ .integer = 0 });
             var command: Command = undefined;
             try std.testing.expectEqualStrings("timeout", validate_command(family, &value, &command).?.field.?);
+        }
+    }
+}
+
+test "account flag combinations and transfer modes are exact" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    for ([_]u16{ 0, 2, 4, 8, 10, 12 }) |flags| {
+        const json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"create_accounts\":[{{\"id\":\"1\",\"flags\":{d},\"ledger\":1,\"code\":1}}]}}",
+            .{flags},
+        );
+        const plan = (try test_plan(allocator, json)).admitted;
+        try std.testing.expectEqual(flags, plan.commands[0].native.account.flags);
+    }
+    for ([_]u16{ 0, 2, 4, 8 }) |flags| {
+        const json = if (flags == 4 or flags == 8)
+            try std.fmt.allocPrint(
+                allocator,
+                "{{\"create_transfers\":[{{\"id\":\"1\",\"pending_id\":\"2\",\"flags\":{d},\"amount\":\"0\"}}]}}",
+                .{flags},
+            )
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "{{\"create_transfers\":[{{\"id\":\"1\",\"flags\":{d},\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1{s}}}]}}",
+                .{ flags, if (flags == 2) ",\"timeout\":1" else "" },
+            );
+        const plan = (try test_plan(allocator, json)).admitted;
+        try std.testing.expectEqual(flags, plan.commands[0].native.transfer.flags);
+    }
+}
+
+test "void fields inherit and direct relationships retain diagnostic precedence" {
+    const cases = [_]struct { command: []const u8, field: ?[]const u8 }{
+        .{ .command = "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"2\",\"amount\":\"0\"}", .field = null },
+        .{ .command = "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"2\",\"amount\":\"42\",\"debit_account_id\":\"0\",\"credit_account_id\":\"0\",\"ledger\":0,\"code\":0}", .field = null },
+        .{ .command = "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"1\",\"amount\":\"0\"}", .field = "pending_id" },
+        .{ .command = "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"2\",\"amount\":\"0\",\"debit_account_id\":\"3\",\"credit_account_id\":\"3\"}", .field = "credit_account_id" },
+        .{ .command = "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"2\",\"amount\":\"0\",\"timeout\":0}", .field = "timeout" },
+        .{ .command = "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"2\"}", .field = "amount" },
+    };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const json = try std.fmt.allocPrint(arena.allocator(), "{{\"create_transfers\":[{s}]}}", .{case.command});
+        const plan = try test_plan(arena.allocator(), json);
+        if (case.field) |field| {
+            try std.testing.expectEqualStrings(field, plan.rejected.field.?);
+        } else {
+            try std.testing.expectEqual(@as(u16, 8), plan.admitted.commands[0].native.transfer.flags);
         }
     }
 }
@@ -2017,7 +2108,7 @@ test "routed numeric boundary table covers code timeout amount and every referen
     }
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const rejected = try test_plan(arena.allocator(), "{\"create_accounts\":[{\"id\":\"1\",\"alias\":null,\"flags\":4,\"ledger\":1,\"code\":1}]}");
+    const rejected = try test_plan(arena.allocator(), "{\"create_accounts\":[{\"id\":\"1\",\"alias\":null,\"flags\":6,\"ledger\":1,\"code\":1}]}");
     try std.testing.expectEqualStrings("flags", rejected.rejected.field.?);
     try std.testing.expectEqual(@as(?u128, 1), rejected.rejected.id);
     try std.testing.expect(rejected.rejected.alias == null);
@@ -3202,36 +3293,47 @@ test "redelivery regroups only intact original chains after a lost shared reply"
     try std.testing.expectEqualStrings("exists", batch.results[1].valid.result.failure.object.get("create_accounts").?.array.items[0].object.get("error_code").?.string);
 }
 
-test "pending and post replay retain original timeout interval full amount and inherited zero sentinels" {
-    const body = "{\"create_transfers\":[{\"id\":\"3\",\"flags\":2,\"debit_account_id\":\"1\",\"credit_account_id\":\"2\",\"amount\":\"10\",\"ledger\":1,\"code\":1,\"timeout\":7},{\"id\":\"4\",\"flags\":4,\"pending_id\":\"3\",\"amount\":\"340282366920938463463374607431768211455\"}]}";
-    for (0..2) |attempt| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        var execution: FakeExecution = .{};
-        if (attempt == 1) {
-            execution.transfer_outcomes[0] = .{ .rejected = tigerbeetle.transfer_exists };
-            execution.transfer_outcomes[1] = .{ .rejected = tigerbeetle.transfer_linked_event_failed };
+test "pending resolution replay retains original timeout amount and inheritance sentinels" {
+    const modes = [_]struct { flags: u16, amount: []const u8, parsed_amount: u128 }{
+        .{ .flags = 4, .amount = "340282366920938463463374607431768211455", .parsed_amount = std.math.maxInt(u128) },
+        .{ .flags = 8, .amount = "0", .parsed_amount = 0 },
+        .{ .flags = 8, .amount = "10", .parsed_amount = 10 },
+    };
+    for (modes) |mode| {
+        for (0..2) |attempt| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const body = try std.fmt.allocPrint(
+                arena.allocator(),
+                "{{\"create_transfers\":[{{\"id\":\"3\",\"flags\":2,\"debit_account_id\":\"1\",\"credit_account_id\":\"2\",\"amount\":\"10\",\"ledger\":1,\"code\":1,\"timeout\":7}},{{\"id\":\"4\",\"flags\":{d},\"pending_id\":\"3\",\"amount\":\"{s}\"}}]}}",
+                .{ mode.flags, mode.amount },
+            );
+            var execution: FakeExecution = .{};
+            if (attempt == 1) {
+                execution.transfer_outcomes[0] = .{ .rejected = tigerbeetle.transfer_exists };
+                execution.transfer_outcomes[1] = .{ .rejected = tigerbeetle.transfer_linked_event_failed };
+            }
+            var publisher: FakePublisher = .{ .send_error = if (attempt == 0) error.AmbiguousSend else null };
+            const response = try test_invoke(arena.allocator(), &.{body}, &execution, &publisher);
+            try std.testing.expectEqualStrings(if (attempt == 0) "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}" else "{\"batchItemFailures\":[]}", response);
+            try std.testing.expectEqualSlices(Family, &.{.create_transfers}, execution.trace[0..execution.trace_count]);
+            const pending = execution.transfers[0];
+            const post = execution.transfers[1];
+            try std.testing.expectEqual(@as(u128, 3), pending.id);
+            try std.testing.expectEqual(@as(u32, 7), pending.timeout);
+            try std.testing.expectEqual(@as(u16, 3), pending.flags);
+            try std.testing.expectEqual(@as(u128, 4), post.id);
+            try std.testing.expectEqual(@as(u128, 3), post.pending_id);
+            try std.testing.expectEqual(mode.parsed_amount, post.amount);
+            try std.testing.expectEqual(@as(u128, 0), post.debit_account_id);
+            try std.testing.expectEqual(@as(u128, 0), post.credit_account_id);
+            try std.testing.expectEqual(@as(u32, 0), post.ledger);
+            try std.testing.expectEqual(@as(u16, 0), post.code);
+            try std.testing.expectEqual(@as(u32, 0), post.timeout);
+            try std.testing.expectEqual(mode.flags, post.flags);
+            const result = (try test_results(arena.allocator(), publisher.messages[0..publisher.send_count])).results[0].valid.result;
+            try std.testing.expect(result == .success);
         }
-        var publisher: FakePublisher = .{ .send_error = if (attempt == 0) error.AmbiguousSend else null };
-        const response = try test_invoke(arena.allocator(), &.{body}, &execution, &publisher);
-        try std.testing.expectEqualStrings(if (attempt == 0) "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}" else "{\"batchItemFailures\":[]}", response);
-        try std.testing.expectEqualSlices(Family, &.{.create_transfers}, execution.trace[0..execution.trace_count]);
-        const pending = execution.transfers[0];
-        const post = execution.transfers[1];
-        try std.testing.expectEqual(@as(u128, 3), pending.id);
-        try std.testing.expectEqual(@as(u32, 7), pending.timeout);
-        try std.testing.expectEqual(@as(u16, 3), pending.flags);
-        try std.testing.expectEqual(@as(u128, 4), post.id);
-        try std.testing.expectEqual(@as(u128, 3), post.pending_id);
-        try std.testing.expectEqual(std.math.maxInt(u128), post.amount);
-        try std.testing.expectEqual(@as(u128, 0), post.debit_account_id);
-        try std.testing.expectEqual(@as(u128, 0), post.credit_account_id);
-        try std.testing.expectEqual(@as(u32, 0), post.ledger);
-        try std.testing.expectEqual(@as(u16, 0), post.code);
-        try std.testing.expectEqual(@as(u32, 0), post.timeout);
-        try std.testing.expectEqual(@as(u16, 4), post.flags);
-        const result = (try test_results(arena.allocator(), publisher.messages[0..publisher.send_count])).results[0].valid.result;
-        try std.testing.expect(result == .success);
     }
 }
 

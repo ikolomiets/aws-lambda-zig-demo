@@ -630,6 +630,8 @@ pub fn build(b: *std.Build) void {
     const run_tigerbeetle_integration_tests = b.addRunArtifact(
         tigerbeetle_integration_tests,
     );
+    // Always run against the live replica; its state is outside the build cache.
+    run_tigerbeetle_integration_tests.has_side_effects = true;
     const tigerbeetle_integration_test_step = b.step(
         "test-tigerbeetle",
         "Run live TigerBeetle integration tests against TIGERBEETLE_ADDRESSES or 127.0.0.1:3000",
