@@ -22,16 +22,16 @@ shared [`processor_message.zig`](../src/processor_message.zig) codec. See
 
 ## Framework boundary
 
-- Retain `SUBMITTED -> COMPLETED`, with immutable `SUCCESS` or `FAILURE` completion payloads.
-  Keep the Operation UUID globally scoped and use it for Operation/Completion correlation only.
-- Preserve server-owned Operation Tenant, current intake authentication and tenant-authorized
-  query reads. The processor introduces no tenant-scoped native resource ownership or access policy.
-- Preserve BLAKE3-256 over the compact normalized fixed-order tenant/name/Body envelope at
-  intake and persistence. Processors receive no tenant, name, hash, state or timestamps and do
-  not recompute that hash. The internal queue-producer boundary is trusted.
-- Public intake Bodies remain capped at 4,096 bytes. Internal Processor Message Bodies are
+- Operations transition from `SUBMITTED` to `COMPLETED`, with immutable `SUCCESS` or `FAILURE`
+  completion payloads. The globally scoped Operation UUID correlates Operations and Completions only.
+- Operation Tenant is server-owned. Intake authentication and tenant-authorized query reads apply.
+  The processor has no tenant-scoped native resource ownership or access policy.
+- Intake and persistence use BLAKE3-256 over the compact normalized fixed-order tenant/name/Body
+  envelope. Processors receive no tenant, name, hash, state or timestamps and do not recompute
+  that hash. The internal queue-producer boundary is trusted.
+- Public intake Bodies are capped at 4,096 bytes. Internal Processor Message Bodies are
   capped at 98,304 compact JSON bytes (96 KiB), independently of intake admission. Persisted
-  Results retain their existing 96 KiB complete-envelope limit.
+  Results have a 96 KiB complete-envelope limit.
 - Intake routes Operation name `TigerBeetle` through `TigerBeetleQueue`. Every internal SQS
   record contains exactly `{operation_id, body, result_queue?}`. UUIDs are canonical lowercase
   hyphenated strings; `body` may be any JSON value. Unknown fields and duplicate decoded keys
@@ -40,8 +40,6 @@ shared [`processor_message.zig`](../src/processor_message.zig) codec. See
 - Incoming `result_queue` selects the destination of this processor's output, falling back to
   `COMPLETION_QUEUE_URL`. The processor independently chooses its outgoing route; TigerBeetle
   omits it. Public intake accepts no routing field. There is no chain orchestration here.
-- This replaces the full-Operation input and aggregate-Completion output wire contracts.
-  Drain old queued messages before switching producers and consumers; there is no legacy parser.
 
 ## Body schema
 
@@ -61,18 +59,19 @@ allowed within and across lists and Operations. Aliases never resolve references
 
 | Command | Required fields beyond id | Optional fields beyond alias | Native construction |
 | --- | --- | --- | --- |
-| Account creation | ledger, code, flags | None | Nonzero ledger/code; flags 0, debit-bound 2, credit-bound 4, history 8, or history with one bound (10 or 12). |
-| Immediate transfer | debit_account_id, credit_account_id, amount, ledger, code, flags | None | Flags 0; concrete account references; nonzero ledger/code; reject pending_id and timeout even zero. |
-| Pending transfer | debit_account_id, credit_account_id, amount, ledger, code, flags, timeout | None | Flags 2; concrete references; nonzero ledger/code; positive timeout; reject pending_id even zero. |
-| Post-pending transfer | pending_id, amount, flags | debit_account_id, credit_account_id, ledger, code | Flags 4; concrete pending ID; omitted optional fields default to native zero inheritance; reject timeout even zero. |
-| Void-pending transfer | pending_id, amount, flags | debit_account_id, credit_account_id, ledger, code | Flags 8; concrete pending ID; omitted optional fields default to native zero inheritance; reject timeout even zero. |
+| Account creation | ledger, code, flags | None | Nonzero ledger/code; flags `[]`, either bound name, `history`, or `history` with one bound. |
+| Immediate transfer | debit_account_id, credit_account_id, amount, ledger, code, flags | None | Flags `[]`; concrete account references; nonzero ledger/code; reject pending_id and timeout even zero. |
+| Pending transfer | debit_account_id, credit_account_id, amount, ledger, code, flags, timeout | None | Flags `["pending"]`; concrete references; nonzero ledger/code; positive timeout; reject pending_id even zero. |
+| Post-pending transfer | pending_id, amount, flags | debit_account_id, credit_account_id, ledger, code | Flags `["post_pending_transfer"]`; concrete pending ID; omitted optional fields default to native zero inheritance; reject timeout even zero. |
+| Void-pending transfer | pending_id, amount, flags | debit_account_id, credit_account_id, ledger, code | Flags `["void_pending_transfer"]`; concrete pending ID; omitted optional fields default to native zero inheritance; reject timeout even zero. |
 | Account lookup | None | None | Submit the concrete account ID. |
 
 - ID/reference/amount strings use `0|[1-9][0-9]*`, with checked conversion and no floats, coercion,
   whitespace, signs, leading zeros, exponents or alternative radices. Amount admits the full u128
   range including zero and maximum. Post and void account references additionally admit zero inheritance.
-- Ledger and timeout use unsigned JSON integers within u32; code and flags within u16. Apply mode
-  constraints from the table. Validate the existing normalized Zig 0.16 Body: original `1.0`/`1e0`
+- Ledger and timeout use unsigned JSON integers within u32; code uses u16. Flags are required arrays
+  of canonical, case-sensitive names. Apply mode constraints from the table. Validate the normalized
+  Zig 0.16 Body: numeric `1.0`/`1e0`
   may already be `1`; reject remaining fractions, negative zero, negatives and overflow. Add no
   raw-token parser, arbitrary-precision intake contract or u64 input field.
 - Require explicit flags and amount. Pending timeout must be 1 through u32 maximum seconds.
@@ -86,10 +85,11 @@ allowed within and across lists and Operations. Aliases never resolve references
   fields inherit; supplied nonzero fields must match native state. Preserve these sentinels.
 - Reject equal immediate/pending debit and credit IDs, resolution ID equal to pending ID, and equal
   nonzero post/void debit and credit IDs. Either or both resolution account references may be zero.
-- Account flags use an allowed-bit mask for 2, 4 and 8, excluding simultaneous debit and credit
-  bounds. Transfer flags must be exactly 0, 2, 4 or 8. Reject caller linked bits, combined transfer
-  modes, balancing, closing, imported,
-  user-data input, timestamps, reserved fields and balance
+- Account input names are `debits_must_not_exceed_credits`, `credits_must_not_exceed_debits` and
+  `history`; allow history with either bound but reject both bounds together. Transfer input names are
+  `pending`, `post_pending_transfer` and `void_pending_transfer`; allow at most one mode. `[]` maps to
+  native zero. Reject integer flags, unknown or duplicate names, caller `linked`, combined transfer
+  modes, balancing, closing, imported, user-data input, timestamps, reserved fields and balance
   counters, including supplied zeros. Derive linked bits; zero processor-owned native fields.
   Post zero user data may inherit metadata from the pending transfer.
 - Leave existence, ledger compatibility, balances, pending lifecycle, inheritance matching and
@@ -137,8 +137,9 @@ JSON Pointer, command indexes or a second machine-readable error taxonomy.
 Use one size-policy parameter: Result multiplier 24 times the 4,096-byte Body bound. Derive raw command
 capacity as floor((98,304−93)/1,435)=68 and round down to a power of two: 64 total commands across all
 families. Use checked arithmetic and compile-time assertions. The complete execution Result proof is
-94 base bytes + 64 × 1,434 maximum entry bytes + 63 separators = 91,933 bytes. It includes maximum
-integer widths and six-byte escaping for alias/message control bytes. The conservative preflight
+94 base bytes + 64 × 1,434 maximum entry bytes + 63 separators = 91,933 bytes. The found-account
+flag array fits below the maximum entry bound. The proof includes maximum integer widths and
+six-byte escaping for alias/message control bytes. The conservative preflight
 prefix bound is 50,706 bytes; validate both proofs against the actual writer. Never use outcome-weighted
 admission or truncate after effects. Overflow after proven admission is a programmer invariant failure.
 
@@ -190,7 +191,7 @@ The execution processor emits native result details directly as the outgoing `bo
 its enclosing Processor Message. Each output occupies its own SQS message.
 
 TigerBeetleCompletionProcessor derives SUCCESS or FAILURE from these details and creates the
-existing `{type,payload}` Result only at the persistence boundary. A valid envelope with an invalid
+`{type,payload}` Result at the persistence boundary. A valid envelope with an invalid
 TigerBeetle result body becomes a deterministic failure diagnostic. If wrapping a body would exceed
 the persisted Result limit, it persists `ResultTooLarge` as the failure diagnostic. Admitted executor
 outputs reserve sufficient room for the stored wrapper, so their details are preserved in full.
@@ -208,21 +209,23 @@ Serialize entry fields as error_code, optional alias, then message or account:
 | Missing account lookup | null | Required explanatory message, no account. |
 
 Serialize canonical lowercase status names from the pinned native boundary, including "created",
-"exists" (account status 21 or transfer status 46), and "linked_event_failed". This replaces the
-previous integer error_code format; consumers must accept string or null. Previously stored Results
-are not rewritten. null is absence of a per-command native status, not itself failure.
+"exists" (account status 21 or transfer status 46), and "linked_event_failed". The `error_code`
+field is a string or null; null means no per-command native status, not failure by itself.
 Do not rewrite replay suffixes. If a native status has no name in the pinned definitions, serialize
 "unknown" and log its family and numeric value. Name translation does not change native outcome
 classification or introduce retries.
 
-The account object includes the returned native id. Top-level requested IDs are removed from all
-command results; consumers must read account.id for found accounts and use positional correlation
-for creation results and errors.
-Previously stored Results are not rewritten. Serialize all native
-fields in this order: id, debits_pending, debits_posted, credits_pending, credits_posted, user_data_128,
+The account object includes the returned native id. Command results omit top-level requested IDs;
+consumers read account.id for found accounts and use positional correlation for creation results and
+errors. Serialize all native fields in this order: id, debits_pending, debits_posted, credits_pending,
+credits_posted, user_data_128,
 user_data_64, user_data_32, reserved, ledger, code, flags, timestamp. Encode u128/u64 as canonical
-unsigned decimal strings and u32/u16 as JSON integers. Preserve every returned flag and field,
-including creation-forbidden flags and zero metadata. Timestamp is native creation time, not read time.
+unsigned decimal strings and u32/u16 metadata as JSON integers. Serialize flags as a named array in
+native bit order: `linked`, `debits_must_not_exceed_credits`, `credits_must_not_exceed_debits`,
+`history`, `imported`, `closed`; emit `[]` for zero. Preserve creation-forbidden known flags and zero
+metadata. An unknown native account bit emits the body-level `UnsupportedTigerBeetleAccountFlags`
+failure Result and Completion; acknowledge the source only after publication succeeds. Timestamp is
+native creation time, not read time.
 
 SUCCESS requires every requested creation chain to succeed under the replay rule and every requested
 lookup to be found. Any definite creation rejection or missing account gives FAILURE once all requested
@@ -254,16 +257,16 @@ for pending expiry/retries, and to own exhaustion disposition and reporting. TTL
 admission or cancellation.
 Participating accounts must not be closed by any writer. Pending and cumulative posted totals,
 including intermediate execution, remain small under the accepted operating assumption; unrestricted
-u128-boundary recovery and special overflow-code deferral are not requirements. No new numeric
+u128-boundary recovery and special overflow-code deferral are not requirements. No numeric
 admission cap is implied by the small-total operating assumption.
 Expired pending creation may replay successfully without renewing a reservation; a first post or
 void after expiry may reject, while replay can establish an already committed resolution.
 
 ## Interfaces and memory ownership
 
-Keep existing modules. The processor owns validation, admission, packing, invocation sequencing,
+The processor owns validation, admission, packing, invocation sequencing,
 reply classification/correlation, direct Result encoding and source dispositions. Use focused pure
-helpers and the existing explicit execution/publisher adapters; add no layer or package.
+helpers and explicit execution/publisher adapters; add no layer or package.
 
 The native wrapper retains its private C boundary, record aliases and client/packet/callback lifetime.
 Expose needed named flags/statuses from pinned definitions. Its three batch methods borrow caller-owned
@@ -294,12 +297,12 @@ response construction retain their invocation lifetime; response-allocation fail
 can still cause whole-invocation redelivery.
 
 Keep Processor Message framing in the shared `processor_message` codec,
-using a bounded writer for already encoded complete Results while retaining existing structured
+using a bounded writer for already encoded complete Results while retaining structured
 consumer paths. Do not construct a second Result JSON tree or reparse generated Results merely to frame
 them. Consumers must accommodate the full bound, JSON escaping and outer framing; review their
 buffers and stack placement whenever the bound changes.
 
-The existing ten-record configuration bounds invocation arrays, loops and checked allocation arithmetic;
+The ten-record configuration bounds invocation arrays, loops and checked allocation arithmetic;
 it admits at most 640 commands. Validate delivered count; do not add configuration interfaces. Native
 packet and message framing remain independently testable at larger synthetic boundaries. Current
 application storage stays within a few MiB before parser/SDK/client overhead, and normal maximum work
@@ -364,13 +367,14 @@ uses fresh random nonreserved IDs on every run, and leaves created records in th
 wait if the replica is unavailable. The optional isolated runner retains its separate ownership check.
 
 The capacity proof reserves worst-case widths and escaping so admission is independent of native
-outcomes. Maximum compact sizes are 467 bytes for a submitted creation entry, 935 for a found lookup,
-1,434 for a skip/miss, 1,462 for a command diagnostic, and 463 for the full nested Account.
+outcomes. Maximum compact sizes are 467 bytes for a submitted creation entry, 1,036 for a found lookup,
+1,434 for a skip/miss, 1,462 for a command diagnostic, and 564 for the full nested Account.
 The preflight proof permits at most 9,830 preceding minimal ten-byte commands under the internal
 96 KiB bound, each becoming `null,`: 94 + 9,830 × 5 + 1,462 = 50,706 bytes including the stored
 wrapper. These conservative structural bounds remain below 96 KiB. Executable plans still admit
-at most 64 commands; larger valid lists produce bounded admission diagnostics. The complete Result bound applies both to sent bytes and compact parser-normalized
-bytes; outer Completion UUID/framing counts separately. Native records are 128 bytes, lookup IDs
+at most 64 commands; larger valid lists produce bounded admission diagnostics. The complete Result
+bound applies both to sent bytes and compact parser-normalized bytes; outer Completion UUID/framing
+counts separately. Native records are 128 bytes, lookup IDs
 16 bytes, creation results 16 bytes and lookup results 128 bytes. A full native record buffer is
 approximately 1 MiB, independently of the current much smaller invocation workspace.
 
@@ -389,44 +393,44 @@ Lookup only, with repeated labels at distinct positions:
 All families, with an immediate transfer between unrestricted accounts:
 
 ```json
-{"create_accounts":[{"id":"101","ledger":1,"code":1,"flags":0},{"id":"102","ledger":1,"code":1,"flags":0}],"create_transfers":[{"id":"201","debit_account_id":"101","credit_account_id":"102","amount":"3","ledger":1,"code":1,"flags":0}],"lookup_accounts":[{"id":"101","alias":"seat"},{"id":"102","alias":"seat"}]}
+{"create_accounts":[{"id":"101","ledger":1,"code":1,"flags":[]},{"id":"102","ledger":1,"code":1,"flags":[]}],"create_transfers":[{"id":"201","debit_account_id":"101","credit_account_id":"102","amount":"3","ledger":1,"code":1,"flags":[]}],"lookup_accounts":[{"id":"101","alias":"seat"},{"id":"102","alias":"seat"}]}
 ```
 
 A debit-bound account and lookup:
 
 ```json
-{"create_accounts":[{"id":"103","ledger":1,"code":1,"flags":2}],"lookup_accounts":[{"id":"103"}]}
+{"create_accounts":[{"id":"103","ledger":1,"code":1,"flags":["debits_must_not_exceed_credits"]}],"lookup_accounts":[{"id":"103"}]}
 ```
 
 Expiring pending transfer referencing existing accounts:
 
 ```json
-{"create_transfers":[{"id":"301","debit_account_id":"101","credit_account_id":"102","amount":"3","ledger":1,"code":1,"flags":2,"timeout":60}]}
+{"create_transfers":[{"id":"301","debit_account_id":"101","credit_account_id":"102","amount":"3","ledger":1,"code":1,"flags":["pending"],"timeout":60}]}
 ```
 
 Full post using omitted inheritance fields (the maximum is a decimal string, not `"AMOUNT_MAX"`):
 
 ```json
-{"create_transfers":[{"id":"302","pending_id":"301","amount":"340282366920938463463374607431768211455","flags":4}]}
+{"create_transfers":[{"id":"302","pending_id":"301","amount":"340282366920938463463374607431768211455","flags":["post_pending_transfer"]}]}
 ```
 
 Zero post with explicit inheritance sentinels:
 
 ```json
-{"create_transfers":[{"id":"303","pending_id":"301","debit_account_id":"0","credit_account_id":"0","amount":"0","ledger":0,"code":0,"flags":4}]}
+{"create_transfers":[{"id":"303","pending_id":"301","debit_account_id":"0","credit_account_id":"0","amount":"0","ledger":0,"code":0,"flags":["post_pending_transfer"]}]}
 ```
 
 Full void using the zero amount sentinel and omitted inheritance fields (as an alternative to
 posting pending transfer 301):
 
 ```json
-{"create_transfers":[{"id":"304","pending_id":"301","amount":"0","flags":8}]}
+{"create_transfers":[{"id":"304","pending_id":"301","amount":"0","flags":["void_pending_transfer"]}]}
 ```
 
 History with a credit bound:
 
 ```json
-{"create_accounts":[{"id":"104","ledger":1,"code":1,"flags":12}]}
+{"create_accounts":[{"id":"104","ledger":1,"code":1,"flags":["credits_must_not_exceed_debits","history"]}]}
 ```
 
 Rejected Body examples, each with a valid Processor Message envelope:
@@ -438,7 +442,7 @@ Rejected Body examples, each with a valid Processor Message envelope:
 | `{"lookup_accounts":["101"]}` | Command 0: expected object; no ID or field/member. |
 | `{"lookup_accounts":[{"id":"101"},{"id":"101"}]}` | Command 1, field `id`; one preceding null. |
 | `{"lookup_accounts":[{"id":"01","alias":"main","unexpected":true}]}` | Command 0, member_index 2; no ID and retained alias. |
-| `{"create_transfers":[{"id":"301","debit_account_id":"101","credit_account_id":"102","amount":"3","ledger":1,"code":1,"flags":2}]}` | Command 0, field `timeout`. |
+| `{"create_transfers":[{"id":"301","debit_account_id":"101","credit_account_id":"102","amount":"3","ledger":1,"code":1,"flags":["pending"]}]}` | Command 0, field `timeout`. |
 
 Duplicate decoded JSON keys instead prevent generic envelope acceptance and produce no Completion.
 
@@ -447,7 +451,7 @@ Duplicate decoded JSON keys instead prevent generic envelope acceptance and prod
 Examples are compact processor output bodies unless explicitly labelled Completion. Values and timestamps
 are illustrative observations, not live output or promised balances.
 
-Accepted replay of a previously committed immutable account chain and singleton transfer, for a
+Accepted replay of an already committed immutable account chain and singleton transfer, for a
 Body requesting no lookups; raw linked-failed suffixes remain visible:
 
 ```json
@@ -457,7 +461,7 @@ Body requesting no lookups; raw linked-failed suffixes remain visible:
 A missing lookup fails the Operation while preserving a found account and its full native fields:
 
 ```json
-{"create_accounts":[],"create_transfers":[],"lookup_accounts":[{"error_code":null,"alias":"pair","message":"Account was not found."},{"error_code":null,"alias":"pair","account":{"id":"101","debits_pending":"0","debits_posted":"7","credits_pending":"0","credits_posted":"9","user_data_128":"123","user_data_64":"456","user_data_32":789,"reserved":0,"ledger":1,"code":1,"flags":8,"timestamp":"1790000000000000001"}}]}
+{"create_accounts":[],"create_transfers":[],"lookup_accounts":[{"error_code":null,"alias":"pair","message":"Account was not found."},{"error_code":null,"alias":"pair","account":{"id":"101","debits_pending":"0","debits_posted":"7","credits_pending":"0","credits_posted":"9","user_data_128":"123","user_data_64":"456","user_data_32":789,"reserved":0,"ledger":1,"code":1,"flags":["history"],"timestamp":"1790000000000000001"}}]}
 ```
 
 For the unknown-member Body above, unknown-field precedence and independent projection give:
@@ -494,11 +498,9 @@ identity allocation, retention, cancellation policy and exhaustion disposition r
 Unsupported creation features include balancing, closing, historical import, history queries,
 caller-controlled linking, user-data input and non-expiring pending transfers. Closure by any participating
 writer, incompatible/partially overlapping creation histories, and unrestricted numeric-boundary
-account totals are excluded from the recovery guarantee. Such counterexamples do not imply new
+account totals are excluded from the recovery guarantee. Such counterexamples do not imply
 production detection or special overflow deferral behavior.
 
-Legacy preservation, dual parsers, automated migrations or queue draining, historical Result repair
-and rollback compatibility are not provided. The deployment guide describes the operator-led cutover. This does not authorize deleting cloud/native resources or reusing
-creation IDs incompatibly. Deployment, AWS validation, topology/IAM/CORS/runtime/timeout/memory
+Deployment, AWS validation, topology/IAM/CORS/runtime/timeout/memory
 changes and package refresh belong to separately authorized deployment work. Seat-reservation
 business rules, UI and unrelated APIs are outside this processor reference.

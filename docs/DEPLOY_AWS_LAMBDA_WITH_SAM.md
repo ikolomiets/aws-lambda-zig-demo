@@ -432,6 +432,12 @@ The final function retains its 15-second timeout, 128 MiB memory, non-VPC config
 
 ### Processor message cutover
 
+Creation-command `flags` now require arrays of canonical names, and newly produced found-account
+Results contain named flag arrays. Before rolling out this processor, stop producers and drain old
+queued and in-flight Operations that contain integer flags; those messages will fail validation after
+the cutover. Previously persisted Results remain unchanged. Update Result consumers to accept named
+flag arrays before restarting production.
+
 This is a breaking internal wire change with no dual parser. Stop intake and internal producers,
 then drain old queued and in-flight work before replacing producers and consumers together. Account
 for delayed messages and retained dead-letter messages before allowing later replay. Old full

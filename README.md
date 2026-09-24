@@ -434,7 +434,7 @@ runtime validation remains separate from the mocked and native local checks.
 TigerBeetleCompletionProcessor has no authentication configuration or Function URL. It is not
 VPC-attached and receives only `OPERATIONS_TABLE_NAME`. One SQS message arrives per invocation.
 It interprets creation-chain statuses, lookup observations and diagnostics to derive SUCCESS or
-FAILURE, then persists the existing `{type,payload}` Result. The stored Result retains its 96 KiB
+FAILURE, then persists the `{type,payload}` Result. The stored Result has a 96 KiB
 complete-envelope bound; invalid or unrepresentable native bodies produce failure diagnostics.
 
 Each conditional update selects only the Operation UUID and requires stored `SUBMITTED` state.
@@ -442,9 +442,6 @@ It writes `COMPLETED`, the Result, the actual write time and a TTL exactly 86,40
 A missing or already completed item is an acknowledged conflict. Malformed envelopes never select
 an item; allocation or transient DynamoDB failures retry only that message. Duplicate delivery
 cannot overwrite the first terminal Result.
-
-The wire change requires draining old full-Operation and aggregate-Completion messages before
-switching producers and consumers. See [migration and deployment effects](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#processor-message-cutover).
 
 ## Lambda Observability
 

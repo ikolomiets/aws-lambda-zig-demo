@@ -41,7 +41,7 @@ still apply.
 
 ## 2. Fixed network design
 
-The initial implementation fixes these values:
+The gateway uses these fixed values:
 
 | Setting | Value |
 | --- | --- |
@@ -263,9 +263,8 @@ value.
 ## 8. Gateway setup resolution and preflight
 
 Running `./wireguard-gateway-setup.sh` enables or reconfigures the feature;
-enablement is implicit. The legacy `--enable-wireguard-gateway` option and
-`ENABLE_WIREGUARD_GATEWAY=0|1` remain accepted by this script for command
-compatibility; `0` selects teardown. Prefer
+enablement is implicit. The script also accepts `--enable-wireguard-gateway` and
+`ENABLE_WIREGUARD_GATEWAY=0|1`; `0` selects teardown. Prefer
 `./wireguard-gateway-setup.sh --disable` for teardown.
 Routine `./deploy.sh` updates preserve the stack's complete gateway parameter
 set and never enable, reconfigure, or disable it. A new stack uses the template's

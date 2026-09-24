@@ -25,6 +25,9 @@ Read sources relevant to the task:
 Consult related implementation files when behavior crosses these boundaries.
 Keep processor contract changes in the processor reference, vocabulary in
 `CONTEXT.md`, and cross-cutting decisions in ADRs.
+Write reference documentation in the present tense and describe only the current
+contract. Keep change history and cutover instructions in the deployment guide;
+record lasting cross-cutting decisions in ADRs.
 
 ## Coding Style and Scope
 

@@ -67,15 +67,9 @@ LICENSE                                                    0d542e0c8804e39aa7f37
 ```
 
 The Linux archive is built for `aarch64-linux-gnu.2.27` and registers nonblocking sockets,
-timerfds, and eventfds with TigerBeetle's epoll backend. The macOS archive remains
-`aarch64-macos` and retains the Darwin backend. The header checksum and exported `tb_client_*`
-symbol set match the previous release. The backport also decodes raw Linux syscall results with
-`std.os.linux.E.init`, avoiding libc-aware errno decoding in the glibc-linked client. The previous
-release remains available for rollback at:
-
-```text
-https://github.com/ikolomiets/aws-lambda-zig-demo/releases/download/tigerbeetle-c-97c7a8ef385270ebe0e1b75959d3d21d134629df/tigerbeetle-c-97c7a8ef385270ebe0e1b75959d3d21d134629df.tar.gz
-```
+timerfds, and eventfds with TigerBeetle's epoll backend. The macOS archive targets
+`aarch64-macos` and uses the Darwin backend. The Linux client decodes raw syscall results with
+`std.os.linux.E.init`, avoiding libc-aware errno decoding in the glibc-linked client.
 
 `PROVENANCE.md` records the exact upstream commits, nine-file PR review, manually resolved
 initialization-error mapping, patched source-tree hash, Zig compiler and SDK shim, build command,
@@ -155,11 +149,12 @@ const found = output[0..count];
 correspondence. Output outside the returned prefix is unspecified; capacity beyond the input count
 is untouched. On error, ignore all output. Empty input returns zero without native submission.
 
-Named `account_linked`, `account_debits_must_not_exceed_credits`, `transfer_linked`,
-`transfer_pending`, and `transfer_post_pending_transfer` flags derive from the private pinned C
-header. Each family's `created`, `exists`, and `linked_event_failed` statuses are also exported
-with `account_` or `transfer_` prefixes. Raw status values remain u32. Existing singleton success
-helpers are retained; they are insufficient to classify a linked chain.
+Named account flags `linked`, `debits_must_not_exceed_credits`,
+`credits_must_not_exceed_debits`, `history`, `imported`, and `closed`, and transfer flags `linked`,
+`pending`, `post_pending_transfer`, and `void_pending_transfer` derive from the private pinned C
+header and carry `account_` or `transfer_` prefixes. Each family's `created`, `exists`, and
+`linked_event_failed` statuses are also exported with those prefixes. Raw status values are u32.
+Singleton success helpers do not classify a linked chain.
 
 ## Error set
 
@@ -323,9 +318,7 @@ prelookup, deduplication, extra native request or bytewise padding comparison is
 All typed workspace allocations finish before native effects, and packets reuse the same borrowed
 buffers after results are copied. A request error or malformed reply stops subsequent native calls;
 earlier facts survive and fully determined Operations remain publishable. The ten-record invocation
-bound needs at most three native calls and one Completion send. See
-[execution evidence](TIGERBEETLE_EXECUTION_EVIDENCE.md) for native semantics, generated properties,
-allocation instrumentation, and [complete local recovery evidence](TIGERBEETLE_RETRY_EVIDENCE.md).
+bound needs at most three native calls and one Completion send.
 
 After execution finishes or stops, publication skips unfinished Operations and sends terminal
 Results in received order. Its ten-Result and byte bounds are independent of native packet and
@@ -426,9 +419,6 @@ by result position.
 All creation histories keep their original IDs, fields and chain membership. Successful records
 are immutable; regular development runs leave them in place, while the isolated runner disposes of
 only its own temporary cluster rather than attempting record deletion.
-The suite starts native evidence for ticket 01, and must be extended and rerun against the final
-implementation in ticket 05. See [the ticket-01 evidence record](TIGERBEETLE_NATIVE_BUFFERS_EVIDENCE.md)
-for commands, identity checks, matrix coverage and runtime limitations.
 
 ## Sources of truth
 

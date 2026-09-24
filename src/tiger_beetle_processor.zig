@@ -384,7 +384,12 @@ fn publish_results(
         const plan = &(planning orelse continue);
         const body = switch (plan.*) {
             .rejected => |*diagnostic| write_diagnostic(result_buffer, diagnostic),
-            .admitted => |*admitted| write_result(result_buffer, admitted) catch continue,
+            .admitted => |*admitted| write_result(result_buffer, admitted) catch |err| switch (err) {
+                error.UnsupportedTigerBeetleAccountFlags => write_diagnostic(result_buffer, &.{
+                    .message = "UnsupportedTigerBeetleAccountFlags",
+                }),
+                else => continue,
+            },
         };
         const message = processor_message.frame(completion_buffer, entry.operation_id, body, null) catch return;
         publisher.send(allocator, entry.result_queue, message) catch return;
@@ -1186,6 +1191,23 @@ const ParsedFields = struct {
     flags: u16 = 0,
 };
 
+const account_output_flags = .{
+    .{ .bit = tigerbeetle.account_linked, .name = "linked" },
+    .{ .bit = tigerbeetle.account_debits_must_not_exceed_credits, .name = "debits_must_not_exceed_credits" },
+    .{ .bit = tigerbeetle.account_credits_must_not_exceed_debits, .name = "credits_must_not_exceed_debits" },
+    .{ .bit = tigerbeetle.account_history, .name = "history" },
+    .{ .bit = tigerbeetle.account_imported, .name = "imported" },
+    .{ .bit = tigerbeetle.account_closed, .name = "closed" },
+};
+const account_output_flags_mask: u16 = blk: {
+    var mask: u16 = 0;
+    for (account_output_flags) |entry| {
+        std.debug.assert(mask & entry.bit == 0);
+        mask |= entry.bit;
+    }
+    break :blk mask;
+};
+
 fn validate_command(family: Family, value: *const std.json.Value, command: *Command) ?Diagnostic {
     if (value.* != .object) return .{ .message = "Expected a command object." };
     const object = &value.object;
@@ -1195,8 +1217,31 @@ fn validate_command(family: Family, value: *const std.json.Value, command: *Comm
     var fields: ParsedFields = .{};
     if (family != .lookup_accounts) {
         const raw = object.get("flags") orelse return field_error("flags", "Required field is missing.");
-        fields.flags = @intCast(small_number(raw, 65535) catch
-            return field_error("flags", "Expected an unsigned u16 integer."));
+        if (raw != .array) return field_error("flags", "Expected an array of flag names.");
+        for (raw.array.items) |item| {
+            if (item != .string) return field_error("flags", "Expected an array of flag names.");
+            const flag: u16 = switch (family) {
+                .create_accounts => if (std.mem.eql(u8, item.string, "debits_must_not_exceed_credits"))
+                    tigerbeetle.account_debits_must_not_exceed_credits
+                else if (std.mem.eql(u8, item.string, "credits_must_not_exceed_debits"))
+                    tigerbeetle.account_credits_must_not_exceed_debits
+                else if (std.mem.eql(u8, item.string, "history"))
+                    tigerbeetle.account_history
+                else
+                    return field_error("flags", "Unsupported flags."),
+                .create_transfers => if (std.mem.eql(u8, item.string, "pending"))
+                    tigerbeetle.transfer_pending
+                else if (std.mem.eql(u8, item.string, "post_pending_transfer"))
+                    tigerbeetle.transfer_post_pending_transfer
+                else if (std.mem.eql(u8, item.string, "void_pending_transfer"))
+                    tigerbeetle.transfer_void_pending_transfer
+                else
+                    return field_error("flags", "Unsupported flags."),
+                .lookup_accounts => unreachable,
+            };
+            if (fields.flags & flag != 0) return field_error("flags", "Unsupported flags.");
+            fields.flags |= flag;
+        }
         const account_bounds = tigerbeetle.account_debits_must_not_exceed_credits |
             tigerbeetle.account_credits_must_not_exceed_debits;
         const account_allowed = account_bounds | tigerbeetle.account_history;
@@ -1433,7 +1478,7 @@ test "valid message invalid Body publishes diagnostics and admits neighbors with
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const invalid = try test_body_message(allocator, 1, "{\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1}],\"lookup_accounts\":[null]}");
+    const invalid = try test_body_message(allocator, 1, "{\"create_accounts\":[{\"id\":\"1\",\"flags\":[],\"ledger\":1,\"code\":1}],\"lookup_accounts\":[null]}");
     const valid = try test_body_message(allocator, 2, "{\"lookup_accounts\":[{\"id\":\"1\"}]}");
     const event = try testEvent(allocator, &.{ invalid, valid, "{\"id\":\"broken\"}" });
     var execution: FakeExecution = .{};
@@ -1462,11 +1507,11 @@ fn test_plan(allocator: Allocator, json: []const u8) !Planning {
 test "wire grammar and diagnostic precedence table" {
     const Case = struct { body: []const u8, family: ?Family = null, index: usize = 0, field: ?[]const u8 = null, member: ?u32 = null };
     const cases = [_]Case{
-        .{ .body = "null" },                                                                                                                                                     .{ .body = "true" },                                                                                                           .{ .body = "[]" },                                                                                                           .{ .body = "{}" },
-        .{ .body = "{\"create_accounts\":[],\"lookup_accounts\":[]}" },                                                                                                          .{ .body = "{\"lookup_accounts\":null}", .field = "lookup_accounts" },                                                         .{ .body = "{\"lookup_accounts\":{},\"bad\":0}", .member = 1 },                                                              .{ .body = "{\"Lookup_accounts\":[]}", .member = 0 },
-        .{ .body = "{\"lookup_accounts\":[\"1\"]}", .family = .lookup_accounts },                                                                                                .{ .body = "{\"lookup_accounts\":[null]}", .family = .lookup_accounts },                                                       .{ .body = "{\"lookup_accounts\":[{}]}", .family = .lookup_accounts, .field = "id" },                                        .{ .body = "{\"lookup_accounts\":[{\"id\":\"01\",\"alias\":\"main\",\"bad\":0}]}", .family = .lookup_accounts, .member = 2 },
-        .{ .body = "{\"create_accounts\":[{\"id\":null}]}", .family = .create_accounts, .field = "flags" },                                                                      .{ .body = "{\"create_accounts\":[{\"flags\":0,\"id\":null}]}", .family = .create_accounts, .field = "id" },                   .{ .body = "{\"lookup_accounts\":[{\"id\":\"1\"},{\"id\":\"1\"}]}", .family = .lookup_accounts, .index = 1, .field = "id" }, .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"1\",\"amount\":\"0\"}]}", .family = .create_transfers, .field = "pending_id" },
-        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\",\"timeout\":0}]}", .family = .create_transfers, .field = "timeout" }, .{ .body = "{\"lookup_accounts\":false,\"create_accounts\":[{\"id\":\"1\"}]}", .family = .create_accounts, .field = "flags" },
+        .{ .body = "null" },                                                                                                                                                                               .{ .body = "true" },                                                                                                           .{ .body = "[]" },                                                                                                           .{ .body = "{}" },
+        .{ .body = "{\"create_accounts\":[],\"lookup_accounts\":[]}" },                                                                                                                                    .{ .body = "{\"lookup_accounts\":null}", .field = "lookup_accounts" },                                                         .{ .body = "{\"lookup_accounts\":{},\"bad\":0}", .member = 1 },                                                              .{ .body = "{\"Lookup_accounts\":[]}", .member = 0 },
+        .{ .body = "{\"lookup_accounts\":[\"1\"]}", .family = .lookup_accounts },                                                                                                                          .{ .body = "{\"lookup_accounts\":[null]}", .family = .lookup_accounts },                                                       .{ .body = "{\"lookup_accounts\":[{}]}", .family = .lookup_accounts, .field = "id" },                                        .{ .body = "{\"lookup_accounts\":[{\"id\":\"01\",\"alias\":\"main\",\"bad\":0}]}", .family = .lookup_accounts, .member = 2 },
+        .{ .body = "{\"create_accounts\":[{\"id\":null}]}", .family = .create_accounts, .field = "flags" },                                                                                                .{ .body = "{\"create_accounts\":[{\"flags\":[],\"id\":null}]}", .family = .create_accounts, .field = "id" },                  .{ .body = "{\"lookup_accounts\":[{\"id\":\"1\"},{\"id\":\"1\"}]}", .family = .lookup_accounts, .index = 1, .field = "id" }, .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":[\"post_pending_transfer\"],\"pending_id\":\"1\",\"amount\":\"0\"}]}", .family = .create_transfers, .field = "pending_id" },
+        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":[\"post_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\",\"timeout\":0}]}", .family = .create_transfers, .field = "timeout" }, .{ .body = "{\"lookup_accounts\":false,\"create_accounts\":[{\"id\":\"1\"}]}", .family = .create_accounts, .field = "flags" },
     };
     for (cases) |case| {
         errdefer std.debug.print("wire case: {s}\n", .{case.body});
@@ -1503,7 +1548,7 @@ test "canonical decimal IDs amounts and reference boundaries" {
     for (amounts) |amount| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        const body = try std.fmt.allocPrint(arena.allocator(), "{{\"create_transfers\":[{{\"id\":\"1\",\"pending_id\":\"2\",\"flags\":4,\"amount\":\"{s}\"}}]}}", .{amount});
+        const body = try std.fmt.allocPrint(arena.allocator(), "{{\"create_transfers\":[{{\"id\":\"1\",\"pending_id\":\"2\",\"flags\":[\"post_pending_transfer\"],\"amount\":\"{s}\"}}]}}", .{amount});
         const result = try test_plan(arena.allocator(), body);
         try std.testing.expectEqual(try std.fmt.parseInt(u128, amount, 10), result.admitted.commands[0].native.transfer.amount);
         try std.testing.expectEqual(@as(u128, 0), result.admitted.commands[0].native.transfer.debit_account_id);
@@ -1523,7 +1568,7 @@ test "normalized small numbers range and negative zero" {
     for (cases) |case| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        const json = try std.fmt.allocPrint(arena.allocator(), "{{\"create_accounts\":[{{\"id\":\"1\",\"flags\":0,\"ledger\":{s},\"code\":65535}}]}}", .{case.number});
+        const json = try std.fmt.allocPrint(arena.allocator(), "{{\"create_accounts\":[{{\"id\":\"1\",\"flags\":[],\"ledger\":{s},\"code\":65535}}]}}", .{case.number});
         const queued = try test_body_message(arena.allocator(), 1, json);
         const parsed = parseRecord(arena.allocator(), "number", queued);
         try std.testing.expect(parsed == .valid);
@@ -1537,7 +1582,7 @@ test "native construction preserves namespaces chain bits post defaults and orig
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const body = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
-        \\{"lookup_accounts":[{"id":"1","alias":"x"}],"create_transfers":[{"id":"1","flags":2,"debit_account_id":"1","credit_account_id":"2","amount":"0","ledger":99,"code":1,"timeout":4294967295},{"id":"3","flags":4,"pending_id":"1","amount":"340282366920938463463374607431768211455"}],"create_accounts":[{"id":"1","alias":"x","flags":2,"ledger":1,"code":1},{"id":"2","flags":0,"ledger":2,"code":1}]}
+        \\{"lookup_accounts":[{"id":"1","alias":"x"}],"create_transfers":[{"id":"1","flags":["pending"],"debit_account_id":"1","credit_account_id":"2","amount":"0","ledger":99,"code":1,"timeout":4294967295},{"id":"3","flags":["post_pending_transfer"],"pending_id":"1","amount":"340282366920938463463374607431768211455"}],"create_accounts":[{"id":"1","alias":"x","flags":["debits_must_not_exceed_credits"],"ledger":1,"code":1},{"id":"2","flags":[],"ledger":2,"code":1}]}
     , .{});
     const before = try operation.operationHash("tenant", "test", &body);
     const plan = (try plan_body(arena.allocator(), &body)).admitted;
@@ -1574,7 +1619,7 @@ test "void chain construction and lost-reply replay retain original native reque
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const body =
-        \\{"create_transfers":[{"id":"11","flags":2,"debit_account_id":"1","credit_account_id":"2","amount":"9","ledger":1,"code":1,"timeout":60},{"id":"12","flags":8,"pending_id":"11","amount":"0"}]}
+        \\{"create_transfers":[{"id":"11","flags":["pending"],"debit_account_id":"1","credit_account_id":"2","amount":"9","ledger":1,"code":1,"timeout":60},{"id":"12","flags":["void_pending_transfer"],"pending_id":"11","amount":"0"}]}
     ;
     const first = (try test_plan(arena.allocator(), body)).admitted;
     const replay = (try test_plan(arena.allocator(), body)).admitted;
@@ -1660,11 +1705,11 @@ test "diagnostic prefix and independent projection have exact Result shape" {
 
 test "field mode matrix rejects omissions prohibited fields and unsupported flags" {
     const bodies = [_][]const u8{
-        "{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1}",
-        "{\"id\":\"1\",\"flags\":0,\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1}",
-        "{\"id\":\"1\",\"flags\":2,\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1,\"timeout\":1}",
-        "{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\"}",
-        "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"2\",\"amount\":\"0\"}",
+        "{\"id\":\"1\",\"flags\":[],\"ledger\":1,\"code\":1}",
+        "{\"id\":\"1\",\"flags\":[],\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1}",
+        "{\"id\":\"1\",\"flags\":[\"pending\"],\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1,\"timeout\":1}",
+        "{\"id\":\"1\",\"flags\":[\"post_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\"}",
+        "{\"id\":\"1\",\"flags\":[\"void_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\"}",
     };
     for (bodies, 0..) |json, mode| {
         const family: Family = if (mode == 0) .create_accounts else .create_transfers;
@@ -1728,8 +1773,16 @@ test "account flag combinations and transfer modes are exact" {
     for ([_]u16{ 0, 2, 4, 8, 10, 12 }) |flags| {
         const json = try std.fmt.allocPrint(
             allocator,
-            "{{\"create_accounts\":[{{\"id\":\"1\",\"flags\":{d},\"ledger\":1,\"code\":1}}]}}",
-            .{flags},
+            "{{\"create_accounts\":[{{\"id\":\"1\",\"flags\":{s},\"ledger\":1,\"code\":1}}]}}",
+            .{switch (flags) {
+                0 => "[]",
+                2 => "[\"debits_must_not_exceed_credits\"]",
+                4 => "[\"credits_must_not_exceed_debits\"]",
+                8 => "[\"history\"]",
+                10 => "[\"history\",\"debits_must_not_exceed_credits\"]",
+                12 => "[\"credits_must_not_exceed_debits\",\"history\"]",
+                else => unreachable,
+            }},
         );
         const plan = (try test_plan(allocator, json)).admitted;
         try std.testing.expectEqual(flags, plan.commands[0].native.account.flags);
@@ -1738,28 +1791,60 @@ test "account flag combinations and transfer modes are exact" {
         const json = if (flags == 4 or flags == 8)
             try std.fmt.allocPrint(
                 allocator,
-                "{{\"create_transfers\":[{{\"id\":\"1\",\"pending_id\":\"2\",\"flags\":{d},\"amount\":\"0\"}}]}}",
-                .{flags},
+                "{{\"create_transfers\":[{{\"id\":\"1\",\"pending_id\":\"2\",\"flags\":[\"{s}\"],\"amount\":\"0\"}}]}}",
+                .{if (flags == 4) "post_pending_transfer" else "void_pending_transfer"},
             )
         else
             try std.fmt.allocPrint(
                 allocator,
-                "{{\"create_transfers\":[{{\"id\":\"1\",\"flags\":{d},\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1{s}}}]}}",
-                .{ flags, if (flags == 2) ",\"timeout\":1" else "" },
+                "{{\"create_transfers\":[{{\"id\":\"1\",\"flags\":{s},\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1{s}}}]}}",
+                .{ if (flags == 2) "[\"pending\"]" else "[]", if (flags == 2) ",\"timeout\":1" else "" },
             );
         const plan = (try test_plan(allocator, json)).admitted;
         try std.testing.expectEqual(flags, plan.commands[0].native.transfer.flags);
     }
 }
 
+test "named flags reject unsupported duplicate conflicting and wrong-typed input" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cases = [_]struct { family: Family, flags: []const u8 }{
+        .{ .family = .create_accounts, .flags = "0" },
+        .{ .family = .create_accounts, .flags = "null" },
+        .{ .family = .create_accounts, .flags = "{}" },
+        .{ .family = .create_accounts, .flags = "[2]" },
+        .{ .family = .create_accounts, .flags = "[\"linked\"]" },
+        .{ .family = .create_accounts, .flags = "[\"imported\"]" },
+        .{ .family = .create_accounts, .flags = "[\"closed\"]" },
+        .{ .family = .create_accounts, .flags = "[\"History\"]" },
+        .{ .family = .create_accounts, .flags = "[\"history\",\"history\"]" },
+        .{ .family = .create_accounts, .flags = "[\"debits_must_not_exceed_credits\",\"credits_must_not_exceed_debits\"]" },
+        .{ .family = .create_transfers, .flags = "0" },
+        .{ .family = .create_transfers, .flags = "[\"pending\",\"pending\"]" },
+        .{ .family = .create_transfers, .flags = "[\"pending\",\"post_pending_transfer\"]" },
+        .{ .family = .create_transfers, .flags = "[\"linked\"]" },
+        .{ .family = .create_transfers, .flags = "[\"unknown\"]" },
+    };
+    for (cases) |case| {
+        const json = if (case.family == .create_accounts)
+            try std.fmt.allocPrint(allocator, "{{\"create_accounts\":[{{\"id\":\"1\",\"flags\":{s},\"ledger\":1,\"code\":1}}]}}", .{case.flags})
+        else
+            try std.fmt.allocPrint(allocator, "{{\"create_transfers\":[{{\"id\":\"1\",\"flags\":{s},\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1}}]}}", .{case.flags});
+        const plan = try test_plan(allocator, json);
+        try std.testing.expect(plan == .rejected);
+        try std.testing.expectEqualStrings("flags", plan.rejected.field.?);
+    }
+}
+
 test "void fields inherit and direct relationships retain diagnostic precedence" {
     const cases = [_]struct { command: []const u8, field: ?[]const u8 }{
-        .{ .command = "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"2\",\"amount\":\"0\"}", .field = null },
-        .{ .command = "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"2\",\"amount\":\"42\",\"debit_account_id\":\"0\",\"credit_account_id\":\"0\",\"ledger\":0,\"code\":0}", .field = null },
-        .{ .command = "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"1\",\"amount\":\"0\"}", .field = "pending_id" },
-        .{ .command = "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"2\",\"amount\":\"0\",\"debit_account_id\":\"3\",\"credit_account_id\":\"3\"}", .field = "credit_account_id" },
-        .{ .command = "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"2\",\"amount\":\"0\",\"timeout\":0}", .field = "timeout" },
-        .{ .command = "{\"id\":\"1\",\"flags\":8,\"pending_id\":\"2\"}", .field = "amount" },
+        .{ .command = "{\"id\":\"1\",\"flags\":[\"void_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\"}", .field = null },
+        .{ .command = "{\"id\":\"1\",\"flags\":[\"void_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"42\",\"debit_account_id\":\"0\",\"credit_account_id\":\"0\",\"ledger\":0,\"code\":0}", .field = null },
+        .{ .command = "{\"id\":\"1\",\"flags\":[\"void_pending_transfer\"],\"pending_id\":\"1\",\"amount\":\"0\"}", .field = "pending_id" },
+        .{ .command = "{\"id\":\"1\",\"flags\":[\"void_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\",\"debit_account_id\":\"3\",\"credit_account_id\":\"3\"}", .field = "credit_account_id" },
+        .{ .command = "{\"id\":\"1\",\"flags\":[\"void_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\",\"timeout\":0}", .field = "timeout" },
+        .{ .command = "{\"id\":\"1\",\"flags\":[\"void_pending_transfer\"],\"pending_id\":\"2\"}", .field = "amount" },
     };
     for (cases) |case| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1776,11 +1861,11 @@ test "void fields inherit and direct relationships retain diagnostic precedence"
 
 test "duplicates precede direct relationships and post references retain zero inheritance" {
     const cases = [_]struct { body: []const u8, field: ?[]const u8 }{
-        .{ .body = "{\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1},{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1}]}", .field = "id" },
-        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\"},{\"id\":\"1\",\"flags\":4,\"pending_id\":\"1\",\"amount\":\"0\"}]}", .field = "id" },
-        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\",\"debit_account_id\":\"3\",\"credit_account_id\":\"3\"}]}", .field = "credit_account_id" },
-        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\",\"debit_account_id\":\"0\",\"credit_account_id\":\"0\",\"ledger\":0,\"code\":0}]}", .field = null },
-        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\",\"debit_account_id\":\"3\"}]}", .field = null },
+        .{ .body = "{\"create_accounts\":[{\"id\":\"1\",\"flags\":[],\"ledger\":1,\"code\":1},{\"id\":\"1\",\"flags\":[],\"ledger\":1,\"code\":1}]}", .field = "id" },
+        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":[\"post_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\"},{\"id\":\"1\",\"flags\":[\"post_pending_transfer\"],\"pending_id\":\"1\",\"amount\":\"0\"}]}", .field = "id" },
+        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":[\"post_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\",\"debit_account_id\":\"3\",\"credit_account_id\":\"3\"}]}", .field = "credit_account_id" },
+        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":[\"post_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\",\"debit_account_id\":\"0\",\"credit_account_id\":\"0\",\"ledger\":0,\"code\":0}]}", .field = null },
+        .{ .body = "{\"create_transfers\":[{\"id\":\"1\",\"flags\":[\"post_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\",\"debit_account_id\":\"3\"}]}", .field = null },
     };
     for (cases) |case| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1808,7 +1893,7 @@ test "sorted duplicate validation preserves original diagnostic precedence" {
         \\{"lookup_accounts":[{"id":"1","alias":null},{"id":"2"},{"id":"2"}]}
         , .index = 0, .field = "alias" },
         .{ .body =
-        \\{"create_transfers":[{"id":"1","flags":4,"pending_id":"1","amount":"0"},{"id":"1","flags":4,"pending_id":"2","amount":"0"}]}
+        \\{"create_transfers":[{"id":"1","flags":["post_pending_transfer"],"pending_id":"1","amount":"0"},{"id":"1","flags":["post_pending_transfer"],"pending_id":"2","amount":"0"}]}
         , .index = 0, .field = "pending_id" },
     };
     for (cases) |case| {
@@ -1924,7 +2009,7 @@ test "seeded family mixes admit uniformly and preserve independent positions" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
-        const count: usize = if (case_index % 2 == 0) 64 else 65;
+        const count: usize = if (case_index < 2) (if (case_index == 0) 64 else 65) else 40;
         var counts = [_]usize{0} ** 3;
         if (case_index < 6) {
             counts[case_index / 2] = count;
@@ -1940,8 +2025,8 @@ test "seeded family mixes admit uniformly and preserve independent positions" {
                 if (index != 0) try writer.writer.writeByte(',');
                 try writer.writer.print("{{\"id\":\"{d}\"", .{index + 1});
                 switch (family) {
-                    .create_accounts => try writer.writer.writeAll(",\"flags\":0,\"ledger\":1,\"code\":1"),
-                    .create_transfers => try writer.writer.writeAll(",\"flags\":4,\"pending_id\":\"999\",\"amount\":\"0\""),
+                    .create_accounts => try writer.writer.writeAll(",\"flags\":[],\"ledger\":1,\"code\":1"),
+                    .create_transfers => try writer.writer.writeAll(",\"flags\":[\"post_pending_transfer\"],\"pending_id\":\"999\",\"amount\":\"0\""),
                     .lookup_accounts => {},
                 }
                 try writer.writer.writeByte('}');
@@ -1952,7 +2037,7 @@ test "seeded family mixes admit uniformly and preserve independent positions" {
         errdefer std.debug.print("seed={x} case={d} input={s}\n", .{ seed, case_index, writer.written() });
         try std.testing.expect(writer.written().len <= 4096);
         const result = try test_plan(allocator, writer.written());
-        try std.testing.expectEqual(count == 64, result == .admitted);
+        try std.testing.expectEqual(count <= 64, result == .admitted);
         if (result == .admitted) {
             try std.testing.expectEqualSlices(usize, &counts, &result.admitted.counts);
             var offset: usize = 0;
@@ -2050,10 +2135,10 @@ test "hash normalization and explicit default identity remain unchanged" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const jsons = [_][]const u8{
-        "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\"}]}",
-        "{ \"create_transfers\" : [ {\"id\":\"\\u0031\",\"flags\":4.0,\"pending_id\":\"2\",\"amount\":\"0\"} ] }",
-        "{\"create_transfers\":[{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\",\"ledger\":0}]}",
-        "{\"create_transfers\":[{\"flags\":4,\"id\":\"1\",\"pending_id\":\"2\",\"amount\":\"0\"}]}",
+        "{\"create_transfers\":[{\"id\":\"1\",\"flags\":[\"post_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\"}]}",
+        "{ \"create_transfers\" : [ {\"id\":\"\\u0031\",\"flags\":[\"post_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\"} ] }",
+        "{\"create_transfers\":[{\"id\":\"1\",\"flags\":[\"post_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\",\"ledger\":0}]}",
+        "{\"create_transfers\":[{\"flags\":[\"post_pending_transfer\"],\"id\":\"1\",\"pending_id\":\"2\",\"amount\":\"0\"}]}",
     };
     var hashes: [4][32]u8 = undefined;
     var records: [4]tigerbeetle.Transfer = undefined;
@@ -2070,8 +2155,8 @@ test "hash normalization and explicit default identity remain unchanged" {
 }
 
 test "routed numeric boundary table covers code timeout amount and every reference" {
-    const pending = "{\"id\":\"1\",\"flags\":2,\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1,\"timeout\":1}";
-    const post = "{\"id\":\"1\",\"flags\":4,\"pending_id\":\"2\",\"amount\":\"0\"}";
+    const pending = "{\"id\":\"1\",\"flags\":[\"pending\"],\"debit_account_id\":\"2\",\"credit_account_id\":\"3\",\"amount\":\"0\",\"ledger\":1,\"code\":1,\"timeout\":1}";
+    const post = "{\"id\":\"1\",\"flags\":[\"post_pending_transfer\"],\"pending_id\":\"2\",\"amount\":\"0\"}";
     const Case = struct { field: []const u8, raw: []const u8, accepted: bool = false, post: bool = false };
     const cases = [_]Case{
         .{ .field = "code", .raw = "0" },                                                                                 .{ .field = "code", .raw = "65535", .accepted = true },
@@ -2091,7 +2176,7 @@ test "routed numeric boundary table covers code timeout amount and every referen
         .{ .field = "pending_id", .raw = "\"340282366920938463463374607431768211454\"", .post = true, .accepted = true }, .{ .field = "pending_id", .raw = "2", .post = true },
         .{ .field = "pending_id", .raw = "\"02\"", .post = true },                                                        .{ .field = "flags", .raw = "\"2\"" },
         .{ .field = "flags", .raw = "-0" },                                                                               .{ .field = "flags", .raw = "2.5" },
-        .{ .field = "flags", .raw = "2e0", .accepted = true },
+        .{ .field = "flags", .raw = "2e0" },
     };
     for (cases) |case| {
         errdefer std.debug.print("field={s} input={s} post={}\n", .{ case.field, case.raw, case.post });
@@ -2130,7 +2215,7 @@ test "Body-level diagnostics encode empty families and one payload error" {
 test "direct Result writer preserves replay positions and refuses unfinished work" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const plan = (try test_plan(arena.allocator(), "{\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1},{\"id\":\"2\",\"flags\":0,\"ledger\":1,\"code\":1}]}")).admitted;
+    const plan = (try test_plan(arena.allocator(), "{\"create_accounts\":[{\"id\":\"1\",\"flags\":[],\"ledger\":1,\"code\":1},{\"id\":\"2\",\"flags\":[],\"ledger\":1,\"code\":1}]}")).admitted;
     const buffer = try arena.allocator().create([operation.result_size_max]u8);
     try std.testing.expectError(error.UnfinishedOperation, write_result(buffer, &plan));
     plan.outcomes[0] = .{ .created = 21 };
@@ -2151,6 +2236,9 @@ fn write_result(
     std.debug.assert(plan.commands.len == plan.counts[0] + plan.counts[1] + plan.counts[2]);
     for (plan.outcomes) |*outcome| {
         if (outcome.* == .unsubmitted) return error.UnfinishedOperation;
+        if (outcome.* == .found and outcome.found.flags & ~account_output_flags_mask != 0) {
+            return error.UnsupportedTigerBeetleAccountFlags;
+        }
     }
     var writer = std.Io.Writer.fixed(buffer);
     writer.writeAll("{") catch unreachable;
@@ -2230,12 +2318,24 @@ fn write_outcome(writer: *std.Io.Writer, command: *const Command, outcome: *cons
 }
 
 fn write_account(writer: *std.Io.Writer, account: *const tigerbeetle.Account) !void {
+    std.debug.assert(account.flags & ~account_output_flags_mask == 0);
     try writer.writeAll("{");
     inline for (.{ "id", "debits_pending", "debits_posted", "credits_pending", "credits_posted", "user_data_128", "user_data_64", "user_data_32", "reserved", "ledger", "code", "flags", "timestamp" }, 0..) |field, index| {
         if (index != 0) try writer.writeAll(",");
         try writer.print("\"{s}\":", .{field});
         const value = @field(account, field);
-        if (@bitSizeOf(@TypeOf(value)) >= 64) {
+        if (comptime std.mem.eql(u8, field, "flags")) {
+            try writer.writeAll("[");
+            var first = true;
+            inline for (account_output_flags) |entry| {
+                if (account.flags & entry.bit != 0) {
+                    if (!first) try writer.writeAll(",");
+                    try std.json.Stringify.value(entry.name, .{}, writer);
+                    first = false;
+                }
+            }
+            try writer.writeAll("]");
+        } else if (@bitSizeOf(@TypeOf(value)) >= 64) {
             try writer.print("\"{d}\"", .{value});
         } else {
             try writer.print("{d}", .{value});
@@ -2383,19 +2483,86 @@ test "found Account projection preserves every native width and zero field" {
     inline for (.{ "id", "debits_pending", "debits_posted", "credits_pending", "credits_posted", "user_data_128", "user_data_64", "user_data_32", "reserved", "ledger", "code", "flags", "timestamp" }) |field| {
         @field(account, field) = std.math.maxInt(@TypeOf(@field(account, field)));
     }
+    account.flags = account_output_flags_mask;
     var bytes: [2048]u8 = undefined;
     var writer = std.Io.Writer.fixed(&bytes);
     try write_account(&writer, &account);
     const expected =
-        \\{"id":"340282366920938463463374607431768211455","debits_pending":"340282366920938463463374607431768211455","debits_posted":"340282366920938463463374607431768211455","credits_pending":"340282366920938463463374607431768211455","credits_posted":"340282366920938463463374607431768211455","user_data_128":"340282366920938463463374607431768211455","user_data_64":"18446744073709551615","user_data_32":4294967295,"reserved":4294967295,"ledger":4294967295,"code":65535,"flags":65535,"timestamp":"18446744073709551615"}
+        \\{"id":"340282366920938463463374607431768211455","debits_pending":"340282366920938463463374607431768211455","debits_posted":"340282366920938463463374607431768211455","credits_pending":"340282366920938463463374607431768211455","credits_posted":"340282366920938463463374607431768211455","user_data_128":"340282366920938463463374607431768211455","user_data_64":"18446744073709551615","user_data_32":4294967295,"reserved":4294967295,"ledger":4294967295,"code":65535,"flags":["linked","debits_must_not_exceed_credits","credits_must_not_exceed_debits","history","imported","closed"],"timestamp":"18446744073709551615"}
     ;
     try std.testing.expectEqualStrings(expected, writer.buffered());
+    account.id -= 1;
+    const command: Command = .{
+        .id = account.id,
+        .alias = "\x00" ** 64,
+        .native = .{ .lookup = account.id },
+    };
+    const outcome: CommandOutcome = .{ .found = account };
+    writer = .fixed(&bytes);
+    try write_outcome(&writer, &command, &outcome);
+    try std.testing.expect(writer.buffered().len <= 1434);
     account = std.mem.zeroes(tigerbeetle.Account);
     writer = .fixed(&bytes);
     try write_account(&writer, &account);
     try std.testing.expectEqualStrings(
-        \\{"id":"0","debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}
+        \\{"id":"0","debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":[],"timestamp":"0"}
     , writer.buffered());
+}
+
+test "found account flags serialize in native bit order and reject unknown bits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var account = std.mem.zeroes(tigerbeetle.Account);
+    account.id = 1;
+    var bytes: [2048]u8 = undefined;
+    inline for (account_output_flags, 0..) |entry, index| {
+        account.flags = entry.bit;
+        var writer = std.Io.Writer.fixed(&bytes);
+        try write_account(&writer, &account);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), writer.buffered(), .{});
+        const flags = parsed.object.get("flags").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), flags.len);
+        try std.testing.expectEqualStrings(account_output_flags[index].name, flags[0].string);
+    }
+    account.flags = account_output_flags_mask;
+    var writer = std.Io.Writer.fixed(&bytes);
+    try write_account(&writer, &account);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"flags\":[\"linked\",\"debits_must_not_exceed_credits\",\"credits_must_not_exceed_debits\",\"history\",\"imported\",\"closed\"]") != null);
+
+    const plan = (try test_plan(arena.allocator(), "{\"lookup_accounts\":[{\"id\":\"1\"}]}")).admitted;
+    account.flags = 0x8000;
+    plan.outcomes[0] = .{ .found = account };
+    const result_buffer = try arena.allocator().create([operation.result_size_max]u8);
+    try std.testing.expectError(error.UnsupportedTigerBeetleAccountFlags, write_result(result_buffer, &plan));
+}
+
+test "unknown native account flags publish terminal failure and retry failed publication" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const message = try test_body_message(allocator, 1, "{\"lookup_accounts\":[{\"id\":\"1\"}]}");
+    const event = try testEvent(allocator, &.{message});
+    inline for (.{ false, true }) |send_fails| {
+        var execution: FakeExecution = .{};
+        execution.lookup_count = 1;
+        execution.lookup_results[0] = std.mem.zeroes(tigerbeetle.Account);
+        execution.lookup_results[0].id = 1;
+        execution.lookup_results[0].flags = 0x8000;
+        var publisher: FakePublisher = .{};
+        if (send_fails) publisher.send_error = error.SendFailed;
+        const response = try handleInvocation(allocator, event, ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+        try std.testing.expectEqualStrings(if (send_fails)
+            "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}"
+        else
+            "{\"batchItemFailures\":[]}", response);
+        try std.testing.expectEqual(@as(u8, 1), publisher.send_count);
+        if (!send_fails) {
+            const decoded = try test_results(allocator, &.{publisher.message});
+            const result = decoded.results[0].valid.result;
+            try std.testing.expect(result == .failure);
+            try std.testing.expectEqualStrings("UnsupportedTigerBeetleAccountFlags", result.failure.object.get("error").?.object.get("message").?.string);
+        }
+    }
 }
 
 test "realizable lookup Body carries found data larger than 4 KiB through Completion" {
@@ -2415,7 +2582,7 @@ test "realizable lookup Body carries found data larger than 4 KiB through Comple
         var account = std.mem.zeroes(tigerbeetle.Account);
         account.id = index + 1;
         account.debits_posted = std.math.maxInt(u128);
-        account.flags = 65535;
+        account.flags = account_output_flags_mask;
         outcome.* = .{ .found = account };
     }
     plan.outcomes[63] = .{ .missing = "Account was not found." };
@@ -2460,7 +2627,7 @@ test "mixed FAILURE retains writes skipped transfers found observations and alia
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const plan = (try test_plan(arena.allocator(),
-        \\{"create_accounts":[{"id":"1","flags":0,"ledger":1,"code":1}],"create_transfers":[{"id":"3","flags":0,"debit_account_id":"1","credit_account_id":"2","amount":"1","ledger":1,"code":1}],"lookup_accounts":[{"id":"1","alias":"same"},{"id":"2","alias":"same"}]}
+        \\{"create_accounts":[{"id":"1","flags":[],"ledger":1,"code":1}],"create_transfers":[{"id":"3","flags":[],"debit_account_id":"1","credit_account_id":"2","amount":"1","ledger":1,"code":1}],"lookup_accounts":[{"id":"1","alias":"same"},{"id":"2","alias":"same"}]}
     )).admitted;
     plan.outcomes[0] = .{ .created = 4294967295 };
     plan.outcomes[1] = .{ .created = 22 };
@@ -2471,7 +2638,7 @@ test "mixed FAILURE retains writes skipped transfers found observations and alia
     const buffer = try arena.allocator().create([operation.result_size_max]u8);
     const result = try write_result(buffer, &plan);
     try std.testing.expectEqualStrings(
-        \\{"create_accounts":[{"error_code":"created"}],"create_transfers":[{"error_code":"credit_account_not_found"}],"lookup_accounts":[{"error_code":null,"alias":"same","account":{"id":"1","debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":0,"timestamp":"0"}},{"error_code":null,"alias":"same","message":"Account was not found."}]}
+        \\{"create_accounts":[{"error_code":"created"}],"create_transfers":[{"error_code":"credit_account_not_found"}],"lookup_accounts":[{"error_code":null,"alias":"same","account":{"id":"1","debits_pending":"0","debits_posted":"0","credits_pending":"0","credits_posted":"0","user_data_128":"0","user_data_64":"0","user_data_32":0,"reserved":0,"ledger":0,"code":0,"flags":[],"timestamp":"0"}},{"error_code":null,"alias":"same","message":"Account was not found."}]}
     , result);
     plan.outcomes[0] = .{ .created = 2 };
     plan.outcomes[1] = .{ .skipped = "Transfer was not submitted because account creation was rejected." };
@@ -2483,7 +2650,7 @@ test "mixed FAILURE retains writes skipped transfers found observations and alia
 }
 
 const execution_body =
-    \\{"create_accounts":[{"id":"1","flags":0,"ledger":1,"code":1},{"id":"2","flags":0,"ledger":1,"code":1}],"create_transfers":[{"id":"3","flags":0,"debit_account_id":"1","credit_account_id":"2","amount":"10","ledger":1,"code":1}],"lookup_accounts":[{"id":"2","alias":"credit"},{"id":"1","alias":"debit"}]}
+    \\{"create_accounts":[{"id":"1","flags":[],"ledger":1,"code":1},{"id":"2","flags":[],"ledger":1,"code":1}],"create_transfers":[{"id":"3","flags":[],"debit_account_id":"1","credit_account_id":"2","amount":"10","ledger":1,"code":1}],"lookup_accounts":[{"id":"2","alias":"credit"},{"id":"1","alias":"debit"}]}
 ;
 
 fn test_invoke(allocator: Allocator, bodies: []const []const u8, fake: *FakeExecution, publisher: *FakePublisher) ![]const u8 {
@@ -2633,7 +2800,7 @@ test "request errors stop each phase and publish later fully determined Operatio
             .lookup_accounts => fake.lookup_error = error.NativeUnavailable,
         }
         var publisher: FakePublisher = .{};
-        const account_only = "{\"create_accounts\":[{\"id\":\"9\",\"flags\":0,\"ledger\":1,\"code\":1}]}";
+        const account_only = "{\"create_accounts\":[{\"id\":\"9\",\"flags\":[],\"ledger\":1,\"code\":1}]}";
         const response = try test_invoke(arena.allocator(), &.{ execution_body, account_only, "true" }, &fake, &publisher);
         try std.testing.expectEqualSlices(Family, families[0 .. phase + 1], fake.trace[0..fake.trace_count]);
         try std.testing.expectEqualStrings(if (phase == 0)
@@ -2856,7 +3023,7 @@ test "maximum admitted invocation uses three native calls and ten individual res
     defer arena.deinit();
     const allocator = arena.allocator();
     var body: std.Io.Writer.Allocating = .init(allocator);
-    try body.writer.writeAll("{\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1}],\"create_transfers\":[{\"id\":\"2\",\"flags\":0,\"debit_account_id\":\"1\",\"credit_account_id\":\"3\",\"amount\":\"1\",\"ledger\":1,\"code\":1}],\"lookup_accounts\":[");
+    try body.writer.writeAll("{\"create_accounts\":[{\"id\":\"1\",\"flags\":[],\"ledger\":1,\"code\":1}],\"create_transfers\":[{\"id\":\"2\",\"flags\":[],\"debit_account_id\":\"1\",\"credit_account_id\":\"3\",\"amount\":\"1\",\"ledger\":1,\"code\":1}],\"lookup_accounts\":[");
     for (0..62) |index| {
         if (index > 0) try body.writer.writeAll(",");
         try body.writer.print("{{\"id\":\"{d}\"}}", .{index + 1});
@@ -2884,8 +3051,8 @@ test "maximum admitted invocation uses three native calls and ten individual res
 }
 
 test "malformed final creation range cannot publish a valid looking prefix in either family" {
-    const account_body = "{\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1},{\"id\":\"2\",\"flags\":0,\"ledger\":1,\"code\":1}]}";
-    const transfer_body = "{\"create_transfers\":[{\"id\":\"3\",\"flags\":0,\"debit_account_id\":\"1\",\"credit_account_id\":\"2\",\"amount\":\"1\",\"ledger\":1,\"code\":1},{\"id\":\"4\",\"flags\":0,\"debit_account_id\":\"1\",\"credit_account_id\":\"2\",\"amount\":\"1\",\"ledger\":1,\"code\":1}]}";
+    const account_body = "{\"create_accounts\":[{\"id\":\"1\",\"flags\":[],\"ledger\":1,\"code\":1},{\"id\":\"2\",\"flags\":[],\"ledger\":1,\"code\":1}]}";
+    const transfer_body = "{\"create_transfers\":[{\"id\":\"3\",\"flags\":[],\"debit_account_id\":\"1\",\"credit_account_id\":\"2\",\"amount\":\"1\",\"ledger\":1,\"code\":1},{\"id\":\"4\",\"flags\":[],\"debit_account_id\":\"1\",\"credit_account_id\":\"2\",\"amount\":\"1\",\"ledger\":1,\"code\":1}]}";
     for ([_][]const u8{ account_body, transfer_body }, 0..) |body, family| {
         for ([_]?usize{ 0, 1, 3, 5, null }) |count| {
             var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3032,7 +3199,7 @@ test "large lookup and mixed Results traverse Completion conditional persistence
             const allocator = arena.allocator();
             var body: std.Io.Writer.Allocating = .init(allocator);
             try body.writer.writeByte('{');
-            if (mixed) try body.writer.writeAll("\"create_accounts\":[{\"id\":\"1\",\"flags\":0,\"ledger\":1,\"code\":1}],");
+            if (mixed) try body.writer.writeAll("\"create_accounts\":[{\"id\":\"1\",\"flags\":[],\"ledger\":1,\"code\":1}],");
             try body.writer.writeAll("\"lookup_accounts\":[");
             for (0..32) |i| {
                 if (i != 0) try body.writer.writeByte(',');
@@ -3263,7 +3430,7 @@ test "redelivery regroups only intact original chains after a lost shared reply"
     defer arena.deinit();
     const allocator = arena.allocator();
     const original = try test_body_message(allocator, 17, execution_body);
-    const neighbor = try test_body_message(allocator, 18, "{\"create_accounts\":[{\"id\":\"9\",\"flags\":0,\"ledger\":1,\"code\":1}]}");
+    const neighbor = try test_body_message(allocator, 18, "{\"create_accounts\":[{\"id\":\"9\",\"flags\":[],\"ledger\":1,\"code\":1}]}");
     {
         var first = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer first.deinit();
@@ -3275,7 +3442,7 @@ test "redelivery regroups only intact original chains after a lost shared reply"
         try std.testing.expectEqual(@as(usize, 3), execution.account_count);
         try std.testing.expectEqual(@as(u8, 0), publisher.send_count);
     }
-    const different_neighbor = try test_body_message(allocator, 19, "{\"create_accounts\":[{\"id\":\"10\",\"flags\":0,\"ledger\":1,\"code\":1}]}");
+    const different_neighbor = try test_body_message(allocator, 19, "{\"create_accounts\":[{\"id\":\"10\",\"flags\":[],\"ledger\":1,\"code\":1}]}");
     var execution: FakeExecution = .{};
     execution.account_outcomes[1] = .{ .rejected = tigerbeetle.account_exists };
     execution.account_outcomes[2] = .{ .rejected = tigerbeetle.account_linked_event_failed };
@@ -3305,8 +3472,8 @@ test "pending resolution replay retains original timeout amount and inheritance 
             defer arena.deinit();
             const body = try std.fmt.allocPrint(
                 arena.allocator(),
-                "{{\"create_transfers\":[{{\"id\":\"3\",\"flags\":2,\"debit_account_id\":\"1\",\"credit_account_id\":\"2\",\"amount\":\"10\",\"ledger\":1,\"code\":1,\"timeout\":7}},{{\"id\":\"4\",\"flags\":{d},\"pending_id\":\"3\",\"amount\":\"{s}\"}}]}}",
-                .{ mode.flags, mode.amount },
+                "{{\"create_transfers\":[{{\"id\":\"3\",\"flags\":[\"pending\"],\"debit_account_id\":\"1\",\"credit_account_id\":\"2\",\"amount\":\"10\",\"ledger\":1,\"code\":1,\"timeout\":7}},{{\"id\":\"4\",\"flags\":[\"{s}\"],\"pending_id\":\"3\",\"amount\":\"{s}\"}}]}}",
+                .{ if (mode.flags == 4) "post_pending_transfer" else "void_pending_transfer", mode.amount },
             );
             var execution: FakeExecution = .{};
             if (attempt == 1) {

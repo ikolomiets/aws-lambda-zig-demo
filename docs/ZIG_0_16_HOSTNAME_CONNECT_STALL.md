@@ -257,7 +257,7 @@ timeout only extends the stall.
 ## Status
 
 The issue is confirmed against Zig 0.16.0 and the repository-pinned transport.
-`build.zig` now selects `../zig/lib` as a temporary standard-library override
+`build.zig` selects `../zig/lib` as a temporary standard-library override
 for the TigerBeetle processor executable. That sibling checkout is external to
 this repository; its patch is not pinned or validated by the files here.
 Check `zig version` reports 0.16.0 and

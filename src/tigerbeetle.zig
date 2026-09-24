@@ -17,6 +17,8 @@ pub const account_credits_must_not_exceed_debits: u16 = @intCast(
     c.TB_ACCOUNT_CREDITS_MUST_NOT_EXCEED_DEBITS,
 );
 pub const account_history: u16 = @intCast(c.TB_ACCOUNT_HISTORY);
+pub const account_imported: u16 = @intCast(c.TB_ACCOUNT_IMPORTED);
+pub const account_closed: u16 = @intCast(c.TB_ACCOUNT_CLOSED);
 pub const transfer_linked: u16 = @intCast(c.TB_TRANSFER_LINKED);
 pub const transfer_pending: u16 = @intCast(c.TB_TRANSFER_PENDING);
 pub const transfer_post_pending_transfer: u16 = @intCast(c.TB_TRANSFER_POST_PENDING_TRANSFER);
