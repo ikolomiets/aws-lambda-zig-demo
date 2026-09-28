@@ -82,13 +82,19 @@ creation lists are independent Linked Chains and all three lists execute in sepa
 _Avoid_: Execution group, cross-family batch
 
 **Processor Message**:
-A message correlating an Operation UUID with a processor's input or output Body and an optional
-Result Queue. It carries work between processors without the Operation's lifecycle or ownership metadata.
+A message correlating an Operation UUID and trusted Operation Tenant with a processor's input or
+output Body, Context, and an optional Result Queue. It carries work between processors without the Operation's
+lifecycle metadata.
 _Avoid_: Operation snapshot, Completion batch
 
 **Processor Body**:
 The JSON value a processor consumes or produces. One processor's output may be another's input.
 _Avoid_: Operation Result, wrapped payload
+
+**Processor Context**:
+Information accompanying a Processor Body whose meaning belongs to the participating domain
+processors. An intermediate processor may carry it forward without interpreting it.
+_Avoid_: Operation Body, Operation Result, execution plan
 
 **Result Queue**:
 An internal instruction identifying where the receiving processor should send its result. When absent,
@@ -100,3 +106,42 @@ _Avoid_: Current message destination, public callback
 A Processor Message delivered to the final processor, which interprets its Body and determines the
 Operation's terminal Result.
 _Avoid_: Native Request, Operation Result, Completion batch
+
+## Seat reservation language
+
+**Seat Event**:
+A tenant-owned offering with a configured number of seats in each Seat Class and a reservation
+time limit. Only its owning tenant may reserve, confirm, or check its seats.
+_Avoid_: Operation, native event
+
+**Seat Class**:
+A tagged category of interchangeable seats with positive configured capacity within one Seat Event,
+such as general or premium.
+_Avoid_: Assigned seat
+
+**Seat Event State**:
+The Seat Event's initialization condition: creating while initialization is incomplete or uncertain,
+ready after all accounts and initial funding succeed, or failed after definitive initialization
+failure. Failed events remain failed; only ready events admit reservations, confirmations,
+and seat checks.
+_Avoid_: Operation State, funding observation
+
+**Capacity Account**:
+The Seat Event's single source account for distributing its configured seat quantities to
+Availability Accounts.
+_Avoid_: Availability Account
+
+**Availability Account**:
+The account representing one Seat Class's configured supply and the seats reserved or confirmed
+against that supply.
+_Avoid_: Remaining-seat count
+
+**Allocation Account**:
+The Seat Event's single destination account for reserved and confirmed seat quantities across
+its Seat Classes.
+_Avoid_: Customer account
+
+**Seat Reservation**:
+A positive quantity of seats held in one specified Seat Class of a Seat Event by one successful
+reserve_seats request. Confirmation applies to the full held quantity.
+_Avoid_: Operation, individual pending transfer
