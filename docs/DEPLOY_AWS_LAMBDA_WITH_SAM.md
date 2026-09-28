@@ -390,11 +390,16 @@ address-syntax validation during cold start. `deploy.sh` exposes matching
 environment overrides.
 
 The TigerBeetle processor event source mapping is enabled with `BatchSize: 10`,
-`MaximumBatchingWindowInSeconds: 0`, `MaximumConcurrency: 8`, and
-`ReportBatchItemFailures`. The event-source concurrency cap limits the mapping
-to eight concurrent TigerBeetle processor invocations, preventing unbounded Lambda scaling
-from consuming TigerBeetle's default 64 client sessions. Lambda polls the queue
-and invokes TigerBeetle processor with SQS events. The mapping remains enabled when the
+`MaximumBatchingWindowInSeconds: 0`, and `ReportBatchItemFailures`. Neither this
+mapping nor the Completion mapping configures `ScalingConfig` or maximum
+concurrency. Lambda can therefore use its standard low-traffic SQS scaling
+optimization to reduce polling requests while the queues are quiet, without
+promising a fixed request rate. Under heavy traffic, more
+concurrent TigerBeetle processors may increase demand for TigerBeetle's default
+64 client sessions. Warm processors retain native clients, so invocation
+concurrency is not a client-session count; monitor session errors, processing
+errors, and queue backlog under load. Lambda polls the queue and invokes
+TigerBeetle processor with SQS events. The mapping remains enabled when the
 managed WireGuard gateway is disabled; operators must provide another trusted
 route to the configured TigerBeetle address or accept timeout-driven
 partial-batch retries. Each record is a minimal Processor Message with canonical `operation_id`,
