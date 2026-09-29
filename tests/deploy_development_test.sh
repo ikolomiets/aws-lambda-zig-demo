@@ -72,7 +72,16 @@ PASETO
         ;;
     zip) printf 'archive\n' >"$2" ;;
     unzip) printf '%s\n' "${MOCK_ARCHIVE_CONTENTS:-bootstrap}" ;;
-    sam) ;;
+    sam)
+        if [ "$1" = sync ] && [ "${MOCK_SAM_CONFIRMATION:-0}" -eq 1 ]; then
+            read -r reply || exit 95
+            [ "$reply" = Y ] || exit 96
+            # Exactly one answer is supplied, so an additional prompt reaches EOF.
+            if read -r reply; then
+                exit 97
+            fi
+        fi
+        ;;
     curl)
         if [ -n "${MOCK_HTTP_STATUS:-}" ]; then
             printf '%s' "$MOCK_HTTP_STATUS"
@@ -224,7 +233,8 @@ test_development_dry_run() {
 test_development_code_sync() {
     local calls
     new_checkout dev-sync
-    run_script --dev --profile=dev-selected --region us-east-1 --stack-name=dev-code-stack ||
+    MOCK_SAM_CONFIRMATION=1 run_script \
+        --dev --profile=dev-selected --region us-east-1 --stack-name=dev-code-stack </dev/null ||
         fail_test "development sync failed: $(cat "$CHECKOUT/output.log")"
     calls="$(cat "$MOCK_CALL_LOG")"
     assert_contains "$calls" 'sam sync --template-file template.yaml --stack-name dev-code-stack --region us-east-1 --profile dev-selected --code --no-watch --no-dependency-layer --resource-id IntakeFunction --resource-id QueryFunction --resource-id TigerBeetleProcessor --resource-id TigerBeetleCompletionProcessor'

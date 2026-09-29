@@ -54,6 +54,7 @@ Options:
   --dev                  Build/package with persistent caches and sync only code
                          to an existing development stack. Skips tests and SAM
                          validation. Configuration changes require full deployment.
+                         Automatically accepts SAM's development-stack confirmation.
   --dry-run              Run local checks, build, package, and validation only.
   --no-url-check         Skip the post-deploy Function URL HTTP status check.
   -h, --help             Show this help.
@@ -849,7 +850,7 @@ run_deployment() {
             --resource-id IntakeFunction \
             --resource-id QueryFunction \
             --resource-id TigerBeetleProcessor \
-            --resource-id TigerBeetleCompletionProcessor ||
+            --resource-id TigerBeetleCompletionProcessor <<< 'Y' ||
             fail "development code sync failed; some functions may already have updated"
     else
         deploy_stack_and_resolve_controller_outputs

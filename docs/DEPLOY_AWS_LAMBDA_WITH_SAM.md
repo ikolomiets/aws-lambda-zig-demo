@@ -1364,7 +1364,9 @@ After SSO login and the active-stack guard, the helper runs one-shot
 the selected stack/profile/Region and exactly `IntakeFunction`, `QueryFunction`,
 `TigerBeetleProcessor`, and `TigerBeetleCompletionProcessor`. SAM handles the
 prebuilt ZIPs, unchanged-code detection, upload, and update waiting. SAM may ask
-for its development-stack opt-in on first use. The helper then retains the
+for its development-stack opt-in on first use; selecting `--dev` automatically
+answers that confirmation with a single `Y`. The warning remains visible, and
+any further prompt receives EOF. The helper then retains the
 existing read-only table/queue summaries, Function URL outputs, and HTTP probes;
 `--no-url-check` skips those HTTP probes and the private-key requirement.
 The public key is not required in development mode because the deployed
