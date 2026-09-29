@@ -1333,6 +1333,61 @@ Use
 to build with local dependency checkouts. The `aws_lambda` checkout defaults
 to `../aws-lambda-zig`; override it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
 
+### Development code updates
+
+Use `./deploy.sh --dev` for compatible code changes on an existing development
+stack. Establish the baseline with a full deployment first. Plain `./deploy.sh`
+retains the full test suite, both SAM validation passes, controller/WireGuard
+flow, outputs, smoke checks, and deletion of `.zig-cache-deploy` and
+`.zig-global-cache-deploy` on exit.
+
+```sh
+# With the private key matching the deployed public key exported for smoke checks:
+./deploy.sh --dev --profile dev --region ca-central-1 --stack-name aws-lambda-zig-demo
+
+# Local build/package checks only; no keys, login, AWS inspection, or sync:
+./deploy.sh --dev --dry-run
+```
+
+Development mode retains `.zig-cache-dev` and `.zig-global-cache-dev` across
+successful and failed runs; ordinary deployment does not delete these caches.
+It checks Zig 0.16.0 and the required sibling standard library, runs the existing
+formatting check, and incrementally builds the same ARM64 ReleaseSafe targets
+and host tools. The sibling file check does not verify the hostname workaround;
+see the [hostname-connect note](ZIG_0_16_HOSTNAME_CONNECT_STALL.md). It refreshes
+all four prebuilt ZIPs and verifies stripped ARM64 bootstraps and root-level
+archive contents. It skips the full suite and both SAM validation passes. Build,
+package, and sync failures fail the run.
+
+After SSO login and the active-stack guard, the helper runs one-shot
+`sam sync --code --no-watch --no-dependency-layer` against `template.yaml`, using
+the selected stack/profile/Region and exactly `IntakeFunction`, `QueryFunction`,
+`TigerBeetleProcessor`, and `TigerBeetleCompletionProcessor`. SAM handles the
+prebuilt ZIPs, unchanged-code detection, upload, and update waiting. SAM may ask
+for its development-stack opt-in on first use. The helper then retains the
+existing read-only table/queue summaries, Function URL outputs, and HTTP probes;
+`--no-url-check` skips those HTTP probes and the private-key requirement.
+The public key is not required in development mode because the deployed
+configuration supplies it. Run `zig build test` separately for the full local
+release gates. The mode has no measured speed guarantee.
+
+Development mode invokes no deployment controller, WireGuard lifecycle action,
+or counter setup. It rejects explicit function-name, TigerBeetle configuration,
+and Lambda-principal flags, lifecycle options including `--cleanup`, and custom
+deployment controllers. Environment configuration overrides such as
+`PASETO_PUBLIC_KEY`, function names, and TigerBeetle settings are not applied by
+code sync. Use full deployment for new resources, IAM, environment/runtime/network
+settings, and coordinated incompatible message-envelope changes; those require
+a new compatible baseline before further code-only iterations.
+
+Multi-function code sync is not atomic: a failed run may leave some functions
+updated. Synchronized code can differ from the artifact recorded by
+CloudFormation. An empty deployment change set or CloudFormation drift status
+does not establish code equality. Return to the full deployment path for
+infrastructure changes and release checks. See the
+[SAM code-sync reference](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-cli-command-reference-sam-sync.html)
+for the AWS CLI behavior.
+
 ## 7. Configure and operate the WireGuard gateway
 
 After deployment, SAM prints stack outputs. Look for:

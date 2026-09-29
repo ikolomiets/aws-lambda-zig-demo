@@ -14,6 +14,7 @@ LAMBDA_PRINCIPAL="${LAMBDA_PRINCIPAL:-*}"
 PASETO_PUBLIC_KEY="${PASETO_PUBLIC_KEY:-}"
 LOCAL_AWS_LAMBDA_ROOT="${LOCAL_AWS_LAMBDA_ROOT:-../aws-lambda-zig}"
 DRY_RUN=0
+DEV=0
 CHECK_URL=1
 USE_LOCAL_LIBS=0
 DEPLOYMENT_STARTED=0
@@ -50,6 +51,9 @@ Options:
                          LAMBDA_PRINCIPAL environment value. Defaults to *.
   --use-local-libs       Use local dependency checkouts with zig build --fork.
                          aws_lambda defaults to ../aws-lambda-zig.
+  --dev                  Build/package with persistent caches and sync only code
+                         to an existing development stack. Skips tests and SAM
+                         validation. Configuration changes require full deployment.
   --dry-run              Run local checks, build, package, and validation only.
   --no-url-check         Skip the post-deploy Function URL HTTP status check.
   -h, --help             Show this help.
@@ -171,7 +175,11 @@ ensure_stack_not_in_progress() {
         2>&1)"
     then
         case "$stack_status" in
-            *"does not exist"*) return 0 ;;
+            *"does not exist"*)
+                [ "$DEV" -eq 0 ] ||
+                    fail "development code sync requires an existing stack; run a full deployment first"
+                return 0
+                ;;
             *) fail "could not inspect CloudFormation stack $STACK_NAME before deployment" ;;
         esac
     fi
@@ -414,6 +422,7 @@ deployment_error_handler() {
 }
 
 deployment_cleanup() {
+    [ "$DEV" -eq 0 ] || return 0
     invoke_deployment_controller cleanup || true
     rm -rf -- "${CACHE_DIR:-.zig-cache-deploy}" \
         "${GLOBAL_CACHE_DIR:-.zig-global-cache-deploy}"
@@ -481,8 +490,17 @@ validate_deployed_function_names() {
 }
 
 parse_deployment_options() {
+    local configuration_option=""
+
     reject_retired_processor_overrides
     while [ "$#" -gt 0 ]; do
+        case "${1%%=*}" in
+            --intake-function-name | --query-function-name | \
+                --tiger-beetle-processor-name | --tiger-beetle-completion-processor-name | \
+                --tigerbeetle-cluster-id | --tigerbeetle-addresses | --lambda-principal)
+                configuration_option="${1%%=*}"
+                ;;
+        esac
         case "$1" in
             --execution-function-name | --execution-function-name=*)
                 fail "--execution-function-name is retired; use --tiger-beetle-processor-name"
@@ -607,6 +625,10 @@ parse_deployment_options() {
                 DRY_RUN=1
                 shift
                 ;;
+            --dev)
+                DEV=1
+                shift
+                ;;
             --no-url-check)
                 CHECK_URL=0
                 shift
@@ -634,6 +656,12 @@ parse_deployment_options() {
             *) fail "unknown option: $1" ;;
         esac
     done
+    if [ "$DEV" -eq 1 ]; then
+        [ -z "$configuration_option" ] ||
+            fail "$configuration_option requires a full deployment; --dev syncs code only"
+        [ "$DEPLOYMENT_CONTROLLER" = preserve_wireguard_state ] ||
+            fail "WireGuard lifecycle or custom controllers require a full deployment; --dev syncs code only"
+    fi
 }
 
 validate_lambda_bootstraps() {
@@ -688,30 +716,43 @@ package_lambda_archives() {
 
 run_deployment() {
     parse_deployment_options "$@"
-    validate_tiger_beetle_completion_processor_name
+    if [ "$DEV" -eq 0 ]; then
+        validate_tiger_beetle_completion_processor_name
+    fi
 
     cd "$(dirname "${BASH_SOURCE[0]}")"
     CACHE_DIR=".zig-cache-deploy"
     GLOBAL_CACHE_DIR=".zig-global-cache-deploy"
+    if [ "$DEV" -eq 1 ]; then
+        CACHE_DIR=".zig-cache-dev"
+        GLOBAL_CACHE_DIR=".zig-global-cache-dev"
+    fi
     trap deployment_cleanup EXIT
 
-    validate_tigerbeetle_configuration
+    if [ "$DEV" -eq 0 ]; then
+        validate_tigerbeetle_configuration
+    fi
 
     if [ "$DRY_RUN" -eq 0 ]; then
         need_command aws
         prepare_aws_sso_session "$PROFILE"
         ensure_stack_not_in_progress
-        validate_existing_intake_name "$INTAKE_FUNCTION_NAME"
+        if [ "$DEV" -eq 0 ]; then
+            validate_existing_intake_name "$INTAKE_FUNCTION_NAME"
+        fi
     fi
 
-    [ -n "$PASETO_PUBLIC_KEY" ] ||
-        fail "PASETO_PUBLIC_KEY is required; generate one with: zig-out/bin/paseto keygen"
+    if [ "$DEV" -eq 0 ]; then
+        [ -n "$PASETO_PUBLIC_KEY" ] ||
+            fail "PASETO_PUBLIC_KEY is required; generate one with: zig-out/bin/paseto keygen"
+    fi
     if [ "$DRY_RUN" -eq 0 ] && [ "$CHECK_URL" -eq 1 ]; then
         [ -n "${PASETO_PRIVATE_KEY:-}" ] ||
             fail "PASETO_PRIVATE_KEY is required for the authenticated Function URL check"
     fi
-
-    invoke_deployment_controller plan
+    if [ "$DEV" -eq 0 ]; then
+        invoke_deployment_controller plan
+    fi
 
     need_command zig
     need_command zip
@@ -720,6 +761,11 @@ run_deployment() {
     need_command sam
     if [ "$DRY_RUN" -eq 0 ] && [ "$CHECK_URL" -eq 1 ]; then
         need_command curl
+    fi
+    if [ "$DEV" -eq 1 ]; then
+        [ "$(zig version)" = 0.16.0 ] || fail "development builds require Zig 0.16.0"
+        [ -f ../zig/lib/std/Io/net/HostName.zig ] ||
+            fail "required sibling Zig standard library missing: ../zig/lib/std/Io/net/HostName.zig"
     fi
 
     LOCAL_FORKS=()
@@ -757,8 +803,10 @@ run_deployment() {
         done
     fi
 
-    printf '==> Running Zig tests\n'
-    zig build test "${ZIG_BUILD_ARGS[@]}"
+    if [ "$DEV" -eq 0 ]; then
+        printf '==> Running Zig tests\n'
+        zig build test "${ZIG_BUILD_ARGS[@]}"
+    fi
 
     printf '==> Removing obsolete root Lambda bootstrap\n'
     rm -f zig-out/bin/bootstrap
@@ -772,16 +820,40 @@ run_deployment() {
     printf '==> Refreshing Lambda zip archives\n'
     package_lambda_archives
 
-    printf '==> Validating SAM template\n'
-    sam validate --template-file template.yaml --region "$REGION"
-    sam validate --lint --template-file template.yaml --region "$REGION"
+    if [ "$DEV" -eq 0 ]; then
+        printf '==> Validating SAM template\n'
+        sam validate --template-file template.yaml --region "$REGION"
+        sam validate --lint --template-file template.yaml --region "$REGION"
+    fi
 
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '==> Dry run complete. Skipped SAM deploy.\n'
+        if [ "$DEV" -eq 1 ]; then
+            printf '==> Development dry run complete. Skipped SAM sync.\n'
+        else
+            printf '==> Dry run complete. Skipped SAM deploy.\n'
+        fi
         return 0
     fi
 
-    deploy_stack_and_resolve_controller_outputs
+    if [ "$DEV" -eq 1 ]; then
+        printf '==> Syncing Lambda code to existing development stack %s in %s\n' \
+            "$STACK_NAME" "$REGION"
+        sam sync \
+            --template-file template.yaml \
+            --stack-name "$STACK_NAME" \
+            --region "$REGION" \
+            --profile "$PROFILE" \
+            --code \
+            --no-watch \
+            --no-dependency-layer \
+            --resource-id IntakeFunction \
+            --resource-id QueryFunction \
+            --resource-id TigerBeetleProcessor \
+            --resource-id TigerBeetleCompletionProcessor ||
+            fail "development code sync failed; some functions may already have updated"
+    else
+        deploy_stack_and_resolve_controller_outputs
+    fi
 
     OPERATIONS_TABLE_NAME="$(aws cloudformation describe-stack-resource \
         --stack-name "$STACK_NAME" \
