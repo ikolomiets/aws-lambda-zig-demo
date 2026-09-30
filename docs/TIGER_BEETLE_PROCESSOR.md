@@ -27,16 +27,26 @@ shared [`processor_message.zig`](../src/processor_message.zig) codec. See
 - Operation Tenant is server-owned. Intake authentication and tenant-authorized query reads apply.
   The processor has no tenant-scoped native resource ownership or access policy.
 - Intake and persistence use BLAKE3-256 over the compact normalized fixed-order tenant/name/Body
-  envelope. Processors receive no tenant, name, hash, state or timestamps and do not recompute
-  that hash. The internal queue-producer boundary is trusted.
+  envelope. Processor Messages carry trusted tenant and opaque Context, but no name, hash, state
+  or timestamps. Processors do not recompute that hash. The internal queue-producer boundary is
+  trusted; tenant and Context are not a cryptographic binding to the original Operation input.
 - Public intake Bodies are capped at 4,096 bytes. Internal Processor Message Bodies are
   capped at 98,304 compact JSON bytes (96 KiB), independently of intake admission. Persisted
-  Results have a 96 KiB complete-envelope limit.
+  Results have a 96 KiB complete-envelope limit. Compact Context is capped at 4,096 bytes and
+  the complete compact Processor Message at 115,328 bytes. Raw message input has the same
+  envelope cap before JSON parsing; SQS request and Lambda event escaping are separate layers.
 - Intake routes Operation name `TigerBeetle` through `TigerBeetleQueue`. Every internal SQS
-  record contains exactly `{operation_id, body, result_queue?}`. UUIDs are canonical lowercase
-  hyphenated strings; `body` may be any JSON value. Unknown fields and duplicate decoded keys
+  record contains exactly `{operation_id, tenant, body, context, result_queue?}`. UUIDs are canonical
+  lowercase hyphenated strings. Tenant contains 1–64 decoded UTF-8 bytes, preserving its spelling
+  without trimming or normalization. `body` and `context` may be any JSON values; explicit null
+  means no Context, while omission is invalid. Unknown fields and duplicate decoded keys
   are rejected. A supplied route must be a nonempty UTF-8 string, at most 2,048 bytes, without
   control characters; omission, rather than null, selects default behavior.
+- Intake derives tenant only from the verified PASETO subject and supplies null Context. Public
+  callers cannot supply tenant, Context or routing. The native processor preserves tenant and
+  Context on every outgoing Processor Message, including admission and native diagnostics,
+  without interpreting either as a native resource policy. Public Results contain only the
+  final interpretation of Body and acquire no Processor Message metadata.
 - Incoming `result_queue` selects the destination of this processor's output, falling back to
   `COMPLETION_QUEUE_URL`. The processor independently chooses its outgoing route; TigerBeetle
   omits it. Public intake accepts no routing field. There is no chain orchestration here.
@@ -482,10 +492,10 @@ For a non-array lookup family:
 {"create_accounts":[],"create_transfers":[],"lookup_accounts":[],"error":{"message":"Expected an array of commands.","field":"lookup_accounts"}}
 ```
 
-Processor Message framing carries the operation UUID outside its body:
+Processor Message framing carries the Operation UUID, trusted tenant and opaque Context outside Body:
 
 ```json
-{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","body":{"create_accounts":[{"error_code":"created"}],"create_transfers":[],"lookup_accounts":[]}}
+{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","tenant":"demo-tenant","context":null,"body":{"create_accounts":[{"error_code":"created"}],"create_transfers":[],"lookup_accounts":[]}}
 ```
 
 ## Scope exclusions

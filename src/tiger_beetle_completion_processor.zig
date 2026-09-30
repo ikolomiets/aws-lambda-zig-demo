@@ -479,7 +479,7 @@ test "completion derives success and failure from native bodies and preserves de
     for (cases) |case| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        const input = try std.fmt.allocPrint(arena.allocator(), "{{\"operation_id\":\"" ++ test_uuid ++ "\",\"body\":{s}}}", .{case.body});
+        const input = try std.fmt.allocPrint(arena.allocator(), "{{\"operation_id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"context\":null,\"body\":{s}}}", .{case.body});
         var store: FakePersistence = .{};
         const response = try test_support.invoke(arena.allocator(), input, &store);
         try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
@@ -503,7 +503,7 @@ pub const test_support = if (@import("builtin").is_test) struct {
 } else struct {};
 
 test "completion retries transient writes acknowledges conflicts and never writes malformed envelopes" {
-    const input = "{\"operation_id\":\"" ++ test_uuid ++ "\",\"body\":{\"create_accounts\":[{\"error_code\":\"created\"}],\"create_transfers\":[],\"lookup_accounts\":[]}}";
+    const input = "{\"operation_id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"context\":null,\"body\":{\"create_accounts\":[{\"error_code\":\"created\"}],\"create_transfers\":[],\"lookup_accounts\":[]}}";
     for ([_]?anyerror{ null, error.OperationConflict, error.AWSFailure, error.OutOfMemory }) |failure| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -519,7 +519,7 @@ test "completion retries transient writes acknowledges conflicts and never write
         try std.testing.expectEqual(try operation.uuidFromString(test_uuid), store.operation_ids[0]);
         try std.testing.expectEqual(@as(i64, 1_800_000_000), store.times[0]);
     }
-    for ([_][]const u8{ "{}", "{\"operation_id\":\"bad\",\"body\":true}", "{\"results\":[]}" }) |invalid| {
+    for ([_][]const u8{ "{}", "{\"operation_id\":\"bad\",\"tenant\":\"tenant-a\",\"context\":null,\"body\":true}", "{\"results\":[]}" }) |invalid| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         var store: FakePersistence = .{};
@@ -531,7 +531,7 @@ test "completion retries transient writes acknowledges conflicts and never write
 test "valid identity with invalid native body persists diagnostic and decode allocation failure retries" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const input = "{\"operation_id\":\"" ++ test_uuid ++ "\",\"body\":true}";
+    const input = "{\"operation_id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"context\":null,\"body\":true}";
     var store: FakePersistence = .{};
     _ = try test_support.invoke(arena.allocator(), input, &store);
     try std.testing.expectEqualStrings("InvalidTigerBeetleResult", store.completions[0].failure.string);

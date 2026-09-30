@@ -1678,6 +1678,30 @@ pub const test_support = if (@import("builtin").is_test) struct {
             return store;
         }
 
+        pub fn create(
+            self: *Store,
+            arena: Allocator,
+            source: *const operation.Operation,
+        ) !operation.Operation {
+            const request = try arena.create(CreateRequest);
+            defer arena.destroy(request);
+            try createRequestInit(request, source);
+            const candidate = try decodeItem(arena, request.items[0..request.item_count]);
+            for (self.entries) |slot| {
+                if (slot) |entry| {
+                    if (entry.id != candidate.id) continue;
+                    if (!std.mem.eql(u8, &entry.hash.?, &candidate.hash.?)) return error.OperationConflict;
+                    return entry;
+                }
+            }
+            for (&self.entries) |*slot| {
+                if (slot.* != null) continue;
+                slot.* = candidate;
+                return candidate;
+            }
+            return error.TestStoreFull;
+        }
+
         pub fn completeById(self: *Store, arena: Allocator, id: u128, completion: *const operation.Completion, now: operation.UnixSeconds) !void {
             const request = try arena.create(CompletionByIdRequest);
             defer arena.destroy(request);

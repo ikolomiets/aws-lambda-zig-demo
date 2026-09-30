@@ -477,26 +477,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_query_tests = b.addRunArtifact(query_tests);
 
-    const tiger_beetle_processor_test_mod = b.createModule(.{
-        .target = b.graph.host,
-        .optimize = .ReleaseSafe,
-        .root_source_file = b.path("src/tiger_beetle_processor.zig"),
-        .single_threaded = false,
-        .imports = &.{
-            .{ .name = "aws", .module = host_aws },
-            .{ .name = "aws-lambda", .module = test_runtime },
-            .{ .name = "processor_message", .module = host_processor_message },
-            .{ .name = "operation", .module = host_operation },
-            .{ .name = "sqs_queue", .module = host_sqs_queue },
-            .{ .name = tigerbeetle_import_name, .module = tigerbeetle_host },
-        },
-    });
-    const tiger_beetle_processor_tests = b.addTest(.{
-        .root_module = tiger_beetle_processor_test_mod,
-    });
-    const run_tiger_beetle_processor_tests = b.addRunArtifact(tiger_beetle_processor_tests);
-    b.step("test-tigerbeetle-processor", "Run processor parsing and invocation tests").dependOn(&run_tiger_beetle_processor_tests.step);
-
     const tiger_beetle_completion_processor_test_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
@@ -510,15 +490,36 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation_persistence", .module = host_operation_persistence },
         },
     });
-    // Existing application modules are connected only for the local full-path tests.
-    tiger_beetle_processor_test_mod.addImport("tiger_beetle_completion_processor", tiger_beetle_completion_processor_test_mod);
-    tiger_beetle_processor_test_mod.addImport("operation_persistence", host_operation_persistence);
-    tiger_beetle_processor_test_mod.addImport("query_lambda", query_test_mod);
     const tiger_beetle_completion_processor_tests = b.addTest(.{
         .root_module = tiger_beetle_completion_processor_test_mod,
     });
     const run_tiger_beetle_completion_processor_tests = b.addRunArtifact(tiger_beetle_completion_processor_tests);
     b.step("test-tigerbeetle-completion-processor", "Run tigerbeetle-completion-processor tests").dependOn(&run_tiger_beetle_completion_processor_tests.step);
+
+    const tiger_beetle_processor_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+        .root_source_file = b.path("src/tiger_beetle_processor.zig"),
+        .single_threaded = false,
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "processor_message", .module = host_processor_message },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "sqs_queue", .module = host_sqs_queue },
+            .{ .name = tigerbeetle_import_name, .module = tigerbeetle_host },
+            .{ .name = "tiger_beetle_completion_processor", .module = tiger_beetle_completion_processor_test_mod },
+            .{ .name = "operation_persistence", .module = host_operation_persistence },
+            .{ .name = "query_lambda", .module = query_test_mod },
+            .{ .name = "intake_lambda", .module = lambda_test_mod },
+            .{ .name = "sqs", .module = host_sqs },
+        },
+    });
+    const tiger_beetle_processor_tests = b.addTest(.{
+        .root_module = tiger_beetle_processor_test_mod,
+    });
+    const run_tiger_beetle_processor_tests = b.addRunArtifact(tiger_beetle_processor_tests);
+    b.step("test-tigerbeetle-processor", "Run processor parsing and invocation tests").dependOn(&run_tiger_beetle_processor_tests.step);
 
     const lambda_auth_tests = b.addTest(.{
         .root_module = host_lambda_auth,

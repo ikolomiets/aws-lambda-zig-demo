@@ -403,9 +403,13 @@ TigerBeetle processor with SQS events. The mapping remains enabled when the
 managed WireGuard gateway is disabled; operators must provide another trusted
 route to the configured TigerBeetle address or accept timeout-driven
 partial-batch retries. Each record is a minimal Processor Message with canonical `operation_id`,
-JSON `body`, and optional internal `result_queue`. Invalid envelopes acknowledge without native
+trusted `tenant`, JSON `body`, explicit JSON `context`, and optional internal `result_queue`. Invalid envelopes acknowledge without native
 work. Intake omits the route and exposes no route field to external callers. Internal Bodies may
-contain up to 96 KiB of compact JSON; public intake stays at 4 KiB.
+contain up to 98,304 bytes of compact JSON; public intake stays at 4,096 bytes. Context permits
+4,096 compact JSON bytes, tenant permits 1–64 decoded UTF-8 bytes, and routes permit 2,048
+decoded bytes. Compact envelopes and pre-parse raw messages are capped at 115,328 bytes.
+SQS request and Lambda event wrapping add escaping outside that envelope. The native processor
+carries tenant and Context unchanged on every output, including diagnostics, without interpreting them.
 
 The executor validates and admits complete command lists, then submits account creations,
 eligible transfer creations, and lookups. It retains native statuses and observations directly in
@@ -435,29 +439,19 @@ transient DynamoDB failures retry the individual message.
 The final function retains its 15-second timeout, 128 MiB memory, non-VPC configuration and
 90-second queue visibility timeout. Each invocation now makes at most one completion write.
 
-### Processor message cutover
+### Processor message rollout
 
-Creation-command `flags` now require arrays of canonical names, and newly produced found-account
-Results contain named flag arrays. Before rolling out this processor, stop producers and drain old
-queued and in-flight Operations that contain integer flags; those messages will fail validation after
-the cutover. Previously persisted Results remain unchanged. Update Result consumers to accept named
-flag arrays before restarting production.
+The current internal envelope requires trusted tenant and explicit Context; messages missing
+either field are invalid and acknowledge without native work or completion writes. Intake derives
+tenant from the verified PASETO subject and supplies null Context. Public callers cannot supply
+these fields or Result Queue routing; stored Operations, public Results and the input hash contract
+retain their existing shape and bounds.
 
-This is a breaking internal wire change with no dual parser. Stop intake and internal producers,
-then drain old queued and in-flight work before replacing producers and consumers together. Account
-for delayed messages and retained dead-letter messages before allowing later replay. Old full
-Operation inputs and aggregate Completion messages will be rejected by the new consumers. Stored
-Operations, public HTTP requests/responses, and the tenant/name/Body hash contract do not change.
-
-Completion resources are renamed to `TigerBeetleCompletionProcessor`, its Role and QueueMapping;
-parameter/output names use `TigerBeetleCompletionProcessorName` and `TigerBeetleCompletionProcessorArn`.
-The default function and zip are `tiger-beetle-completion-processor` and
-`tiger-beetle-completion-processor.zip`; the executable is
-`zig-out/bin/tiger_beetle_completion_processor/bootstrap`. Deployment helpers now accept
-`TIGER_BEETLE_COMPLETION_PROCESSOR_NAME` and `--tiger-beetle-completion-processor-name`.
-The former `COMPLETION_PROCESSOR_NAME` and `--completion-processor-name` are rejected before AWS calls.
-Review the CloudFormation change set for renamed-resource replacements before an existing-stack
-upgrade. No old packages are refreshed automatically by build validation.
+Deploy compatible producers and consumers together through full deployment before using code-only
+`--dev` sync. The codec has no dual parser. Stop producers and drain incompatible queued, delayed
+and in-flight messages, including retained dead-letter messages eligible for later replay, before
+replacing the pipeline. Re-submit work through authenticated intake as needed; do not invent trusted
+metadata for historical messages. Build validation does not refresh zip packages automatically.
 
 Per-message routing does not expand IAM: the template still permits the executor to send only to
 CompletionQueue. Adding an internal processor destination requires an explicit send grant and
@@ -1827,8 +1821,9 @@ return static HTTP 503; malformed items and other unexpected failures remain
 sanitized HTTP 500 responses. DynamoDB TTL remains asynchronous, so an item is
 readable while it is still stored even after `expires_at`.
 
-The SQS message is compact `{operation_id,body}` JSON with no trailing newline.
-Intake supplies the submitted Body and omits internal routing metadata. The DynamoDB item and successful HTTP response omit `body`.
+The SQS message is compact `{operation_id,tenant,context,body}` JSON with no trailing newline.
+Intake supplies the verified PASETO subject as tenant, null Context, and the submitted Body, and
+omits internal routing metadata. The DynamoDB item and successful HTTP response omit `body`.
 A matching retry whose stored item is still `SUBMITTED` sends the queued copy again.
 Matching `COMPLETED` retries return the stored Operation without
 another send.
@@ -2038,16 +2033,18 @@ URL under the same logical ID used by the CLI, and runs the requested operation.
 Use `TigerBeetleQueue` or `CompletionQueue` for this template. Override the
 environment defaults with `PROFILE`, `REGION`, or `STACK_NAME`.
 
-Send an internal Processor Message (no tenant or lifecycle metadata):
+Send an internal Processor Message with explicit trusted tenant and Context (no lifecycle metadata):
 
 ```sh
 message_json='{"operation_id":"00112233-4455-6677-8899-aabbccddeeff",'\
-'"body":{"lookup_accounts":[{"id":"101"}]}}'
+'"tenant":"demo-tenant","context":null,"body":{"lookup_accounts":[{"id":"101"}]}}'
 printf '%s\n' "$message_json" | ./queue.sh TigerBeetleQueue send
 ```
 
 `send` validates and compactly serializes `src/processor_message.zig`'s envelope. `body` may be
-up to 96 KiB; an optional `result_queue` is available to this internal producer. The command
+up to 98,304 compact JSON bytes; `context` is required and permits up to 4,096 compact JSON
+bytes, with null meaning no Context. `tenant` is required and permits 1–64 decoded UTF-8 bytes.
+An optional nonempty `result_queue` permits 2,048 decoded bytes. The envelope permits 115,328 bytes. The command
 rejects `--tenant` and full Operation snapshots. After a successful send, stdout contains the
 exact message plus a newline. It never reads or updates DynamoDB. Use authenticated intake to
 create the Operation and enqueue it together. To target CompletionQueue, supply a native result

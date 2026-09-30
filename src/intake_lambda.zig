@@ -332,7 +332,9 @@ fn operation_message_body(
 
     return processor_message.encode(allocator, &.{
         .operation_id = queued.id,
+        .tenant = queued.tenant,
         .body = queued.body.?,
+        .context = .null,
     });
 }
 
@@ -526,6 +528,42 @@ fn handleInvocationForTest(
     );
 }
 
+/// Composed tests authenticate real Function URL requests and replace only external effects.
+pub const test_support = if (@import("builtin").is_test) struct {
+    pub const Submission = struct {
+        input: []const u8,
+        subject: []const u8,
+    };
+
+    pub fn submit(
+        allocator: Allocator,
+        options: *const Submission,
+        backend: anytype,
+    ) ![]const u8 {
+        const token = try lambda_auth.testing.issue_token(allocator, .{
+            .seed_byte = 0x63,
+            .subject = options.subject,
+            .now = 1000,
+            .ttl_seconds = 60,
+        });
+        defer allocator.free(token);
+        var environment = std.process.Environ.Map.init(allocator);
+        defer environment.deinit();
+        try lambda_auth.testing.put_public_key(&environment, 0x63);
+        try put_test_queue_url(&environment, "TigerBeetle");
+        const event = try test_authorization_request_event(
+            allocator,
+            .POST,
+            "Authorization",
+            "Bearer",
+            token,
+            options.input,
+        );
+        defer allocator.free(event);
+        return handleInvocation(allocator, event, &environment, IntakeAdapter.init(backend), 1000);
+    }
+} else struct {};
+
 fn put_test_queue_url(
     environment: *std.process.Environ.Map,
     operation_name: []const u8,
@@ -713,7 +751,7 @@ test "authenticated POST persists and queues SUBMITTED then returns without its 
         "\\\"expires_at\\\":1700086400," ++
         "\\\"hash\\\":\\\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\\\"}\"}";
     const expected_message =
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":{\"message\":\"hello\",\"count\":2}}";
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":{\"message\":\"hello\",\"count\":2}}";
 
     for (inputs) |input| {
         var fake: FakeIntake = .{};
@@ -780,12 +818,12 @@ test "POST queues every JSON body variant as exact minimal Processor Message JSO
 
     const bodies = [_][]const u8{ "null", "false", "42", "\"text\"", "[1]", "{\"a\":1}" };
     const messages = [_][]const u8{
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":null}",
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":false}",
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":42}",
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":\"text\"}",
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":[1]}",
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":{\"a\":1}}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":null}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":false}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":42}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":\"text\"}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":[1]}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":{\"a\":1}}",
     };
 
     for (bodies, messages) |body, expected_message| {
@@ -869,6 +907,11 @@ test "POST derives tenant and hash from distinct bounded verified subjects" {
 
         try expectContains(response, subject);
         try std.testing.expectEqualStrings(subject, fake.lastTenant());
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const queued = try processor_message.decode(arena.allocator(), fake.lastMessage());
+        try std.testing.expectEqualStrings(subject, queued.tenant);
+        try std.testing.expect(queued.context == .null);
         hashes[index] = fake.last_hash.?;
     }
     try std.testing.expect(!std.mem.eql(u8, &hashes[0], &hashes[1]));
@@ -1712,12 +1755,29 @@ test "public intake preserves the 4 KiB cap and rejects internal routing metadat
         .{ .input = prefix ++ "\"" ++ "x" ** 4094 ++ "\"}", .accepted = true },
         .{ .input = prefix ++ "\"" ++ "x" ** 4095 ++ "\"}", .accepted = false },
         .{ .input = prefix ++ "{},\"result_queue\":\"https://sqs.example.invalid/internal\"}", .accepted = false },
+        .{ .input = prefix ++ "{},\"tenant\":\"spoofed\"}", .accepted = false },
+        .{ .input = prefix ++ "{},\"context\":null}", .accepted = false },
     };
     for (cases) |case| {
         var fake: FakeIntake = .{};
-        const event = try test_authorization_request_event(allocator, .POST, "Authorization", "Bearer", token, case.input);
+        const event = try test_authorization_request_event(
+            allocator,
+            .POST,
+            "Authorization",
+            "Bearer",
+            token,
+            case.input,
+        );
         defer allocator.free(event);
-        const response = handleInvocationForTest(allocator, event, .{}, .{}, &environment, &fake, 1000);
+        const response = handleInvocationForTest(
+            allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            &fake,
+            1000,
+        );
         defer allocator.free(response);
         if (case.accepted) {
             try expectContains(response, "\"statusCode\":200");

@@ -267,23 +267,25 @@ remain readable until DynamoDB removes it asynchronously.
 
 ## SQS Workflows
 
-`queue.sh` sends canonical Operations, destructively consumes queued messages,
+`queue.sh` sends canonical Processor Messages, destructively consumes queued messages,
 and checks a named SQS queue in the SAM stack. Its first argument must be the
 queue's SAM logical resource ID, such as `TigerBeetleQueue` or
 `CompletionQueue`. It uses `PROFILE`, `REGION`, and `STACK_NAME`, defaulting to
 `dev`, `ca-central-1`, and `aws-lambda-zig-demo`. It exports temporary profile
 credentials, resolves the selected physical queue URL, and exports that URL
-under the logical resource ID expected by the CLI. Send a lookup-only `TigerBeetle` Operation
+under the logical resource ID expected by the CLI. Send a lookup-only `TigerBeetle` Processor Message
 with a concrete account Resource ID like this:
 
 ```sh
 message_json='{"operation_id":"11223344-5566-7788-99aa-bbccddeeff00",'\
-'"body":{"lookup_accounts":[{"id":"101"}]}}'
+'"tenant":"demo-tenant","context":null,"body":{"lookup_accounts":[{"id":"101"}]}}'
 printf '%s\n' "$message_json" | ./queue.sh TigerBeetleQueue send
 ```
 
 `send` validates a minimal Processor Message with `src/processor_message.zig`, including its
-96 KiB Body bound and optional internal `result_queue`. It sends compact JSON and prints the same
+98,304-byte compact Body bound, required 1–64-byte UTF-8 tenant, required Context (null or up to
+4,096 compact JSON bytes), optional internal `result_queue` (up to 2,048 decoded bytes), and
+115,328-byte envelope bound. It sends compact JSON and prints the same
 bytes followed by a newline after success. It neither accepts `--tenant` nor reads or updates
 DynamoDB. The matching Operation must already exist as `SUBMITTED` for final completion to persist.
 Use authenticated intake for the complete persistence-and-enqueue flow. CompletionQueue accepts
@@ -391,21 +393,28 @@ receives `COMPLETION_QUEUE_URL`, `TIGERBEETLE_CLUSTER_ID`, and
 invocations. Lambda polls `TigerBeetleQueue` in batches of at most 10 records with no batching
 delay.
 
-For every record, the handler decodes `{operation_id, body, result_queue?}`. Its Body contains
+For every record, the handler decodes `{operation_id, tenant, body, context, result_queue?}`.
+Tenant is trusted metadata derived by intake from the verified PASETO subject. Context is an opaque
+JSON value; explicit null means no Context, while omission is invalid. Its Body contains
 `create_accounts`, `create_transfers`, and `lookup_accounts` command lists, with at most 64
-commands combined. Public intake accepts at most 4 KiB; internal Bodies permit 96 KiB.
+commands combined. Public intake accepts at most 4,096 bytes; internal Bodies permit 98,304 compact
+JSON bytes. Context permits 4,096 compact JSON bytes, tenant permits 1–64 decoded UTF-8 bytes,
+routes permit 2,048 decoded bytes, and compact envelopes and pre-parse raw messages permit
+115,328 bytes. SQS request and Lambda event escaping are separate layers.
 See the maintained [Body schema](docs/TIGER_BEETLE_PROCESSOR.md#body-schema) and
 [output contract](docs/TIGER_BEETLE_PROCESSOR.md#result-and-completion-publication).
 
 Output places native details directly in `body`, without `type` or `payload`:
 
 ```json
-{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","body":{"create_accounts":[{"error_code":"exists"},{"error_code":"linked_event_failed"}],"create_transfers":[],"lookup_accounts":[]}}
+{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","tenant":"demo-tenant","context":null,"body":{"create_accounts":[{"error_code":"exists"},{"error_code":"linked_event_failed"}],"create_transfers":[],"lookup_accounts":[]}}
 ```
 
-Each SQS message carries one Operation UUID and Body. Incoming `result_queue` overrides the
+Each SQS message carries one Operation UUID, trusted tenant, Body and Context. Native outputs and
+diagnostics preserve tenant and Context without interpreting them; public Results contain only
+the final interpretation of Body. Incoming `result_queue` overrides the
 default `COMPLETION_QUEUE_URL`. TigerBeetle omits the outgoing route; another processor may choose
-its own. The public caller cannot set this internal field. The template grants sends only to
+its own. Public callers cannot set tenant, Context or routing. The template grants sends only to
 CompletionQueue; any additional internal destination needs an explicit IAM grant.
 
 The processor executes all admitted account chains, then eligible transfer chains, then requested
@@ -659,7 +668,8 @@ do not. The ID comes only from the single `rawPath` segment: query strings and
 GET bodies neither provide nor alter it. A different token subject receives the
 same `404 Not Found` response as a missing Operation.
 
-For `SUBMITTED`, intake sends compact `{operation_id,body}` JSON to SQS without a
+For `SUBMITTED`, intake sends compact `{operation_id,tenant,context,body}` JSON to SQS, using
+the verified PASETO subject as tenant and null Context, without a
 trailing newline or routing field. It returns the unchanged bodyless Operation snapshot. A matching retry whose item is still `SUBMITTED` sends it again; matching
 `COMPLETED` items are returned immediately without another SQS
 send.
