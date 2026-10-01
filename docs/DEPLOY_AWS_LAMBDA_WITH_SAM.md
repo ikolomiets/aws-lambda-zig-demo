@@ -148,7 +148,9 @@ zig build --release -Darch=arm
 ```
 
 The build also installs the host-native `paseto` utility and the local command
-implementations invoked by `persistence.sh` and `queue.sh`. Each Lambda zip
+implementations invoked by `persistence.sh`, `queue.sh`, and `events.sh`. The
+Events utility can also be built separately with `zig build build-events`.
+Each Lambda zip
 contains only its handler's root-level `bootstrap`.
 
 Verify that all four built artifacts are Linux ARM64 executables.
@@ -1966,6 +1968,87 @@ The caller running `persistence.sh` needs `dynamodb:GetItem`,
 command additionally needs `dynamodb:Scan` and `dynamodb:DeleteItem`. The
 Lambda roles do not grant these permissions to the local AWS identity;
 TigerBeetle processor itself has no DynamoDB permissions.
+
+### Seat Event metadata utility
+
+Build the host `zig-out/bin/events` binary independently with:
+
+```sh
+zig build build-events
+./events.sh --help
+```
+
+`events create` inserts validated `creating` metadata absent-only; `events read`
+uses a strongly consistent tenant/Event key. Both commands require `--tenant`
+and `--event-id`. Creation accepts one complete logical Event document on stdin,
+whose tenant and event ID must match those arguments. See the
+[Seat Reservation reference](SEAT_RESERVATION.md) for exact fields and validation.
+The utility stores supplied ledger/account IDs. It does not allocate a ledger,
+create or fund native resources, implement a public creation Operation, or
+finalize readiness. It has no replace, update, reset, or delete-all command.
+
+```sh
+cat <<'JSON' | ./events.sh create \
+  --tenant tenant-a --event-id 00000000-0000-0000-0000-000000000001
+{"tenant":"tenant-a","event_id":"00000000-0000-0000-0000-000000000001","ledger":1001,"timeout_seconds":300,"capacity_account_id":"1","allocation_account_id":"2","state":"creating","classes":{"general":{"total":100,"tb_account_id":"3"}}}
+JSON
+
+./events.sh read \
+  --tenant tenant-a --event-id 00000000-0000-0000-0000-000000000001
+```
+
+These example IDs describe metadata only. Operators supply identities appropriate
+to their cluster. A racing or uncertain insertion returns the validated saved
+winner, including its IDs, ledger and current state. Different classes or timeout
+report a conflict. If readback cannot establish a saved winner, creation fails
+and the caller retries with the same tenant/Event identity.
+
+The wrapper defaults to `PROFILE=dev`, `REGION=ca-central-1`, and
+`STACK_NAME=aws-lambda-zig-demo`. It also accepts `--profile`, `--region`, and
+`--stack-name` before the command. It exports the selected profile's temporary
+credentials, disables EC2 metadata discovery, resolves `SeatEventsTable` through
+CloudFormation, and exports `EVENTS_TABLE_NAME` before forwarding arguments and
+stdin unchanged. Help also works as `create --help` or `read --help`, without AWS
+commands, credentials, resource discovery, or a built binary.
+
+The current SAM template has no `SeatEventsTable`; deployment resource wiring is a
+separate slice. Wrapper tests mock that lookup. Until a stack supplies that
+resource, use an explicitly configured existing table with the direct binary:
+
+```sh
+EVENTS_TABLE_NAME='<events-table-name>' AWS_REGION=ca-central-1 \
+  zig-out/bin/events read \
+    --tenant tenant-a --event-id 00000000-0000-0000-0000-000000000001
+```
+
+The direct binary uses the pinned SDK's standard AWS credentials, profile,
+Region and endpoint configuration. The table requires separate String keys
+`tenant` (partition) and `event_id` (sort), without TTL. The local AWS identity
+needs table-scoped `dynamodb:PutItem` and `dynamodb:GetItem`; wrapper execution
+also needs `cloudformation:DescribeStackResource`. These are operator permissions;
+this utility adds no Lambda IAM or SAM resources.
+
+Creation stdin is bounded at 16 KiB; commands accept at most six arguments,
+each at most 4,096 bytes, with tenant limited to 64 bytes. Logical metadata must
+fit 16 KiB and the SDK's typed-item encoding must fit 32 KiB. Success prints one
+complete JSON Event plus a newline. Exit `1` means an unavailable Event or a
+configuration conflict; exit `2` means invalid input/configuration, malformed
+storage, service failure, unresolved insertion, or output failure. Binary and
+wrapper diagnostics use fixed messages and omit input, credentials and service
+details.
+
+Run local deterministic utility checks with:
+
+```sh
+zig build test-seat-reservation test-seat-persistence test-events-cli test-events-wrapper
+for script in events.sh tests/events_wrapper_test.sh; do
+  bash -n "$script" || exit
+done
+```
+
+These tests are part of the ordinary `zig build test` graph and contact no AWS
+service. They do not certify deployed permissions, resource resolution or native
+provisioning. No Lambda ZIP is required for the host utility.
 
 ### Troubleshoot persistence command configuration
 

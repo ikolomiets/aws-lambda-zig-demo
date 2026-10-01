@@ -1,0 +1,152 @@
+# Seat Reservation contracts and Event metadata
+
+The pure [seat domain module](../src/seat_reservation.zig) defines typed commands,
+Context, public Results, native input serialization, and pre-effect size admission.
+The [shared persistence module](../src/seat_reservation_persistence.zig) reads and
+inserts tenant-owned Event metadata. The host `events` utility uses these modules.
+The current Lambda pipeline does not route or execute `SeatReservation` commands.
+
+## Commands
+
+Every public Body is exactly one object with these required fields. There are no
+optional fields, tenant overrides, routes, flags, ledger or native account IDs.
+
+| `command` | Other required fields |
+| --- | --- |
+| `create_event` | `classes`: tag-to-capacity object; `timeout_seconds`: positive u32 |
+| `reserve_seats` | `event_id`: canonical UUID; `class`: one tag; `quantity`: positive u32 |
+| `confirm_seats` | `event_id`: canonical UUID; `class`: one tag; `pending_id`: native ID string |
+| `check_seats` | `event_id`: canonical UUID |
+
+Unknown or missing fields, wrong types, nulls and decoded duplicate keys are
+errors. Reserve and confirm accept one scalar class, never arrays or class Maps.
+Create accepts 1–31 classes; check serializes every configured class.
+
+Tags contain 1–54 decoded UTF-8 bytes. U+0000–U+001F and U+007F–U+009F, invalid
+UTF-8, and the exact decoded names `capacity` and `allocation` are rejected.
+Case, spaces, punctuation, combining marks and format characters are preserved.
+Equality and ordering use unsigned decoded bytes without normalization. Equivalent
+JSON escapes are the same key; composed and decomposed Unicode tags are distinct.
+
+Capacities, quantities and timeout are integers in 1–4,294,967,295. Integral
+spellings normalized to these values are accepted; remaining fractions, zero,
+negative zero, strings, negatives and overflow are rejected. Supply is summed
+with checked u64 arithmetic, at most 133,143,986,145. UUIDs are lowercase,
+hyphenated canonical strings, including zero and any version/variant. Native IDs
+are canonical ASCII decimal Strings from 1 through 2^128−2, with no leading zeros,
+signs, whitespace, exponent notation or numeric JSON form.
+
+## Context, native inputs and Results
+
+Context is the flat command object. Reserve additionally requires
+`reservation_id`, naming that attempt's pending transfer. Confirm carries
+`pending_id` and no posting ID. Creation uses its enclosing Operation UUID as the
+Event identity. These codecs reject unknown and decoded duplicate keys.
+
+The native input serializer emits all three family lists. Creation orders
+Capacity, Allocation and Availability Accounts by tag bytes, then funds those
+classes in the same order, without lookups. Funding reuses each Availability
+Account ID as the transfer ID. Reserve serializes one pending transfer with the
+Event's ledger/timeout and class quantity. Confirm serializes one full posting
+with amount 2^128−1, explicit Availability debit, Allocation credit, ledger and
+code 2, and no timeout. Linked flags belong to the native processor's list framing.
+Check serializes all Availability lookups in class order. These are pure serializers;
+they perform no native calls or ledger allocation.
+
+Public Results contain the existing `type`/`payload` wrapper:
+
+| Success | Exact payload fields |
+| --- | --- |
+| Create | `event_id` |
+| Reserve | `event_id`, `class`, `quantity`, `reservation_id` |
+| Confirm | `event_id`, `class`, `reservation_id` (the input pending ID) |
+| Check | `event_id`, `classes` mapping every tag to `total` and `available` integers |
+
+Failure payloads contain only `code`: `invalid_request`, `event_unavailable`,
+`unknown_class`, `event_not_ready`, `event_failed`, `insufficient_seats`,
+`reservation_expired`, `invalid_reservation`, or `operation_rejected`.
+Serializing a Result does not interpret or certify native execution evidence.
+
+`admit` validates the complete command and measures its actual public Body,
+Context, native input, compact shared envelope, complete public success Result,
+and logical Event before external effects. Creation uses maximum-width synthetic
+IDs and ledger for this proof, then discards them. Other commands need matching
+tenant/Event identity; authorization precedes readiness and class disclosure.
+Creating and failed Events reject these requests; only ready Events reach class
+lookup. Persistence independently proves typed-item admission before insertion.
+
+## Persistent Event contract
+
+An Event has exactly these logical fields:
+
+- `tenant`: the owning tenant, 1–64 UTF-8 bytes.
+- `event_id`: canonical UUID, separate from the tenant key.
+- `ledger`, `timeout_seconds`: positive u32 values.
+- `capacity_account_id`, `allocation_account_id`: native ID Strings.
+- `state`: `creating`, `ready`, or `failed`.
+- `classes`: 1–31 tags, each mapping exactly `total` and `tb_account_id`.
+
+Account IDs are distinct within an Event. Classes retain sorted tag bytes and
+positive u32 totals. DynamoDB uses separate String partition/sort keys `tenant`
+and `event_id`; ledger, timeout and class totals are Numbers, native IDs are
+Strings, and classes are nested Maps. There is no Event TTL or history field.
+
+Reads use strongly consistent tenant/Event keys and validate the complete stored
+item, including returned identity. Missing and foreign Events return the same
+`EventUnavailable` error. Unknown, missing, duplicate or wrongly typed attributes,
+malformed IDs, invalid states, duplicate accounts, and invalid class Maps return
+`InvalidItem`. Decoded Events own tenant and class storage in the caller's arena.
+
+Creation accepts only validated `creating` metadata and uses
+`attribute_not_exists(#tenant) AND attribute_not_exists(#event_id)`. It never
+replaces an existing item. A conflict or lost put response triggers a strongly
+consistent read. Matching classes and timeout return the saved winner, preserving
+its ledger, IDs and state even when the losing candidate generated other IDs.
+Different classes/totals or timeout produce `EventConflict`. Missing readback
+produces `InsertionUncertain`; failed or malformed readback produces an error.
+No unresolved insertion returns a dispatchable candidate. Request Strings and
+nested Maps remain owned by the request arena through the SDK call; service
+error diagnostics remain internal and are released before returning.
+
+## Size bounds and deterministic evidence
+
+| Boundary | Bytes |
+| --- | ---: |
+| Public Body / compact Context | 4,096 each |
+| Processor Body / complete Result | 98,304 each |
+| Decoded Result Queue | 2,048 |
+| Compact shared envelope | 115,328 |
+| Logical Event JSON | 16,384 |
+| Typed DynamoDB item JSON | 32,768 |
+
+Compact sizing uses the same domain serializers as output. Typed-item sizing uses
+the pinned SDK's actual uppercase `S`/`N`/`M` serializer. Oversized inputs are
+rejected whole, without truncation or prefix admission. Raw command, Context and
+metadata readers check their bounds before parsing, including whitespace.
+
+Tests cover 31 escaped 54-byte tags, maximum u32 numbers, distinct 39-digit native
+IDs, maximum UUIDs, 64-byte escaped tenants and 2,048-byte escaped routes. Accepted
+metadata and public Results remain below the larger caps; those caps do not
+require reducing the class ceiling. Constructible exact/one-byte-over fixtures
+cover raw Body/Context/Event input and compact generic Body/Context, complete
+Results and typed-item serialization. Artificial item-size fixtures isolate the
+size gate and do not make extra Event attributes valid. Shared envelope tests
+also cover raw exact/over bounds and separate SDK SQS and Lambda event escaping;
+the existing native serializer tests prove the generic complete-Result bound.
+
+Run the focused credential-free checks:
+
+```sh
+zig build build-events test-seat-reservation test-seat-persistence test-events-cli test-events-wrapper
+zig build fmt-check
+```
+
+All deterministic suites also run in `zig build test`; the wrapper uses mocked
+AWS credentials and resource resolution. These checks establish local contracts,
+ownership and recovery behavior. They do not establish live AWS IAM, DynamoDB
+service behavior, seat processor integration, or native accounting guarantees.
+
+The [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-event-metadata-utility)
+owns utility invocation, environment, permissions and deployment prerequisites.
+The [Event identity ADR](adr/0004-seat-event-identities.md) records the durable
+identity decision.

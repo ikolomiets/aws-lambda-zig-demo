@@ -348,6 +348,50 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation", .module = host_operation },
         },
     });
+    const host_seat_reservation = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/seat_reservation.zig"),
+        .imports = &.{
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "processor_message", .module = host_processor_message },
+        },
+    });
+    const seat_reservation_tests = b.addTest(.{ .root_module = host_seat_reservation });
+    const run_seat_reservation_tests = b.addRunArtifact(seat_reservation_tests);
+    b.step("test-seat-reservation", "Run pure Seat Reservation contract tests")
+        .dependOn(&run_seat_reservation_tests.step);
+    const host_seat_persistence = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/seat_reservation_persistence.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "dynamodb", .module = host_dynamodb },
+            .{ .name = "seat_reservation", .module = host_seat_reservation },
+        },
+    });
+    const seat_persistence_tests = b.addTest(.{ .root_module = host_seat_persistence });
+    const run_seat_persistence_tests = b.addRunArtifact(seat_persistence_tests);
+    b.step("test-seat-persistence", "Run Seat Event persistence tests")
+        .dependOn(&run_seat_persistence_tests.step);
+    const events_cli_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/seat_events_cli.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "seat_reservation", .module = host_seat_reservation },
+            .{ .name = "seat_reservation_persistence", .module = host_seat_persistence },
+        },
+    });
+    const events_exe = b.addExecutable(.{ .name = "events", .root_module = events_cli_mod });
+    const install_events = b.addInstallArtifact(events_exe, .{});
+    b.getInstallStep().dependOn(&install_events.step);
+    b.step("build-events", "Build the host Events utility").dependOn(&install_events.step);
+    const events_cli_tests = b.addTest(.{ .root_module = events_cli_mod });
+    const run_events_cli_tests = b.addRunArtifact(events_cli_tests);
+    b.step("test-events-cli", "Run Events utility tests").dependOn(&run_events_cli_tests.step);
     const host_operation_persistence = b.createModule(.{
         .target = b.graph.host,
         .optimize = optimize,
@@ -716,6 +760,10 @@ pub fn build(b: *std.Build) void {
 
     const development_deployment_test = b.addSystemCommand(&.{"bash"});
     development_deployment_test.addFileArg(b.path("tests/deploy_development_test.sh"));
+    const events_wrapper_test = b.addSystemCommand(&.{"bash"});
+    events_wrapper_test.addFileArg(b.path("tests/events_wrapper_test.sh"));
+    b.step("test-events-wrapper", "Run mocked Events wrapper tests")
+        .dependOn(&events_wrapper_test.step);
 
     const deploy_test_step = b.step(
         "test-deploy",
@@ -726,8 +774,12 @@ pub fn build(b: *std.Build) void {
     deploy_test_step.dependOn(&gateway_interface_test.step);
     deploy_test_step.dependOn(&processor_interface_test.step);
     deploy_test_step.dependOn(&development_deployment_test.step);
+    deploy_test_step.dependOn(&events_wrapper_test.step);
 
     const test_step = b.step("test", "Run unit and integration tests");
+    test_step.dependOn(&run_seat_reservation_tests.step);
+    test_step.dependOn(&run_seat_persistence_tests.step);
+    test_step.dependOn(&run_events_cli_tests.step);
     test_step.dependOn(&run_lambda_auth_tests.step);
     test_step.dependOn(&run_query_tests.step);
     test_step.dependOn(&run_tiger_beetle_processor_tests.step);

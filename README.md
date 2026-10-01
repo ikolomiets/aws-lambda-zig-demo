@@ -39,6 +39,11 @@ The maintained [TigerBeetle processor design](docs/TIGER_BEETLE_PROCESSOR.md) de
 Body schema, replay obligations, complete Results and retry behavior; use it for the current
 processor contract.
 
+The [Seat Reservation contracts](docs/SEAT_RESERVATION.md) provide pure command
+and metadata validation. The host `events` binary and `events.sh` wrapper insert
+validated creating Event metadata and read tenant-scoped records; this utility
+does not provision native resources or run a seat workflow.
+
 ## Requirements for Zig on AWS Lambda
 
 - Zig 0.16.0 or newer within the supported 0.16.x line.
@@ -67,7 +72,8 @@ zig build --release -Darch=arm
 ```
 
 This also installs the host-native `zig-out/bin/paseto` utility and the local
-implementations invoked by `persistence.sh` and `queue.sh`. The intake and query
+implementations invoked by `persistence.sh`, `queue.sh`, and `events.sh`. Build
+only the Events utility with `zig build build-events`. The intake and query
 bootstraps and the PASETO utility use the shared PASETO implementation in
 `src/paseto.zig`; the persistence and queue commands use the shared model in
 `src/operation.zig`. The Lambda and local commands reach AWS through
