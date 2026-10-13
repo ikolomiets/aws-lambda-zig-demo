@@ -14,6 +14,9 @@ or assignee. IDs are immutable.
 File names contain an ordering prefix and a readable name. Human-facing references always
 link the issue title.
 
+For incoming issue triage, use the [triage label mapping](triage-labels.md).
+Triage roles live in `labels`; `status` continues to record only `open` or `closed`.
+
 `comments/<issue-id>/` stores separate dated comment files. Research assets live under
 `docs/research/` and are linked from resolution comments. Do not store answers in the
 question body or duplicate them in the map.

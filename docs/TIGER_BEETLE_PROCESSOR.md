@@ -7,7 +7,7 @@ account lookups, or any combination. Whole-Operation preflight prevents invalid 
 native effects; independent native creation chains and conditional Completion persistence support
 redelivery under the operating assumptions below.
 
-This document owns processor behavior and its rationale. [CONTEXT.md](../CONTEXT.md) owns domain
+This document owns processor behavior and its rationale. [GLOSSARY.md](../GLOSSARY.md) owns domain
 vocabulary; the [hash ADR](adr/0001-operation-json-hash-contract.md) and
 [lifecycle ADR](adr/0002-two-state-operation-state.md) own cross-cutting decisions. The
 [native wrapper reference](ZIG_WRAPPER_FOR_TIGERBEETLE.md) owns the C ABI, packaging and client

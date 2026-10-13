@@ -19,17 +19,27 @@ Read sources relevant to the task:
 | SQS processors | `src/tiger_beetle_processor.zig`, `src/tiger_beetle_completion_processor.zig`, [processor contract](docs/TIGER_BEETLE_PROCESSOR.md) |
 | TigerBeetle client wrapper | `src/tigerbeetle.zig`, [wrapper design](docs/ZIG_WRAPPER_FOR_TIGERBEETLE.md) |
 | PASETO and local CLI tools | `src/paseto.zig`, `src/paseto_cli.zig`, `src/persistence_cli.zig`, `src/queue_cli.zig` |
-| Vocabulary or cross-cutting decisions | `CONTEXT.md`, relevant files in `docs/adr/` |
+| Vocabulary or cross-cutting decisions | `GLOSSARY.md`, relevant files in `docs/adr/` |
 | SAM resources, permissions, or function settings | `template.yaml`, relevant sections of [deployment guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md) |
 | Generic deployment flow | `deploy.sh`, relevant sections of the deployment guide |
 | WireGuard lifecycle | `wireguard-gateway-setup.sh`, relevant sections of the deployment guide |
 
 Consult related implementation files when behavior crosses these boundaries.
 Keep processor contract changes in the processor reference, vocabulary in
-`CONTEXT.md`, and cross-cutting decisions in ADRs.
+`GLOSSARY.md`, and cross-cutting decisions in ADRs.
 Write reference documentation in the present tense and describe only the current
 contract. Keep change history and cutover instructions in the deployment guide;
 record lasting cross-cutting decisions in ADRs.
+
+## Agent skills
+
+- **Issue tracker:** local Markdown issues under `.scratch/<effort>/`. Before reading
+  or updating tickets, specs, or decision maps, read the
+  [tracker conventions](docs/agents/issue-tracker.md).
+- **Triage labels:** use the default role names. Before triaging incoming issues
+  or changing triage labels, read the [label mapping](docs/agents/triage-labels.md).
+- **Domain docs:** one root `GLOSSARY.md` and `docs/adr/`. Before engineering
+  exploration, read the [domain documentation rules](docs/agents/domain.md).
 
 ## Coding Style and Scope
 
