@@ -148,8 +148,9 @@ zig build --release -Darch=arm
 ```
 
 The build also installs the host-native `paseto` utility and the local command
-implementations invoked by `persistence.sh`, `queue.sh`, and `events.sh`. The
-Events utility can also be built separately with `zig build build-events`.
+implementations invoked by `persistence.sh`, `queue.sh`, `events.sh`, and
+`ledger-counter.sh`. The utilities can also be built separately with
+`zig build build-events` and `zig build build-ledger-counter`.
 Each Lambda zip
 contains only its handler's root-level `bootstrap`.
 
@@ -2049,6 +2050,100 @@ done
 These tests are part of the ordinary `zig build test` graph and contact no AWS
 service. They do not certify deployed permissions, resource resolution or native
 provisioning. No Lambda ZIP is required for the host utility.
+
+### Global ledger counter utility
+
+Build the host binary and inspect credential-free help:
+
+```sh
+zig build build-ledger-counter
+./ledger-counter.sh --help
+```
+
+The shared [global allocator contract](SEAT_RESERVATION.md#global-ledger-allocator)
+uses exactly String partition key `counter_id = "global"` and Number u32
+`high_water`. The table has no sort key or TTL. Every participating deployment
+and tenant uses the same actual table and fixed key, independently of native
+cluster selection. A deployment may own this table or explicitly reference an
+existing one; only the owner may clean it up. These utilities create no table
+and expose no deletion, reset, decrement, recycling or repair command.
+
+Run `init` only for explicit first-time setup of a new allocator. It inserts
+1000 absent-only, preserves an existing record and prints its validated current
+value. An interrupted setup may be rerun explicitly. Normal deployment inspects
+an existing counter without changing it. A missing established counter requires
+investigation; it is not authorization to initialize a new sequence. Native
+cluster changes never justify setup, reset or rebinding to a fresh table.
+
+```sh
+# Explicit first-time setup only, after selecting the intended new global table.
+./ledger-counter.sh --stack-name '<stack-name>' init
+./ledger-counter.sh --stack-name '<stack-name>' read
+./ledger-counter.sh --stack-name '<stack-name>' allocate
+```
+
+`allocate` performs the same bounded conditional atomic increment exposed to
+runtime callers. First allocation returns 1001; 4,294,967,295 is the last value.
+Manual allocation consumes a value even if no Event uses it. Lost responses and
+losing Event-creation races can leave permanent gaps. Never infer an uncertain
+allocation from a later `read`: it cannot identify which caller consumed a value.
+A fresh allocation may consume another value; no value is reclaimed.
+
+The wrapper defaults to `PROFILE=dev`, `REGION=ca-central-1`, and
+`STACK_NAME=aws-lambda-zig-demo`, with `--profile`, `--region`, and `--stack-name`
+overrides before the command. It exports the selected profile's temporary
+credentials, disables EC2 metadata discovery and resolves the selected stack's
+`LedgerCounterTableName` output through `cloudformation describe-stacks`. This
+output names the actual owned or referenced physical allocator table; the wrapper
+never assumes a stack-owned logical resource and never discovers or requires a
+native cluster ID. It exports `LEDGER_COUNTER_TABLE_NAME`, replacing any stale
+environment binding, then forwards the command to the prebuilt binary. Help
+also works as `init --help`, `read --help`, and `allocate --help` without AWS
+commands, credentials, discovery or a built binary.
+
+The current SAM template has no counter table or `LedgerCounterTableName` output.
+Resource wiring, owner-only cleanup and deployment binding/data guards belong to
+the separate deployment slices. Wrapper discovery is mock-tested until that
+wiring exists. For a deliberately selected existing table with the exact schema,
+use the direct binary with explicit configuration:
+
+```sh
+LEDGER_COUNTER_TABLE_NAME='<global-counter-table-name>' AWS_REGION=ca-central-1 \
+  zig-out/bin/ledger-counter read
+```
+
+The direct binary uses the pinned SDK's standard credentials, profile, Region and
+endpoint configuration. Operator permissions are table-scoped `dynamodb:GetItem`
+for read, plus `dynamodb:PutItem` for init and `dynamodb:UpdateItem` for allocate.
+Wrapper execution also needs `cloudformation:DescribeStacks`. These utilities add
+no Lambda IAM permissions or SAM resources, and generate no Lambda ZIP packages.
+
+Commands consume no stdin and accept at most three binary arguments, each at
+most 256 bytes. SDK response bodies are capped at 8 KiB, with one HTTP attempt
+per call. Allocation retries at most four definite concurrent conditional
+rejections; it never retries a possibly successful mutation internally.
+Success prints one bounded JSON object and newline, for example
+`{"counter_id":"global","high_water":1001}`. For successful `allocate`, that
+returned high-water value is the allocated ledger. Help prints usage text.
+Exit `1` means missing state or exhaustion; exit `2` means invalid invocation or
+configuration, corruption, contention, service failure, uncertain setup/allocation
+or output failure. Fixed stderr messages omit arguments, credentials, table names
+and upstream service details. Output failure after mutation may also consume a gap.
+
+Run the credential-free deterministic checks:
+
+```sh
+zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli test-ledger-counter-wrapper
+for script in ledger-counter.sh tests/ledger_counter_wrapper_test.sh; do
+  bash -n "$script" || exit
+done
+```
+
+These suites also run in `zig build test`. They exercise real typed request
+builders/serialization with controlled external effects, interleaved global
+allocation, bounds, corrupt/missing state, response uncertainty, table/name
+ownership and wrapper binding. They do not establish live DynamoDB, AWS IAM,
+seat processor integration or cloud deployment behavior.
 
 ### Troubleshoot persistence command configuration
 

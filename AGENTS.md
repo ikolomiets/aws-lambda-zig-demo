@@ -3,7 +3,7 @@
 ## Repository and Sources of Truth
 
 This is a Zig 0.16.0 AWS Lambda example with four handlers and host-native
-`paseto`, `dynamodb`, `sqs`, and `events` CLI tools. `build.zig` and `build.zig.zon` own
+`paseto`, `dynamodb`, `sqs`, `events`, and `ledger-counter` CLI tools. `build.zig` and `build.zig.zon` own
 supported targets, optimization, executables, and pinned dependencies, including
 `aws_lambda`.
 
@@ -14,6 +14,7 @@ Read sources relevant to the task:
 | HTTP intake or operation query | `src/intake_lambda.zig`, `src/query_lambda.zig`, `src/lambda_auth.zig` |
 | Operation data and persistence | `src/operation.zig`, `src/operation_persistence.zig` |
 | Seat contracts, Event metadata, and host tooling | `src/seat_reservation.zig`, `src/seat_reservation_persistence.zig`, `src/seat_events_cli.zig`, `events.sh`, [seat reference](docs/SEAT_RESERVATION.md) |
+| Global ledger allocation and counter tooling | `src/ledger_counter.zig`, `src/ledger_counter_cli.zig`, `ledger-counter.sh`, [seat reference](docs/SEAT_RESERVATION.md#global-ledger-allocator) |
 | Queue transport and Completion messages | `src/sqs_queue.zig`, `src/processor_message.zig` |
 | SQS processors | `src/tiger_beetle_processor.zig`, `src/tiger_beetle_completion_processor.zig`, [processor contract](docs/TIGER_BEETLE_PROCESSOR.md) |
 | TigerBeetle client wrapper | `src/tigerbeetle.zig`, [wrapper design](docs/ZIG_WRAPPER_FOR_TIGERBEETLE.md) |
@@ -115,6 +116,7 @@ Select checks by the affected behavior:
 | `zig build test` | Full local Zig and mocked deployment-helper suite; excludes the live replica and separate ABI checks |
 | `zig build test-deploy` | Mocked deployment regression tests; requires Bash and `jq` |
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli test-events-wrapper` | Host Events build and deterministic seat/domain/persistence/tooling tests |
+| `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli test-ledger-counter-wrapper` | Host counter build and deterministic global allocation/tooling tests |
 | `zig build test-tigerbeetle-processor` | Processor parsing and invocation tests |
 | `zig build test-tigerbeetle-wrapper` | Offline wrapper tests |
 | `zig build test-tigerbeetle-c-abi` | Native C ABI smoke test on Apple Silicon macOS |

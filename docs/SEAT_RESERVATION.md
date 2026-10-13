@@ -1,9 +1,11 @@
-# Seat Reservation contracts and Event metadata
+# Seat Reservation contracts, Event metadata and global ledgers
 
 The pure [seat domain module](../src/seat_reservation.zig) defines typed commands,
 Context, public Results, native input serialization, and pre-effect size admission.
 The [shared persistence module](../src/seat_reservation_persistence.zig) reads and
 inserts tenant-owned Event metadata. The host `events` utility uses these modules.
+The independent [ledger counter](../src/ledger_counter.zig) and host
+`ledger-counter` utility initialize, inspect and allocate global ledgers.
 The current Lambda pipeline does not route or execute `SeatReservation` commands.
 
 ## Commands
@@ -108,6 +110,45 @@ No unresolved insertion returns a dispatchable candidate. Request Strings and
 nested Maps remain owned by the request arena through the SDK call; service
 error diagnostics remain internal and are released before returning.
 
+## Global ledger allocator
+
+Each selected DynamoDB counter table has one record with exactly String
+`counter_id = "global"` and Number `high_water`, an integer u32 from 1000 through
+4,294,967,295. The table identity and fixed key define the allocator. All tenants
+and deployments participating in the sequence use the same physical table,
+including deployments using different native clusters or distinct clusters with
+equal numeric cluster IDs. Separate tables define separate sequences.
+`cluster_id` appears in neither counter storage, API nor allocation configuration.
+
+Explicit first-time `initialize` inserts 1000 absent-only. A conditional conflict
+reads and validates the existing record without replacing it. `read` uses the
+fixed key with strong consistency. Neither read nor allocation initializes a
+missing record. Missing or corrupt established state requires operator investigation;
+there is no automatic repair, reset, decrement, recycling or restore reconciliation.
+
+`allocate` first validates the complete record, then conditionally increments its
+number atomically with an exact-value, Number-type and range guard, requesting
+`ALL_NEW`. The read protects against incrementing fractional or malformed storage;
+it never supplies an allocated value. Only a validated returned update equal to
+the guarded value plus one supplies a ledger. First allocation is 1001, and the
+maximum u32 value is the final allocation. Up to four attempts retry only definite
+conditional rejections from concurrent updates; exhaustion, persistent contention,
+service rejection and response uncertainty are explicit errors.
+
+The SDK uses one HTTP attempt per call and caps response bodies at 8 KiB.
+Transport errors, server errors, missing/malformed update output and mismatched
+updated values make allocation uncertain. No failed update triggers readback or
+retry to infer its value. A later read reports only current state. Retrying a
+fresh allocation may consume another value. Lost responses, manual allocations
+and losing Event-creation races may leave permanent gaps.
+
+`Counter` owns a copy of `LEDGER_COUNTER_TABLE_NAME`; the AWS configuration outlives
+its client. Request arrays, table text and numeric expression values belong to
+the caller's arena through the SDK call. Returned high-water values are owned
+integers without borrowed response storage. The table can be owned by a deployment
+or explicitly referenced; tooling performs no table lifecycle actions. Counter
+data has no TTL, and only the owning deployment may clean up its table.
+
 ## Size bounds and deterministic evidence
 
 | Boundary | Bytes |
@@ -138,6 +179,7 @@ Run the focused credential-free checks:
 
 ```sh
 zig build build-events test-seat-reservation test-seat-persistence test-events-cli test-events-wrapper
+zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli test-ledger-counter-wrapper
 zig build fmt-check
 ```
 
@@ -148,5 +190,6 @@ service behavior, seat processor integration, or native accounting guarantees.
 
 The [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-event-metadata-utility)
 owns utility invocation, environment, permissions and deployment prerequisites.
+The [global ledger ADR](adr/0005-global-ledger-allocation.md) records the allocator scope.
 The [Event identity ADR](adr/0004-seat-event-identities.md) records the durable
 identity decision.

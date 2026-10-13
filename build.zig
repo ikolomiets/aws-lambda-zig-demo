@@ -392,6 +392,40 @@ pub fn build(b: *std.Build) void {
     const events_cli_tests = b.addTest(.{ .root_module = events_cli_mod });
     const run_events_cli_tests = b.addRunArtifact(events_cli_tests);
     b.step("test-events-cli", "Run Events utility tests").dependOn(&run_events_cli_tests.step);
+    const host_ledger_counter = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/ledger_counter.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "dynamodb", .module = host_dynamodb },
+        },
+    });
+    const ledger_counter_tests = b.addTest(.{ .root_module = host_ledger_counter });
+    const run_ledger_counter_tests = b.addRunArtifact(ledger_counter_tests);
+    b.step("test-ledger-counter", "Run global ledger counter tests")
+        .dependOn(&run_ledger_counter_tests.step);
+    const ledger_counter_cli_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/ledger_counter_cli.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "ledger_counter", .module = host_ledger_counter },
+        },
+    });
+    const ledger_counter_exe = b.addExecutable(.{
+        .name = "ledger-counter",
+        .root_module = ledger_counter_cli_mod,
+    });
+    const install_ledger_counter = b.addInstallArtifact(ledger_counter_exe, .{});
+    b.getInstallStep().dependOn(&install_ledger_counter.step);
+    b.step("build-ledger-counter", "Build the host global ledger counter utility")
+        .dependOn(&install_ledger_counter.step);
+    const ledger_counter_cli_tests = b.addTest(.{ .root_module = ledger_counter_cli_mod });
+    const run_ledger_counter_cli_tests = b.addRunArtifact(ledger_counter_cli_tests);
+    b.step("test-ledger-counter-cli", "Run ledger counter utility tests")
+        .dependOn(&run_ledger_counter_cli_tests.step);
     const host_operation_persistence = b.createModule(.{
         .target = b.graph.host,
         .optimize = optimize,
@@ -764,6 +798,10 @@ pub fn build(b: *std.Build) void {
     events_wrapper_test.addFileArg(b.path("tests/events_wrapper_test.sh"));
     b.step("test-events-wrapper", "Run mocked Events wrapper tests")
         .dependOn(&events_wrapper_test.step);
+    const ledger_counter_wrapper_test = b.addSystemCommand(&.{"bash"});
+    ledger_counter_wrapper_test.addFileArg(b.path("tests/ledger_counter_wrapper_test.sh"));
+    b.step("test-ledger-counter-wrapper", "Run mocked global counter wrapper tests")
+        .dependOn(&ledger_counter_wrapper_test.step);
 
     const deploy_test_step = b.step(
         "test-deploy",
@@ -775,11 +813,14 @@ pub fn build(b: *std.Build) void {
     deploy_test_step.dependOn(&processor_interface_test.step);
     deploy_test_step.dependOn(&development_deployment_test.step);
     deploy_test_step.dependOn(&events_wrapper_test.step);
+    deploy_test_step.dependOn(&ledger_counter_wrapper_test.step);
 
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_seat_reservation_tests.step);
     test_step.dependOn(&run_seat_persistence_tests.step);
     test_step.dependOn(&run_events_cli_tests.step);
+    test_step.dependOn(&run_ledger_counter_tests.step);
+    test_step.dependOn(&run_ledger_counter_cli_tests.step);
     test_step.dependOn(&run_lambda_auth_tests.step);
     test_step.dependOn(&run_query_tests.step);
     test_step.dependOn(&run_tiger_beetle_processor_tests.step);

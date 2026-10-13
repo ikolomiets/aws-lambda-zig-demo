@@ -43,6 +43,9 @@ The [Seat Reservation contracts](docs/SEAT_RESERVATION.md) provide pure command
 and metadata validation. The host `events` binary and `events.sh` wrapper insert
 validated creating Event metadata and read tenant-scoped records; this utility
 does not provision native resources or run a seat workflow.
+The host `ledger-counter` binary and `ledger-counter.sh` wrapper provide explicit
+first-time initialization, inspection and allocation through one shared global
+ledger sequence. See the [counter utility guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#global-ledger-counter-utility).
 
 ## Requirements for Zig on AWS Lambda
 
@@ -72,8 +75,9 @@ zig build --release -Darch=arm
 ```
 
 This also installs the host-native `zig-out/bin/paseto` utility and the local
-implementations invoked by `persistence.sh`, `queue.sh`, and `events.sh`. Build
-only the Events utility with `zig build build-events`. The intake and query
+implementations invoked by `persistence.sh`, `queue.sh`, `events.sh`, and
+`ledger-counter.sh`. Build the Events utility with `zig build build-events` or
+the counter utility with `zig build build-ledger-counter`. The intake and query
 bootstraps and the PASETO utility use the shared PASETO implementation in
 `src/paseto.zig`; the persistence and queue commands use the shared model in
 `src/operation.zig`. The Lambda and local commands reach AWS through

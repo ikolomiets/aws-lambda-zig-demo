@@ -145,3 +145,8 @@ _Avoid_: Customer account
 A positive quantity of seats held in one specified Seat Class of a Seat Event by one successful
 reserve_seats request. Confirmation applies to the full held quantity.
 _Avoid_: Operation, individual pending transfer
+
+**Global Ledger Allocator**:
+A bounded monotonic ledger sequence shared by participating tenants and
+deployments independently of native cluster identity. Allocations may leave gaps.
+_Avoid_: Cluster counter, tenant ledger range
