@@ -735,14 +735,11 @@ or CloudFront.
 
 ## Development and Validation
 
-Run formatting checks before committing Zig changes:
+Run the complete formatting check for build files, Zig sources, and tests before
+committing Zig changes:
 
 ```sh
-zig fmt --check build.zig src/processor_message.zig src/tiger_beetle_completion_processor.zig \
-  src/tiger_beetle_processor.zig src/intake_lambda.zig src/lambda_auth.zig \
-  src/query_lambda.zig \
-  src/operation.zig src/operation_persistence.zig src/sqs_queue.zig \
-  src/persistence_cli.zig src/queue_cli.zig src/paseto.zig src/paseto_cli.zig
+zig build fmt-check
 ```
 
 Run only the local deployment-helper regression tests with:

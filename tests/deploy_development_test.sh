@@ -32,7 +32,8 @@ cat >"$TEST_TMP_DIR/bin/mock-command" <<'MOCK'
 set -euo pipefail
 command_name="${0##*/}"
 printf '%s %s\n' "$command_name" "$*" >>"$MOCK_CALL_LOG"
-if [ "${MOCK_FAILURE:-}" = "$command_name:${1:-}" ]; then
+if [ "${MOCK_FAILURE:-}" = "$command_name:${1:-}" ] ||
+    [ "${MOCK_FAILURE:-}" = "$command_name:${1:-}:${2:-}" ]; then
     exit 42
 fi
 case "$command_name" in
@@ -46,6 +47,10 @@ case "$command_name" in
                             index=$((index + 1))
                             mkdir -p "${!index}"
                             printf 'cached\n' >"${!index}/retained"
+                            ;;
+                        --fork=*)
+                            fork_argument="${!index}"
+                            [ -f "${fork_argument#--fork=}/build.zig.zon" ] || exit 98
                             ;;
                     esac
                 done
@@ -191,7 +196,7 @@ test_full_deployment_baseline() {
     run_script || fail_test "full deployment failed: $(cat "$CHECKOUT/output.log")"
     calls="$(cat "$MOCK_CALL_LOG")"
     stages="$(sed -n -e '/^zig /p' -e '/^sam /p' "$MOCK_CALL_LOG")"
-    expected='zig fmt --check build.zig src/processor_message.zig src/tiger_beetle_completion_processor.zig src/tiger_beetle_processor.zig src/intake_lambda.zig src/lambda_auth.zig src/paseto.zig src/paseto_cli.zig src/query_lambda.zig
+    expected='zig build fmt-check --cache-dir .zig-cache-deploy --global-cache-dir .zig-global-cache-deploy
 zig build test --cache-dir .zig-cache-deploy --global-cache-dir .zig-global-cache-deploy
 zig build --cache-dir .zig-cache-deploy --global-cache-dir .zig-global-cache-deploy --release -Darch=arm
 sam validate --template-file template.yaml --region ca-central-1
@@ -216,7 +221,7 @@ test_development_dry_run() {
     MOCK_PUBLIC_KEY='' MOCK_PRIVATE_KEY='' run_script --dev --dry-run ||
         fail_test "development dry run failed: $(cat "$CHECKOUT/output.log")"
     calls="$(cat "$MOCK_CALL_LOG")"
-    assert_contains "$calls" 'zig fmt --check'
+    assert_contains "$calls" 'zig build fmt-check --cache-dir .zig-cache-dev --global-cache-dir .zig-global-cache-dev'
     assert_contains "$calls" 'zig build --cache-dir .zig-cache-dev --global-cache-dir .zig-global-cache-dev --release -Darch=arm'
     assert_contains "$calls" 'zip -qj tiger-beetle-completion-processor.zip'
     assert_not_contains "$calls" 'zig build test'
@@ -228,6 +233,32 @@ test_development_dry_run() {
     run_script --dry-run --dev || fail_test 'repeated development dry run failed'
     [ -f "$CHECKOUT/.zig-cache-dev/previous" ] && [ -f "$CHECKOUT/.zig-global-cache-dev/previous" ] ||
         fail_test 'repeated development run removed previous caches'
+}
+
+test_local_forks_reach_all_build_steps() {
+    local mode fork_root stages expected
+    local options
+    for mode in deploy dev; do
+        new_checkout "fork-$mode"
+        fork_root="$CHECKOUT/local aws-lambda"
+        mkdir -p "$fork_root/src"
+        touch "$fork_root/build.zig.zon" "$fork_root/src/root.zig"
+        options=(--dry-run --use-local-libs)
+        if [ "$mode" = dev ]; then
+            options+=(--dev)
+        fi
+        LOCAL_AWS_LAMBDA_ROOT="$fork_root" run_script "${options[@]}" ||
+            fail_test "local fork $mode run failed: $(cat "$CHECKOUT/output.log")"
+        stages="$(sed -n '/^zig build /p' "$MOCK_CALL_LOG")"
+        expected="zig build fmt-check --cache-dir .zig-cache-$mode --global-cache-dir .zig-global-cache-$mode --fork=$fork_root"
+        if [ "$mode" = deploy ]; then
+            expected+="
+zig build test --cache-dir .zig-cache-$mode --global-cache-dir .zig-global-cache-$mode --fork=$fork_root"
+        fi
+        expected+="
+zig build --cache-dir .zig-cache-$mode --global-cache-dir .zig-global-cache-$mode --fork=$fork_root --release -Darch=arm"
+        [ "$stages" = "$expected" ] || fail_test "unexpected local fork $mode build steps: $stages"
+    done
 }
 
 test_development_code_sync() {
@@ -287,12 +318,16 @@ test_development_rejects_configuration_and_lifecycle_options() {
 
 test_development_gates_and_failure_propagation() {
     local failure
-    for failure in zig:fmt zig:build file:zig-out/bin/intake/bootstrap zip:-qj unzip:-Z1 sam:sync; do
+    for failure in zig:build:fmt-check zig:build:--cache-dir file:zig-out/bin/intake/bootstrap zip:-qj unzip:-Z1 sam:sync; do
         new_checkout failure
         if MOCK_FAILURE="$failure" run_script --dev; then
             fail_test "development succeeded after command failure: $failure"
         fi
         assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'curl '
+        if [ "$failure" = zig:build:fmt-check ]; then
+            assert_not_contains "$(cat "$MOCK_CALL_LOG")" '--release -Darch=arm'
+            assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'zip '
+        fi
         if [ "$failure" != sam:sync ]; then
             assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'sam sync '
         fi
@@ -376,9 +411,21 @@ test_full_dry_run_and_failed_build_cleanup() {
     [ ! -e "$CHECKOUT/.zig-cache-deploy" ] && [ ! -e "$CHECKOUT/.zig-global-cache-deploy" ] ||
         fail_test 'ordinary dry run retained temporary caches'
 
+    new_checkout full-format-failure
+    mkdir -p "$CHECKOUT/.zig-cache-deploy" "$CHECKOUT/.zig-global-cache-deploy"
+    if MOCK_FAILURE=zig:build:fmt-check run_script --dry-run; then
+        fail_test 'full deployment succeeded after failed formatting'
+    fi
+    [ ! -e "$CHECKOUT/.zig-cache-deploy" ] && [ ! -e "$CHECKOUT/.zig-global-cache-deploy" ] ||
+        fail_test 'failed formatting retained temporary caches'
+    assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'zig build test '
+    assert_not_contains "$(cat "$MOCK_CALL_LOG")" '--release -Darch=arm'
+    assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'zip '
+    assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'sam '
+
     new_checkout full-failure
     mkdir -p "$CHECKOUT/.zig-cache-deploy" "$CHECKOUT/.zig-global-cache-deploy"
-    if MOCK_FAILURE=zig:build run_script --dry-run; then
+    if MOCK_FAILURE=zig:build:test run_script --dry-run; then
         fail_test 'full deployment succeeded after failed tests'
     fi
     [ ! -e "$CHECKOUT/.zig-cache-deploy" ] && [ ! -e "$CHECKOUT/.zig-global-cache-deploy" ] ||
@@ -388,6 +435,7 @@ test_full_dry_run_and_failed_build_cleanup() {
 
 test_full_deployment_baseline
 test_development_dry_run
+test_local_forks_reach_all_build_steps
 test_development_code_sync
 test_development_rejects_configuration_and_lifecycle_options
 test_development_gates_and_failure_propagation

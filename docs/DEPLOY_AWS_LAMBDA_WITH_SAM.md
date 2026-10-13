@@ -1330,6 +1330,10 @@ Use
 to build with local dependency checkouts. The `aws_lambda` checkout defaults
 to `../aws-lambda-zig`; override it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
 
+Both deployment modes run `zig build fmt-check` with their selected local and
+global caches and any `--use-local-libs` package forks. This target checks build
+files, Zig sources, and tests before the remaining test/build steps.
+
 ### Development code updates
 
 Use `./deploy.sh --dev` for compatible code changes on an existing development
@@ -1349,8 +1353,8 @@ flow, outputs, smoke checks, and deletion of `.zig-cache-deploy` and
 Development mode retains `.zig-cache-dev` and `.zig-global-cache-dev` across
 successful and failed runs; ordinary deployment does not delete these caches.
 It checks Zig 0.16.0 and the required sibling standard library, runs the existing
-formatting check, and incrementally builds the same ARM64 ReleaseSafe targets
-and host tools. The sibling file check does not verify the hostname workaround;
+complete `fmt-check` target, and incrementally builds the same ARM64 ReleaseSafe
+targets and host tools. The sibling file check does not verify the hostname workaround;
 see the [hostname-connect note](ZIG_0_16_HOSTNAME_CONNECT_STALL.md). It refreshes
 all four prebuilt ZIPs and verifies stripped ARM64 bootstraps and root-level
 archive contents. It skips the full suite and both SAM validation passes. Build,

@@ -780,18 +780,6 @@ run_deployment() {
         LOCAL_FORKS+=("$LOCAL_AWS_LAMBDA_ROOT")
     fi
 
-    printf '==> Checking Zig formatting\n'
-    zig fmt --check \
-        build.zig \
-        src/processor_message.zig \
-        src/tiger_beetle_completion_processor.zig \
-        src/tiger_beetle_processor.zig \
-        src/intake_lambda.zig \
-        src/lambda_auth.zig \
-        src/paseto.zig \
-        src/paseto_cli.zig \
-        src/query_lambda.zig
-
     ZIG_BUILD_ARGS=(
         --cache-dir "$CACHE_DIR"
         --global-cache-dir "$GLOBAL_CACHE_DIR"
@@ -803,6 +791,9 @@ run_deployment() {
             ZIG_BUILD_ARGS+=(--fork="$path")
         done
     fi
+
+    printf '==> Checking Zig formatting\n'
+    zig build fmt-check "${ZIG_BUILD_ARGS[@]}"
 
     if [ "$DEV" -eq 0 ]; then
         printf '==> Running Zig tests\n'
