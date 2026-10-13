@@ -815,7 +815,13 @@ pub fn build(b: *std.Build) void {
     deploy_test_step.dependOn(&events_wrapper_test.step);
     deploy_test_step.dependOn(&ledger_counter_wrapper_test.step);
 
+    const tracker_test = b.addSystemCommand(&.{"python3"});
+    tracker_test.addFileArg(b.path("tests/tracker_test.py"));
+    b.step("test-tracker", "Run temporary-tree Markdown tracker command tests")
+        .dependOn(&tracker_test.step);
+
     const test_step = b.step("test", "Run unit and integration tests");
+    test_step.dependOn(&tracker_test.step);
     test_step.dependOn(&run_seat_reservation_tests.step);
     test_step.dependOn(&run_seat_persistence_tests.step);
     test_step.dependOn(&run_events_cli_tests.step);
