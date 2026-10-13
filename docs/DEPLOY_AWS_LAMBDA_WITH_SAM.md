@@ -1972,10 +1972,25 @@ TigerBeetle processor itself has no DynamoDB permissions.
 
 ### Seat Event metadata utility
 
-Build the host `zig-out/bin/events` binary independently with:
+The host `events` utility is available for a deliberately selected existing
+DynamoDB table. The current SAM template has no `SeatEventsTable`; stack-wrapper
+execution requires a selected stack that already supplies that logical resource
+and a discoverable physical table ID. Use the direct binary with explicit table
+configuration until that binding exists.
+
+The table requires separate String keys `tenant` (partition) and `event_id`
+(sort), without TTL. The direct binary uses the pinned SDK's standard AWS
+credentials, profile, Region and endpoint configuration. Authenticate the
+selected identity before table commands; it needs table-scoped `dynamodb:PutItem`
+and `dynamodb:GetItem`. Wrapper execution also needs AWS CLI credential export
+and `cloudformation:DescribeStackResource`. These are operator permissions;
+this utility adds no Lambda IAM or SAM resources.
+
+Build the host binary independently and inspect credential-free help:
 
 ```sh
 zig build build-events
+zig-out/bin/events --help
 ./events.sh --help
 ```
 
@@ -1988,46 +2003,42 @@ The utility stores supplied ledger/account IDs. It does not allocate a ledger,
 create or fund native resources, implement a public creation Operation, or
 finalize readiness. It has no replace, update, reset, or delete-all command.
 
+For direct execution, select the intended existing table and authenticated
+profile explicitly. These example IDs describe metadata only; operators supply
+identities appropriate to their cluster.
+
 ```sh
-cat <<'JSON' | ./events.sh create \
+export EVENTS_TABLE_NAME='<events-table-name>' AWS_PROFILE=dev AWS_REGION=ca-central-1
+
+cat <<'JSON' | zig-out/bin/events create \
   --tenant tenant-a --event-id 00000000-0000-0000-0000-000000000001
 {"tenant":"tenant-a","event_id":"00000000-0000-0000-0000-000000000001","ledger":1001,"timeout_seconds":300,"capacity_account_id":"1","allocation_account_id":"2","state":"creating","classes":{"general":{"total":100,"tb_account_id":"3"}}}
 JSON
 
-./events.sh read \
+zig-out/bin/events read \
   --tenant tenant-a --event-id 00000000-0000-0000-0000-000000000001
 ```
 
-These example IDs describe metadata only. Operators supply identities appropriate
-to their cluster. A racing or uncertain insertion returns the validated saved
-winner, including its IDs, ledger and current state. Different classes or timeout
+A racing or uncertain insertion returns the validated saved winner, including
+its IDs, ledger and current state. Different classes or timeout
 report a conflict. If readback cannot establish a saved winner, creation fails
 and the caller retries with the same tenant/Event identity.
 
-The wrapper defaults to `PROFILE=dev`, `REGION=ca-central-1`, and
-`STACK_NAME=aws-lambda-zig-demo`. It also accepts `--profile`, `--region`, and
+Only use stack-wrapper execution when the selected stack supplies the
+`SeatEventsTable` logical resource. The wrapper defaults to `PROFILE=dev`,
+`REGION=ca-central-1`, and `STACK_NAME=aws-lambda-zig-demo`. It also accepts
+`--profile`, `--region`, and
 `--stack-name` before the command. It exports the selected profile's temporary
 credentials, disables EC2 metadata discovery, resolves `SeatEventsTable` through
-CloudFormation, and exports `EVENTS_TABLE_NAME` before forwarding arguments and
-stdin unchanged. Help also works as `create --help` or `read --help`, without AWS
+CloudFormation's `describe-stack-resource` physical-ID result, and exports
+`EVENTS_TABLE_NAME` before forwarding arguments and stdin unchanged. Help also
+works as `create --help` or `read --help`, without AWS
 commands, credentials, resource discovery, or a built binary.
 
-The current SAM template has no `SeatEventsTable`; deployment resource wiring is a
-separate slice. Wrapper tests mock that lookup. Until a stack supplies that
-resource, use an explicitly configured existing table with the direct binary:
-
 ```sh
-EVENTS_TABLE_NAME='<events-table-name>' AWS_REGION=ca-central-1 \
-  zig-out/bin/events read \
-    --tenant tenant-a --event-id 00000000-0000-0000-0000-000000000001
+./events.sh --profile dev --region ca-central-1 --stack-name '<stack-name>' read \
+  --tenant tenant-a --event-id 00000000-0000-0000-0000-000000000001
 ```
-
-The direct binary uses the pinned SDK's standard AWS credentials, profile,
-Region and endpoint configuration. The table requires separate String keys
-`tenant` (partition) and `event_id` (sort), without TTL. The local AWS identity
-needs table-scoped `dynamodb:PutItem` and `dynamodb:GetItem`; wrapper execution
-also needs `cloudformation:DescribeStackResource`. These are operator permissions;
-this utility adds no Lambda IAM or SAM resources.
 
 Creation stdin is bounded at 16 KiB; commands accept at most six arguments,
 each at most 4,096 bytes, with tenant limited to 64 bytes. Logical metadata must
@@ -2053,12 +2064,13 @@ provisioning. No Lambda ZIP is required for the host utility.
 
 ### Global ledger counter utility
 
-Build the host binary and inspect credential-free help:
-
-```sh
-zig build build-ledger-counter
-./ledger-counter.sh --help
-```
+The host `ledger-counter` utility is available for a deliberately selected
+existing DynamoDB table. The current SAM template has no counter table or
+`LedgerCounterTableName` output. Stack-wrapper execution requires a selected
+stack that already exposes the actual physical allocator table through that
+output, including when the table is referenced. Use the direct binary with
+explicit table configuration until that binding exists. `deploy.sh` does not
+inspect, initialize or allocate counter state.
 
 The shared [global allocator contract](SEAT_RESERVATION.md#global-ledger-allocator)
 uses exactly String partition key `counter_id = "global"` and Number u32
@@ -2068,18 +2080,41 @@ cluster selection. A deployment may own this table or explicitly reference an
 existing one; only the owner may clean it up. These utilities create no table
 and expose no deletion, reset, decrement, recycling or repair command.
 
+The direct binary uses the pinned SDK's standard credentials, profile, Region
+and endpoint configuration. Authenticate the selected identity before table
+commands. Operator permissions are table-scoped `dynamodb:GetItem` for read,
+plus `dynamodb:PutItem` for init and `dynamodb:UpdateItem` for allocate. Wrapper
+execution also needs AWS CLI credential export and
+`cloudformation:DescribeStacks`. These utilities add no Lambda IAM permissions
+or SAM resources, and generate no Lambda ZIP packages.
+
+Build the host binary and inspect credential-free help:
+
+```sh
+zig build build-ledger-counter
+zig-out/bin/ledger-counter --help
+./ledger-counter.sh --help
+```
+
+For direct execution against the intended existing global allocator, configure
+the table and authenticated profile explicitly:
+
+```sh
+export LEDGER_COUNTER_TABLE_NAME='<global-counter-table-name>' AWS_PROFILE=dev AWS_REGION=ca-central-1
+zig-out/bin/ledger-counter read
+```
+
 Run `init` only for explicit first-time setup of a new allocator. It inserts
 1000 absent-only, preserves an existing record and prints its validated current
-value. An interrupted setup may be rerun explicitly. Normal deployment inspects
-an existing counter without changing it. A missing established counter requires
-investigation; it is not authorization to initialize a new sequence. Native
+value. An interrupted setup may be rerun explicitly. A missing established
+counter requires investigation; it is not authorization to initialize a new sequence. Native
 cluster changes never justify setup, reset or rebinding to a fresh table.
 
 ```sh
 # Explicit first-time setup only, after selecting the intended new global table.
-./ledger-counter.sh --stack-name '<stack-name>' init
-./ledger-counter.sh --stack-name '<stack-name>' read
-./ledger-counter.sh --stack-name '<stack-name>' allocate
+zig-out/bin/ledger-counter init
+zig-out/bin/ledger-counter read
+zig-out/bin/ledger-counter allocate
 ```
 
 `allocate` performs the same bounded conditional atomic increment exposed to
@@ -2089,8 +2124,10 @@ losing Event-creation races can leave permanent gaps. Never infer an uncertain
 allocation from a later `read`: it cannot identify which caller consumed a value.
 A fresh allocation may consume another value; no value is reclaimed.
 
-The wrapper defaults to `PROFILE=dev`, `REGION=ca-central-1`, and
-`STACK_NAME=aws-lambda-zig-demo`, with `--profile`, `--region`, and `--stack-name`
+Only use stack-wrapper execution when the selected stack exposes a valid
+`LedgerCounterTableName` output. The wrapper defaults to `PROFILE=dev`,
+`REGION=ca-central-1`, and `STACK_NAME=aws-lambda-zig-demo`, with `--profile`,
+`--region`, and `--stack-name`
 overrides before the command. It exports the selected profile's temporary
 credentials, disables EC2 metadata discovery and resolves the selected stack's
 `LedgerCounterTableName` output through `cloudformation describe-stacks`. This
@@ -2101,22 +2138,13 @@ environment binding, then forwards the command to the prebuilt binary. Help
 also works as `init --help`, `read --help`, and `allocate --help` without AWS
 commands, credentials, discovery or a built binary.
 
-The current SAM template has no counter table or `LedgerCounterTableName` output.
-Resource wiring, owner-only cleanup and deployment binding/data guards belong to
-the separate deployment slices. Wrapper discovery is mock-tested until that
-wiring exists. For a deliberately selected existing table with the exact schema,
-use the direct binary with explicit configuration:
+Missing or invalid discovery fails with a fixed diagnostic naming the required
+`LedgerCounterTableName` output; upstream data is omitted. Wrapper discovery is
+mock-tested and does not establish current SAM integration.
 
 ```sh
-LEDGER_COUNTER_TABLE_NAME='<global-counter-table-name>' AWS_REGION=ca-central-1 \
-  zig-out/bin/ledger-counter read
+./ledger-counter.sh --profile dev --region ca-central-1 --stack-name '<stack-name>' read
 ```
-
-The direct binary uses the pinned SDK's standard credentials, profile, Region and
-endpoint configuration. Operator permissions are table-scoped `dynamodb:GetItem`
-for read, plus `dynamodb:PutItem` for init and `dynamodb:UpdateItem` for allocate.
-Wrapper execution also needs `cloudformation:DescribeStacks`. These utilities add
-no Lambda IAM permissions or SAM resources, and generate no Lambda ZIP packages.
 
 Commands consume no stdin and accept at most three binary arguments, each at
 most 256 bytes. SDK response bodies are capped at 8 KiB, with one HTTP attempt

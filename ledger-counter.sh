@@ -68,11 +68,11 @@ export AWS_EC2_METADATA_DISABLED=true
 counter_table="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
     --query 'Stacks[0].Outputs[?OutputKey==`LedgerCounterTableName`].OutputValue | [0]' \
     --output text --profile "$PROFILE" --region "$REGION" 2>/dev/null)" ||
-    fail 'failed to resolve the global allocator from the selected stack'
+    fail 'failed to resolve LedgerCounterTableName from the selected stack; verify AWS access and the required global allocator output'
 [ "$counter_table" != None ] && [ "${#counter_table}" -ge 3 ] &&
-    [ "${#counter_table}" -le 255 ] || fail 'selected stack has no valid global allocator binding'
+    [ "${#counter_table}" -le 255 ] || fail 'selected stack requires a valid LedgerCounterTableName output for the global allocator'
 case "$counter_table" in
-    *[!a-zA-Z0-9_.-]*) fail 'selected stack has an invalid global allocator binding' ;;
+    *[!a-zA-Z0-9_.-]*) fail 'selected stack requires a valid LedgerCounterTableName output for the global allocator' ;;
 esac
 export LEDGER_COUNTER_TABLE_NAME="$counter_table"
 unset counter_table

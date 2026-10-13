@@ -19,6 +19,11 @@ case "$1 $2" in
         printf '%s\n' 'export AWS_ACCESS_KEY_ID=test-access' 'export AWS_SECRET_ACCESS_KEY=test-secret' 'export AWS_SESSION_TOKEN=test-session'
         ;;
     'cloudformation describe-stacks')
+        if [ "${FAIL_DISCOVERY:-0}" = 1 ]; then
+            printf 'sensitive upstream output\n'
+            printf 'sensitive upstream diagnostic\n' >&2
+            exit 7
+        fi
         case "$*" in
             *LedgerCounterTableName*) printf '%s\n' "${RESOLVED_TABLE-shared-ledgers}" ;;
             *) exit 99 ;;
@@ -71,12 +76,31 @@ output="$(RESOLVED_TABLE=externally-owned-ledgers bash "$TEST_DIR/work/ledger-co
     --profile override --region=override-region --stack-name override-stack read)"
 contains "$output" 'externally-owned-ledgers|override-region|override|true'
 
-for table in '' None 'table with spaces' 'a' 'x/y'; do
+long_table="$(printf '%0256d' 0)"
+for table in '' None 'table with spaces' 'a' 'x/y' "$long_table" 'sensitive/table'; do
+    : >"$COUNTER_ARGUMENTS"
+    status=0
     if output="$(RESOLVED_TABLE="$table" bash "$TEST_DIR/work/ledger-counter.sh" init 2>&1)"; then
         fail_test 'invalid allocator binding accepted'
+    else
+        status=$?
     fi
-    contains "$output" 'allocator'
+    [ "$status" -eq 2 ] || fail_test 'invalid allocator binding exit code changed'
+    contains "$output" 'LedgerCounterTableName'
+    case "$output" in *sensitive*) fail_test 'invalid binding data leaked' ;; esac
+    [ ! -s "$COUNTER_ARGUMENTS" ] || fail_test 'invalid binding invoked the binary'
 done
+: >"$COUNTER_ARGUMENTS"
+status=0
+if output="$(FAIL_DISCOVERY=1 bash "$TEST_DIR/work/ledger-counter.sh" read 2>&1)"; then
+    fail_test 'discovery error accepted'
+else
+    status=$?
+fi
+[ "$status" -eq 2 ] || fail_test 'discovery error exit code changed'
+contains "$output" 'LedgerCounterTableName'
+case "$output" in *sensitive*) fail_test 'upstream discovery data leaked' ;; esac
+[ ! -s "$COUNTER_ARGUMENTS" ] || fail_test 'failed discovery invoked the binary'
 if output="$(FAIL_AWS=1 bash "$TEST_DIR/work/ledger-counter.sh" read 2>&1)"; then
     fail_test 'AWS error accepted'
 fi
