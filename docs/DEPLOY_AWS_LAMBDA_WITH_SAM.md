@@ -2092,12 +2092,16 @@ explicit table configuration until that binding exists. `deploy.sh` does not
 inspect, initialize or allocate counter state.
 
 The shared [global allocator contract](SEAT_RESERVATION.md#global-ledger-allocator)
-uses exactly String partition key `counter_id = "global"` and Number u32
-`high_water`. The table has no sort key or TTL. Every participating deployment
-and tenant uses the same actual table and fixed key, independently of native
-cluster selection. A deployment may own this table or explicitly reference an
+supports independent records with String partition key `counter_id` and Number
+u32 `high_water`. The table has no sort key or TTL. The actual physical table and
+selected ID define the binding. Participating deployments and tenants requiring
+one sequence use the same binding independently of native cluster selection;
+different bindings may allocate equal numeric values. ID selection does not
+change the key schema or rewrite existing `"global"` records. A deployment may own this table or explicitly reference an
 existing one; only the owner may clean it up. These utilities create no table
-and expose no deletion, reset, decrement, recycling or repair command.
+and expose no deletion, reset, decrement, recycling or repair command. Deleting
+an owned table removes all its counters; referenced tables and their counters
+remain the owner's responsibility.
 
 The direct binary uses the pinned SDK's standard credentials, profile, Region
 and endpoint configuration. Authenticate the selected identity before table
@@ -2115,26 +2119,53 @@ zig-out/bin/ledger-counter --help
 ./ledger-counter.sh --help
 ```
 
-For direct execution against the intended existing global allocator, configure
-the table and authenticated profile explicitly:
+The binary selects `--counter-id <id>` before the command, then
+`LEDGER_COUNTER_ID`, then `"global"`. IDs contain 1–128 ASCII bytes: letter or
+digit first, then letters, digits, `.`, `_`, or `-`. Equality is case-sensitive
+without trimming or normalization. Empty/invalid selections, missing option
+values, duplicate selectors and unexpected arguments fail before effects.
+
+For direct execution against the intended existing allocator, configure the
+table and authenticated profile explicitly. Omitted ID selection retains the
+existing default invocation:
 
 ```sh
-export LEDGER_COUNTER_TABLE_NAME='<global-counter-table-name>' AWS_PROFILE=dev AWS_REGION=ca-central-1
+export LEDGER_COUNTER_TABLE_NAME='<counter-table-name>' AWS_PROFILE=dev AWS_REGION=ca-central-1
 zig-out/bin/ledger-counter read
 ```
 
-Run `init` only for explicit first-time setup of a new allocator. It inserts
-1000 absent-only, preserves an existing record and prints its validated current
-value. An interrupted setup may be rerun explicitly. A missing established
+Run `init` only for explicit first-time setup of a new selected counter. It
+inserts 1000 absent-only, preserves that ID's existing record and prints its
+validated current value. It leaves other IDs untouched. An interrupted setup may be rerun explicitly. A missing established
 counter requires investigation; it is not authorization to initialize a new sequence. Native
-cluster changes never justify setup, reset or rebinding to a fresh table.
+cluster changes never justify setup, reset or rebinding to another table or ID.
+Retain both components of an established binding; another initialized ID does
+not establish sequence continuity.
 
 ```sh
-# Explicit first-time setup only, after selecting the intended new global table.
+# Explicit first-time setup only, after selecting the intended new global binding.
 zig-out/bin/ledger-counter init
 zig-out/bin/ledger-counter read
 zig-out/bin/ledger-counter allocate
 ```
+
+Select an independent new counter explicitly in the same existing table:
+
+```sh
+zig-out/bin/ledger-counter --counter-id demo-blue init
+zig-out/bin/ledger-counter --counter-id demo-blue allocate
+export LEDGER_COUNTER_ID=demo-blue
+zig-out/bin/ledger-counter read
+# Explicit selection overrides the environment and reads the original record.
+zig-out/bin/ledger-counter --counter-id global read
+unset LEDGER_COUNTER_ID
+```
+
+This setup does not alter the original `"global"` high-water value. Each new ID
+starts at 1000 and allocates 1001 first; identical numbers across IDs are expected.
+The configured shared client owns its table and ID text; request builders copy
+both through SDK serialization/calls. Seat-runtime and SAM ID wiring remain
+separate work and add no public SeatReservation fields.
 
 `allocate` performs the same bounded conditional atomic increment exposed to
 runtime callers. First allocation returns 1001; 4,294,967,295 is the last value.
@@ -2153,7 +2184,15 @@ credentials, disables EC2 metadata discovery and resolves the selected stack's
 output names the actual owned or referenced physical allocator table; the wrapper
 never assumes a stack-owned logical resource and never discovers or requires a
 native cluster ID. It exports `LEDGER_COUNTER_TABLE_NAME`, replacing any stale
-environment binding, then forwards the command to the prebuilt binary. Help
+environment table binding. ID precedence is explicit `--counter-id`, caller
+`LEDGER_COUNTER_ID`, optional selected-stack `LedgerCounterId` output, then
+`"global"`. Caller selections are validated before AWS commands. If no caller
+selection exists, the wrapper queries the optional output and its presence:
+a missing output defaults to `"global"`; an empty or invalid supplied output
+fails. The literal ID `None` remains a valid selection. Existing stacks need
+only `LedgerCounterTableName`. The wrapper
+exports the effective `LEDGER_COUNTER_ID` and forwards explicit selection to
+the prebuilt binary. It creates no counter state during discovery. Help
 also works as `init --help`, `read --help`, and `allocate --help` without AWS
 commands, credentials, discovery or a built binary.
 
@@ -2163,10 +2202,12 @@ mock-tested and does not establish current SAM integration.
 
 ```sh
 ./ledger-counter.sh --profile dev --region ca-central-1 --stack-name '<stack-name>' read
+./ledger-counter.sh --stack-name '<stack-name>' --counter-id demo-blue read
 ```
 
-Commands consume no stdin and accept at most three binary arguments, each at
-most 256 bytes. SDK response bodies are capped at 8 KiB, with one HTTP attempt
+Commands consume no stdin and accept at most five binary arguments (including
+the executable name), each at most 256 bytes. SDK response bodies are capped at
+8 KiB, with one HTTP attempt
 per call. Allocation retries at most four definite concurrent conditional
 rejections; it never retries a possibly successful mutation internally.
 Success prints one bounded JSON object and newline, for example
@@ -2188,8 +2229,9 @@ done
 
 These suites also run in `zig build test`. They exercise real typed request
 builders/serialization with controlled external effects, interleaved global
-allocation, bounds, corrupt/missing state, response uncertainty, table/name
-ownership and wrapper binding. They do not establish live DynamoDB, AWS IAM,
+and independent selected-ID allocation, bounds, corrupt/missing state, wrong
+returned keys, response uncertainty, table/ID ownership and selection precedence
+through mocked wrapper discovery. They do not establish live DynamoDB, AWS IAM,
 seat processor integration or cloud deployment behavior.
 
 ### Troubleshoot persistence command configuration

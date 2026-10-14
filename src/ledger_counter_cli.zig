@@ -3,7 +3,8 @@ const aws = @import("aws");
 const counter = @import("ledger_counter");
 const Allocator = std.mem.Allocator;
 
-const argument_count_max = 3;
+const argument_count_max = 5;
+const Invocation = struct { command: Command, id: ?[]const u8 = null };
 const argument_size_max = 256;
 const Command = enum { help, init, read, allocate };
 const usage =
@@ -12,12 +13,14 @@ const usage =
     \\  ledger-counter read
     \\  ledger-counter allocate
     \\
+    \\Use --counter-id <id> before a command to select an independent sequence.
     \\Explicit first-time init stores 1000 absent-only and preserves existing state.
     \\Allocation returns the new high_water; first allocation is 1001. Gaps are permitted.
     \\No stdin is consumed. No reset, decrement, recycle, or delete command exists.
     \\
     \\Environment:
-    \\  LEDGER_COUNTER_TABLE_NAME  Physical DynamoDB global allocator table
+    \\  LEDGER_COUNTER_TABLE_NAME  Physical DynamoDB counter table
+    \\  LEDGER_COUNTER_ID          Selected ID; defaults to global
     \\  AWS_*                      Standard credentials, Region, profile and endpoint
     \\
 ;
@@ -44,11 +47,15 @@ fn main_execute(init: std.process.Init, stdout: *std.Io.Writer) !u8 {
         arguments_buffer[count] = argument;
         count += 1;
     }
-    const command = try parse_command(arguments_buffer[0..count]);
-    if (command == .help) {
+    const invocation = try parse_command(arguments_buffer[0..count]);
+    if (invocation.command == .help) {
         try stdout.writeAll(usage);
         return 0;
     }
+    const id = try counter.select_id(&.{
+        .explicit_id = invocation.id,
+        .configured_id = init.environ_map.get("LEDGER_COUNTER_ID"),
+    });
     const table = init.environ_map.get("LEDGER_COUNTER_TABLE_NAME") orelse
         return error.InvalidConfiguration;
     try counter.validate_table_name(table);
@@ -57,11 +64,11 @@ fn main_execute(init: std.process.Init, stdout: *std.Io.Writer) !u8 {
     }) catch return error.InvalidConfiguration;
     defer config.deinit();
     var store: counter.Counter = undefined;
-    try store.init(init.gpa, &config, init.environ_map);
+    try store.init_with_id(init.gpa, &config, init.environ_map, id);
     defer store.deinit();
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
-    try execute(arena.allocator(), command, stdout, Backend.init(&store));
+    try execute(arena.allocator(), invocation.command, id, stdout, Backend.init(&store));
     return 0;
 }
 
@@ -80,31 +87,48 @@ fn is_help(argument: []const u8) bool {
         std.mem.eql(u8, argument, "help");
 }
 
-fn parse_command(arguments: []const []const u8) !Command {
+fn parse_command(arguments: []const []const u8) !Invocation {
     if (arguments.len < 2 or arguments.len > argument_count_max) return error.InvalidInvocation;
     for (arguments) |argument| if (argument.len > argument_size_max) return error.InvalidInvocation;
-    if (arguments.len == 2 and is_help(arguments[1])) return .help;
-    const command = std.meta.stringToEnum(Command, arguments[1]) orelse
+    var index: usize = 1;
+    var id: ?[]const u8 = null;
+    if (std.mem.eql(u8, arguments[index], "--counter-id")) {
+        if (arguments.len < 4) return error.InvalidInvocation;
+        id = arguments[index + 1];
+        counter.validate_id(id.?) catch return error.InvalidInvocation;
+        index += 2;
+    }
+    if (index + 1 == arguments.len and is_help(arguments[index])) {
+        return .{ .command = .help, .id = id };
+    }
+    const command = std.meta.stringToEnum(Command, arguments[index]) orelse
         return error.InvalidInvocation;
     if (command == .help) return error.InvalidInvocation;
-    if (arguments.len == 3 and is_help(arguments[2])) return .help;
-    if (arguments.len != 2) return error.InvalidInvocation;
-    return command;
+    if (index + 2 == arguments.len and is_help(arguments[index + 1])) {
+        return .{ .command = .help, .id = id };
+    }
+    if (index + 1 != arguments.len) return error.InvalidInvocation;
+    return .{ .command = command, .id = id };
 }
 
 pub const Backend = struct {
     context: *anyopaque,
-    invoke_fn: *const fn (*anyopaque, Allocator, Command) anyerror!u32,
+    invoke_fn: *const fn (*anyopaque, Allocator, Command, []const u8) anyerror!u32,
 
     pub fn init(pointer: anytype) Backend {
         const Pointer = @TypeOf(pointer);
         const Adapter = struct {
-            fn invoke(context: *anyopaque, arena: Allocator, command: Command) !u32 {
+            fn invoke(
+                context: *anyopaque,
+                arena: Allocator,
+                command: Command,
+                id: []const u8,
+            ) !u32 {
                 const self: Pointer = @ptrCast(@alignCast(context));
                 return switch (command) {
-                    .init => self.setup(arena),
-                    .read => self.read(arena),
-                    .allocate => self.allocate(arena),
+                    .init => self.setup_selected(arena, id),
+                    .read => self.read_selected(arena, id),
+                    .allocate => self.allocate_selected(arena, id),
                     .help => unreachable,
                 };
             }
@@ -121,25 +145,52 @@ pub fn run(
     stderr: *std.Io.Writer,
     backend: ?Backend,
 ) u8 {
-    const command = parse_command(arguments) catch |err| return report_error(stderr, err);
+    return run_with_id(allocator, arguments, null, stdout, stderr, backend);
+}
+
+pub fn run_with_id(
+    allocator: Allocator,
+    arguments: []const []const u8,
+    configured_id: ?[]const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    backend: ?Backend,
+) u8 {
+    const invocation = parse_command(arguments) catch |err| return report_error(stderr, err);
+    var id: []const u8 = counter.counter_id;
+    if (invocation.command != .help) {
+        id = counter.select_id(&.{
+            .explicit_id = invocation.id,
+            .configured_id = configured_id,
+        }) catch |err| {
+            return report_error(stderr, err);
+        };
+    }
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     execute(
         arena.allocator(),
-        command,
+        invocation.command,
+        id,
         stdout,
         backend,
     ) catch |err| return report_error(stderr, err);
     return 0;
 }
 
-fn execute(arena: Allocator, command: Command, stdout: *std.Io.Writer, optional: ?Backend) !void {
+fn execute(
+    arena: Allocator,
+    command: Command,
+    id: []const u8,
+    stdout: *std.Io.Writer,
+    optional: ?Backend,
+) !void {
     if (command == .help) {
         try stdout.writeAll(usage);
         return;
     }
     const backend = optional orelse return error.InvalidConfiguration;
-    const high_water = try backend.invoke_fn(backend.context, arena, command);
+    const high_water = try backend.invoke_fn(backend.context, arena, command, id);
     if (high_water < counter.initial_high_water) {
         return if (command == .allocate) error.AllocationUncertain else error.CounterCorrupt;
     }
@@ -147,7 +198,9 @@ fn execute(arena: Allocator, command: Command, stdout: *std.Io.Writer, optional:
         return error.AllocationUncertain;
     }
     std.debug.assert(high_water >= counter.initial_high_water);
-    stdout.print("{{\"counter_id\":\"global\",\"high_water\":{d}}}\n", .{high_water}) catch |err| {
+    stdout.print("{{\"counter_id\":\"{s}\",\"high_water\":{d}}}\n", .{
+        id, high_water,
+    }) catch |err| {
         return if (command == .allocate) error.AllocationUncertain else err;
     };
 }
@@ -155,7 +208,9 @@ fn execute(arena: Allocator, command: Command, stdout: *std.Io.Writer, optional:
 fn report_error(stderr: *std.Io.Writer, err: anyerror) u8 {
     const message, const code: u8 = switch (err) {
         error.InvalidInvocation => .{ "invalid invocation; use --help", 2 },
-        error.InvalidConfiguration => .{ "missing or invalid configuration", 2 },
+        error.InvalidCounterId, error.InvalidConfiguration => .{
+            "missing or invalid configuration", 2,
+        },
         error.CounterMissing => .{ "counter missing; verify allocator binding and setup", 1 },
         error.CounterExhausted => .{ "ledger sequence exhausted", 1 },
         error.CounterCorrupt => .{ "stored counter is invalid", 2 },
@@ -200,9 +255,22 @@ test "counter help requires neither credentials nor a backend" {
 
 const TestCounter = struct {
     high_water: u32 = 1000,
+    selected_id: []const u8 = "global",
     failure: ?anyerror = null,
     calls: u8 = 0,
 
+    pub fn setup_selected(self: *TestCounter, arena: Allocator, id: []const u8) !u32 {
+        self.selected_id = id;
+        return self.setup(arena);
+    }
+    pub fn read_selected(self: *TestCounter, arena: Allocator, id: []const u8) !u32 {
+        self.selected_id = id;
+        return self.read(arena);
+    }
+    pub fn allocate_selected(self: *TestCounter, arena: Allocator, id: []const u8) !u32 {
+        self.selected_id = id;
+        return self.allocate(arena);
+    }
     pub fn setup(self: *TestCounter, arena: Allocator) !u32 {
         return self.read(arena);
     }
@@ -217,6 +285,149 @@ const TestCounter = struct {
         return self.high_water;
     }
 };
+
+test "explicit and configured selection reaches persistence and JSON with bounded validation" {
+    const cases = [_]struct {
+        arguments: []const []const u8,
+        configured_id: ?[]const u8,
+        expected_id: []const u8,
+    }{
+        .{
+            .arguments = &.{ "ledger-counter", "read" },
+            .configured_id = null,
+            .expected_id = "global",
+        },
+        .{
+            .arguments = &.{ "ledger-counter", "read" },
+            .configured_id = "configured",
+            .expected_id = "configured",
+        },
+        .{
+            .arguments = &.{ "ledger-counter", "--counter-id", "Alpha-1", "read" },
+            .configured_id = "configured",
+            .expected_id = "Alpha-1",
+        },
+        .{
+            .arguments = &.{ "ledger-counter", "--counter-id", "global", "read" },
+            .configured_id = "",
+            .expected_id = "global",
+        },
+    };
+    for (cases) |case| {
+        var stdout = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer stderr.deinit();
+        var database: TestCounter = .{};
+        try std.testing.expectEqual(@as(u8, 0), run_with_id(
+            std.testing.allocator,
+            case.arguments,
+            case.configured_id,
+            &stdout.writer,
+            &stderr.writer,
+            Backend.init(&database),
+        ));
+        try std.testing.expectEqualStrings(case.expected_id, database.selected_id);
+        const expected = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "{{\"counter_id\":\"{s}\",\"high_water\":1000}}\n",
+            .{case.expected_id},
+        );
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, stdout.written());
+        try std.testing.expectEqualStrings("", stderr.written());
+    }
+}
+
+test "selected command and configuration validation precedes persistence effects" {
+    const invalid = [_][]const []const u8{
+        &.{ "ledger-counter", "--counter-id" },
+        &.{ "ledger-counter", "--counter-id", "a" },
+        &.{ "ledger-counter", "--counter-id", "", "read" },
+        &.{ "ledger-counter", "--counter-id", "a/b", "init" },
+        &.{ "ledger-counter", "--counter-id", "-a", "allocate" },
+        &.{ "ledger-counter", "--counter-id", "a" ** 129, "read" },
+        &.{ "ledger-counter", "--counter-id", "a", "--counter-id", "b", "read" },
+        &.{ "ledger-counter", "--counter-id", "a", "read", "extra" },
+        &.{ "ledger-counter", "read", "--counter-id", "a" },
+    };
+    for (invalid) |arguments| {
+        var stdout = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer stderr.deinit();
+        var database: TestCounter = .{};
+        try std.testing.expectEqual(@as(u8, 2), run(
+            std.testing.allocator,
+            arguments,
+            &stdout.writer,
+            &stderr.writer,
+            Backend.init(&database),
+        ));
+        try std.testing.expectEqual(@as(u8, 0), database.calls);
+        try std.testing.expectEqualStrings("", stdout.written());
+        try std.testing.expectEqualStrings(
+            "ledger-counter: invalid invocation; use --help\n",
+            stderr.written(),
+        );
+    }
+    for ([_][]const u8{ "", ".a", "a b", "é", "a" ** 129 }) |id| {
+        var stdout = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer stdout.deinit();
+        var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer stderr.deinit();
+        var database: TestCounter = .{};
+        try std.testing.expectEqual(@as(u8, 2), run_with_id(
+            std.testing.allocator,
+            &.{ "ledger-counter", "read" },
+            id,
+            &stdout.writer,
+            &stderr.writer,
+            Backend.init(&database),
+        ));
+        try std.testing.expectEqual(@as(u8, 0), database.calls);
+        try std.testing.expectEqualStrings("", stdout.written());
+        try std.testing.expectEqualStrings(
+            "ledger-counter: missing or invalid configuration\n",
+            stderr.written(),
+        );
+    }
+}
+
+test "all selected commands accept boundary IDs and help ignores environment configuration" {
+    for ([_][]const u8{ "init", "read", "allocate" }) |command| {
+        for ([_][]const u8{ "0", "a" ** 128 }) |id| {
+            var stdout = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer stdout.deinit();
+            var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer stderr.deinit();
+            var database: TestCounter = .{};
+            try std.testing.expectEqual(@as(u8, 0), run(
+                std.testing.allocator,
+                &.{ "ledger-counter", "--counter-id", id, command },
+                &stdout.writer,
+                &stderr.writer,
+                Backend.init(&database),
+            ));
+            try std.testing.expectEqualStrings(id, database.selected_id);
+            try std.testing.expectEqual(@as(u8, 1), database.calls);
+        }
+    }
+    var stdout = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer stdout.deinit();
+    var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer stderr.deinit();
+    try std.testing.expectEqual(@as(u8, 0), run_with_id(
+        std.testing.allocator,
+        &.{ "ledger-counter", "--counter-id", "selected", "init", "--help" },
+        "",
+        &stdout.writer,
+        &stderr.writer,
+        null,
+    ));
+    try std.testing.expect(std.mem.startsWith(u8, stdout.written(), "Usage:\n"));
+    try std.testing.expectEqualStrings("", stderr.written());
+}
 
 test "counter commands print bounded JSON and reject invalid invocations before effects" {
     var stdout = std.Io.Writer.Allocating.init(std.testing.allocator);

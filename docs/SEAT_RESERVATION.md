@@ -112,18 +112,27 @@ error diagnostics remain internal and are released before returning.
 
 ## Global ledger allocator
 
-Each selected DynamoDB counter table has one record with exactly String
-`counter_id = "global"` and Number `high_water`, an integer u32 from 1000 through
-4,294,967,295. The table identity and fixed key define the allocator. All tenants
-and deployments participating in the sequence use the same physical table,
-including deployments using different native clusters or distinct clusters with
-equal numeric cluster IDs. Separate tables define separate sequences.
+A DynamoDB LedgerCounter table supports independent records, each with exactly
+String partition key `counter_id` and Number `high_water`, an integer u32 from
+1000 through 4,294,967,295. The physical table and selected ID define the binding.
+IDs contain 1–128 ASCII bytes: the first is a letter or digit, and subsequent
+bytes are letters, digits, `.`, `_`, or `-`. Equality is case-sensitive without
+trimming or normalization. Invalid or explicitly empty IDs fail before effects;
+only omitted selection defaults to `"global"`.
+
+Tenants and deployments requiring one sequence use the same binding, including
+those using different native clusters. Different IDs in one table and different
+tables define independent sequences that may allocate equal numeric values.
 `cluster_id` appears in neither counter storage, API nor allocation configuration.
+Existing `"global"` records retain their high-water values. The partition-key
+schema is unchanged; selection needs no table replacement or data conversion.
 
 Explicit first-time `initialize` inserts 1000 absent-only. A conditional conflict
-reads and validates the existing record without replacing it. `read` uses the
-fixed key with strong consistency. Neither read nor allocation initializes a
-missing record. Missing or corrupt established state requires operator investigation;
+reads and validates the selected record without replacing it. `read` uses the
+selected key with strong consistency. Every returned record must match the
+requested ID. Setup and failures for one ID leave other IDs untouched. Neither
+read nor allocation initializes a missing record. Missing or corrupt established
+state requires operator investigation;
 there is no automatic repair, reset, decrement, recycling or restore reconciliation.
 
 `allocate` first validates the complete record, then conditionally increments its
@@ -142,12 +151,25 @@ retry to infer its value. A later read reports only current state. Retrying a
 fresh allocation may consume another value. Lost responses, manual allocations
 and losing Event-creation races may leave permanent gaps.
 
-`Counter` owns a copy of `LEDGER_COUNTER_TABLE_NAME`; the AWS configuration outlives
-its client. Request arrays, table text and numeric expression values belong to
-the caller's arena through the SDK call. Returned high-water values are owned
-integers without borrowed response storage. The table can be owned by a deployment
-or explicitly referenced; tooling performs no table lifecycle actions. Counter
-data has no TTL, and only the owning deployment may clean up its table.
+The shared `initialize_selected`, `read_selected` and `allocate_selected` APIs
+accept a `Binding` containing `table_name` and `id`; omitted `id` uses `"global"`.
+Existing `initialize`, `read` and `allocate` calls retain that default.
+`Counter.init` selects `LEDGER_COUNTER_ID` or `"global"`; `init_with_id` gives an
+explicit ID precedence over environment configuration. Its `setup_selected`,
+`read_selected` and `allocate_selected` methods override the retained ID for
+one call. Invalid selected IDs fail before persistence effects.
+
+`Counter` owns copies of both table and ID text; the AWS configuration outlives
+its client. Request arrays, table/ID text and numeric expression values belong
+to the caller's arena through serialization and the SDK call. Returned high-water
+values are owned integers without borrowed response storage. The table can be
+owned by a deployment or explicitly referenced; tooling performs no table
+lifecycle actions. Counter data has no TTL, and only the owning deployment may
+clean up its table. Deleting an owned table deletes every counter in it;
+referenced tables and their counters remain the owner's responsibility.
+Selecting another ID establishes another binding, rather than repairing or
+resetting the existing sequence. Public SeatReservation contracts are unchanged;
+trusted seat-runtime selection and SAM wiring remain separate implementation work.
 
 ## Size bounds and deterministic evidence
 

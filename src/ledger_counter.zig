@@ -5,6 +5,18 @@ const Allocator = std.mem.Allocator;
 pub const Attribute = aws.map.MapEntry(dynamodb.types.AttributeValue);
 
 pub const counter_id = "global";
+pub const counter_id_size_max = 128;
+
+/// Borrowed selection at the call boundary; request builders copy both fields.
+pub const Binding = struct {
+    table_name: []const u8,
+    id: []const u8 = counter_id,
+};
+
+pub const Selection = struct {
+    explicit_id: ?[]const u8 = null,
+    configured_id: ?[]const u8 = null,
+};
 pub const initial_high_water: u32 = 1000;
 pub const allocation_attempts_max: u8 = 4;
 pub const response_size_max = 8192;
@@ -20,11 +32,12 @@ comptime {
     std.debug.assert(allocation_attempts_max > 0);
 }
 
-/// The selected physical table is the complete binding. Config outlives this client;
-/// the counter owns its table name, while each method uses the caller's request arena.
+/// Config outlives this client. The counter owns its table and ID binding;
+/// each method copies request text into the caller's request arena.
 pub const Counter = struct {
     client: dynamodb.Client,
     table_name: []const u8,
+    selected_id: []const u8,
 
     pub fn init(
         target: *Counter,
@@ -32,9 +45,27 @@ pub const Counter = struct {
         config: *aws.Config,
         environment: *const std.process.Environ.Map,
     ) !void {
+        return target.init_with_id(allocator, config, environment, null);
+    }
+
+    pub fn init_with_id(
+        target: *Counter,
+        allocator: Allocator,
+        config: *aws.Config,
+        environment: *const std.process.Environ.Map,
+        explicit_id: ?[]const u8,
+    ) !void {
+        const id = try select_id(&.{
+            .explicit_id = explicit_id,
+            .configured_id = environment.get("LEDGER_COUNTER_ID"),
+        });
         const table = environment.get("LEDGER_COUNTER_TABLE_NAME") orelse
             return error.InvalidConfiguration;
         try validate_table_name(table);
+        const owned_table = try allocator.dupe(u8, table);
+        errdefer allocator.free(owned_table);
+        const owned_id = try allocator.dupe(u8, id);
+        errdefer allocator.free(owned_id);
         target.* = .{
             .client = dynamodb.Client.initWithOptions(allocator, config, .{
                 // A retry after a lost UpdateItem response could consume another ledger.
@@ -42,7 +73,8 @@ pub const Counter = struct {
                 .max_response_size = response_size_max,
                 .keep_alive = true,
             }),
-            .table_name = try allocator.dupe(u8, table),
+            .table_name = owned_table,
+            .selected_id = owned_id,
         };
         std.debug.assert(target.client.config == config);
         std.debug.assert(target.client.options.max_attempts.? == 1);
@@ -50,29 +82,49 @@ pub const Counter = struct {
 
     pub fn deinit(self: *Counter) void {
         self.client.allocator.free(self.table_name);
+        self.client.allocator.free(self.selected_id);
         self.client.deinit();
         self.* = undefined;
     }
 
     pub fn setup(self: *Counter, arena: Allocator) !u32 {
+        return self.setup_selected(arena, self.selected_id);
+    }
+
+    pub fn setup_selected(self: *Counter, arena: Allocator, id: []const u8) !u32 {
         var backend: SDKBackend = .{ .client = &self.client };
-        return initialize(arena, self.table_name, &backend);
+        return initialize_selected(arena, &.{ .table_name = self.table_name, .id = id }, &backend);
     }
 
     pub fn read(self: *Counter, arena: Allocator) !u32 {
+        return self.read_selected(arena, self.selected_id);
+    }
+
+    pub fn read_selected(self: *Counter, arena: Allocator, id: []const u8) !u32 {
         var backend: SDKBackend = .{ .client = &self.client };
-        return read_counter(arena, self.table_name, &backend);
+        return read_counter_selected(
+            arena,
+            &.{ .table_name = self.table_name, .id = id },
+            &backend,
+        );
     }
 
     pub fn allocate(self: *Counter, arena: Allocator) !u32 {
+        return self.allocate_selected(arena, self.selected_id);
+    }
+
+    pub fn allocate_selected(self: *Counter, arena: Allocator, id: []const u8) !u32 {
         var backend: SDKBackend = .{ .client = &self.client };
-        return allocate_ledger(arena, self.table_name, &backend);
+        return allocate_ledger_selected(
+            arena,
+            &.{ .table_name = self.table_name, .id = id },
+            &backend,
+        );
     }
 };
 
-// Keep the effect-free test seam and client methods named for their callers.
-const read_counter = read;
-const allocate_ledger = allocate;
+const read_counter_selected = read_selected;
+const allocate_ledger_selected = allocate_selected;
 
 const SDKBackend = struct {
     client: *dynamodb.Client,
@@ -137,9 +189,13 @@ fn mutation_error(kind: dynamodb.ServiceError.Kind, conflict: anyerror) anyerror
 }
 
 pub fn initialize(arena: Allocator, table: []const u8, backend: anytype) !u32 {
-    const request = try initialize_request(arena, table);
+    return initialize_selected(arena, &.{ .table_name = table }, backend);
+}
+
+pub fn initialize_selected(arena: Allocator, binding: *const Binding, backend: anytype) !u32 {
+    const request = try initialize_request_selected(arena, binding);
     backend.put(arena, request) catch |err| {
-        if (err == error.CounterExists) return read(arena, table, backend);
+        if (err == error.CounterExists) return read_selected(arena, binding, backend);
         if (err == error.CounterTransient or err == error.AWSFailure) return err;
         return error.InitializationUncertain;
     };
@@ -147,30 +203,55 @@ pub fn initialize(arena: Allocator, table: []const u8, backend: anytype) !u32 {
 }
 
 pub fn read(arena: Allocator, table: []const u8, backend: anytype) !u32 {
-    const request = try read_request(arena, table);
+    return read_selected(arena, &.{ .table_name = table }, backend);
+}
+
+pub fn read_selected(arena: Allocator, binding: *const Binding, backend: anytype) !u32 {
+    const request = try read_request_selected(arena, binding);
     const item = try backend.get(arena, request) orelse return error.CounterMissing;
-    return decode_item(item);
+    return decode_item_selected(item, binding.id);
 }
 
 /// A validated read guards integer storage. Its exact-value condition makes the increment
 /// atomic across concurrent callers; only the returned update can allocate a ledger.
 /// Retry only a definite conditional rejection, never a failed or malformed update response.
 pub fn allocate(arena: Allocator, table: []const u8, backend: anytype) !u32 {
+    return allocate_selected(arena, &.{ .table_name = table }, backend);
+}
+
+pub fn allocate_selected(arena: Allocator, binding: *const Binding, backend: anytype) !u32 {
     for (0..allocation_attempts_max) |_| {
-        const previous = try read(arena, table, backend);
+        const previous = try read_selected(arena, binding, backend);
         if (previous == std.math.maxInt(u32)) return error.CounterExhausted;
-        const request = try allocation_request(arena, table, previous);
+        const request = try allocation_request_selected(arena, binding, previous);
         const item = backend.update(arena, request) catch |err| {
             if (err == error.CounterChanged) continue;
             if (err == error.CounterTransient or err == error.AWSFailure) return err;
             return error.AllocationUncertain;
         } orelse return error.AllocationUncertain;
-        const updated = decode_item(item) catch return error.AllocationUncertain;
+        const updated = decode_item_selected(item, binding.id) catch {
+            return error.AllocationUncertain;
+        };
         if (updated != previous + 1) return error.AllocationUncertain;
         std.debug.assert(updated > initial_high_water);
         return updated;
     }
     return error.CounterContended;
+}
+
+pub fn validate_id(id: []const u8) !void {
+    if (id.len == 0 or id.len > counter_id_size_max) return error.InvalidCounterId;
+    if (!std.ascii.isAlphanumeric(id[0])) return error.InvalidCounterId;
+    for (id[1..]) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '_' or byte == '-') continue;
+        return error.InvalidCounterId;
+    }
+}
+
+pub fn select_id(selection: *const Selection) ![]const u8 {
+    const id = selection.explicit_id orelse selection.configured_id orelse counter_id;
+    try validate_id(id);
+    return id;
 }
 
 pub fn validate_table_name(table: []const u8) !void {
@@ -182,19 +263,36 @@ pub fn validate_table_name(table: []const u8) !void {
 }
 
 pub fn read_request(arena: Allocator, table: []const u8) !dynamodb.GetItemInput {
-    try validate_table_name(table);
+    return read_request_selected(arena, &.{ .table_name = table });
+}
+
+pub fn read_request_selected(arena: Allocator, binding: *const Binding) !dynamodb.GetItemInput {
+    try validate_table_name(binding.table_name);
+    try validate_id(binding.id);
     const key = try arena.alloc(Attribute, 1);
-    key[0] = .{ .key = "counter_id", .value = .{ .s = counter_id } };
-    return .{ .table_name = try arena.dupe(u8, table), .key = key, .consistent_read = true };
+    key[0] = .{ .key = "counter_id", .value = .{ .s = try arena.dupe(u8, binding.id) } };
+    return .{
+        .table_name = try arena.dupe(u8, binding.table_name),
+        .key = key,
+        .consistent_read = true,
+    };
 }
 
 pub fn initialize_request(arena: Allocator, table: []const u8) !dynamodb.PutItemInput {
-    try validate_table_name(table);
+    return initialize_request_selected(arena, &.{ .table_name = table });
+}
+
+pub fn initialize_request_selected(
+    arena: Allocator,
+    binding: *const Binding,
+) !dynamodb.PutItemInput {
+    try validate_table_name(binding.table_name);
+    try validate_id(binding.id);
     const names = try arena.alloc(aws.map.StringMapEntry, 1);
     names[0] = .{ .key = "#counter_id", .value = "counter_id" };
     return .{
-        .table_name = try arena.dupe(u8, table),
-        .item = try encode_item(arena, initial_high_water),
+        .table_name = try arena.dupe(u8, binding.table_name),
+        .item = try encode_item_selected(arena, binding.id, initial_high_water),
         .condition_expression = initialize_condition,
         .expression_attribute_names = names,
     };
@@ -205,9 +303,17 @@ pub fn allocation_request(
     table: []const u8,
     previous: u32,
 ) !dynamodb.UpdateItemInput {
+    return allocation_request_selected(arena, &.{ .table_name = table }, previous);
+}
+
+pub fn allocation_request_selected(
+    arena: Allocator,
+    binding: *const Binding,
+    previous: u32,
+) !dynamodb.UpdateItemInput {
     if (previous < initial_high_water) return error.CounterCorrupt;
     if (previous == std.math.maxInt(u32)) return error.CounterExhausted;
-    const read_input = try read_request(arena, table);
+    const read_input = try read_request_selected(arena, binding);
     const names = try arena.alloc(aws.map.StringMapEntry, 2);
     names[0] = .{ .key = "#counter_id", .value = "counter_id" };
     names[1] = .{ .key = "#high_water", .value = "high_water" };
@@ -231,9 +337,14 @@ pub fn allocation_request(
 }
 
 pub fn encode_item(arena: Allocator, high_water: u32) ![]const Attribute {
+    return encode_item_selected(arena, counter_id, high_water);
+}
+
+pub fn encode_item_selected(arena: Allocator, id: []const u8, high_water: u32) ![]const Attribute {
+    try validate_id(id);
     if (high_water < initial_high_water) return error.CounterCorrupt;
     const item = try arena.alloc(Attribute, 2);
-    item[0] = .{ .key = "counter_id", .value = .{ .s = counter_id } };
+    item[0] = .{ .key = "counter_id", .value = .{ .s = try arena.dupe(u8, id) } };
     item[1] = .{ .key = "high_water", .value = .{
         .n = try std.fmt.allocPrint(arena, "{d}", .{high_water}),
     } };
@@ -241,6 +352,11 @@ pub fn encode_item(arena: Allocator, high_water: u32) ![]const Attribute {
 }
 
 pub fn decode_item(item: []const Attribute) !u32 {
+    return decode_item_selected(item, counter_id);
+}
+
+pub fn decode_item_selected(item: []const Attribute, id: []const u8) !u32 {
+    try validate_id(id);
     if (item.len != 2) return error.CounterCorrupt;
     var key_found = false;
     var high_water: ?u32 = null;
@@ -248,7 +364,7 @@ pub fn decode_item(item: []const Attribute) !u32 {
         if (std.mem.eql(u8, attribute.key, "counter_id")) {
             if (key_found or attribute.value != .s) return error.CounterCorrupt;
             const key = attribute.value.s orelse return error.CounterCorrupt;
-            if (!std.mem.eql(u8, key, counter_id)) return error.CounterCorrupt;
+            if (!std.mem.eql(u8, key, id)) return error.CounterCorrupt;
             key_found = true;
         } else if (std.mem.eql(u8, attribute.key, "high_water")) {
             if (high_water != null or attribute.value != .n) return error.CounterCorrupt;
@@ -280,7 +396,68 @@ test "explicit setup preserves the global counter and first allocation returns 1
     try std.testing.expectEqual(@as(u32, 1001), try read(memory, "shared-ledgers", &database));
 }
 
+test "selected counters initialize and interleave independently while preserving global" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const memory = arena.allocator();
+    var database: SelectedTestDatabase = .{};
+    const alpha: Binding = .{ .table_name = "shared-ledgers", .id = "Alpha-1" };
+    const beta: Binding = .{ .table_name = "shared-ledgers", .id = "beta_2" };
+    try std.testing.expectEqual(
+        @as(u32, 9000),
+        try initialize(memory, alpha.table_name, &database),
+    );
+    try std.testing.expectEqual(@as(u32, 1000), try initialize_selected(memory, &alpha, &database));
+    try std.testing.expectEqual(@as(u32, 1001), try allocate_selected(memory, &alpha, &database));
+    try std.testing.expectError(error.CounterMissing, read_selected(memory, &beta, &database));
+    try std.testing.expectEqual(@as(u32, 1000), try initialize_selected(memory, &beta, &database));
+    try std.testing.expectEqual(@as(u32, 1001), try allocate_selected(memory, &beta, &database));
+    try std.testing.expectEqual(@as(u32, 1002), try allocate_selected(memory, &alpha, &database));
+    try std.testing.expectEqual(@as(u32, 1002), try initialize_selected(memory, &alpha, &database));
+    try std.testing.expectEqual(@as(u32, 1001), try read_selected(memory, &beta, &database));
+    const global: Binding = .{ .table_name = alpha.table_name };
+    try std.testing.expectEqual(@as(u32, 9000), try read_selected(memory, &global, &database));
+    try std.testing.expectEqual(@as(u32, 9001), try allocate(memory, alpha.table_name, &database));
+    try std.testing.expectEqual(@as(u32, 9002), try allocate_selected(memory, &global, &database));
+}
+
+const SelectedTestDatabase = struct {
+    records: [3]TestDatabase = .{
+        .{ .selected_id = "global", .high_water = 9000 },
+        .{ .selected_id = "Alpha-1" },
+        .{ .selected_id = "beta_2" },
+    },
+
+    fn record(self: *SelectedTestDatabase, key: []const Attribute) !*TestDatabase {
+        for (&self.records) |*database| {
+            if (std.mem.eql(u8, database.selected_id, key[0].value.s.?)) return database;
+        }
+        return error.UnexpectedTestBinding;
+    }
+
+    pub fn put(self: *SelectedTestDatabase, arena: Allocator, input: dynamodb.PutItemInput) !void {
+        return (try self.record(input.item)).put(arena, input);
+    }
+
+    pub fn get(
+        self: *SelectedTestDatabase,
+        arena: Allocator,
+        input: dynamodb.GetItemInput,
+    ) !?[]const Attribute {
+        return (try self.record(input.key)).get(arena, input);
+    }
+
+    pub fn update(
+        self: *SelectedTestDatabase,
+        arena: Allocator,
+        input: dynamodb.UpdateItemInput,
+    ) !?[]const Attribute {
+        return (try self.record(input.key)).update(arena, input);
+    }
+};
+
 const TestDatabase = struct {
+    selected_id: []const u8 = counter_id,
     table_name: []const u8 = "shared-ledgers",
     high_water: ?u32 = null,
     put_error: ?anyerror = null,
@@ -292,6 +469,7 @@ const TestDatabase = struct {
     corrupt_item: ?[]const Attribute = null,
     invalid_update_response: bool = false,
     response_high_water: ?u32 = null,
+    response_id: ?[]const u8 = null,
     puts: u8 = 0,
     gets: u8 = 0,
     updates: u8 = 0,
@@ -305,7 +483,7 @@ const TestDatabase = struct {
         );
         try std.testing.expectEqual(@as(usize, 2), request.item.len);
         try std.testing.expectEqualStrings("counter_id", request.item[0].key);
-        try std.testing.expectEqualStrings("global", request.item[0].value.s.?);
+        try std.testing.expectEqualStrings(self.selected_id, request.item[0].value.s.?);
         try std.testing.expectEqualStrings("1000", request.item[1].value.n.?);
         if (self.put_error) |err| return err;
         if (self.high_water != null or self.corrupt_item != null) return error.CounterExists;
@@ -322,10 +500,13 @@ const TestDatabase = struct {
         try std.testing.expectEqualStrings(self.table_name, request.table_name);
         try std.testing.expectEqual(true, request.consistent_read.?);
         try std.testing.expectEqual(@as(usize, 1), request.key.len);
-        try std.testing.expectEqualStrings("global", request.key[0].value.s.?);
+        try std.testing.expectEqualStrings(self.selected_id, request.key[0].value.s.?);
         if (self.get_error) |err| return err;
         if (self.corrupt_item) |item| return item;
-        return if (self.high_water) |value| try encode_item(arena, value) else null;
+        if (self.high_water) |value| {
+            return try encode_item_selected(arena, self.selected_id, value);
+        }
+        return null;
     }
 
     pub fn update(
@@ -356,7 +537,7 @@ const TestDatabase = struct {
         );
         try std.testing.expectEqual(@as(usize, 1), request.key.len);
         try std.testing.expectEqualStrings("counter_id", request.key[0].key);
-        try std.testing.expectEqualStrings("global", request.key[0].value.s.?);
+        try std.testing.expectEqualStrings(self.selected_id, request.key[0].value.s.?);
         const values = request.expression_attribute_values.?;
         try std.testing.expectEqualStrings("1000", values[1].value.n.?);
         try std.testing.expectEqualStrings("4294967295", values[2].value.n.?);
@@ -375,8 +556,13 @@ const TestDatabase = struct {
         self.high_water = current + 1;
         if (self.lose_after_update) return error.MutationUncertain;
         if (self.invalid_update_response) return null;
-        if (self.response_high_water) |value| return try encode_item(arena, value);
-        return try encode_item(arena, self.high_water.?);
+        if (self.response_id) |id| return try encode_item_selected(arena, id, self.high_water.?);
+        if (self.response_high_water) |value| return try encode_item_selected(
+            arena,
+            self.selected_id,
+            value,
+        );
+        return try encode_item_selected(arena, self.selected_id, self.high_water.?);
     }
 };
 
@@ -642,4 +828,179 @@ test "stored records reject wrong keys types duplicates missing and additional a
         try std.testing.expectEqual(@as(u8, 0), database.updates);
         try std.testing.expectEqual(@as(?u32, null), database.high_water);
     }
+}
+
+test "selected ID boundaries fail before effects" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const memory = arena.allocator();
+    var database: SelectedTestDatabase = .{};
+    const invalid_ids = [_][]const u8{
+        "",   "a" ** 129, ".a", "_a", "-a", "a b", "a/b", "a\n",
+        "é",
+        " a", "a ",
+    };
+    for (invalid_ids) |id| {
+        const binding: Binding = .{ .table_name = "shared-ledgers", .id = id };
+        try std.testing.expectError(
+            error.InvalidCounterId,
+            initialize_selected(memory, &binding, &database),
+        );
+        try std.testing.expectError(
+            error.InvalidCounterId,
+            read_selected(memory, &binding, &database),
+        );
+        try std.testing.expectError(
+            error.InvalidCounterId,
+            allocate_selected(memory, &binding, &database),
+        );
+    }
+    for (database.records) |record| {
+        try std.testing.expectEqual(@as(u8, 0), record.puts);
+        try std.testing.expectEqual(@as(u8, 0), record.gets);
+        try std.testing.expectEqual(@as(u8, 0), record.updates);
+    }
+    for ([_][]const u8{ "a", "0", "Z.a_9-", "a" ** 128 }) |id| {
+        const input = try read_request_selected(
+            memory,
+            &.{ .table_name = "shared-ledgers", .id = id },
+        );
+        const encoded = try aws.json.jsonStringify(input, memory);
+        const key = try std.fmt.allocPrint(memory, "\"counter_id\":{{\"S\":\"{s}\"}}", .{id});
+        try std.testing.expect(std.mem.indexOf(u8, encoded, key) != null);
+    }
+}
+
+test "retained bindings own configuration and explicit selection overrides it" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("LEDGER_COUNTER_TABLE_NAME", "shared-ledgers");
+    var config: aws.Config = undefined;
+    var store: Counter = undefined;
+    for ([_][]const u8{ "", "a/b", "a" ** 129 }) |id| {
+        try environment.put("LEDGER_COUNTER_ID", id);
+        try std.testing.expectError(
+            error.InvalidCounterId,
+            store.init(std.testing.allocator, &config, &environment),
+        );
+    }
+    try environment.put("LEDGER_COUNTER_ID", "configured");
+    try store.init(std.testing.allocator, &config, &environment);
+    try environment.put("LEDGER_COUNTER_TABLE_NAME", "another-table");
+    try environment.put("LEDGER_COUNTER_ID", "changed");
+    try std.testing.expectEqualStrings("shared-ledgers", store.table_name);
+    try std.testing.expectEqualStrings("configured", store.selected_id);
+    store.deinit();
+    var explicit = [_]u8{ 'A', 'l', 'p', 'h', 'a' };
+    try environment.put("LEDGER_COUNTER_ID", "");
+    try store.init_with_id(std.testing.allocator, &config, &environment, &explicit);
+    @memset(&explicit, 'x');
+    try std.testing.expectEqualStrings("Alpha", store.selected_id);
+    store.deinit();
+}
+
+test "selected request builders retain table and ID through serialization after source teardown" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const memory = arena.allocator();
+    var source = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const binding: Binding = .{
+        .table_name = try source.allocator().dupe(u8, "shared-ledgers"),
+        .id = try source.allocator().dupe(u8, "Alpha-1"),
+    };
+    const get = try read_request_selected(memory, &binding);
+    const put = try initialize_request_selected(memory, &binding);
+    const update = try allocation_request_selected(memory, &binding, 1000);
+    source.deinit();
+    const encoded = [_][]const u8{
+        try aws.json.jsonStringify(get, memory),
+        try aws.json.jsonStringify(put, memory),
+        try aws.json.jsonStringify(update, memory),
+    };
+    for (encoded) |json| {
+        try std.testing.expect(
+            std.mem.indexOf(u8, json, "\"counter_id\":{\"S\":\"Alpha-1\"}") != null,
+        );
+        try std.testing.expect(
+            std.mem.indexOf(u8, json, "\"TableName\":\"shared-ledgers\"") != null,
+        );
+    }
+    try std.testing.expectEqual(@as(u32, 1000), try decode_item_selected(put.item, "Alpha-1"));
+    try std.testing.expectError(error.CounterCorrupt, decode_item_selected(put.item, "alpha-1"));
+}
+
+test "selected counter failures and concurrent allocations leave other records untouched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const memory = arena.allocator();
+    const binding: Binding = .{ .table_name = "shared-ledgers", .id = "Alpha-1" };
+    const beta: Binding = .{ .table_name = binding.table_name, .id = "beta_2" };
+    var database: SelectedTestDatabase = .{};
+    _ = try initialize_selected(memory, &beta, &database);
+    try std.testing.expectError(
+        error.CounterMissing,
+        allocate_selected(memory, &binding, &database),
+    );
+    database.records[1].corrupt_item = try encode_item_selected(memory, "global", 1000);
+    try std.testing.expectError(error.CounterCorrupt, read_selected(memory, &binding, &database));
+    try std.testing.expectError(
+        error.CounterCorrupt,
+        initialize_selected(memory, &binding, &database),
+    );
+    try std.testing.expectError(
+        error.CounterCorrupt,
+        allocate_selected(memory, &binding, &database),
+    );
+    database.records[1] = .{ .selected_id = binding.id, .high_water = std.math.maxInt(u32) - 1 };
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        try allocate_selected(memory, &binding, &database),
+    );
+    try std.testing.expectError(
+        error.CounterExhausted,
+        allocate_selected(memory, &binding, &database),
+    );
+    // Inject another same-binding caller's increments between our read and conditional update.
+    database.records[1] = .{
+        .selected_id = binding.id,
+        .high_water = 1000,
+        .conflicts_remaining = 2,
+    };
+    try std.testing.expectEqual(@as(u32, 1003), try allocate_selected(memory, &binding, &database));
+    try std.testing.expectEqual(@as(u32, 1004), try allocate_selected(memory, &binding, &database));
+    database.records[1].conflicts_remaining = allocation_attempts_max;
+    try std.testing.expectError(
+        error.CounterContended,
+        allocate_selected(memory, &binding, &database),
+    );
+    database.records[1] = .{
+        .selected_id = binding.id,
+        .high_water = 1000,
+        .lose_after_update = true,
+    };
+    try std.testing.expectError(
+        error.AllocationUncertain,
+        allocate_selected(memory, &binding, &database),
+    );
+    try std.testing.expectEqual(@as(u8, 1), database.records[1].gets);
+    try std.testing.expectEqual(@as(u8, 1), database.records[1].updates);
+    database.records[1].lose_after_update = false;
+    try std.testing.expectEqual(@as(u32, 1002), try allocate_selected(memory, &binding, &database));
+    database.records[1].response_id = "beta_2";
+    try std.testing.expectError(
+        error.AllocationUncertain,
+        allocate_selected(memory, &binding, &database),
+    );
+    database.records[1] = .{ .selected_id = binding.id, .lose_after_put = true };
+    try std.testing.expectError(
+        error.InitializationUncertain,
+        initialize_selected(memory, &binding, &database),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 1000),
+        try initialize_selected(memory, &binding, &database),
+    );
+    try std.testing.expectEqual(@as(u32, 1000), try read_selected(memory, &beta, &database));
+    try std.testing.expectEqual(@as(?u32, 9000), database.records[0].high_water);
+    try std.testing.expectEqual(@as(u8, 0), database.records[2].updates);
 }

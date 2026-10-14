@@ -7,6 +7,7 @@ mkdir -p "$TEST_DIR/bin" "$TEST_DIR/work/zig-out/bin"
 cp "$REPOSITORY_ROOT/ledger-counter.sh" "$TEST_DIR/work/ledger-counter.sh"
 export AWS_CALLS="$TEST_DIR/aws-calls" COUNTER_ARGUMENTS="$TEST_DIR/arguments"
 : >"$AWS_CALLS"
+unset LEDGER_COUNTER_ID
 cat >"$TEST_DIR/bin/aws" <<'MOCK'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$AWS_CALLS"
@@ -25,6 +26,17 @@ case "$1 $2" in
             exit 7
         fi
         case "$*" in
+            *LedgerCounterId*)
+                if [ "${FAIL_ID_DISCOVERY:-0}" = 1 ]; then
+                    printf 'sensitive upstream diagnostic\n' >&2
+                    exit 7
+                fi
+                if [ "${RESOLVED_ID+x}" = x ]; then
+                    printf '1:%s:\n' "$RESOLVED_ID"
+                else
+                    printf '0:null:\n'
+                fi
+                ;;
             *LedgerCounterTableName*) printf '%s\n' "${RESOLVED_TABLE-shared-ledgers}" ;;
             *) exit 99 ;;
         esac
@@ -34,7 +46,7 @@ esac
 MOCK
 cat >"$TEST_DIR/work/zig-out/bin/ledger-counter" <<'MOCK'
 #!/usr/bin/env bash
-printf '%s\n' "$LEDGER_COUNTER_TABLE_NAME|$AWS_REGION|$AWS_PROFILE|$AWS_EC2_METADATA_DISABLED"
+printf '%s\n' "$LEDGER_COUNTER_TABLE_NAME|$AWS_REGION|$AWS_PROFILE|$AWS_EC2_METADATA_DISABLED|${LEDGER_COUNTER_ID-unset}"
 printf '%s\0' "$@" >"$COUNTER_ARGUMENTS"
 [ "$AWS_ACCESS_KEY_ID" = test-access ] && [ "$AWS_SECRET_ACCESS_KEY" = test-secret ] &&
     [ "$AWS_SESSION_TOKEN" = test-session ] || exit 98
@@ -47,7 +59,7 @@ contains() { case "$1" in *"$2"*) ;; *) fail_test "missing expected text: $2" ;;
 
 # Help works before a binary is built and does not discover table or native configuration.
 mv "$TEST_DIR/work/zig-out/bin/ledger-counter" "$TEST_DIR/counter-binary"
-for args in '--help' 'init --help' 'read -h' 'allocate help'; do
+for args in '--help' 'init --help' 'read -h' 'allocate help' '--counter-id selected read --help'; do
     output="$(FAIL_AWS=1 bash "$TEST_DIR/work/ledger-counter.sh" $args)"
     contains "$output" 'ledger-counter allocate'
 done
@@ -75,6 +87,66 @@ PY
 output="$(RESOLVED_TABLE=externally-owned-ledgers bash "$TEST_DIR/work/ledger-counter.sh" \
     --profile override --region=override-region --stack-name override-stack read)"
 contains "$output" 'externally-owned-ledgers|override-region|override|true'
+
+# Optional stack ID discovery supports old stacks and explicit/caller precedence.
+output="$(bash "$TEST_DIR/work/ledger-counter.sh" read)"
+contains "$output" '|global'
+output="$(RESOLVED_ID=stack-id bash "$TEST_DIR/work/ledger-counter.sh" read)"
+contains "$output" '|stack-id'
+output="$(RESOLVED_ID=None bash "$TEST_DIR/work/ledger-counter.sh" read)"
+contains "$output" '|None'
+output="$(RESOLVED_ID=stack-id LEDGER_COUNTER_ID=caller-id bash "$TEST_DIR/work/ledger-counter.sh" read)"
+contains "$output" '|caller-id'
+output="$(RESOLVED_ID=stack-id LEDGER_COUNTER_ID=caller-id bash "$TEST_DIR/work/ledger-counter.sh" --counter-id explicit-id read)"
+contains "$output" '|explicit-id'
+python3 - "$COUNTER_ARGUMENTS" <<'ARGS'
+from pathlib import Path
+import sys
+assert Path(sys.argv[1]).read_bytes().split(b'\0') == [b'--counter-id', b'explicit-id', b'read', b'']
+ARGS
+output="$(LEDGER_COUNTER_ID='' bash "$TEST_DIR/work/ledger-counter.sh" --counter-id global read)"
+contains "$output" '|global'
+long_id="$(printf '%0129d' 0)"
+for id in '' '.bad' '-bad' 'bad/value' 'bad value' 'é' $'bad\n' $'\n' "$long_id"; do
+    : >"$AWS_CALLS"
+    : >"$COUNTER_ARGUMENTS"
+    for source in option environment stack; do
+        status=0
+        case "$source" in
+            option) output="$(bash "$TEST_DIR/work/ledger-counter.sh" --counter-id "$id" read 2>&1)" || status=$? ;;
+            environment) output="$(LEDGER_COUNTER_ID="$id" bash "$TEST_DIR/work/ledger-counter.sh" read 2>&1)" || status=$? ;;
+            stack) output="$(RESOLVED_ID="$id" bash "$TEST_DIR/work/ledger-counter.sh" read 2>&1)" || status=$? ;;
+        esac
+        [ "$status" -eq 2 ] || fail_test "invalid $source ID accepted"
+        contains "$output" 'invalid counter ID'
+        [ ! -s "$COUNTER_ARGUMENTS" ] || fail_test 'invalid ID invoked binary'
+        if [ "$source" != stack ]; then
+            [ ! -s "$AWS_CALLS" ] || fail_test 'caller ID validation contacted AWS'
+        fi
+    done
+done
+: >"$AWS_CALLS"
+for args in '--counter-id' '--counter-id read' '--counter-id a --counter-id b read' 'read --counter-id a'; do
+    status=0
+    bash "$TEST_DIR/work/ledger-counter.sh" $args >/dev/null 2>&1 || status=$?
+    [ "$status" -eq 2 ] || fail_test 'invalid selection invocation accepted'
+done
+[ ! -s "$AWS_CALLS" ] || fail_test 'invalid selection invocation contacted AWS'
+for id in 0 "$(printf '%0128d' 0)" 'Z.a_9-'; do
+    output="$(bash "$TEST_DIR/work/ledger-counter.sh" --counter-id "$id" read)"
+    contains "$output" "|$id"
+    output="$(LEDGER_COUNTER_ID="$id" bash "$TEST_DIR/work/ledger-counter.sh" read)"
+    contains "$output" "|$id"
+    output="$(RESOLVED_ID="$id" bash "$TEST_DIR/work/ledger-counter.sh" read)"
+    contains "$output" "|$id"
+done
+: >"$COUNTER_ARGUMENTS"
+status=0
+output="$(FAIL_ID_DISCOVERY=1 bash "$TEST_DIR/work/ledger-counter.sh" read 2>&1)" || status=$?
+[ "$status" -eq 2 ] || fail_test 'optional ID discovery failure accepted'
+contains "$output" 'LedgerCounterId'
+case "$output" in *sensitive*) fail_test 'upstream ID diagnostic leaked' ;; esac
+[ ! -s "$COUNTER_ARGUMENTS" ] || fail_test 'failed ID discovery invoked binary'
 
 long_table="$(printf '%0256d' 0)"
 for table in '' None 'table with spaces' 'a' 'x/y' "$long_table" 'sensitive/table'; do
