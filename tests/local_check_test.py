@@ -188,12 +188,12 @@ if "fmt-check" in args:
                 path.write_bytes(original)
         self.assertFalse(self.log.exists())
 
-    def test_hook_rejects_ignored_code_docs_and_new_check_inputs(self):
-        self.write(".gitignore", ".scratch/\nzig-pkg/\nsrc/ignored.zig\n")
+    def test_hook_rejects_nonignored_new_check_inputs(self):
         self.git("add", ".")
-        for name, content in (("src/ignored.zig", "const value = 1;\n"),
+        for name, content in (("src/new.zig", "const value = 1;\n"),
                               ("tests/new harness.sh", "#!/bin/bash\nexit 0\n"),
                               ("docs/new\nreference.md", "# Reference\n"),
+                              ("docs/.DS_Store.md", "# Relevant documentation\n"),
                               ("new_check.py", "raise SystemExit(0)\n"),
                               (".githooks/new-hook", "#!/bin/bash\nexit 0\n")):
             with self.subTest(name=name):
@@ -203,6 +203,78 @@ if "fmt-check" in args:
                 self.assertIn("untracked check input", result.stderr)
                 path.unlink()
         self.assertFalse(self.log.exists())
+
+    def test_hook_accepts_ignored_files_and_directories(self):
+        self.write(".gitignore", (
+            ".scratch/\nzig-pkg/\nsrc/ignored.zig\ndocs/.DS_Store.md\n"
+            "local_check.py\nignored/\n*.log\n"
+        ))
+        self.git("add", ".")
+        files = {
+            "src/ignored.zig": "const value = 1;\n",
+            "docs/.DS_Store.md": "# Local notes\n",
+            "local_check.py": "# Local notes\n",
+            "src/ignored/nested/example.zig": "const value = 1;\n",
+            "docs/ignored/nested/reference.md": "# Local notes\n",
+            "tests/ignored/nested/harness.sh": "#!/bin/bash\nexit 0\n",
+            ".githooks/ignored.log": "# Local notes\n",
+        }
+        for name, content in files.items():
+            self.write(name, content)
+        ignored = self.git("check-ignore", "--", *files)
+        self.assertEqual(set(ignored.stdout.splitlines()), set(files))
+
+        result = self.hook()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Local offline checks passed.", result.stdout)
+        for name, content in files.items():
+            self.assertEqual((self.root / name).read_text(), content)
+
+    def test_hook_honors_nested_ignore_rules_and_negation(self):
+        self.write("docs/.gitignore", "local-*.md\n!local-keep.md\n")
+        self.git("add", ".")
+        self.write("docs/local-notes.md", "# Local notes\n")
+        self.assertEqual(self.hook().returncode, 0)
+        self.log.unlink()
+        self.write("docs/local-keep.md", "# Intended documentation\n")
+
+        result = self.hook()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("docs/local-keep.md", result.stderr)
+        self.assertIn("untracked check input", result.stderr)
+        self.assertFalse(self.log.exists())
+
+    def test_hook_rejects_unstaged_tracked_files_matching_ignore_rules(self):
+        self.write(".gitignore", ".scratch/\nzig-pkg/\nREADME.md\n")
+        self.git("add", ".")
+        self.git("add", "--force", "README.md")
+        self.write("README.md", "# An unstaged fix\n")
+
+        result = self.hook()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("working tree differs from the index", result.stderr)
+        self.assertFalse(self.log.exists())
+
+    def test_hook_accepts_ignored_finder_metadata_at_any_depth(self):
+        self.write(".gitignore", ".scratch/\nzig-pkg/\n.DS_Store\n")
+        self.git("add", ".")
+        names = (".DS_Store", "docs/.DS_Store", "docs/nested/.DS_Store",
+                 "src/nested/.DS_Store", "tests/nested/.DS_Store",
+                 ".githooks/.DS_Store")
+        for name in names:
+            self.write(name, "Finder metadata.\n")
+        self.git("check-ignore", "--", *names)
+
+        result = self.hook()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Local offline checks passed.", result.stdout)
+        self.assertTrue(any("test" in args for args in self.effects()))
+        for name in names:
+            self.assertEqual((self.root / name).read_text(), "Finder metadata.\n")
 
     def test_hook_accepts_staged_inputs_and_ignored_local_tracker(self):
         self.git("add", ".")

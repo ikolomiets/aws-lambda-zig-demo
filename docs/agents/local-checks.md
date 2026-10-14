@@ -106,11 +106,17 @@ differences from Git. Clear such flags on affected paths before committing;
 the hook does not modify the index.
 
 The hook also rejects untracked inputs under `src/`, `tests/`, `docs/` and `.githooks/`, plus root
-Zig, manifest, shell, Python, Markdown, JSON and YAML files. This includes ignored
-files in those input locations because checks read them. Stage intended inputs or
-move incidental files out of those locations before committing. Generated caches
-and packages and unrelated local notes are outside that guard. Ignored tracker
-efforts are validated as local state and do not have to be staged.
+Zig, manifest, shell, Python, Markdown, JSON and YAML files. This guard honors Git's
+standard ignore rules through `git ls-files --others --exclude-standard`, including
+root and nested `.gitignore` files, `.git/info/exclude`, and global excludes.
+Ignored files and directories, including `.DS_Store`, do not need to be staged.
+Tracked files remain subject to the working-tree/index guard even if an ignore
+rule matches them. Stage intended inputs or ignore incidental files before
+committing.
+
+Ignore rules only affect the untracked-input guard. The check suite still reads
+the working tree and may check ignored files in its input locations. Ignored
+tracker efforts are validated as local state and do not have to be staged.
 
 The hook checks the working tree only after these guards pass. It creates no staged
 snapshot and does not stage files. On a checkout whose tracked files match the index

@@ -21,10 +21,9 @@ if ! git diff --quiet --ignore-submodules=none --; then
     exit 1
 fi
 
-# Include ignored files in these input locations: formatters and checkers read
-# them too. Generated package/cache directories and local tracker efforts are
-# outside these paths; tracker validation still checks actual ignored efforts.
-git ls-files --others -z -- src tests docs .githooks \
+# Require new check inputs to be staged, honoring Git's standard ignore rules.
+# The check suite still reads the working tree, including some ignored files.
+git ls-files --others --exclude-standard -z -- src tests docs .githooks \
     ':(top,glob)*.zig' ':(top,glob)*.zon' ':(top,glob)*.sh' \
     ':(top,glob)*.py' ':(top,glob)*.md' ':(top,glob)*.json' \
     ':(top,glob)*.yaml' ':(top,glob)*.yml' |
