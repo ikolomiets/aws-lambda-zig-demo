@@ -27,8 +27,9 @@ class LocalCheckTest(unittest.TestCase):
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env["PATH"]
         self.env["CHECK_TEST_LOG"] = str(self.log)
         self.env["CHECK_TEST_REAL_ZIG"] = shutil.which("zig") or ""
-        # Keep nested Git commands independent of an enclosing pre-commit hook.
-        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+        # Keep fixture packages and nested Git independent of caller configuration.
+        for key in ("CHECK_ZIG_PACKAGE_DIR", "GIT_DIR", "GIT_WORK_TREE",
+                    "GIT_INDEX_FILE", "GIT_COMMON_DIR",
                     "GIT_PREFIX", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
                     "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"):
             self.env.pop(key, None)
@@ -317,6 +318,23 @@ if "fmt-check" in args:
         self.assertEqual(result.returncode, 2)
         self.assertIn("must use glibc", result.stderr)
 
+    def test_unavailable_nested_bash_reports_executable_and_runner_version(self):
+        real_bash = shutil.which("bash")
+        version = subprocess.check_output(
+            [real_bash, "-c", 'printf "%s" "$BASH_VERSION"'], text=True)
+        self.command("bash", f'''
+if sys.argv[1:] == ["--version"]:
+    sys.exit(19)
+os.execv({real_bash!r}, [{real_bash!r}] + sys.argv[1:])
+''')
+
+        result = self.checks()
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(f"Bash at {self.bin / 'bash'} is unavailable", result.stderr)
+        self.assertIn(f"runner Bash {version}", result.stderr)
+        self.assertFalse(self.log.exists())
+
     def test_missing_shell_utilities_fail_as_setup_errors_before_checks(self):
         self.env["PATH"] = str(self.bin)
         for name in ("bash", "dirname", "python3"):
@@ -337,6 +355,7 @@ if "fmt-check" in args:
     def test_package_directory_override_remains_offline(self):
         packages = self.base / "provisioned packages"
         packages.mkdir()
+        (self.root / "zig-pkg").rmdir()
         self.env["CHECK_ZIG_PACKAGE_DIR"] = str(packages)
 
         result = self.checks()
@@ -345,6 +364,19 @@ if "fmt-check" in args:
         for args in self.effects():
             self.assertIn("--system", args)
             self.assertEqual(args[args.index("--system") + 1], str(packages))
+
+    def test_inherited_package_override_preserves_missing_fixture_package_failure(self):
+        packages = self.base / "inherited packages with spaces"
+        packages.mkdir()
+        env = os.environ.copy()
+        env["CHECK_ZIG_PACKAGE_DIR"] = str(packages)
+
+        result = subprocess.run(
+            [sys.executable, str(SOURCE / "tests/local_check_test.py"),
+             "LocalCheckTest.test_setup_errors_do_not_silently_skip_checks"],
+            cwd=SOURCE, env=env, capture_output=True, text=True, check=False)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

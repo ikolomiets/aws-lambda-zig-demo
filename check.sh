@@ -12,7 +12,9 @@ for tool in bash jq python3 zig uname dirname find; do
     command -v "$tool" >/dev/null || setup_error "Install $tool before checking."
 done
 cd "$(dirname "${BASH_SOURCE[0]}")"
-bash --version >/dev/null || setup_error 'Bash is unavailable.'
+bash_path="$(command -v bash)"
+bash --version >/dev/null ||
+    setup_error "Bash at $bash_path is unavailable (runner Bash $BASH_VERSION)."
 jq --version >/dev/null || setup_error 'jq is unavailable.'
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' ||
     setup_error 'Python 3.9 or newer is required.'

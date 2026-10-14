@@ -14,14 +14,19 @@ structural [tracker validation](issue-tracker.md), and the existing `zig build t
 It stops at the first required failure. The existing aggregate target owns the
 offline test graph; this command does not maintain a second list of tests.
 
+Use focused checks during implementation and normally run this complete gate once
+after final fixes. Repeat or broaden validation when subsequent changes, failures
+or unresolved concerns warrant it, and record the reason for another complete run.
+
 Tracker validation discovers actual ignored `.scratch/*/issues/*.md` efforts.
 A fresh clone without local issues reports `Validated 0 issues.` No registry or
 access to another developer's ignored tickets is required.
 
 ## Host and package prerequisites
 
-Use an ARM64 macOS or ARM64 glibc Linux host, Zig **0.16.0**, Bash, `jq`, Python
-**3.9 or newer**, and the ordinary host tools `dirname`, `find` and `uname`.
+Use an ARM64 macOS or ARM64 glibc Linux host, Zig **0.16.0**, Bash (tested with
+**3.2 and 5.3**), `jq`, Python **3.9 or newer**, and the ordinary host tools
+`dirname`, `find` and `uname`.
 Linux also requires `getconf` to identify glibc. The native TigerBeetle archive in
 the pinned packages targets glibc 2.27 or newer. Hook setup and invocation require
 Git; `git hook run` for activation verification requires Git 2.36 or newer.
@@ -49,6 +54,32 @@ Build-cache environment settings such as `ZIG_LOCAL_CACHE_DIR` and
 `ZIG_GLOBAL_CACHE_DIR` still apply. Provisioning does not upgrade dependency pins.
 The patched sibling Zig standard library is a separate Lambda-build prerequisite;
 this gate does not build deployable Lambdas or refresh zip packages.
+
+## Diagnose check-environment failures
+
+1. Identify the checkout and failing phase from the command output. Standalone
+   checks accept uncommitted files; the hook's staged-input guards run before the
+   gate. Use `./check.sh` while developing.
+2. Inspect the Bash executable selected by PATH and its version:
+
+   ```sh
+   command -v bash
+   bash --version
+   ```
+
+   For shell compatibility checks, put the selected Bash first on PATH for the
+   entire process tree. The runner and test harnesses launch nested `bash`
+   commands, so an absolute interpreter path for only the outer script is
+   insufficient. A Bash startup failure reports the selected executable and
+   the runner's Bash version.
+3. Inspect `CHECK_ZIG_PACKAGE_DIR` and the provisioned packages. Relative paths
+   resolve from the checkout containing `check.sh`. Reuse an existing provisioned
+   directory through the override above when checking another checkout; the
+   temporary-repository tests isolate inherited overrides and set their own
+   values for explicit override coverage.
+4. For documentation failures, inspect the reported destination in this checkout.
+   Ordinary links require their targets even when an absent research document
+   appears in the archive registry; see [documentation checks](documentation-checks.md#links-and-anchors).
 
 ## Hook activation and staged inputs
 

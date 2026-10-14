@@ -146,7 +146,12 @@ A positive quantity of seats held in one specified Seat Class of a Seat Event by
 reserve_seats request. Confirmation applies to the full held quantity.
 _Avoid_: Operation, individual pending transfer
 
+**Ledger Counter**:
+An independent bounded monotonic sequence of ledger values. Allocations may leave
+gaps, and different Ledger Counters may contain equal numeric values.
+_Avoid_: Globally unique ledger number
+
 **Global Ledger Allocator**:
-A bounded monotonic ledger sequence shared by participating tenants and
-deployments independently of native cluster identity. Allocations may leave gaps.
+The Ledger Counter shared by participating tenants and deployments that require
+one ledger sequence, independently of native cluster identity.
 _Avoid_: Cluster counter, tenant ledger range

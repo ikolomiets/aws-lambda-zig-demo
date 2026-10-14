@@ -353,7 +353,10 @@ build_sam_parameter_overrides() {
         "LambdaPrincipal=$LAMBDA_PRINCIPAL"
         "PasetoPublicKey=$PASETO_PUBLIC_KEY"
     )
-    SAM_PARAMETER_OVERRIDES+=("${DEPLOYMENT_PARAMETER_OVERRIDES[@]}")
+    # Bash 3.2 treats an empty array expansion as unset under nounset.
+    if [ "${#DEPLOYMENT_PARAMETER_OVERRIDES[@]}" -gt 0 ]; then
+        SAM_PARAMETER_OVERRIDES+=("${DEPLOYMENT_PARAMETER_OVERRIDES[@]}")
+    fi
 }
 
 deploy_stack_phase() {

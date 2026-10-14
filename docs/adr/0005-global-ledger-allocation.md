@@ -1,6 +1,11 @@
 # 0005: Allocate ledgers through one global counter binding
 
-Status: Accepted
+Status: Superseded by [0006: Select independent ledger counters within one table](0006-selectable-ledger-counters.md).
+
+The decision below records the historical fixed-global contract. The replacement
+shared API and host tooling are implemented by the
+[Support selectable independent ledger counters](../../.scratch/seat-reservation/issues/05-selectable-ledger-counters.md)
+ticket.
 
 ## Decision
 

@@ -36,15 +36,15 @@ It does not interpret MDX, generated navigation, arbitrary HTML links, or custom
 extensions. Keep checked links in the supported forms; review unusual rendering manually.
 
 Absolute paths, `file:` links, home-relative paths, and relative paths outside the
-repository fail as nonportable destinations. Preserved archival documents are named in
-[documentation-archives.json](documentation-archives.json), with a reason and SHA-256
-of their exact bytes. For those documents only, the check reports the count of absolute
+repository fail as nonportable destinations. Preserved archival documents can be named in
+the optional `docs/agents/documentation-archives.json` registry, with a reason and SHA-256
+of their exact bytes. A missing registry is equivalent to an empty one. For registered
+documents only, the check reports the count of absolute
 machine-local evidence links and treats command mentions as historical. Relative links
 are still checked. A changed archive fails its checksum check; the registry does not
 exempt ordinary research or current reference documentation. Archival documents can be
 optional local research: when absent, they are outside the scan and no checksum is read.
-Ordinary links to absent archives still fail. The dated navigation audit retains its
-exact preserved bytes and archival classification whenever it is present.
+Ordinary links to absent archives still fail.
 
 ## Command names
 

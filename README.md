@@ -743,11 +743,9 @@ Run the complete offline local check gate during development:
 ./check.sh
 ```
 
-It checks complete Zig formatting, shell syntax, documentation links and command
-names, actual local tracker structure, and the existing full offline test suite.
 It accepts uncommitted development files. See [local check setup](docs/agents/local-checks.md)
-for supported hosts, prerequisites, separate pinned-package provisioning, and the
-tracked pre-commit hook. Activate the hook for this checkout with:
+for the gate's scope, supported hosts, prerequisites, pinned-package provisioning,
+and the tracked pre-commit hook. Activate the hook for this checkout with:
 
 ```sh
 ./setup-hooks.sh

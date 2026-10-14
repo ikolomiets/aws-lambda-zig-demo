@@ -114,6 +114,10 @@ the AWS CLI query that retrieves it instead of recording the value itself.
 
 ## Build and Validation
 
+Before final validation or diagnosing check-environment failures, read the
+[local-check guide](docs/agents/local-checks.md). Use the complete offline gate
+after final fixes and the targeted checks below during implementation.
+
 The TigerBeetle processor build currently requires the sibling Zig standard
 library at `../zig/lib`. Before a Lambda build, check `zig version` (0.16.0) and
 `test -f ../zig/lib/std/Io/net/HostName.zig`. A missing checkout is an environment

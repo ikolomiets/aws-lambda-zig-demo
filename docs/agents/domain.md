@@ -17,18 +17,29 @@ documents to consult for each area.
 
 ## Bounded exploration
 
-1. Start with the relevant `AGENTS.md` source pointer. Discover filenames with
-   `rg --files`, headings with `rg -n '^#{1,4} '`, and declarations or callers
-   with a focused symbol search before selecting excerpts.
-2. Budget the combined output of each read batch at about 6,000 tokens, including
-   parallel reads. Select heading ranges or symbol context that answer the
-   current question, leaving room for discovery output in the same batch.
-3. State the purpose of a full-file read before making it. Estimate its output
-   first; split a large file or collection into bounded batches when needed.
-4. If output truncates, narrow the files, pattern, or line range and read the
-   missing relevant material again. Base conclusions on the recovered excerpts;
-   an output cap alone does not establish that the required material was read.
-5. Reuse material already read. Read it again when it changes or an unresolved
-   question requires more context. Stop exploration when the relevant current
-   contract, implementation symbols, and validation path answer the question;
-   dated research supplies rationale and forwards to current authority.
+1. Begin each batch with one concrete question and the relevant `AGENTS.md`
+   source pointer. Discover filenames with `rg --files`, headings with
+   `rg -n '^#{1,4} '`, and declarations or callers with a focused symbol search.
+2. Select the ranges that answer the question, including nearby callers when
+   they determine behavior. Start with about 80–150 source lines per excerpt,
+   adjusted for line length and content density. Use discovery searches to
+   locate symbols before selecting source excerpts.
+3. Aim for about 3,000 tokens of combined exploration output per batch, leaving
+   margin below the existing budget of about 6,000 tokens. Batch independent
+   reads when they answer the same question and their combined output fits;
+   count discovery output and all parallel reads toward the whole batch.
+   These defaults guide selection while preserving necessary context.
+4. State the purpose and estimate the output before a full-file read. Read
+   mandatory long references and large collections in sequential, bounded
+   chunks, preserving required domain and safety material.
+5. Match requested excerpts to the output limit by narrowing files, patterns
+   or ranges. Lowering the output cap alone leaves the request too broad and
+   causes truncation.
+6. If output truncates, recover the missing relevant range immediately before
+   drawing a conclusion. Record the answered question briefly in working
+   context; reuse unchanged excerpts for the same question. Read sources again
+   when they change or a new question needs more context, using working context
+   rather than a separately maintained inventory of files read.
+7. Stop exploration when the relevant current contract, implementation symbols
+   and validation path answer the question. Dated research supplies rationale
+   and forwards to current authority.
