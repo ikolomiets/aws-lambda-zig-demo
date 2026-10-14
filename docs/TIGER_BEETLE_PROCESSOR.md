@@ -324,6 +324,48 @@ serializer proofs. Handle malformed external replies, allocation/native/publicat
 Retain the repository's scoped dynamic invocation-allocation allowance and follow Tiger Style
 without unrelated refactors.
 
+## Test navigation
+
+Deterministic tests are embedded beside the implementation in `src/`. The composed
+test `authenticated pipeline retains Results through diagnostics duplicates and failed sends`
+in [the processor source](../src/tiger_beetle_processor.zig) exercises authenticated
+intake → native execution adapter → Completion → authenticated query, including
+diagnostics, duplicate delivery, and failed or uncertain sends. `FakeExecution`
+supplies native replies and `SerialPublisher` captures sends; this test uses no
+live TigerBeetle or AWS service.
+
+Its `test_pipeline_submit`, `test_pipeline_query`, and `test_pipeline_redelivery`
+helpers call `test_support.submit` in [intake](../src/intake_lambda.zig),
+`test_support.invoke` in [Completion](../src/tiger_beetle_completion_processor.zig),
+and `test_support.query` in [query](../src/query_lambda.zig).
+`test_support.Store` in [persistence](../src/operation_persistence.zig) uses the
+real item/request encoders for deterministic storage behavior. In
+[build.zig](../build.zig), `tiger_beetle_processor_test_mod` wires those host
+imports, including `lambda_test_mod`, `query_test_mod`,
+`tiger_beetle_completion_processor_test_mod`, and `host_operation_persistence`.
+The existing `zig build test-tigerbeetle-processor` target selects these tests;
+`zig build test` also includes them.
+
+Locate the test, helper callers, and host wiring by symbols before reading their
+surrounding declarations:
+
+```sh
+rg -n 'authenticated pipeline|test_pipeline_|test_support\.(submit|invoke|query)|test_support.Store' src/tiger_beetle_processor.zig
+rg -n 'pub const test_support' src/intake_lambda.zig src/query_lambda.zig src/tiger_beetle_completion_processor.zig src/operation_persistence.zig
+rg -n 'tiger_beetle_processor_test_mod|test-tigerbeetle-processor' build.zig
+```
+
+Separate harnesses in `tests/` cover live integration
+([tigerbeetle_integration.zig](../tests/tigerbeetle_integration.zig)), native ABI
+([tigerbeetle_c_abi.zig](../tests/tigerbeetle_c_abi.zig)), and shell behavior
+([deployment](../tests/deploy_development_test.sh),
+[processor interface](../tests/processor_interface_test.sh), and
+[isolated replica](../tests/tigerbeetle_isolated_test.sh)). Deployment/interface
+shell tests mock external commands; the isolated-replica harness starts a local
+TigerBeetle process. Live and ABI checks are separate from the aggregate local
+suite. The [repository validation table](../AGENTS.md#build-and-validation)
+owns target selection and prerequisites.
+
 ## Rationale and precise boundaries
 
 Native IDs are cluster-wide within each resource kind, not tenant- or ledger-scoped. References

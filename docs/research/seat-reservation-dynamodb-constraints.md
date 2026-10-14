@@ -1,5 +1,15 @@
 # Seat Reservation: DynamoDB constraints and persistence options
 
+Snapshot notice — 2026-10-13: the 2026-09-25 research below records design
+alternatives before the allocator decision and implementation. The accepted
+[Global Ledger Allocator ADR](../adr/0005-global-ledger-allocation.md) and
+[Seat Reservation contract](../SEAT_RESERVATION.md#global-ledger-allocator)
+own current sequence scope, gap handling, and allocation behavior; the
+[counter utility reference](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#global-ledger-counter-utility)
+owns setup and discovery. The historical alternatives, SDK observations, and
+decision prompts below retain their research meaning; they do not leave the
+accepted allocator choice open.
+
 Research date: 2026-09-25. This report supplies facts and design alternatives for
 **Verify durable allocation and completion options in DynamoDB**. It does not
 select application policy or implement a processor. The agreed constraints are a

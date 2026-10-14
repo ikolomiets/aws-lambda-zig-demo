@@ -19,6 +19,18 @@ the TigerBeetle processor is VPC-attached, SAM supplies outbound IPv6 access to 
 dual-stack endpoint through a stack-owned egress-only internet gateway (EIGW).
 The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 
+## Contents
+
+- [Assumptions](#assumptions) · [SSO authentication](#1-authenticate-with-aws-sso)
+- [Build and package](#2-build-and-package-the-zig-lambdas) · [Template validation](#3-validate-the-sam-template)
+- [Stack resources](#4-understand-what-the-template-creates) · [Deployment values](#5-preserve-the-intake-function-name-and-choose-deployment-values)
+- [Full deployment](#6-deploy-with-sam-guided-mode) · [Development code updates](#development-code-updates) · [Rebuild and redeploy](#12-update-the-deployed-lambda-code)
+- [Gateway operation](#7-configure-and-operate-the-wireguard-gateway) · [Gateway diagnostics](#diagnose-failures) · [Key rotation](#rotate-wireguard-keys)
+- [API checks](#8-test-query-get-and-intake-post) · [Lambda logs](#9-download-lambda-logs)
+- [Operation persistence utility](#10-create-read-update-and-delete-persisted-operations) · [Seat Event utility](#seat-event-metadata-utility) · [Ledger counter utility](#global-ledger-counter-utility) · [Queue utility](#11-send-receive-and-check-queued-operations)
+- [Persistence configuration diagnostics](#troubleshoot-persistence-command-configuration) · [Lambda initialization diagnostics](#troubleshoot-lambda-initialization)
+- [Stack deletion](#13-delete-the-sam-stack) · [Security note](#security-note)
+
 ## Assumptions
 
 - AWS CLI v2 and SAM CLI are installed.

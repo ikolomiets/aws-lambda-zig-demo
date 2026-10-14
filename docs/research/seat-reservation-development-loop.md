@@ -1,5 +1,12 @@
 # Seat reservation development: code-only Lambda updates
 
+Snapshot notice — 2026-10-13: the 2026-09-27 research below predates the
+implemented development helper. For current behavior, flags, prerequisites, and
+the boundary between code sync and full deployment, read
+[Development code updates](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#development-code-updates).
+The comparisons and direct-upload sequence below remain historical rationale
+and alternatives, rather than the helper's operating instructions.
+
 Verified on 2026-09-27 against official AWS documentation and the locally installed
 AWS SAM CLI 1.166.2 source. This is planning evidence, not an implemented helper.
 No cloud APIs, deployments, builds, or package updates were run.

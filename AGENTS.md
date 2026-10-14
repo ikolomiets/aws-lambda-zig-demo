@@ -13,16 +13,18 @@ Read sources relevant to the task:
 | --- | --- |
 | HTTP intake or operation query | `src/intake_lambda.zig`, `src/query_lambda.zig`, `src/lambda_auth.zig` |
 | Operation data and persistence | `src/operation.zig`, `src/operation_persistence.zig` |
-| Seat contracts, Event metadata, and host tooling | `src/seat_reservation.zig`, `src/seat_reservation_persistence.zig`, `src/seat_events_cli.zig`, `events.sh`, [seat reference](docs/SEAT_RESERVATION.md) |
-| Global ledger allocation and counter tooling | `src/ledger_counter.zig`, `src/ledger_counter_cli.zig`, `ledger-counter.sh`, [seat reference](docs/SEAT_RESERVATION.md#global-ledger-allocator) |
-| Queue transport and Completion messages | `src/sqs_queue.zig`, `src/processor_message.zig` |
+| Seat contracts, Event metadata, and host tooling | `src/seat_reservation.zig`, `src/seat_reservation_persistence.zig`, `src/seat_events_cli.zig`, `events.sh`, [seat reference](docs/SEAT_RESERVATION.md), [Event utility setup and discovery](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-event-metadata-utility) |
+| Global ledger allocation and counter tooling | `src/ledger_counter.zig`, `src/ledger_counter_cli.zig`, `ledger-counter.sh`, [seat reference](docs/SEAT_RESERVATION.md#global-ledger-allocator), [counter setup and discovery](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#global-ledger-counter-utility) |
+| Queue transport and Completion messages | `src/sqs_queue.zig`, `src/processor_message.zig`, [minimal Processor Messages ADR](docs/adr/0003-minimal-processor-messages.md) |
 | SQS processors | `src/tiger_beetle_processor.zig`, `src/tiger_beetle_completion_processor.zig`, [processor contract](docs/TIGER_BEETLE_PROCESSOR.md) |
 | TigerBeetle client wrapper | `src/tigerbeetle.zig`, [wrapper design](docs/ZIG_WRAPPER_FOR_TIGERBEETLE.md) |
-| PASETO and local CLI tools | `src/paseto.zig`, `src/paseto_cli.zig`, `src/persistence_cli.zig`, `src/queue_cli.zig` |
+| PASETO and local CLI tools | `src/paseto.zig`, `src/paseto_cli.zig`, `src/persistence_cli.zig`, `src/queue_cli.zig`, `persistence.sh`, `queue.sh`, [persistence utility](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#10-create-read-update-and-delete-persisted-operations), [queue utility](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#11-send-receive-and-check-queued-operations) |
 | Vocabulary or cross-cutting decisions | `GLOSSARY.md`, relevant files in `docs/adr/` |
-| SAM resources, permissions, or function settings | `template.yaml`, relevant sections of [deployment guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md) |
-| Generic deployment flow | `deploy.sh`, relevant sections of the deployment guide |
-| WireGuard lifecycle | `wireguard-gateway-setup.sh`, relevant sections of the deployment guide |
+| SAM resources, permissions, or function settings | `template.yaml`, [resource contract](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#4-understand-what-the-template-creates), [deployment values](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#5-preserve-the-intake-function-name-and-choose-deployment-values) |
+| Generic deployment flow or development code updates | `deploy.sh`, [full deployment](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#6-deploy-with-sam-guided-mode), [development code updates](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#development-code-updates) |
+| Deployment lifecycle | `deploy.sh`, [stack deletion](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#13-delete-the-sam-stack), [gateway deployment and disablement](docs/EC2-WireGuard-Gateway.md#10-deployment-and-disablement-lifecycle) |
+| WireGuard setup and keys | `wireguard-gateway-setup.sh`, [gateway operation](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#7-configure-and-operate-the-wireguard-gateway), [key rotation](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#rotate-wireguard-keys) |
+| Deployment or runtime diagnostics | `lambda_logs.sh`, [Lambda logs](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#9-download-lambda-logs), [gateway failures](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#diagnose-failures), [persistence configuration](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#troubleshoot-persistence-command-configuration), [Lambda initialization](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#troubleshoot-lambda-initialization) |
 
 Consult related implementation files when behavior crosses these boundaries.
 Keep processor contract changes in the processor reference, vocabulary in
