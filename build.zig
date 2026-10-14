@@ -833,7 +833,13 @@ pub fn build(b: *std.Build) void {
     b.step("test-docs", "Run temporary-repository documentation command tests")
         .dependOn(&documentation_test.step);
 
+    const local_check_test = b.addSystemCommand(&.{"python3"});
+    local_check_test.addFileArg(b.path("tests/local_check_test.py"));
+    b.step("test-local-checks", "Run temporary-repository offline gate and hook tests")
+        .dependOn(&local_check_test.step);
+
     const test_step = b.step("test", "Run unit and integration tests");
+    test_step.dependOn(&local_check_test.step);
     test_step.dependOn(&documentation_test.step);
     test_step.dependOn(&tracker_test.step);
     test_step.dependOn(&run_seat_reservation_tests.step);

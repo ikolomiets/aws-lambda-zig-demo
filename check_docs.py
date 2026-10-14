@@ -16,7 +16,7 @@ DEFINITION = re.compile(
 ZIG_VALUE_OPTIONS = {
     "--build-file", "--cache-dir", "--global-cache-dir", "--zig-lib-dir", "--prefix",
     "--prefix-lib-dir", "--prefix-exe-dir", "--prefix-include-dir", "--search-prefix",
-    "--sysroot", "--libc", "--color", "--summary", "--seed", "--maxrss", "-p",
+    "--sysroot", "--libc", "--color", "--summary", "--seed", "--maxrss", "--system", "-p",
 }
 
 

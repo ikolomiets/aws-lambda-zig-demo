@@ -735,6 +735,26 @@ or CloudFront.
 
 ## Development and Validation
 
+Run the complete offline local check gate during development:
+
+```sh
+./check.sh
+```
+
+It checks complete Zig formatting, shell syntax, documentation links and command
+names, actual local tracker structure, and the existing full offline test suite.
+It accepts uncommitted development files. See [local check setup](docs/agents/local-checks.md)
+for supported hosts, prerequisites, separate pinned-package provisioning, and the
+tracked pre-commit hook. Activate the hook for this checkout with:
+
+```sh
+./setup-hooks.sh
+```
+
+Setup selects the local `core.hooksPath=.githooks` and refuses to replace an existing
+hook arrangement. Before checks, the hook requires tracked working-tree files to
+match the index and relevant untracked code/check inputs to be staged.
+
 Check documentation links, anchors, and current repository command names with:
 
 ```sh

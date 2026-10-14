@@ -74,7 +74,7 @@ class DocumentationCheckTest(unittest.TestCase):
         self.write("README.md", (
             "Use `zig build test-new` and `./run.sh`.\n```sh\n"
             "MODE=test ./run.sh\npython3 tests/check.py\n"
-            "zig build --cache-dir cache --release -Darch=arm \\\n  test-new\n"
+            "zig build --cache-dir cache --system packages --release -Darch=arm \\\n  test-new\n"
             "./zig-out/bin/new-tool --help\n```\n"
         ))
 

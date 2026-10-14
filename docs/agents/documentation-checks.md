@@ -17,7 +17,7 @@ explicitly. The command reads files, returns 0 for success or 1 for check/setup
 failures, and prints the source file, line, and broken destination or command name.
 Invalid command-line arguments return 2. It does not execute examples or contact services.
 The temporary-repository tests also run in `zig build test`; the documentation scan
-itself remains a standalone check for later gate integration.
+remains independently usable and runs in the [local check gate](local-checks.md).
 
 ## Links and anchors
 
