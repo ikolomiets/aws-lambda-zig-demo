@@ -4,6 +4,11 @@ This runbook records the workaround used to build TigerBeetle from source on an
 Apple Silicon Mac running macOS 26.6.1. The checkout was at commit
 `97c7a8ef385270ebe0e1b75959d3d21d134629df`.
 
+The commands below are historical evidence from that TigerBeetle checkout. Their
+relative entry points belong to that checkout, rather than this Lambda repository.
+
+<!-- doc-check: commands=historical -->
+
 The normal source-build command is:
 
 ```sh

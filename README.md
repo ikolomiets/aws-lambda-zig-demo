@@ -735,6 +735,15 @@ or CloudFront.
 
 ## Development and Validation
 
+Check documentation links, anchors, and current repository command names with:
+
+```sh
+python3 check_docs.py
+```
+
+See the [documentation check scope](docs/agents/documentation-checks.md) for historical
+evidence handling, fixture tests, and manual option/prerequisite/schema review.
+
 Run the complete formatting check for build files, Zig sources, and tests before
 committing Zig changes:
 

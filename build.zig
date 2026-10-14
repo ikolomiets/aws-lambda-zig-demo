@@ -820,7 +820,13 @@ pub fn build(b: *std.Build) void {
     b.step("test-tracker", "Run temporary-tree Markdown tracker command tests")
         .dependOn(&tracker_test.step);
 
+    const documentation_test = b.addSystemCommand(&.{"python3"});
+    documentation_test.addFileArg(b.path("tests/documentation_check_test.py"));
+    b.step("test-docs", "Run temporary-repository documentation command tests")
+        .dependOn(&documentation_test.step);
+
     const test_step = b.step("test", "Run unit and integration tests");
+    test_step.dependOn(&documentation_test.step);
     test_step.dependOn(&tracker_test.step);
     test_step.dependOn(&run_seat_reservation_tests.step);
     test_step.dependOn(&run_seat_persistence_tests.step);
