@@ -36,6 +36,8 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 - AWS CLI v2 and SAM CLI are installed.
 - `zip`, `unzip`, and `file` are installed for package validation.
 - `jq` is installed for `lambda_logs.sh` and shell regression tests.
+- Python 3.9 or newer is installed for the Python regression suites in
+  `zig build test`, which normal `deploy.sh` runs before packaging.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
@@ -134,8 +136,9 @@ for script in deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh; do
 done
 ```
 
-Run the full local test graph before packaging. This includes the Zig tests and
-the local deployment-helper regression tests:
+Run the full local test graph before packaging. This includes the Zig tests,
+mocked deployment-helper tests, and Python tracker, documentation-checker, and
+local-gate regression suites. The Python suites require Python 3.9 or newer:
 
 ```sh
 zig build test

@@ -52,6 +52,8 @@ ledger sequence. See the [counter utility guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM
 - Zig 0.16.0 or newer within the supported 0.16.x line.
 - AWS CLI v2 and AWS SAM CLI for the SAM deployment flow and stack queries.
 - `jq` for the Lambda log helper and shell regression tests.
+- Python 3.9 or newer for the regression suites in `zig build test` and the
+  offline local check gate. Normal `deploy.sh` runs that test graph before packaging.
 - An AWS profile with permission to create Lambda, IAM, and CloudFormation
   resources.
 

@@ -233,6 +233,45 @@ class DocumentationCheckTest(unittest.TestCase):
         result = self.run_command()
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_literal_comment_openers_do_not_hide_following_links_or_commands(self):
+        examples = (
+            ("inline", "Literal `<!--` and `[Example](example-only.md)`.\n", 3),
+            ("fenced", "```sh\nprintf '<!-- [Example](example-only.md)'\n```\n", 5),
+        )
+        for name, example, link_line in examples:
+            with self.subTest(name=name):
+                self.write("README.md", example + (
+                    "\n[Broken](missing.md)\nUse `zig build missing-target`.\n\n"
+                    "<!-- [Hidden](comment-only.md) `zig build comment-only` -->\n"
+                ))
+                result = self.run_command()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"README.md:{link_line}:", result.stderr)
+                self.assertIn("missing repository target: missing.md", result.stderr)
+                self.assertIn(f"README.md:{link_line + 1}:", result.stderr)
+                self.assertIn("unknown Zig build target: missing-target", result.stderr)
+                self.assertNotIn("example-only", result.stderr)
+                self.assertNotIn("comment-only", result.stderr)
+
+    def test_fence_markers_with_trailing_text_do_not_hide_following_links_or_commands(self):
+        examples = (
+            ("```", "```literal marker inside example", "```  \t"),
+            ("~~~", "~~~literal marker inside example", "~~~~"),
+            ("```", "````literal marker inside example", "````"),
+        )
+        for opening, literal, closing in examples:
+            with self.subTest(literal=literal):
+                self.write("README.md", (
+                    f"{opening}markdown\n{literal}\n"
+                    "[Example](example-only.md)\nUse `zig build example-only`.\n"
+                    f"{closing}\n[Broken](missing.md)\nUse `zig build missing-target`.\n"
+                ))
+                result = self.run_command()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("README.md:6: missing repository target: missing.md", result.stderr)
+                self.assertIn("README.md:7: unknown Zig build target: missing-target", result.stderr)
+                self.assertNotIn("example-only", result.stderr)
+
     def test_current_commands_do_not_accept_names_from_comments_or_literal_examples(self):
         self.write("build.zig", (
             'pub fn build(b: *std.Build) void {\n'

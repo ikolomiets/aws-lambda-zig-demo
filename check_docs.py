@@ -38,14 +38,39 @@ def build_names(root):
     return targets, executables
 
 
+def mask_comments(text):
+    """Preserve code literals and source positions while masking real comments."""
+    syntax = re.compile(r"(?m)^ {0,3}(`{3,}|~{3,})([^\r\n]*)|<!--|`+|\\[^\r\n]")
+    parts = []
+    position = 0
+    fence = None
+    while match := syntax.search(text, position):
+        parts.append(text[position:match.start()])
+        value = match[0]
+        end = match.end()
+        if match[1]:
+            fence = fence_transition(fence, match)
+        elif fence is None and value == "<!--":
+            closing = text.find("-->", end)
+            end = len(text) if closing == -1 else closing + 3
+            value = text[match.start():end]
+            if not re.fullmatch(
+                r"<!-- doc-check: commands=(current|planning|historical) -->", value,
+            ):
+                value = re.sub(r"[^\r\n]", " ", value)
+        elif fence is None and value.startswith("`"):
+            closing = re.compile(r"(?<!`)" + re.escape(value) + r"(?!`)").search(text, end)
+            if closing:
+                end = closing.end()
+                value = text[match.start():end]
+        parts.append(value)
+        position = end
+    parts.append(text[position:])
+    return "".join(parts)
+
+
 def command_examples(text):
-    text = re.sub(
-        r"<!--.*?-->",
-        lambda match: (match[0] if re.fullmatch(
-            r"<!-- doc-check: commands=(current|planning|historical) -->", match[0],
-        ) else "\n" * match[0].count("\n")),
-        text, flags=re.DOTALL,
-    )
+    text = mask_comments(text)
     fence = None
     shell = False
     pending = ""
@@ -234,18 +259,18 @@ def document_links(text):
 def fence_transition(fence, marker):
     if fence is None:
         return marker[1]
-    if marker[1][0] == fence[0] and len(marker[1]) >= len(fence):
+    if (marker[1][0] == fence[0] and len(marker[1]) >= len(fence)
+            and not marker[2].strip(" \t")):
         return None
     return fence
 
 
 def markdown_lines(text):
     """Exclude fenced examples and comments from rendered Markdown."""
-    text = re.sub(r"<!--.*?-->", lambda match: "\n" * match[0].count("\n"), text,
-                  flags=re.DOTALL)
+    text = mask_comments(text)
     fence = None
     for number, line in enumerate(text.splitlines(), 1):
-        marker = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+        marker = re.match(r"^\s{0,3}(`{3,}|~{3,})(.*)$", line)
         if marker:
             fence = fence_transition(fence, marker)
             yield number, ""
