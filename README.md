@@ -777,5 +777,39 @@ Use the same local checkout in the deployment helper with:
 ./deploy.sh --dry-run --use-local-libs
 ```
 
+### Dependency Source Discovery
+
+When inspecting SDK or client internals, discover the direct package sources
+selected by the active build graph:
+
+```sh
+zig build dependency-paths
+```
+
+The step prints one tab-separated package name and existing source root per direct
+dependency. It uses the names declared in `build.zig.zon` and follows Zig's cache
+and fork resolution. Pins remain in the manifest. It compiles no application
+artifacts and makes no cloud calls; Zig may compile its build runner and write
+build-cache metadata.
+
+Pass the same cache and fork options as the build being investigated. For example,
+with alternate build caches or the existing sibling runtime checkout:
+
+```sh
+zig build dependency-paths --cache-dir .zig-cache-dev --global-cache-dir .zig-global-cache-dev
+zig build dependency-paths --fork=../aws-lambda-zig
+```
+
+The Zig toolchain, `printf`, and resolved package sources must be available.
+Provision unavailable packages separately: `zig build --fetch` fetches the
+manifest's pinned dependencies and requires network access. Normal Zig resolution
+can fetch missing packages before the step runs. To disable fetching, append
+`--system zig-pkg` to the discovery command, pointing `--system` at an already
+provisioned package directory.
+
+Build-cache selection need not change package roots when Zig reuses available
+sources. Use the printed roots for focused file and symbol searches; pins remain
+owned by the manifest, and absolute cache paths belong only in local evidence.
+
 Zig code in this repository should follow
 [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md).

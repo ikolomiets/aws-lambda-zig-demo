@@ -18,6 +18,7 @@ Read sources relevant to the task:
 | Queue transport and Completion messages | `src/sqs_queue.zig`, `src/processor_message.zig`, [minimal Processor Messages ADR](docs/adr/0003-minimal-processor-messages.md) |
 | SQS processors | `src/tiger_beetle_processor.zig`, `src/tiger_beetle_completion_processor.zig`, [processor contract](docs/TIGER_BEETLE_PROCESSOR.md) |
 | TigerBeetle client wrapper | `src/tigerbeetle.zig`, [wrapper design](docs/ZIG_WRAPPER_FOR_TIGERBEETLE.md) |
+| SDK/client dependency internals | `build.zig.zon`, `zig build dependency-paths` with the active cache/fork options; [dependency source discovery](README.md#dependency-source-discovery) |
 | PASETO and local CLI tools | `src/paseto.zig`, `src/paseto_cli.zig`, `src/persistence_cli.zig`, `src/queue_cli.zig`, `persistence.sh`, `queue.sh`, [persistence utility](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#10-create-read-update-and-delete-persisted-operations), [queue utility](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#11-send-receive-and-check-queued-operations) |
 | Vocabulary or cross-cutting decisions | `GLOSSARY.md`, relevant files in `docs/adr/` |
 | SAM resources, permissions, or function settings | `template.yaml`, [resource contract](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#4-understand-what-the-template-creates), [deployment values](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#5-preserve-the-intake-function-name-and-choose-deployment-values) |

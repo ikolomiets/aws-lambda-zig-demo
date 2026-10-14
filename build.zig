@@ -84,6 +84,14 @@ fn resolve_tiger_beetle_processor_target(
 }
 
 pub fn build(b: *std.Build) void {
+    const dependency_paths = b.addSystemCommand(&.{ "printf", "%s\t%s\n" });
+    for (b.available_deps) |dependency| {
+        dependency_paths.addArg(dependency[0]);
+        dependency_paths.addDirectoryArg(b.dependency(dependency[0], .{}).path(""));
+    }
+    b.step("dependency-paths", "Print named source roots for resolved direct dependencies")
+        .dependOn(&dependency_paths.step);
+
     const fmt_check = b.addFmt(.{
         .paths = &.{ "build.zig", "build.zig.zon", "src", "tests" },
         .check = true,
