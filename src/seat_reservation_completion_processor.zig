@@ -6,11 +6,13 @@ const operation = @import("operation");
 const operations = @import("operation_persistence");
 const messages = @import("processor_message");
 const seat = @import("seat_reservation");
+const events = @import("seat_reservation_persistence");
 const submission = @import("seat_reservation_processor");
 const Allocator = std.mem.Allocator;
 
 pub const Options = struct {
     operations_table: []const u8,
+    events_table: []const u8 = "Events",
     now: operation.UnixSeconds,
     response_allocator: ?Allocator = null,
 };
@@ -33,6 +35,7 @@ fn handler(context: lambda.Context, input: []const u8) ![]const u8 {
     const resources = runtime orelse return error.NotInitialized;
     return handle_invocation(context.arena, input, &.{
         .operations_table = resources.persistence.table_name,
+        .events_table = resources.events_table,
         .now = std.Io.Clock.real.now(context.io).toSeconds(),
     }, resources);
 }
@@ -40,8 +43,12 @@ fn handler(context: lambda.Context, input: []const u8) ![]const u8 {
 const Runtime = struct {
     config: aws.Config,
     persistence: operations.Persistence,
+    events_table: []const u8,
 
     fn init(self: *Runtime, process_init: std.process.Init) !void {
+        self.events_table = process_init.environ_map.get("EVENTS_TABLE_NAME") orelse
+            return error.InvalidConfiguration;
+        try events.validate_table_name(self.events_table);
         self.config = try aws.Config.load(
             process_init.gpa,
             process_init.io,
@@ -92,6 +99,34 @@ const Runtime = struct {
     pub fn report(_: *Runtime, diagnostic: []const u8) !void {
         std.log.err("{s}", .{diagnostic});
     }
+
+    pub fn transact_write(
+        self: *Runtime,
+        arena: Allocator,
+        request: dynamodb.TransactWriteItemsInput,
+    ) !void {
+        var diagnostic: dynamodb.ServiceError = undefined;
+        _ = self.persistence.client.transactWriteItems(arena, request, .{
+            .diagnostic = &diagnostic,
+        }) catch |err| {
+            if (err == error.ServiceError) diagnostic.deinit();
+            return error.AWSFailure;
+        };
+    }
+
+    pub fn transact_get(
+        self: *Runtime,
+        arena: Allocator,
+        request: dynamodb.TransactGetItemsInput,
+    ) !dynamodb.TransactGetItemsOutput {
+        var diagnostic: dynamodb.ServiceError = undefined;
+        return self.persistence.client.transactGetItems(arena, request, .{
+            .diagnostic = &diagnostic,
+        }) catch |err| {
+            if (err == error.ServiceError) diagnostic.deinit();
+            return error.AWSFailure;
+        };
+    }
 };
 
 pub fn handle_invocation(
@@ -141,18 +176,43 @@ fn process_record(
         );
         return false;
     }
-    const code = seat.local_failure(&message.body) catch {
-        submission.diagnose(
-            arena,
-            .completion,
-            "InvalidLocalFailure",
-            sqs_id,
-            input,
-            &message,
-            backend,
-        );
-        return false;
+    const outcome = if (message.body == .object and message.body.object.contains("code"))
+        complete_local(arena, &message, options, backend)
+    else
+        complete_creation(arena, &message, options, backend);
+    outcome catch |err| {
+        switch (err) {
+            error.InvalidNativeEvidence,
+            error.InconsistentCreation,
+            error.InvalidItem,
+            error.EventConflict,
+            error.InvalidLocalFailure,
+            error.InconsistentOperation,
+            => {
+                submission.diagnose(
+                    arena,
+                    .completion,
+                    @errorName(err),
+                    sqs_id,
+                    input,
+                    &message,
+                    backend,
+                );
+                return false;
+            },
+            else => return true,
+        }
     };
+    return false;
+}
+
+fn complete_local(
+    arena: Allocator,
+    message: *const messages.Message,
+    options: *const Options,
+    backend: anytype,
+) !void {
+    const code = seat.local_failure(&message.body) catch return error.InvalidLocalFailure;
     const result_json = try seat.encode_result(arena, &.{ .failure = code });
     const result = try operation.parseCompletionJSON(arena, result_json);
     const update = try operations.seat_completion_update(
@@ -164,29 +224,43 @@ fn process_record(
     );
     backend.update(arena, update) catch {
         // A failed condition or lost response proves nothing without authoritative readback.
-        const valid_winner = read_winner(
-            arena,
-            options.operations_table,
-            &message,
-            backend,
-        ) catch |err| {
-            if (err == error.InvalidItem or err == error.InconsistentOperation) {
-                submission.diagnose(
-                    arena,
-                    .completion,
-                    @errorName(err),
-                    sqs_id,
-                    input,
-                    &message,
-                    backend,
-                );
-                return false;
-            }
-            return true;
-        };
-        return !valid_winner;
+        if (!try read_winner(arena, options.operations_table, message, backend)) {
+            return error.RetryFinalization;
+        }
     };
-    return false;
+}
+
+fn complete_creation(
+    arena: Allocator,
+    message: *const messages.Message,
+    options: *const Options,
+    backend: anytype,
+) !void {
+    const context_json = try seat.encode_bounded(arena, message.context, messages.context_size_max);
+    const context = seat.decode_context(arena, context_json) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidNativeEvidence;
+    };
+    if (context.command != .create_event) return error.InvalidNativeEvidence;
+    const saved = events.read_event(arena, options.events_table, &.{
+        .tenant = message.tenant,
+        .event_id = message.operation_id,
+    }, backend) catch |err| {
+        if (err == error.EventUnavailable) return error.InconsistentCreation;
+        return err;
+    };
+    try seat.validate_configuration(&context.command.create_event, &saved);
+    const projected = seat.creation_result(arena, &message.body, &saved) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidNativeEvidence;
+    };
+    const result_json = try seat.encode_result(arena, &projected);
+    const result = try operation.parseCompletionJSON(arena, result_json);
+    try events.finalize_creation(arena, &.{
+        .events_table = options.events_table,
+        .operations_table = options.operations_table,
+        .now = options.now,
+    }, &saved, &result, backend);
 }
 
 fn read_winner(

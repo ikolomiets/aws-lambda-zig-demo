@@ -17,10 +17,20 @@ output and acknowledge without inventing a public Result.
 Durable Event identities remain separate from disposable Operations, as described in
 [ADR 0004](0004-seat-event-identities.md). The shared Event and Operation update
 builders compose atomically in the isolated [SDK transaction probe](../SEAT_TRANSACTIONS.md).
-The probe establishes the persistence seam; runtime native creation finalization is
-a separate implementation slice. The accepted creation contract requires Event
-readiness and the creation Result to commit together. Separate writes cannot replace
-that transaction.
+Runtime creation completion uses that transaction to guard the full saved Event
+configuration and creating state together with the submitted, absent-Result Operation
+identity. Ready/success and permanently failed/failure commit together. Account and
+funding chains remain separate native phases, so incomplete or uncertain native
+initialization stays creating. Stable saved identities permit complete-chain replay;
+they do not make the two native phases atomic.
+
+Transaction conflicts and uncertain responses require a coherent transactional pair
+read. A matching terminal pair is the immutable winner, including when later valid
+evidence proposes the opposite outcome. A matching creating/submitted pair remains
+retryable. Contradictory states or identity/configuration mismatches are diagnosed
+without mutation. Failed Events have no repair transition; a new creation Operation
+provides a new Event. Separate writes cannot replace the transaction, and deletion
+of a disposable Operation does not authorize reconstructing or repairing completion.
 
 No durable per-Operation execution plan, outbox or reconciliation process is added.
 A terminal Result does not establish exactly-once native effects or reverse another

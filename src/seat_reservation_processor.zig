@@ -6,12 +6,14 @@ const operation = @import("operation");
 const messages = @import("processor_message");
 const seat = @import("seat_reservation");
 const events = @import("seat_reservation_persistence");
+const ledger_counter = @import("ledger_counter");
 const sqs_queue = @import("sqs_queue");
 const Allocator = std.mem.Allocator;
 
 pub const Options = struct {
     events_table: []const u8,
     completion_queue: []const u8,
+    native_queue: []const u8 = "",
     response_allocator: ?Allocator = null,
 };
 pub const Stage = enum { submission, completion };
@@ -37,6 +39,7 @@ fn handler(context: lambda.Context, input: []const u8) ![]const u8 {
     return handle_invocation(context.arena, input, &.{
         .events_table = resources.events.table_name,
         .completion_queue = resources.completion_queue,
+        .native_queue = resources.native_queue,
     }, resources);
 }
 
@@ -45,8 +48,16 @@ const Runtime = struct {
     events: events.Persistence,
     sender: sqs_queue.Sender,
     completion_queue: []const u8,
+    native_queue: []const u8,
+    counter: ledger_counter.Counter,
+    io: std.Io,
 
     fn init(self: *Runtime, process_init: std.process.Init) !void {
+        self.io = process_init.io;
+        self.native_queue = try sqs_queue.configured_queue_url(
+            process_init.environ_map,
+            "TigerBeetleQueue",
+        );
         self.completion_queue = try sqs_queue.configured_queue_url(
             process_init.environ_map,
             "SeatReservationCompletionQueue",
@@ -59,11 +70,14 @@ const Runtime = struct {
         );
         errdefer self.config.deinit();
         try self.events.init(process_init.gpa, &self.config, process_init.environ_map);
+        errdefer self.events.deinit();
+        try self.counter.init(process_init.gpa, &self.config, process_init.environ_map);
         sqs_queue.Sender.init(&self.sender, process_init.gpa, &self.config);
     }
 
     fn deinit(self: *Runtime) void {
         self.sender.deinit();
+        self.counter.deinit();
         self.events.deinit();
         self.config.deinit();
     }
@@ -87,6 +101,28 @@ const Runtime = struct {
 
     pub fn send(self: *Runtime, arena: Allocator, queue: []const u8, body: []const u8) !void {
         return self.sender.send(arena, queue, body);
+    }
+
+    pub fn allocate(self: *Runtime, arena: Allocator) !u32 {
+        return self.counter.allocate(arena);
+    }
+
+    pub fn generate_id(self: *Runtime) !u128 {
+        for (0..4) |_| {
+            var bytes: [16]u8 = undefined;
+            try std.Io.randomSecure(self.io, &bytes);
+            const id = std.mem.readInt(u128, &bytes, .little);
+            if (id > 0 and id <= seat.native_id_max) return id;
+        }
+        return error.IDGenerationFailed;
+    }
+
+    pub fn put(self: *Runtime, arena: Allocator, request: dynamodb.PutItemInput) !void {
+        var diagnostic: dynamodb.ServiceError = undefined;
+        _ = self.events.client.putItem(arena, request, .{ .diagnostic = &diagnostic }) catch |err| {
+            if (err == error.ServiceError) diagnostic.deinit();
+            return error.AWSFailure;
+        };
     }
 
     pub fn report(_: *Runtime, diagnostic: []const u8) !void {
@@ -146,8 +182,18 @@ fn process_record(
         }
         return true;
     };
-    // Admitted native work is implemented by the subsequent command slices.
-    const rejection = code orelse return true;
+    const rejection = code orelse {
+        const command = try seat.command_from_value(arena, &message.body);
+        if (command != .create_event) return true;
+        create_event(arena, &message, &command, options, backend) catch |err| {
+            if (err == error.InvalidItem or err == error.EventConflict) {
+                diagnose(arena, .submission, @errorName(err), sqs_id, input, &message, backend);
+                return false;
+            }
+            return true;
+        };
+        return false;
+    };
     var body: std.json.ObjectMap = .empty;
     try body.put(arena, "code", .{ .string = @tagName(rejection) });
     const output = messages.encode(arena, &.{
@@ -162,6 +208,75 @@ fn process_record(
     };
     try backend.send(arena, options.completion_queue, output);
     return false;
+}
+
+fn create_event(
+    arena: Allocator,
+    message: *const messages.Message,
+    command: *const seat.Command,
+    options: *const Options,
+    backend: anytype,
+) !void {
+    std.debug.assert(command.* == .create_event);
+    var saved = events.read_event(arena, options.events_table, &.{
+        .tenant = message.tenant,
+        .event_id = message.operation_id,
+    }, backend) catch |err| switch (err) {
+        error.EventUnavailable => try insert_event(
+            arena,
+            message,
+            &command.create_event,
+            options,
+            backend,
+        ),
+        else => return err,
+    };
+    try seat.validate_configuration(&command.create_event, &saved);
+    // Permanent terminal Events never restart native initialization.
+    if (saved.state != .creating) return;
+    const body = try seat.encode_native_body(arena, &.{
+        .command = command,
+        .event = &saved,
+        .attempt_id = 0,
+    });
+    const context = try seat.encode_context(arena, command, null);
+    const output = try messages.encode(arena, &.{
+        .operation_id = message.operation_id,
+        .tenant = message.tenant,
+        .body = try seat.parse_value(arena, body, messages.body_size_max),
+        .context = try seat.parse_value(arena, context, messages.context_size_max),
+        .result_queue = options.completion_queue,
+    });
+    try backend.send(arena, options.native_queue, output);
+}
+
+fn insert_event(
+    arena: Allocator,
+    message: *const messages.Message,
+    create: *const seat.CreateEvent,
+    options: *const Options,
+    backend: anytype,
+) !seat.Event {
+    const ledger = try backend.allocate(arena);
+    const capacity = try backend.generate_id();
+    const allocation = try backend.generate_id();
+    const classes = try arena.alloc(seat.EventClass, create.classes.len);
+    for (create.classes, classes) |source, *target| target.* = .{
+        .tag = source.tag,
+        .total = source.total,
+        .tb_account_id = try backend.generate_id(),
+    };
+    const candidate: seat.Event = .{
+        .tenant = message.tenant,
+        .event_id = message.operation_id,
+        .ledger = ledger,
+        .capacity_account_id = capacity,
+        .allocation_account_id = allocation,
+        .classes = classes,
+        .timeout_seconds = create.timeout_seconds,
+        .state = .creating,
+    };
+    return events.insert(arena, options.events_table, &candidate, backend);
 }
 
 fn admission(

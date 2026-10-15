@@ -314,6 +314,17 @@ const RecordParseOutcome = union(enum) {
     valid: processor_message.Message,
 };
 
+pub const test_support = if (@import("builtin").is_test) struct {
+    pub fn invoke(arena: Allocator, event: []const u8, effects: anytype) ![]const u8 {
+        return handleInvocation(
+            arena,
+            event,
+            ExecutionAdapter.init(effects),
+            CompletionPublisher.init(effects),
+        );
+    }
+} else struct {};
+
 fn handleInvocation(
     allocator: Allocator,
     event: []const u8,

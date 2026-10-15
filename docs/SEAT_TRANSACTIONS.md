@@ -58,6 +58,10 @@ The executable evidence covers:
 - Diagnostic Strings surviving request/HTTP-response release, with the testing
   allocator checking cleanup. Simulated missing, empty and malformed readback JSON
   is tested separately from database execution and cannot establish a committed pair.
+- The runtime creation finalizer commits success and failure with those same SDK
+  actions. Simulated response loss after a real commit and real conditional
+  cancellation both resolve through actual transactional pair readback, preserving
+  the first terminal winner when later valid evidence proposes a different Result.
 
 DynamoDB Local does not reproduce every AWS behavior. Conditional cancellation
 establishes these local guard/composition paths; it does not prove live transaction

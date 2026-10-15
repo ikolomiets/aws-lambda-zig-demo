@@ -444,6 +444,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation", .module = host_operation },
         },
     });
+    host_seat_persistence.addImport("operation", host_operation);
+    host_seat_persistence.addImport("operation_persistence", host_operation_persistence);
     const host_sqs_queue = b.createModule(.{
         .target = b.graph.host,
         .optimize = optimize,
@@ -620,6 +622,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "processor_message", .module = host_processor_message },
             .{ .name = "seat_reservation", .module = host_seat_reservation },
             .{ .name = "seat_reservation_persistence", .module = host_seat_persistence },
+            .{ .name = "ledger_counter", .module = host_ledger_counter },
             .{ .name = "sqs_queue", .module = host_sqs_queue },
         },
     });
@@ -636,6 +639,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation_persistence", .module = host_operation_persistence },
             .{ .name = "processor_message", .module = host_processor_message },
             .{ .name = "seat_reservation", .module = host_seat_reservation },
+            .{ .name = "seat_reservation_persistence", .module = host_seat_persistence },
             .{ .name = "seat_reservation_processor", .module = seat_submission_mod },
         },
     });
@@ -658,8 +662,11 @@ pub fn build(b: *std.Build) void {
         },
     });
     const seat_workflow_tests = b.addTest(.{ .root_module = seat_workflow_mod });
+    seat_workflow_mod.addImport("tiger_beetle_processor", tiger_beetle_processor_test_mod);
+    seat_workflow_mod.addImport("tigerbeetle", tigerbeetle_host);
+    seat_workflow_mod.addImport("tigerbeetle_c", tigerbeetle_c_host);
     const run_seat_workflow_tests = b.addRunArtifact(seat_workflow_tests);
-    b.step("test-seat-workflow", "Run composed authenticated Seat Reservation rejection tests")
+    b.step("test-seat-workflow", "Run composed authenticated Seat Reservation workflow tests")
         .dependOn(&run_seat_workflow_tests.step);
     const seat_submission_exe = b.addExecutable(.{
         .name = "seat-reservation-processor",

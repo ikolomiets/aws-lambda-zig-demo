@@ -8,8 +8,9 @@ The independent [ledger counter](../src/ledger_counter.zig) and host
 `ledger-counter` utility initialize, inspect and allocate global ledgers.
 The [submission](../src/seat_reservation_processor.zig) and
 [completion](../src/seat_reservation_completion_processor.zig) handlers implement
-local rejections through authenticated intake and query. Native seat execution and
-SAM provisioning of the two handlers remain separate slices.
+local rejections and native Event creation through authenticated intake and query.
+Reservation, confirmation and availability execution, and SAM provisioning of the
+two handlers, remain separate slices.
 
 ## Rejection workflow
 
@@ -45,12 +46,13 @@ A local failure goes only to the configured `SeatReservationCompletionQueue`:
 The original input becomes arbitrary Context, including invalid scalar or null
 input. It must fit the shared 4 KiB Context bound. An internal message whose input
 cannot be carried within that bound is diagnosed as unusable. No local rejection
-allocates a ledger, writes an Event or dispatches native work. Admitted commands
-remain retryable pending the native command implementations.
+allocates a ledger, writes an Event or dispatches native work. Admitted creation
+dispatches initialization as described below. Other admitted commands remain
+retryable pending their native command implementations.
 
-Completion rejects Result Queue overrides and accepts only an unambiguous
+Completion rejects Result Queue overrides. Local completion accepts an unambiguous
 admission-failure Body containing exactly `code`. Native three-list and mixed
-Bodies do not become local failures. It preserves the admission code without
+Bodies do not become local failures. Local completion preserves the admission code without
 decoding Context as a command or reading the Event again. Thus a delayed
 `event_not_ready` remains that failure even after the Event becomes ready.
 
@@ -75,8 +77,10 @@ original body length, escaped preview and explicit `truncated` boolean within
 8 KiB. Non-ASCII/control bytes in previews use visible byte escapes. Diagnostic
 delivery does not determine acknowledgement and creates no public Result.
 
-The submission runtime uses `EVENTS_TABLE_NAME` and
-`SeatReservationCompletionQueue`; completion uses `OPERATIONS_TABLE_NAME`.
+The submission runtime uses `EVENTS_TABLE_NAME`, `LEDGER_COUNTER_TABLE_NAME`,
+optional `LEDGER_COUNTER_ID` (default `global`), `TigerBeetleQueue` and
+`SeatReservationCompletionQueue`. Completion uses `EVENTS_TABLE_NAME` and
+`OPERATIONS_TABLE_NAME` in the same account and Region.
 Both use the existing SDK configuration and SQS/persistence mechanics.
 
 ```sh
@@ -90,6 +94,69 @@ effects faked, including invocation restarts and ambiguous outcomes. They run in
 the ordinary offline suite. The separate [SDK transaction probe](SEAT_TRANSACTIONS.md)
 establishes executable persistence composition evidence. The
 [consistency ADR](adr/0007-seat-completion-consistency.md) records the recovery decision.
+
+## Event creation workflow
+
+`create_event` uses its Operation UUID as Event ID and the verified tenant as owner.
+After whole-command admission, submission first reads that Event. A missing Event
+requires one allocation from the trusted configured physical counter table/ID
+binding and fresh Capacity, Allocation and Availability account IDs. Native cluster
+identity does not select the counter. Submission inserts all identities, ledger,
+class totals, timeout and `creating` state before sending native work. Concurrent
+insertions and lost insert responses resolve to the saved winner; a losing candidate
+never supplies dispatch identities. Allocation and insertion uncertainty may leave
+gaps. Unresolved writes do not authorize dispatch.
+
+Retries reconstruct the saved complete chains and exact fields. Account creation
+orders Capacity (code 3, `credits_must_not_exceed_debits`), Allocation (code 2,
+`debits_must_not_exceed_credits`), then Availability accounts (code 1,
+`debits_must_not_exceed_credits`) in unsigned class-tag byte order. Aliases are
+`capacity`, `allocation`, then the class tags. A separate linked funding chain
+debits Capacity and credits each Availability account with its configured total,
+code 1, no transfer flags, and alias `available-${tag}` in the same class order.
+Each funding transfer reuses its Availability ID in the separate transfer namespace.
+The native processor supplies linked flags within each complete family. Initialization
+contains `N+2` accounts, `N` transfers and no lookups: `2N+2`, at most 64 commands.
+Account creation and funding execute in separate native phases.
+
+Submission sends to `TigerBeetleQueue` with `SeatReservationCompletionQueue` as
+Result Queue. Context contains exactly the flat original creation request; the
+native adapter preserves UUID, trusted tenant and Context and sends its three-list
+Body to that completion queue. Completion validates Context against the saved Event,
+then checks every family, count, position, alias and per-entry field. A successful
+chain is all `created`, or first `exists` followed entirely by `linked_event_failed`
+(including singleton `exists`). Account success requires complete funding evidence.
+Rejected accounts require the complete deliberately skipped funding list. Generated
+account conflicts and invalid server configuration are internal failures; they leave
+both records unchanged. Funding `id_already_failed` with failed-link entries at all
+other positions establishes permanent `operation_rejected`. Unknown, mixed,
+late-exists, truncated, skipped-success or diagnostic evidence never establishes readiness.
+
+Valid evidence finalizes both records through one `TransactWriteItems`: the Event
+changes from `creating` to `ready` with a `SUCCESS` Result containing only `event_id`,
+or to `failed` with a `FAILURE` Result containing only `code: operation_rejected`.
+The Event condition covers its tenant/Event key and every saved configuration field,
+including account IDs and the entire classes Map. The Operation condition covers
+UUID, tenant, exact name `SeatReservation`, `SUBMITTED` and absent Result, without
+checking its hash. Normal timestamps and 24-hour Operation TTL apply. No readiness
+write occurs separately from the Result write.
+
+After conflicts or lost transaction responses, one `TransactGetItems` reads the
+coherent pair. Matching ready/success or failed/failure identifies the immutable
+winner, even when incoming valid evidence proposes a different outcome. A matching
+creating/submitted pair stays retryable with the same evidence. Missing records,
+configuration or identity mismatches, and contradictory states are diagnosed without
+mutation. Transient errors retain retry eligibility. Failed Events never restart
+initialization; creating Events retain uncertainty until valid evidence completes
+them. A failed Event requires a new creation Operation/Event. There is no repair
+transition, separate-write fallback, outbox, or automatic recovery after Operation deletion.
+
+The composed offline workflow checks races, duplicate/competing completions,
+allocation gaps, lost dispatch/transaction responses, partial initialization and
+contradictory pairs. The separate local SDK probe exercises runtime finalization
+and winner readback. `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle`
+proves native funding, intact replay and the three account bounds against the local
+replica; the offline fakes do not establish those native guarantees.
 
 ## Commands
 

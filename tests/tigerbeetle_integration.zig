@@ -1232,6 +1232,67 @@ test "native account flags void balances and complete linked replay" {
     try std.testing.expectEqualDeep(committed, try lookup_account_balances(client, debit_id, credit_id));
 }
 
+test "Seat Event initialization funds class totals replays intact and enforces bounds" {
+    const ns = try TestNamespace.init();
+    const client = try local_client();
+    defer client.destroy();
+    var accounts = [_]tigerbeetle.Account{
+        make_account(ns.id(8101)), make_account(ns.id(8102)),
+        make_account(ns.id(8103)), make_account(ns.id(8104)),
+    };
+    accounts[0].code = 3;
+    accounts[0].flags = @intCast(c.TB_ACCOUNT_CREDITS_MUST_NOT_EXCEED_DEBITS);
+    accounts[1].code = 2;
+    accounts[1].flags = @intCast(c.TB_ACCOUNT_DEBITS_MUST_NOT_EXCEED_CREDITS);
+    for (accounts[2..]) |*account| {
+        account.code = 1;
+        account.flags = @intCast(c.TB_ACCOUNT_DEBITS_MUST_NOT_EXCEED_CREDITS);
+    }
+    for (accounts[0..3]) |*account| account.flags |= account_linked_flag;
+    try expect_accounts(
+        client,
+        &accounts,
+        &.{ account_created, account_created, account_created, account_created },
+    );
+    // Account and transfer IDs intentionally share values in separate namespaces.
+    var funding = [_]tigerbeetle.Transfer{
+        make_transfer(accounts[2].id, accounts[0].id, accounts[2].id),
+        make_transfer(accounts[3].id, accounts[0].id, accounts[3].id),
+    };
+    for (&funding) |*transfer| transfer.amount = std.math.maxInt(u32);
+    funding[0].flags = transfer_linked_flag;
+    try expect_transfers(client, &funding, &.{ transfer_created, transfer_created });
+    const before = try observe(client, accounts[0].id);
+    try std.testing.expectEqual(@as(u128, 8_589_934_590), before.debits_posted);
+    try std.testing.expectEqual(
+        @as(u128, 4_294_967_295),
+        (try observe(client, accounts[2].id)).credits_posted,
+    );
+    try expect_accounts(
+        client,
+        &accounts,
+        &.{
+            account_exists,              account_linked_event_failed,
+            account_linked_event_failed, account_linked_event_failed,
+        },
+    );
+    try expect_transfers(client, &funding, &.{ transfer_exists, transfer_linked_event_failed });
+    try std.testing.expectEqualDeep(before, try observe(client, accounts[0].id));
+    var overdraw = make_transfer(ns.id(8110), accounts[2].id, accounts[1].id);
+    overdraw.amount = 4_294_967_296;
+    try expect_transfers(client, &.{overdraw}, &.{c.TB_CREATE_TRANSFER_EXCEEDS_CREDITS});
+    var allocation_debit = make_transfer(ns.id(8111), accounts[1].id, accounts[2].id);
+    allocation_debit.amount = 1;
+    try expect_transfers(client, &.{allocation_debit}, &.{c.TB_CREATE_TRANSFER_EXCEEDS_CREDITS});
+    const source = make_account(ns.id(8112));
+    try expect_accounts(client, &.{source}, &.{account_created});
+    var capacity_credit = make_transfer(ns.id(8113), source.id, accounts[0].id);
+    capacity_credit.amount = 8_589_934_591;
+    try expect_transfers(client, &.{capacity_credit}, &.{c.TB_CREATE_TRANSFER_EXCEEDS_DEBITS});
+    try std.testing.expectEqualDeep(before, try observe(client, accounts[0].id));
+    try std.testing.expectEqual(@as(u128, 0), (try observe(client, accounts[1].id)).credits_posted);
+}
+
 fn void_transfer(id: u128, pending_id: u128) tigerbeetle.Transfer {
     var transfer = std.mem.zeroes(tigerbeetle.Transfer);
     transfer.id = id;

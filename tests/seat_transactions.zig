@@ -17,6 +17,24 @@ const Harness = struct {
     operations_table: []const u8,
     event: seat.Event,
     submitted: operation.Operation,
+    lose_write_response: bool = false,
+
+    pub fn transact_write(
+        self: *Harness,
+        arena: Allocator,
+        input: dynamodb.TransactWriteItemsInput,
+    ) !void {
+        _ = try self.client.transactWriteItems(arena, input, .{});
+        if (self.lose_write_response) return error.LostResponse;
+    }
+
+    pub fn transact_get(
+        self: *Harness,
+        arena: Allocator,
+        input: dynamodb.TransactGetItemsInput,
+    ) !dynamodb.TransactGetItemsOutput {
+        return self.client.transactGetItems(arena, input, .{});
+    }
 
     fn init(self: *Harness, name: []const u8) !void {
         self.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -151,6 +169,54 @@ const Harness = struct {
         return decode_pair(arena, response);
     }
 };
+
+test "runtime creation persistence commits and recognizes immutable winners through the real SDK" {
+    for ([_]bool{ false, true }) |failure| {
+        var harness: Harness = undefined;
+        try harness.init(if (failure) "RuntimeFailure" else "RuntimeSuccess");
+        defer harness.deinit();
+        const arena = harness.arena.allocator();
+        const accepted = try success(arena);
+        const rejected = try operation.parseCompletionJSON(
+            arena,
+            "{\"type\":\"FAILURE\",\"payload\":{\"code\":\"operation_rejected\"}}",
+        );
+        const options: events.FinalizationOptions = .{
+            .events_table = harness.events_table,
+            .operations_table = harness.operations_table,
+            .now = 1001,
+        };
+        harness.lose_write_response = true;
+        try events.finalize_creation(
+            arena,
+            &options,
+            &harness.event,
+            if (failure) &rejected else &accepted,
+            &harness,
+        );
+        const pair = try harness.read_pair();
+        try std.testing.expectEqual(
+            if (failure) seat.EventState.failed else .ready,
+            pair.event.state,
+        );
+        try std.testing.expect(pair.operation.state == .completed);
+        try std.testing.expectEqual(@as(?i64, 1001), pair.operation.last_updated);
+        // Real conditional cancellation takes the same coherent readback path as uncertainty.
+        try events.finalize_creation(
+            arena,
+            &options,
+            &harness.event,
+            if (failure) &accepted else &rejected,
+            &harness,
+        );
+        const winner = try harness.read_pair();
+        try std.testing.expectEqual(pair.event.state, winner.event.state);
+        try std.testing.expectEqualStrings(
+            try std.json.Stringify.valueAlloc(arena, pair.operation.state.completed, .{}),
+            try std.json.Stringify.valueAlloc(arena, winner.operation.state.completed, .{}),
+        );
+    }
+}
 
 fn operations_attribute(key: []const u8, value: dynamodb.types.AttributeValue) events.Attribute {
     return .{ .key = key, .value = value };

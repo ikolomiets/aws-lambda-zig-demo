@@ -402,7 +402,7 @@ fn write_native_transfer(json: anytype, transfer: *const NativeTransfer) !void {
     try id_field(json, "amount", transfer.amount);
     try field(json, "ledger", transfer.ledger);
     try field(json, "code", transfer.code);
-    if (transfer.flag) |flag| try field(json, "flags", &[_][]const u8{flag});
+    try field(json, "flags", if (transfer.flag) |flag| &[_][]const u8{flag} else &[_][]const u8{});
     if (transfer.pending_id) |id| try id_field(json, "pending_id", id);
     if (transfer.timeout) |timeout| try field(json, "timeout", timeout);
     try json.endObject();
@@ -456,6 +456,98 @@ pub fn encode_native_body(arena: Allocator, body: *const NativeBody) ![]const u8
         }
     }
     return encode_bounded(arena, body.*, processor_message.body_size_max);
+}
+
+/// Native results omit IDs; the trusted producer must reconstruct these immutable chains.
+pub fn creation_result(arena: Allocator, body: *const std.json.Value, event: *const Event) !Result {
+    try validate_event(event);
+    try exact_fields(body, &.{ "create_accounts", "create_transfers", "lookup_accounts" });
+    const accounts = try outcome_list(body, "create_accounts", event.classes.len + 2);
+    const funding = try outcome_list(body, "create_transfers", event.classes.len);
+    _ = try outcome_list(body, "lookup_accounts", 0);
+    var account_aliases: [class_count_max + 2][]const u8 = undefined;
+    var funding_aliases: [class_count_max][]const u8 = undefined;
+    account_aliases[0] = "capacity";
+    account_aliases[1] = "allocation";
+    for (event.classes, 0..) |*class, index| {
+        account_aliases[index + 2] = class.tag.slice();
+        funding_aliases[index] = try std.fmt.allocPrint(
+            arena,
+            "available-{s}",
+            .{class.tag.slice()},
+        );
+    }
+    if (try creation_chain(accounts, account_aliases[0..accounts.len])) |_| {
+        try skipped_funding(funding, funding_aliases[0..funding.len]);
+        // Account rejections indicate invalid generated configuration or conflicting IDs.
+        return error.InvalidNativeEvidence;
+    }
+    if (try creation_chain(funding, funding_aliases[0..funding.len])) |status| {
+        if (std.mem.eql(u8, status, "id_already_failed")) {
+            return .{ .failure = .operation_rejected };
+        }
+        // Funding has fixed valid accounts and bounded amounts. Other rejections
+        // indicate missing/closed accounts, ID conflicts, or impossible server state.
+        return error.InvalidNativeEvidence;
+    }
+    return .{ .success = .{ .create_event = event.event_id } };
+}
+
+fn outcome_list(
+    body: *const std.json.Value,
+    name: []const u8,
+    count: usize,
+) ![]const std.json.Value {
+    const value = try required(body, name);
+    if (value != .array) return error.InvalidNativeEvidence;
+    if (value.array.items.len != count) return error.InvalidNativeEvidence;
+    return value.array.items;
+}
+
+fn creation_chain(entries: []const std.json.Value, aliases: []const []const u8) !?[]const u8 {
+    std.debug.assert(entries.len > 0);
+    std.debug.assert(entries.len == aliases.len);
+    var created_count: usize = 0;
+    var decisive: ?[]const u8 = null;
+    var decisive_index: usize = 0;
+    for (entries, aliases, 0..) |*entry, alias, index| {
+        try exact_fields(entry, &.{ "error_code", "alias" });
+        if (!std.mem.eql(u8, alias, try string_value(try required(entry, "alias")))) {
+            return error.InvalidNativeEvidence;
+        }
+        const status = try string_value(try required(entry, "error_code"));
+        if (std.mem.eql(u8, status, "created")) {
+            created_count += 1;
+        } else if (!std.mem.eql(u8, status, "linked_event_failed")) {
+            if (decisive != null) return error.InvalidNativeEvidence;
+            decisive = status;
+            decisive_index = index;
+        }
+    }
+    if (created_count == entries.len) return null;
+    if (created_count != 0) return error.InvalidNativeEvidence;
+    const status = decisive orelse return error.InvalidNativeEvidence;
+    if (std.mem.eql(u8, status, "exists")) {
+        if (decisive_index != 0) return error.InvalidNativeEvidence;
+        return null;
+    }
+    return status;
+}
+
+fn skipped_funding(entries: []const std.json.Value, aliases: []const []const u8) !void {
+    std.debug.assert(entries.len == aliases.len);
+    for (entries, aliases) |*entry, alias| {
+        try exact_fields(entry, &.{ "error_code", "alias", "message" });
+        if (try required(entry, "error_code") != .null) return error.InvalidNativeEvidence;
+        if (!std.mem.eql(u8, alias, try string_value(try required(entry, "alias")))) {
+            return error.InvalidNativeEvidence;
+        }
+        const reason = try string_value(try required(entry, "message"));
+        const expected = "Transfer was not submitted because account creation was rejected.";
+        if (!std.mem.eql(u8, reason, expected)) {
+            return error.InvalidNativeEvidence;
+        }
+    }
 }
 
 fn validate_command_event(command: *const Command, event: *const Event) !void {

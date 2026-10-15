@@ -2,6 +2,8 @@ const std = @import("std");
 const aws = @import("aws");
 const dynamodb = @import("dynamodb");
 const seat = @import("seat_reservation");
+const operation = @import("operation");
+const operations = @import("operation_persistence");
 const Allocator = std.mem.Allocator;
 pub const Attribute = aws.map.MapEntry(dynamodb.types.AttributeValue);
 
@@ -16,6 +18,113 @@ const event_fields = [_][]const u8{
     "classes",
 };
 pub const create_condition = "attribute_not_exists(#tenant) AND attribute_not_exists(#event_id)";
+
+pub const FinalizationOptions = struct {
+    events_table: []const u8,
+    operations_table: []const u8,
+    now: operation.UnixSeconds,
+};
+
+/// There is no separate-write fallback. An uncertain transaction requires one coherent pair.
+pub fn finalize_creation(
+    arena: Allocator,
+    options: *const FinalizationOptions,
+    saved: *const seat.Event,
+    result: *const operation.Completion,
+    backend: anytype,
+) !void {
+    if (saved.state == .creating) {
+        const terminal: seat.EventState = if (result.* == .success) .ready else .failed;
+        const actions = try arena.alloc(dynamodb.types.TransactWriteItem, 2);
+        actions[0] = .{ .update = try finalization_update(
+            arena,
+            options.events_table,
+            saved,
+            terminal,
+        ) };
+        actions[1] = .{ .update = try operations.seat_completion_update(
+            arena,
+            options.operations_table,
+            &.{ .id = saved.event_id, .tenant = saved.tenant },
+            result,
+            options.now,
+        ) };
+        if (backend.transact_write(arena, .{ .transact_items = actions })) |_| {
+            return;
+        } else |_| {}
+    }
+    const event_read = try read_request(arena, options.events_table, &.{
+        .tenant = saved.tenant,
+        .event_id = saved.event_id,
+    });
+    const operation_read = try operations.read_request(
+        arena,
+        options.operations_table,
+        saved.event_id,
+    );
+    const response = try backend.transact_get(arena, .{ .transact_items = &.{
+        .{ .get = .{ .table_name = event_read.table_name, .key = event_read.key } },
+        .{ .get = .{ .table_name = operation_read.table_name, .key = operation_read.key } },
+    } });
+    const records = response.responses orelse return error.InconsistentCreation;
+    if (records.len != 2) return error.InconsistentCreation;
+    const event = try decode_item(arena, records[0].item orelse return error.InconsistentCreation);
+    const winner = try operations.decode_item(
+        arena,
+        records[1].item orelse return error.InconsistentCreation,
+    );
+    try validate_creation_pair(saved, &event, &winner);
+}
+
+fn validate_creation_pair(
+    expected: *const seat.Event,
+    event: *const seat.Event,
+    winner: *const operation.Operation,
+) !void {
+    if (event.event_id != expected.event_id) return error.InconsistentCreation;
+    if (!std.mem.eql(u8, event.tenant, expected.tenant)) return error.InconsistentCreation;
+    if (event.ledger != expected.ledger) return error.InconsistentCreation;
+    if (event.capacity_account_id != expected.capacity_account_id) {
+        return error.InconsistentCreation;
+    }
+    if (event.allocation_account_id != expected.allocation_account_id) {
+        return error.InconsistentCreation;
+    }
+    seat.validate_configuration(expected, event) catch return error.InconsistentCreation;
+    for (event.classes, expected.classes) |stored, original| {
+        if (stored.tb_account_id != original.tb_account_id) return error.InconsistentCreation;
+    }
+    if (winner.id != expected.event_id) return error.InconsistentCreation;
+    if (!std.mem.eql(u8, winner.tenant, expected.tenant)) return error.InconsistentCreation;
+    if (!std.mem.eql(u8, winner.name, "SeatReservation")) return error.InconsistentCreation;
+    switch (winner.state) {
+        .submitted => {
+            if (event.state == .creating) return error.RetryFinalization;
+            return error.InconsistentCreation;
+        },
+        .completed => |*result| {
+            seat.validate_completion(result) catch return error.InconsistentCreation;
+            switch (result.*) {
+                .success => |payload| {
+                    if (event.state != .ready) return error.InconsistentCreation;
+                    seat.exact_fields(&payload, &.{"event_id"}) catch
+                        return error.InconsistentCreation;
+                    const text = try seat.string_value(try seat.required(&payload, "event_id"));
+                    const id = seat.canonical_uuid(text) catch
+                        return error.InconsistentCreation;
+                    if (id != event.event_id) return error.InconsistentCreation;
+                },
+                .failure => |payload| {
+                    if (event.state != .failed) return error.InconsistentCreation;
+                    const code = try seat.string_value(try seat.required(&payload, "code"));
+                    if (!std.mem.eql(u8, code, "operation_rejected")) {
+                        return error.InconsistentCreation;
+                    }
+                },
+            }
+        },
+    }
+}
 
 /// Guard every immutable saved field. Each action owns its aliases and arena-backed values.
 pub fn finalization_update(
