@@ -764,6 +764,10 @@ python3 check_docs.py
 See the [documentation check scope](docs/agents/documentation-checks.md) for historical
 evidence handling, fixture tests, and manual option/prerequisite/schema review.
 
+The [Seat Reservation rejection workflow](docs/SEAT_RESERVATION.md#rejection-workflow)
+has a composed deterministic `test-seat-workflow` target in the offline suite and
+a separate [local SDK transaction probe](docs/SEAT_TRANSACTIONS.md).
+
 Run the complete formatting check for build files, Zig sources, and tests before
 committing Zig changes:
 

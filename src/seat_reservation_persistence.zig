@@ -17,6 +17,45 @@ const event_fields = [_][]const u8{
 };
 pub const create_condition = "attribute_not_exists(#tenant) AND attribute_not_exists(#event_id)";
 
+/// Guard every immutable saved field. Each action owns its aliases and arena-backed values.
+pub fn finalization_update(
+    arena: Allocator,
+    table: []const u8,
+    source: *const seat.Event,
+    terminal: seat.EventState,
+) !dynamodb.types.Update {
+    try validate_table_name(table);
+    if (source.state != .creating) return error.InvalidCreationState;
+    if (terminal == .creating) return error.InvalidTerminalState;
+    const item = try encode_item(arena, source);
+    const names = try arena.alloc(aws.map.StringMapEntry, event_fields.len);
+    const values = try arena.alloc(Attribute, event_fields.len + 1);
+    for (item, 0..) |attribute, index| {
+        names[index] = .{
+            .key = try std.fmt.allocPrint(arena, "#{s}", .{attribute.key}),
+            .value = attribute.key,
+        };
+        values[index] = .{
+            .key = try std.fmt.allocPrint(arena, ":{s}", .{attribute.key}),
+            .value = attribute.value,
+        };
+    }
+    values[item.len] = string_attribute(":terminal", @tagName(terminal));
+    return .{
+        .table_name = try arena.dupe(u8, table),
+        .key = item[0..2],
+        .expression_attribute_names = names,
+        .expression_attribute_values = values,
+        .condition_expression = "#tenant = :tenant AND #event_id = :event_id AND " ++
+            "#ledger = :ledger AND #timeout_seconds = :timeout_seconds AND " ++
+            "#capacity_account_id = :capacity_account_id AND " ++
+            "#allocation_account_id = :allocation_account_id AND #classes = :classes AND " ++
+            "#state = :state",
+        .update_expression = "SET #state = :terminal",
+        .return_values_on_condition_check_failure = .all_old,
+    };
+}
+
 pub const Persistence = struct {
     client: dynamodb.Client,
     table_name: []const u8,

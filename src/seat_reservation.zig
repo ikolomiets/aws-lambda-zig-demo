@@ -145,6 +145,57 @@ pub const FailureCode = enum {
     invalid_reservation,
     operation_rejected,
 };
+
+/// Local admission failures never contain native lists or require valid command Context.
+pub fn local_failure(body: *const std.json.Value) !FailureCode {
+    try exact_fields(body, &.{"code"});
+    const code = std.meta.stringToEnum(FailureCode, try string_value(try required(body, "code"))) orelse return error.InvalidLocalFailure;
+    return switch (code) {
+        .invalid_request, .event_unavailable, .unknown_class, .event_not_ready, .event_failed => code,
+        else => error.InvalidLocalFailure,
+    };
+}
+
+/// A readback winner must have a valid public seat Result, independently of incoming evidence.
+pub fn validate_completion(completion: *const operation.Completion) !void {
+    switch (completion.*) {
+        .failure => |payload| {
+            try exact_fields(&payload, &.{"code"});
+            _ = std.meta.stringToEnum(FailureCode, try string_value(try required(&payload, "code"))) orelse
+                return error.InvalidSeatResult;
+        },
+        .success => |payload| try validate_success_payload(&payload),
+    }
+}
+
+fn validate_success_payload(payload: *const std.json.Value) !void {
+    _ = try canonical_uuid(try string_value(try required(payload, "event_id")));
+    if (payload.object.contains("classes")) {
+        try exact_fields(payload, &.{ "event_id", "classes" });
+        const classes = try required(payload, "classes");
+        if (classes != .object) return error.InvalidSeatResult;
+        try validate_class_count(classes.object.count());
+        for (classes.object.keys(), classes.object.values()) |tag, values| {
+            _ = try Tag.init(tag);
+            try exact_fields(&values, &.{ "total", "available" });
+            const total = try positive_u32(try required(&values, "total"));
+            const available = try required(&values, "available");
+            if (available != .integer) return error.InvalidSeatResult;
+            if (available.integer < 0 or available.integer > total) return error.InvalidSeatResult;
+        }
+    } else if (payload.object.contains("class")) {
+        _ = try Tag.init(try string_value(try required(payload, "class")));
+        _ = try native_id(try string_value(try required(payload, "reservation_id")));
+        if (payload.object.contains("quantity")) {
+            try exact_fields(payload, &.{ "event_id", "class", "quantity", "reservation_id" });
+            _ = try positive_u32(try required(payload, "quantity"));
+        } else {
+            try exact_fields(payload, &.{ "event_id", "class", "reservation_id" });
+        }
+    } else {
+        try exact_fields(payload, &.{"event_id"});
+    }
+}
 pub const Availability = struct { tag: Tag, total: u32, available: u32 };
 pub const Success = union(enum) {
     create_event: u128,

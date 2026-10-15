@@ -6,7 +6,90 @@ The [shared persistence module](../src/seat_reservation_persistence.zig) reads a
 inserts tenant-owned Event metadata. The host `events` utility uses these modules.
 The independent [ledger counter](../src/ledger_counter.zig) and host
 `ledger-counter` utility initialize, inspect and allocate global ledgers.
-The current Lambda pipeline does not route or execute `SeatReservation` commands.
+The [submission](../src/seat_reservation_processor.zig) and
+[completion](../src/seat_reservation_completion_processor.zig) handlers implement
+local rejections through authenticated intake and query. Native seat execution and
+SAM provisioning of the two handlers remain separate slices.
+
+## Rejection workflow
+
+When configured with `SeatReservationQueue`, intake routes the exact name
+`SeatReservation` through its existing name-based mechanism. It persists a
+`SUBMITTED` Operation with the verified PASETO subject as tenant, then publishes
+the original Body and null Context. The current SAM template still provisions
+the existing four functions; it does not configure this seat route.
+
+Each seat invocation accepts exactly one SQS record. Submission rejects incoming
+Result Queue overrides and non-null incoming Context. Whole-request schema and
+size admission precedes any allocation, Event write or native dispatch. Invalid
+requests produce `invalid_request`. Missing and foreign Events both produce
+`event_unavailable`; only owned Events disclose `event_not_ready`, `event_failed`
+or, when ready, `unknown_class`. Transient reads remain retryable.
+
+A local failure goes only to the configured `SeatReservationCompletionQueue`:
+
+```json
+{
+  "operation_id": "00000000-0000-0000-0000-000000000001",
+  "tenant": "theatre",
+  "body": { "code": "event_not_ready" },
+  "context": {
+    "command": "reserve_seats",
+    "event_id": "00000000-0000-0000-0000-000000000002",
+    "class": "general",
+    "quantity": 2
+  }
+}
+```
+
+The original input becomes arbitrary Context, including invalid scalar or null
+input. It must fit the shared 4 KiB Context bound. An internal message whose input
+cannot be carried within that bound is diagnosed as unusable. No local rejection
+allocates a ledger, writes an Event or dispatches native work. Admitted commands
+remain retryable pending the native command implementations.
+
+Completion rejects Result Queue overrides and accepts only an unambiguous
+admission-failure Body containing exactly `code`. Native three-list and mixed
+Bodies do not become local failures. It preserves the admission code without
+decoding Context as a command or reading the Event again. Thus a delayed
+`event_not_ready` remains that failure even after the Event becomes ready.
+
+Operation-only finalization guards UUID, tenant, exact name `SeatReservation`,
+`SUBMITTED` state and absent Result, with normal timestamps and 24-hour TTL and
+without comparing the input hash. A conflict or uncertain write requires a
+strongly consistent readback. Only a matching identity with a valid terminal seat
+Result proves a winner; that Result remains unchanged even when it differs from
+the incoming rejection. Submitted readback and transient write/readback failures
+remain retryable. Identity or stored-state inconsistencies are diagnosed.
+
+Submission acknowledges after successful publication; completion acknowledges
+after durable finalization or validated winner readback. A lost send response can
+produce duplicate completions. A lost write response can resolve through readback.
+Response-encoding failure after effects also permits redelivery under the same
+guards. Authenticated query exposes the code-only `FAILURE` Result only to the
+owning tenant; an earlier query can still observe `SUBMITTED`.
+
+Diagnosed unrecoverable inputs acknowledge without Event or Operation mutation.
+Structured ERROR output includes stage, reason, SQS ID, available UUID/tenant,
+original body length, escaped preview and explicit `truncated` boolean within
+8 KiB. Non-ASCII/control bytes in previews use visible byte escapes. Diagnostic
+delivery does not determine acknowledgement and creates no public Result.
+
+The submission runtime uses `EVENTS_TABLE_NAME` and
+`SeatReservationCompletionQueue`; completion uses `OPERATIONS_TABLE_NAME`.
+Both use the existing SDK configuration and SQS/persistence mechanics.
+
+```sh
+zig build build-seat-processors test-seat-workflow
+```
+
+`build-seat-processors` compiles the host runtime entry points without installing
+or packaging Lambda artifacts. The composed deterministic tests exercise real
+authenticated handlers, domain codecs and persistence builders with external
+effects faked, including invocation restarts and ambiguous outcomes. They run in
+the ordinary offline suite. The separate [SDK transaction probe](SEAT_TRANSACTIONS.md)
+establishes executable persistence composition evidence. The
+[consistency ADR](adr/0007-seat-completion-consistency.md) records the recovery decision.
 
 ## Commands
 
@@ -207,8 +290,9 @@ zig build fmt-check
 
 All deterministic suites also run in `zig build test`; the wrapper uses mocked
 AWS credentials and resource resolution. These checks establish local contracts,
-ownership and recovery behavior. They do not establish live AWS IAM, DynamoDB
-service behavior, seat processor integration, or native accounting guarantees.
+ownership and recovery behavior. The composed rejection suite establishes local
+seat handler integration; these tests do not establish live AWS IAM, DynamoDB
+service behavior or native accounting guarantees.
 
 The [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-event-metadata-utility)
 owns utility invocation, environment, permissions and deployment prerequisites.

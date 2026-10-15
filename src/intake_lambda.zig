@@ -533,6 +533,7 @@ pub const test_support = if (@import("builtin").is_test) struct {
     pub const Submission = struct {
         input: []const u8,
         subject: []const u8,
+        operation_name: []const u8 = "TigerBeetle",
     };
 
     pub fn submit(
@@ -550,7 +551,7 @@ pub const test_support = if (@import("builtin").is_test) struct {
         var environment = std.process.Environ.Map.init(allocator);
         defer environment.deinit();
         try lambda_auth.testing.put_public_key(&environment, 0x63);
-        try put_test_queue_url(&environment, "TigerBeetle");
+        try put_test_queue_url(&environment, options.operation_name);
         const event = try test_authorization_request_event(
             allocator,
             .POST,

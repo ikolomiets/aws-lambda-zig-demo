@@ -607,6 +607,72 @@ pub fn build(b: *std.Build) void {
     const run_tiger_beetle_processor_tests = b.addRunArtifact(tiger_beetle_processor_tests);
     b.step("test-tigerbeetle-processor", "Run processor parsing and invocation tests").dependOn(&run_tiger_beetle_processor_tests.step);
 
+    const seat_submission_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .single_threaded = true,
+        .root_source_file = b.path("src/seat_reservation_processor.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "dynamodb", .module = host_dynamodb },
+            .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "processor_message", .module = host_processor_message },
+            .{ .name = "seat_reservation", .module = host_seat_reservation },
+            .{ .name = "seat_reservation_persistence", .module = host_seat_persistence },
+            .{ .name = "sqs_queue", .module = host_sqs_queue },
+        },
+    });
+    const seat_completion_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .single_threaded = true,
+        .root_source_file = b.path("src/seat_reservation_completion_processor.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "dynamodb", .module = host_dynamodb },
+            .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "operation_persistence", .module = host_operation_persistence },
+            .{ .name = "processor_message", .module = host_processor_message },
+            .{ .name = "seat_reservation", .module = host_seat_reservation },
+            .{ .name = "seat_reservation_processor", .module = seat_submission_mod },
+        },
+    });
+    const seat_workflow_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .root_source_file = b.path("tests/seat_rejection_workflow.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "dynamodb", .module = host_dynamodb },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "operation_persistence", .module = host_operation_persistence },
+            .{ .name = "processor_message", .module = host_processor_message },
+            .{ .name = "seat_reservation", .module = host_seat_reservation },
+            .{ .name = "seat_reservation_persistence", .module = host_seat_persistence },
+            .{ .name = "seat_reservation_processor", .module = seat_submission_mod },
+            .{ .name = "seat_reservation_completion_processor", .module = seat_completion_mod },
+            .{ .name = "intake_lambda", .module = lambda_test_mod },
+            .{ .name = "query_lambda", .module = query_test_mod },
+        },
+    });
+    const seat_workflow_tests = b.addTest(.{ .root_module = seat_workflow_mod });
+    const run_seat_workflow_tests = b.addRunArtifact(seat_workflow_tests);
+    b.step("test-seat-workflow", "Run composed authenticated Seat Reservation rejection tests")
+        .dependOn(&run_seat_workflow_tests.step);
+    const seat_submission_exe = b.addExecutable(.{
+        .name = "seat-reservation-processor",
+        .root_module = seat_submission_mod,
+    });
+    const seat_completion_exe = b.addExecutable(.{
+        .name = "seat-reservation-completion-processor",
+        .root_module = seat_completion_mod,
+    });
+    const seat_processors_build = b.step("build-seat-processors", "Compile host seat invocation adapters");
+    seat_processors_build.dependOn(&seat_submission_exe.step);
+    seat_processors_build.dependOn(&seat_completion_exe.step);
+
     const lambda_auth_tests = b.addTest(.{
         .root_module = host_lambda_auth,
     });
@@ -838,12 +904,32 @@ pub fn build(b: *std.Build) void {
     b.step("test-local-checks", "Run temporary-repository offline gate and hook tests")
         .dependOn(&local_check_test.step);
 
+    const seat_transactions_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .link_libc = true,
+        .root_source_file = b.path("tests/seat_transactions.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "dynamodb", .module = host_dynamodb },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "operation_persistence", .module = host_operation_persistence },
+            .{ .name = "seat_reservation", .module = host_seat_reservation },
+            .{ .name = "seat_reservation_persistence", .module = host_seat_persistence },
+        },
+    });
+    const seat_transactions_tests = b.addTest(.{ .root_module = seat_transactions_mod });
+    const run_seat_transactions_tests = b.addRunArtifact(seat_transactions_tests);
+    b.step("test-seat-transactions", "Run SDK transaction tests against isolated DynamoDB Local")
+        .dependOn(&run_seat_transactions_tests.step);
+
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&local_check_test.step);
     test_step.dependOn(&documentation_test.step);
     test_step.dependOn(&tracker_test.step);
     test_step.dependOn(&run_seat_reservation_tests.step);
     test_step.dependOn(&run_seat_persistence_tests.step);
+    test_step.dependOn(&run_seat_workflow_tests.step);
     test_step.dependOn(&run_events_cli_tests.step);
     test_step.dependOn(&run_ledger_counter_tests.step);
     test_step.dependOn(&run_ledger_counter_cli_tests.step);

@@ -2081,6 +2081,29 @@ These tests are part of the ordinary `zig build test` graph and contact no AWS
 service. They do not certify deployed permissions, resource resolution or native
 provisioning. No Lambda ZIP is required for the host utility.
 
+### Local seat rejection and persistence validation
+
+The seat rejection handlers compile and run through the composed deterministic
+workflow without cloud resources:
+
+```sh
+zig build build-seat-processors test-seat-workflow
+```
+
+The [seat reference](SEAT_RESERVATION.md#rejection-workflow) describes runtime
+configuration and current behavior. These host builds create no Lambda ZIPs;
+the SAM template still provisions four functions and has no seat queue mappings.
+
+The separate [SDK transaction probe](SEAT_TRANSACTIONS.md) documents pinned Docker
+image provisioning, isolated loopback execution and debugging:
+
+```sh
+./tests/seat_transactions_test.sh
+```
+
+It uses dummy credentials and its own local database; it performs no deployment
+or cloud-side validation and is outside the ordinary offline suite.
+
 ### Global ledger counter utility
 
 The host `ledger-counter` utility is available for a deliberately selected

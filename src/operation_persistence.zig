@@ -14,6 +14,83 @@ const attribute_count_min = 7;
 const attribute_count_max = 8;
 const create_condition = "attribute_not_exists(id)";
 
+pub const SeatIdentity = struct { id: u128, tenant: []const u8 };
+
+/// Request backing storage belongs to arena through the SDK call.
+pub fn create_request(
+    arena: Allocator,
+    table: []const u8,
+    source: *const operation.Operation,
+) !dynamodb.PutItemInput {
+    const persisted = persistentCopy(source);
+    try validateCreation(&persisted);
+    const request = try arena.create(CreateRequest);
+    try createRequestInit(request, &persisted);
+    return .{
+        .table_name = try arena.dupe(u8, table),
+        .item = request.items[0..request.item_count],
+        .condition_expression = create_condition,
+    };
+}
+
+pub fn decode_item(arena: Allocator, item: []const Attribute) !operation.Operation {
+    return decodeItem(arena, item);
+}
+
+pub fn read_request(arena: Allocator, table: []const u8, id: u128) !dynamodb.GetItemInput {
+    const request = try arena.create(ReadRequest);
+    readRequestInit(request, id);
+    return .{
+        .table_name = try arena.dupe(u8, table),
+        .key = &request.key,
+        .consistent_read = true,
+    };
+}
+
+/// Seat finalization binds trusted identity without comparing the original input hash.
+/// This Update is also composable with Event finalization in TransactWriteItems.
+pub fn seat_completion_update(
+    arena: Allocator,
+    table: []const u8,
+    identity: *const SeatIdentity,
+    completion: *const operation.Completion,
+    now: operation.UnixSeconds,
+) !dynamodb.types.Update {
+    try operation.validateTenant(identity.tenant);
+    const expires_at = try operation.expires_at_from_last_updated(now);
+    const result_buffer = try arena.create([operation.result_size_max]u8);
+    const result = try operation.writeCompletionJSON(result_buffer, completion);
+    const id_buffer = try arena.create([id_size]u8);
+    const id = operation.uuidToString(identity.id, id_buffer);
+    const key = try arena.dupe(Attribute, &.{stringAttribute("id", id)});
+    const names = try arena.dupe(AttributeName, &.{
+        .{ .key = "#tenant", .value = "tenant" },
+        .{ .key = "#name", .value = "name" },
+        .{ .key = "#state", .value = "state" },
+        .{ .key = "#result", .value = "result" },
+    });
+    const values = try arena.dupe(Attribute, &.{
+        stringAttribute(":id", id),
+        stringAttribute(":tenant", try arena.dupe(u8, identity.tenant)),
+        stringAttribute(":name", "SeatReservation"),
+        stringAttribute(":submitted", "SUBMITTED"),
+        stringAttribute(":completed", "COMPLETED"),
+        stringAttribute(":result", result),
+        numberAttribute(":now", try std.fmt.allocPrint(arena, "{d}", .{now})),
+        numberAttribute(":expires_at", try std.fmt.allocPrint(arena, "{d}", .{expires_at})),
+    });
+    return .{
+        .table_name = try arena.dupe(u8, table),
+        .key = key,
+        .expression_attribute_names = names,
+        .expression_attribute_values = values,
+        .condition_expression = "id = :id AND #tenant = :tenant AND #name = :name AND " ++
+            "#state = :submitted AND attribute_not_exists(#result)",
+        .update_expression = completion_update,
+        .return_values_on_condition_check_failure = .all_old,
+    };
+}
+
 comptime {
     std.debug.assert(id_size == 36);
     std.debug.assert(hash_size == 2 * 32);
