@@ -19,6 +19,7 @@ PASETO_PUBLIC_KEY="${PASETO_PUBLIC_KEY:-}"
 LOCAL_AWS_LAMBDA_ROOT="${LOCAL_AWS_LAMBDA_ROOT:-../aws-lambda-zig}"
 DRY_RUN=0
 DEV=0
+CLEANUP=0
 CHECK_URL=1
 USE_LOCAL_LIBS=0
 DEPLOYMENT_STARTED=0
@@ -70,6 +71,9 @@ Options:
                          to an existing development stack. Skips tests and SAM
                          validation. Configuration changes require full deployment.
                          Automatically accepts SAM's development-stack confirmation.
+  --cleanup              Tear down the selected stack only. Permanently deletes
+                         owned tables (all counters) and queued messages. Completes
+                         guarded WireGuard disable first; preserves external resources.
   --dry-run              Run local checks, build, package, and validation only.
   --no-url-check         Skip the post-deploy Function URL HTTP status check.
   -h, --help             Show this help.
@@ -83,7 +87,7 @@ Environment overrides:
   PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT
 
 Authentication:
-  Non-dry-run deployments require an SSO-backed AWS CLI profile. The script
+  Non-dry-run deployments and cleanup require an SSO-backed AWS CLI profile. The script
   clears inherited static credentials, selects the configured profile, and
   always runs aws sso login to obtain a fresh token before AWS inspection or
   local build work. Dry runs make no AWS authentication calls.
@@ -375,6 +379,7 @@ preserve_wireguard_state() {
             fi
             ;;
         deploy) deploy_stack_phase "Deploying stack" ;;
+        teardown) teardown_preserved_wireguard ;;
         outputs | cleanup) ;;
         *) fail "unknown deployment-controller phase: $phase" ;;
     esac
@@ -683,6 +688,7 @@ deployment_error_handler() {
 deployment_cleanup() {
     [ "$DEV" -eq 0 ] || return 0
     invoke_deployment_controller cleanup || true
+    [ "$CLEANUP" -eq 0 ] || return 0
     rm -rf -- "${CACHE_DIR:-.zig-cache-deploy}" \
         "${GLOBAL_CACHE_DIR:-.zig-global-cache-deploy}"
 }
@@ -755,8 +761,131 @@ validate_deployed_function_names() {
     printf '==> Deployed Lambda function names match requested values\n'
 }
 
+# Read by immutable ID after the initial name lookup. Only an explicit service
+# not-found response means already complete; access/transport errors are unknown.
+inspect_cleanup_stack() {
+    local response
+    if ! response="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+        --output json --profile "$PROFILE" --region "$REGION" 2>&1)"
+    then
+        case "$response" in
+            *"(ValidationError) when calling the DescribeStacks operation: Stack with id $STACK_NAME does not exist")
+                return 1 ;;
+            *) fail "could not inspect stack for cleanup; deletion is unverified: $response" ;;
+        esac
+    fi
+    jq -e '.Stacks | type == "array" and length == 1 and
+        (.[0] | (.StackId | type == "string" and startswith("arn:")) and
+        (.StackStatus | type == "string") and (.Parameters | type == "array"))' \
+        <<<"$response" >/dev/null || fail "malformed cleanup stack inspection; nothing deleted"
+    CLEANUP_STACK_DESCRIPTION="$response"
+}
+
+teardown_preserved_wireguard() (
+    local gateway_state retained_state
+    gateway_state="$(jq -er '.Stacks[0].Parameters | map(select(.ParameterKey == "EnableWireGuardGateway")) |
+        if length == 1 then .[0].ParameterValue else error("missing gateway state") end' \
+        <<<"$CLEANUP_STACK_DESCRIPTION")" || fail "could not resolve cleanup gateway state"
+    retained_state="$(jq -er '.Stacks[0].Parameters | map(select(.ParameterKey == "RetainTigerBeetleProcessorVpcCleanupResources")) |
+        if length == 1 then .[0].ParameterValue else error("missing retained state") end' \
+        <<<"$CLEANUP_STACK_DESCRIPTION")" || fail "could not resolve retained cleanup state"
+    case "$gateway_state:$retained_state" in
+        false:false) return 0 ;;
+        true:false | true:true | false:true) ;;
+        *) fail "unknown WireGuard cleanup state; nothing deleted" ;;
+    esac
+
+    # Reuse the same ownership preflight, detachment, version and ENI guards as
+    # explicit gateway disable. No local artifacts or allocator setup are needed.
+    source ./wireguard-gateway-setup.sh
+    CLEANUP=1
+    ENABLE_WIREGUARD_GATEWAY=0
+    plan_wireguard_deployment
+    TIGER_BEETLE_PROCESSOR_NAME="$(aws cloudformation describe-stack-resource \
+        --stack-name "$STACK_NAME" --logical-resource-id TigerBeetleProcessor \
+        --query StackResourceDetail.PhysicalResourceId --output text \
+        --profile "$PROFILE" --region "$REGION")" || fail "could not resolve deployed TigerBeetle processor"
+    [[ "$TIGER_BEETLE_PROCESSOR_NAME" =~ ^[A-Za-z0-9_-]+$ ]] ||
+        fail "invalid deployed TigerBeetle processor name"
+    preflight_planned_cleanup_ipv6_egress
+    run_wireguard_deployment "$WIREGUARD_DEPLOYMENT_MODE"
+)
+
+update_wireguard_cleanup_state() {
+    local retain_resources="$1" parameters update_output
+    inspect_cleanup_stack || fail "stack disappeared during guarded WireGuard cleanup"
+    parameters="$(jq -c --arg retain "$retain_resources" '.Stacks[0].Parameters | map(
+        if .ParameterKey == "EnableWireGuardGateway" then {ParameterKey:.ParameterKey,ParameterValue:"false"}
+        elif .ParameterKey == "RetainTigerBeetleProcessorVpcCleanupResources" then {ParameterKey:.ParameterKey,ParameterValue:$retain}
+        else {ParameterKey:.ParameterKey,UsePreviousValue:true} end)' \
+        <<<"$CLEANUP_STACK_DESCRIPTION")" || fail "could not preserve deployed parameters for teardown"
+    if ! update_output="$(aws cloudformation update-stack --stack-name "$STACK_NAME" \
+        --use-previous-template --parameters "$parameters" \
+        --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+        --profile "$PROFILE" --region "$REGION" 2>&1)"
+    then
+        case "$update_output" in
+            *"(ValidationError) when calling the UpdateStack operation: No updates are to be performed.") ;;
+            *) fail "guarded WireGuard teardown update failed: $update_output" ;;
+        esac
+    else
+        aws cloudformation wait stack-update-complete --stack-name "$STACK_NAME" \
+            --profile "$PROFILE" --region "$REGION" ||
+            fail "WireGuard teardown update did not complete; rerun --cleanup after the active operation finishes"
+    fi
+    inspect_cleanup_stack || fail "stack disappeared during WireGuard teardown verification"
+    jq -e --arg retain "$retain_resources" '.Stacks[0] |
+        (.StackStatus == "UPDATE_COMPLETE" or .StackStatus == "CREATE_COMPLETE") and
+        ([.Parameters[] | select(.ParameterKey == "EnableWireGuardGateway") | .ParameterValue] == ["false"]) and
+        ([.Parameters[] | select(.ParameterKey == "RetainTigerBeetleProcessorVpcCleanupResources") | .ParameterValue] == [$retain])' \
+        <<<"$CLEANUP_STACK_DESCRIPTION" >/dev/null ||
+        fail "WireGuard teardown state is unverified; dependent resources remain"
+}
+
+run_owned_resource_cleanup() {
+    local stack_status resources
+    need_command aws
+    need_command jq
+    printf '==> Cleanup permanently deletes owned Operations, Events, every counter in an owned table, and queued messages. Native state is unchanged.\n'
+    prepare_aws_sso_session "$PROFILE"
+    if ! inspect_cleanup_stack; then
+        printf '==> Stack %s is already absent; no deletion attempted.\n' "$STACK_NAME"
+        return 0
+    fi
+    STACK_NAME="$(jq -r '.Stacks[0].StackId' <<<"$CLEANUP_STACK_DESCRIPTION")"
+    stack_status="$(jq -r '.Stacks[0].StackStatus' <<<"$CLEANUP_STACK_DESCRIPTION")"
+    printf '==> Cleanup stack ID: %s (use this ID to resume verification after deletion).\n' "$STACK_NAME"
+    case "$stack_status" in
+        DELETE_IN_PROGRESS | DELETE_COMPLETE) ;;
+        *_IN_PROGRESS) fail "stack is $stack_status; wait for the active operation to finish before retrying --cleanup" ;;
+        CREATE_COMPLETE | CREATE_FAILED | ROLLBACK_COMPLETE | ROLLBACK_FAILED | \
+            UPDATE_COMPLETE | UPDATE_FAILED | UPDATE_ROLLBACK_COMPLETE | UPDATE_ROLLBACK_FAILED | \
+            IMPORT_COMPLETE | IMPORT_ROLLBACK_COMPLETE | IMPORT_ROLLBACK_FAILED | DELETE_FAILED)
+            invoke_deployment_controller teardown
+            # Recheck after prerequisites and before the irreversible delete.
+            ensure_stack_not_in_progress
+            aws cloudformation delete-stack --stack-name "$STACK_NAME" \
+                --profile "$PROFILE" --region "$REGION" ||
+                fail "stack deletion request failed; rerun --cleanup to inspect/resume"
+            ;;
+        *) fail "unknown stack status $stack_status; nothing deleted" ;;
+    esac
+    aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" \
+        --profile "$PROFILE" --region "$REGION" ||
+        fail "stack deletion did not complete within the AWS waiter bound; resources may remain; inspect stack events and rerun --cleanup"
+    # JSON output preserves AWS CLI pagination. DELETE_SKIPPED is not completion.
+    resources="$(aws cloudformation list-stack-resources --stack-name "$STACK_NAME" \
+        --output json --profile "$PROFILE" --region "$REGION")" ||
+        fail "could not verify deleted stack resources; cleanup is unverified"
+    jq -e '.StackResourceSummaries | type == "array" and length > 0 and
+        all(.[]; .ResourceStatus == "DELETE_COMPLETE")' <<<"$resources" >/dev/null ||
+        fail "stack contains retained, failed, or unknown resources; cleanup is incomplete"
+    printf '==> Verified deletion of all resources in stack %s. External resources are preserved.\n' "$STACK_NAME"
+}
+
 parse_deployment_options() {
     local configuration_option=""
+    local build_option=""
 
     reject_retired_processor_overrides
     while [ "$#" -gt 0 ]; do
@@ -907,6 +1036,7 @@ parse_deployment_options() {
                 shift
                 ;;
             --use-local-libs)
+                build_option=--use-local-libs
                 USE_LOCAL_LIBS=1
                 shift
                 ;;
@@ -918,7 +1048,12 @@ parse_deployment_options() {
                 DEV=1
                 shift
                 ;;
+            --cleanup)
+                CLEANUP=1
+                shift
+                ;;
             --no-url-check)
+                build_option=--no-url-check
                 CHECK_URL=0
                 shift
                 ;;
@@ -945,6 +1080,14 @@ parse_deployment_options() {
             *) fail "unknown option: $1" ;;
         esac
     done
+    if [ "$CLEANUP" -eq 1 ]; then
+        [ "$DEV" -eq 0 ] && [ "$DRY_RUN" -eq 0 ] ||
+            fail "--cleanup is teardown-only and cannot be combined with --dev or --dry-run"
+        [ -z "$configuration_option$build_option" ] ||
+            fail "--cleanup accepts only profile, region, and stack selection; remove deployment/build options"
+        [ "$DEPLOYMENT_CONTROLLER" = preserve_wireguard_state ] ||
+            fail "--cleanup uses deploy.sh's guarded teardown controller; custom or WireGuard deployment controllers are incompatible"
+    fi
     if [ "$DEV" -eq 1 ]; then
         [ -z "$configuration_option" ] ||
             fail "$configuration_option requires a full deployment; --dev syncs code only"
@@ -1013,6 +1156,12 @@ package_lambda_archives() {
 
 run_deployment() {
     parse_deployment_options "$@"
+    if [ "$CLEANUP" -eq 1 ]; then
+        cd "$(dirname "${BASH_SOURCE[0]}")"
+        trap deployment_cleanup EXIT
+        run_owned_resource_cleanup
+        return
+    fi
     if [ "$DEV" -eq 0 ]; then
         validate_tiger_beetle_completion_processor_name
         validate_seat_configuration

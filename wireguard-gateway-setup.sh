@@ -1802,6 +1802,10 @@ deploy_wireguard_cleanup_phase() {
     local VPC_ID="$WIREGUARD_CLEANUP_VPC_ID"
     local LAMBDA_ROUTE_TABLE_ID="$WIREGUARD_CLEANUP_ROUTE_TABLE_ID"
 
+    if [ "$CLEANUP" -eq 1 ]; then
+        update_wireguard_cleanup_state "$retain_cleanup_resources"
+        return
+    fi
     deploy_wireguard_stack_phase "$retain_cleanup_resources" "$phase_description"
 }
 
@@ -1835,6 +1839,8 @@ build_wireguard_parameter_reset_overrides() {
 }
 
 clear_saved_wireguard_parameters() {
+    # Owned-resource teardown deletes the stack next, including saved inputs.
+    [ "$CLEANUP" -eq 0 ] || return 0
     build_wireguard_parameter_reset_overrides
     deploy_stack_phase "Clearing saved WireGuard inputs"
 }

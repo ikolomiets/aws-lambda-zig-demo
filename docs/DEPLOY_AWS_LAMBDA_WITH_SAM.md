@@ -1241,7 +1241,9 @@ Routine `deploy.sh` runs preserve all existing WireGuard-related CloudFormation
 parameters, whether the gateway is enabled or disabled. A new stack uses the
 template defaults and remains disabled. Gateway flags are rejected by
 `deploy.sh`, while gateway-specific environment variables are not read; use
-`wireguard-gateway-setup.sh` for any gateway lifecycle change. A routine
+`wireguard-gateway-setup.sh` for gateway configuration changes. The explicit
+[`deploy.sh --cleanup` teardown](#13-delete-the-sam-stack) also completes guarded
+disablement before deleting owned resources. A routine
 deployment also rejects the internal retained-cleanup state until explicit
 teardown finishes.
 
@@ -2603,29 +2605,71 @@ SAM uploads all six packages and updates their CloudFormation-managed Lambda fun
 
 ## 13. Delete the SAM stack
 
-If the WireGuard gateway is enabled or retained cleanup is in progress, first
-run the guarded disable flow:
+Explicit owned-resource teardown is a separate mode:
 
 ```sh
-./wireguard-gateway-setup.sh --disable
-```
-
-This detaches TigerBeetle processor, waits for every published version and Lambda-created
-ENI to release the retained security group, then removes the stack-owned EIGW,
-IPv6 route, security group, and ENI-management IAM before clearing saved
-gateway inputs. A timed-out run leaves those resources retained; rerun the
-same command to resume. Do not replace this sequence with direct deletion of
-an enabled stack.
-
-Then remove all six SAM-managed functions and roles, Operations and Events,
-the owned counter table, all four queues, Function URLs, permissions, and any remaining stack resources:
-
-```sh
-sam delete \
+./deploy.sh --cleanup \
   --stack-name aws-lambda-zig-demo \
   --profile dev \
   --region ca-central-1
 ```
+
+**This permanently deletes owned data.** Cleanup removes all six SAM-managed
+functions and roles, Operations and Events, every counter in an owned counter
+table, all four queues and queued messages, Function URLs, permissions, and the
+remaining stack resources. It preserves a referenced counter table and every
+counter in that table, regardless of the selected counter ID.
+
+Cleanup accepts only stack/profile/Region selection. It rejects `--dev`,
+`--dry-run`, build and configuration flags, URL-check flags, custom deployment
+controllers, and invocation through `wireguard-gateway-setup.sh`. It requires
+AWS CLI, `jq`, Bash, and a fresh SSO login using the selected profile. It does
+not require Zig, SAM, Lambda archives, PASETO keys, counter initialization, or a
+working counter record. Ordinary full deployment never invokes this mode.
+
+When the gateway is enabled or retained cleanup is in progress, cleanup first
+reuses the guarded disable sequence: verify ownership of the old EIGW and IPv6
+route, detach the deployed TigerBeetle processor while retaining network cleanup
+resources and ENI-management IAM, wait for the current function and every
+published version to detach and for zero Lambda ENIs on the retained security
+group, then remove retained resources. The VPC wait retains its approximately
+20-minute bound and `VPC_CLEANUP_MAX_ATTEMPTS`/`VPC_CLEANUP_POLL_SECONDS` controls.
+Any failed inspection, unresolved version/ENI, or failed update stops teardown
+before deleting dependent resources or tables. Rerun `--cleanup` to resume.
+Saved optional gateway parameters disappear with the stack, so cleanup omits
+the separate parameter-reset update used by gateway-only disablement.
+
+These prerequisite updates use the deployed template with
+[`UpdateStack --use-previous-template`](https://docs.aws.amazon.com/cli/latest/reference/cloudformation/update-stack.html).
+Only `EnableWireGuardGateway` and `RetainTigerBeetleProcessorVpcCleanupResources`
+change; all other parameters use `UsePreviousValue=true`, preserving deployed
+function names, code, allocator binding, and authentication settings. The
+controller receives teardown and exit-cleanup phases without deployment planning,
+code deployment, or output/smoke phases. Gateway-only disablement remains
+available through `./wireguard-gateway-setup.sh --disable`.
+
+The helper prints and pins the inspected immutable stack ID before mutation.
+It issues a normal `DeleteStack`, waits with the
+[bounded AWS deletion waiter](https://docs.aws.amazon.com/cli/latest/reference/cloudformation/wait/stack-delete-complete.html)
+(30-second polls, up to 120 failed checks), then verifies every automatically
+paginated `ListStackResources` result is `DELETE_COMPLETE`. Retained/skipped,
+failed, unknown, empty, or unreadable results fail verification. It never uses
+force deletion or deletes resources outside CloudFormation ownership. The
+operator needs `cloudformation:DescribeStacks`, `ListStackResources`, `DeleteStack`,
+and, when WireGuard is active/retained, `UpdateStack`, existing Lambda/EC2
+inspection permissions and permissions for the stack's resource lifecycle.
+Runtime IAM is unchanged.
+
+An active non-deletion stack update stops cleanup. `DELETE_IN_PROGRESS` resumes
+the waiter without reissuing deletion; `DELETE_FAILED` retries normal deletion.
+After interruption, repeat the command. To verify a stack already deleted, pass
+the printed immutable ID as `--stack-name`; CloudFormation retains its
+[resource history for up to 90 days](https://docs.aws.amazon.com/cli/latest/reference/cloudformation/list-stack-resources.html).
+An explicit stack-not-found response reports already absent without claiming
+resource-level verification or searching for orphan resources. Access, transport,
+and malformed-response failures remain errors. A failed verification requires
+inspection of that stack ID and its events; cleanup offers no orphan-removal or
+force-delete path.
 
 This deletes only resources owned by the SAM stack. The operations table has
 `DeletionPolicy: Delete` and `UpdateReplacePolicy: Delete`, so deleting the
@@ -2636,6 +2680,12 @@ permanently removes Events and every counter in an owned table; referenced
 counter tables remain with their owner. All four queues are deleted with their
 queued messages. None has a dead-letter queue
 or another retention/replay resource.
+
+Recreating AWS tables does not reset the externally hosted TigerBeetle state or
+repair lost allocator history. Native accounts and transfers can still contain
+previous ledger values after Events or counters disappear. This helper provides
+no native reset, counter recycling, allocator repair, or automatic reconciliation;
+creating or initializing a new table/ID is not recovery of an established allocator.
 
 The guarded disable terminates the EC2 gateway, releases its Elastic IP,
 removes both stack-owned routes and security groups, and deletes the

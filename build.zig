@@ -952,6 +952,8 @@ pub fn build(b: *std.Build) void {
     cleanup_lifecycle_test.addFileArg(
         b.path("tests/deploy_cleanup_lifecycle_test.sh"),
     );
+    const owned_cleanup_test = b.addSystemCommand(&.{"bash"});
+    owned_cleanup_test.addFileArg(b.path("tests/deploy_owned_cleanup_test.sh"));
 
     const gateway_interface_test = b.addSystemCommand(&.{"bash"});
     gateway_interface_test.addFileArg(
@@ -980,6 +982,7 @@ pub fn build(b: *std.Build) void {
     );
     deploy_test_step.dependOn(&wireguard_discovery_test.step);
     deploy_test_step.dependOn(&cleanup_lifecycle_test.step);
+    deploy_test_step.dependOn(&owned_cleanup_test.step);
     deploy_test_step.dependOn(&gateway_interface_test.step);
     deploy_test_step.dependOn(&processor_interface_test.step);
     deploy_test_step.dependOn(&development_deployment_test.step);
