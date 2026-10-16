@@ -15,7 +15,7 @@ Usage:
 
 Defaults: PROFILE=dev, REGION=ca-central-1, STACK_NAME=aws-lambda-zig-demo.
 Creation inserts validated creating metadata only; it does not provision native resources.
-Execution requires the selected stack's SeatEventsTable. Deployment wiring is added separately.
+Execution resolves the selected stack's SeatEventsTable physical resource.
 USAGE
 }
 

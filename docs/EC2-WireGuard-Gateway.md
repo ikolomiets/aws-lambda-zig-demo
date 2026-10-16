@@ -395,7 +395,7 @@ non-SSO profiles are unsupported. Dry runs make no AWS authentication calls.
 The helper stops before local work when the stack status ends in
 `_IN_PROGRESS`.
 
-The helper then runs Zig formatting and tests, builds all four Linux ARM64
+The helper then runs Zig formatting and tests, builds all six Linux ARM64
 bootstraps, refreshes their zip archives, and runs both SAM validations. First
 enablement preflights a VPC with no EIGW or `::/0` conflict, then uses one SAM
 update. CloudFormation creates `TigerBeetleProcessorEgressOnlyInternetGateway`, adds

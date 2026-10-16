@@ -8,6 +8,10 @@ INTAKE_FUNCTION_NAME="${INTAKE_FUNCTION_NAME:-intake-lambda}"
 QUERY_FUNCTION_NAME="${QUERY_FUNCTION_NAME:-query-lambda}"
 TIGER_BEETLE_PROCESSOR_NAME="${TIGER_BEETLE_PROCESSOR_NAME:-tiger-beetle-processor}"
 TIGER_BEETLE_COMPLETION_PROCESSOR_NAME="${TIGER_BEETLE_COMPLETION_PROCESSOR_NAME:-tiger-beetle-completion-processor}"
+SEAT_RESERVATION_PROCESSOR_NAME="${SEAT_RESERVATION_PROCESSOR_NAME-seat-reservation-processor}"
+SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME="${SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME-seat-reservation-completion-processor}"
+EXISTING_LEDGER_COUNTER_TABLE_NAME="${EXISTING_LEDGER_COUNTER_TABLE_NAME-}"
+LEDGER_COUNTER_ID="${LEDGER_COUNTER_ID-global}"
 TIGERBEETLE_CLUSTER_ID="${TIGERBEETLE_CLUSTER_ID:-0}"
 TIGERBEETLE_ADDRESSES="${TIGERBEETLE_ADDRESSES:-10.200.0.2:3000}"
 LAMBDA_PRINCIPAL="${LAMBDA_PRINCIPAL:-*}"
@@ -45,6 +49,14 @@ Options:
                          Completion processor name. Defaults to tiger-beetle-completion-processor.
   --tigerbeetle-cluster-id ID
                          Unsigned decimal cluster ID. Defaults to 0.
+  --seat-reservation-processor-name NAME
+                         Seat submission name. Defaults to seat-reservation-processor.
+  --seat-reservation-completion-processor-name NAME
+                         Seat completion name. Defaults to seat-reservation-completion-processor.
+  --existing-ledger-counter-table-name NAME
+                         Reference a counter table in this account and Region.
+                         Omit to create a stack-owned table.
+  --ledger-counter-id ID  Counter record ID, 1–128 ASCII bytes. Defaults to global.
   --tigerbeetle-addresses ADDRESSES
                          Comma-separated replica addresses. Defaults to 10.200.0.2:3000.
   --lambda-principal VALUE
@@ -63,6 +75,8 @@ Environment overrides:
   PROFILE, REGION, STACK_NAME, INTAKE_FUNCTION_NAME, QUERY_FUNCTION_NAME,
   TIGER_BEETLE_PROCESSOR_NAME, TIGER_BEETLE_COMPLETION_PROCESSOR_NAME, TIGERBEETLE_CLUSTER_ID,
   TIGERBEETLE_ADDRESSES, LAMBDA_PRINCIPAL, PASETO_PRIVATE_KEY,
+  SEAT_RESERVATION_PROCESSOR_NAME, SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME,
+  EXISTING_LEDGER_COUNTER_TABLE_NAME, LEDGER_COUNTER_ID,
   PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT
 
 Authentication:
@@ -141,6 +155,35 @@ validate_tigerbeetle_configuration() {
         fail "TIGERBEETLE_ADDRESSES must be at most 4096 characters"
     [[ ! "$TIGERBEETLE_ADDRESSES" =~ [[:space:]] ]] ||
         fail "TIGERBEETLE_ADDRESSES must not contain whitespace"
+}
+
+validate_seat_configuration() {
+    local name
+    for name in "$SEAT_RESERVATION_PROCESSOR_NAME" "$SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME"; do
+        [ -n "$name" ] && [ "${#name}" -le 64 ] &&
+            [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] ||
+            fail "seat Lambda names must contain 1–64 letters, digits, hyphens, or underscores"
+    done
+    [ "${#LEDGER_COUNTER_ID}" -ge 1 ] && [ "${#LEDGER_COUNTER_ID}" -le 128 ] &&
+        [[ "$LEDGER_COUNTER_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+        fail "LEDGER_COUNTER_ID must contain 1–128 ASCII bytes: alphanumeric first, then letters, digits, '.', '_' or '-'"
+    if [ -n "$EXISTING_LEDGER_COUNTER_TABLE_NAME" ]; then
+        [ "${#EXISTING_LEDGER_COUNTER_TABLE_NAME}" -ge 3 ] &&
+            [ "${#EXISTING_LEDGER_COUNTER_TABLE_NAME}" -le 255 ] &&
+            [[ "$EXISTING_LEDGER_COUNTER_TABLE_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] ||
+            fail "EXISTING_LEDGER_COUNTER_TABLE_NAME must be a 3–255 character physical table name"
+    fi
+}
+
+require_seat_development_baseline() {
+    local seat_output_count
+    seat_output_count="$(aws cloudformation describe-stacks \
+        --stack-name "$STACK_NAME" \
+        --query "length(Stacks[0].Outputs[?OutputKey=='SeatReservationProcessorName' || OutputKey=='SeatReservationCompletionProcessorName'])" \
+        --output text --profile "$PROFILE" --region "$REGION")" ||
+        fail "could not verify the six-function baseline; use full deployment before seat development sync"
+    [ "$seat_output_count" = 2 ] ||
+        fail "seat development sync requires a full deployment of the six-function baseline first"
 }
 
 clear_aws_credentials() {
@@ -348,11 +391,17 @@ build_sam_parameter_overrides() {
         "QueryFunctionName=$QUERY_FUNCTION_NAME"
         "TigerBeetleProcessorName=$TIGER_BEETLE_PROCESSOR_NAME"
         "TigerBeetleCompletionProcessorName=$TIGER_BEETLE_COMPLETION_PROCESSOR_NAME"
+        "SeatReservationProcessorName=$SEAT_RESERVATION_PROCESSOR_NAME"
+        "SeatReservationCompletionProcessorName=$SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME"
         "TigerBeetleClusterId=$TIGERBEETLE_CLUSTER_ID"
         "TigerBeetleAddresses=$TIGERBEETLE_ADDRESSES"
         "LambdaPrincipal=$LAMBDA_PRINCIPAL"
         "PasetoPublicKey=$PASETO_PUBLIC_KEY"
     )
+    if [ -n "$EXISTING_LEDGER_COUNTER_TABLE_NAME" ]; then
+        SAM_PARAMETER_OVERRIDES+=("ExistingLedgerCounterTableName=$EXISTING_LEDGER_COUNTER_TABLE_NAME")
+    fi
+    SAM_PARAMETER_OVERRIDES+=("LedgerCounterId=$LEDGER_COUNTER_ID")
     # Bash 3.2 treats an empty array expansion as unset under nounset.
     if [ "${#DEPLOYMENT_PARAMETER_OVERRIDES[@]}" -gt 0 ]; then
         SAM_PARAMETER_OVERRIDES+=("${DEPLOYMENT_PARAMETER_OVERRIDES[@]}")
@@ -460,10 +509,11 @@ validate_deployed_function_names() {
     local stack_outputs line output_key output_value
     local deployed_intake_name="" deployed_query_name=""
     local deployed_tiger_beetle_processor_name="" deployed_tiger_beetle_completion_processor_name=""
+    local deployed_seat_processor_name="" deployed_seat_completion_processor_name=""
 
     stack_outputs="$(aws cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='IntakeFunctionName' || OutputKey=='QueryFunctionName' || OutputKey=='TigerBeetleProcessorName' || OutputKey=='TigerBeetleCompletionProcessorName'].join('|', [OutputKey,OutputValue])" \
+        --query "Stacks[0].Outputs[?OutputKey=='IntakeFunctionName' || OutputKey=='QueryFunctionName' || OutputKey=='TigerBeetleProcessorName' || OutputKey=='TigerBeetleCompletionProcessorName' || OutputKey=='SeatReservationProcessorName' || OutputKey=='SeatReservationCompletionProcessorName'].join('|', [OutputKey,OutputValue])" \
         --output text \
         --profile "$PROFILE" \
         --region "$REGION")" ||
@@ -478,6 +528,8 @@ validate_deployed_function_names() {
             QueryFunctionName) deployed_query_name="$output_value" ;;
             TigerBeetleProcessorName) deployed_tiger_beetle_processor_name="$output_value" ;;
             TigerBeetleCompletionProcessorName) deployed_tiger_beetle_completion_processor_name="$output_value" ;;
+            SeatReservationProcessorName) deployed_seat_processor_name="$output_value" ;;
+            SeatReservationCompletionProcessorName) deployed_seat_completion_processor_name="$output_value" ;;
             *) fail "stack returned an unexpected Lambda function-name output" ;;
         esac
     done <<<"${stack_outputs//$'\t'/$'\n'}"
@@ -490,6 +542,10 @@ validate_deployed_function_names() {
         fail "stack output TigerBeetleProcessorName does not match the requested name"
     [ "$deployed_tiger_beetle_completion_processor_name" = "$TIGER_BEETLE_COMPLETION_PROCESSOR_NAME" ] ||
         fail "stack output TigerBeetleCompletionProcessorName does not match the requested name"
+    [ "$deployed_seat_processor_name" = "$SEAT_RESERVATION_PROCESSOR_NAME" ] ||
+        fail "stack output SeatReservationProcessorName does not match the requested name"
+    [ "$deployed_seat_completion_processor_name" = "$SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME" ] ||
+        fail "stack output SeatReservationCompletionProcessorName does not match the requested name"
     printf '==> Deployed Lambda function names match requested values\n'
 }
 
@@ -501,6 +557,8 @@ parse_deployment_options() {
         case "${1%%=*}" in
             --intake-function-name | --query-function-name | \
                 --tiger-beetle-processor-name | --tiger-beetle-completion-processor-name | \
+                --seat-reservation-processor-name | --seat-reservation-completion-processor-name | \
+                --existing-ledger-counter-table-name | --ledger-counter-id | \
                 --tigerbeetle-cluster-id | --tigerbeetle-addresses | --lambda-principal)
                 configuration_option="${1%%=*}"
                 ;;
@@ -589,6 +647,27 @@ parse_deployment_options() {
                     fail "empty value for --tiger-beetle-completion-processor-name"
                 shift
                 ;;
+            --seat-reservation-processor-name | --seat-reservation-processor-name=* | \
+                --seat-reservation-completion-processor-name | --seat-reservation-completion-processor-name=* | \
+                --existing-ledger-counter-table-name | --existing-ledger-counter-table-name=* | \
+                --ledger-counter-id | --ledger-counter-id=*)
+                local seat_option="${1%%=*}" seat_value
+                if [[ "$1" = *=* ]]; then
+                    seat_value="${1#*=}"
+                    [ -n "$seat_value" ] || fail "empty value for $seat_option"
+                    shift
+                else
+                    need_value "$1" "${2:-}"
+                    seat_value="$2"
+                    shift 2
+                fi
+                case "$seat_option" in
+                    --seat-reservation-processor-name) SEAT_RESERVATION_PROCESSOR_NAME="$seat_value" ;;
+                    --seat-reservation-completion-processor-name) SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME="$seat_value" ;;
+                    --existing-ledger-counter-table-name) EXISTING_LEDGER_COUNTER_TABLE_NAME="$seat_value" ;;
+                    --ledger-counter-id) LEDGER_COUNTER_ID="$seat_value" ;;
+                esac
+                ;;
             --tigerbeetle-cluster-id)
                 need_value "$1" "${2:-}"
                 TIGERBEETLE_CLUSTER_ID="$2"
@@ -674,7 +753,9 @@ validate_lambda_bootstraps() {
     for bootstrap in \
         zig-out/bin/intake/bootstrap \
         zig-out/bin/query/bootstrap \
-        zig-out/bin/tiger_beetle_completion_processor/bootstrap
+        zig-out/bin/tiger_beetle_completion_processor/bootstrap \
+        zig-out/bin/seat_reservation_processor/bootstrap \
+        zig-out/bin/seat_reservation_completion_processor/bootstrap
     do
         artifact_type="$(file "$bootstrap")"
         case "$artifact_type" in
@@ -699,17 +780,23 @@ package_lambda_archives() {
         intake-lambda.zip \
         query-lambda.zip \
         tiger-beetle-processor.zip \
-        tiger-beetle-completion-processor.zip
+        tiger-beetle-completion-processor.zip \
+        seat-reservation-processor.zip \
+        seat-reservation-completion-processor.zip
     zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
     zip -qj query-lambda.zip zig-out/bin/query/bootstrap
     zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
     zip -qj tiger-beetle-completion-processor.zip zig-out/bin/tiger_beetle_completion_processor/bootstrap
+    zip -qj seat-reservation-processor.zip zig-out/bin/seat_reservation_processor/bootstrap
+    zip -qj seat-reservation-completion-processor.zip zig-out/bin/seat_reservation_completion_processor/bootstrap
 
     for archive in \
         intake-lambda.zip \
         query-lambda.zip \
         tiger-beetle-processor.zip \
-        tiger-beetle-completion-processor.zip
+        tiger-beetle-completion-processor.zip \
+        seat-reservation-processor.zip \
+        seat-reservation-completion-processor.zip
     do
         [ -s "$archive" ] || fail "$archive was not created or is empty"
         archive_contents="$(unzip -Z1 "$archive")"
@@ -722,6 +809,7 @@ run_deployment() {
     parse_deployment_options "$@"
     if [ "$DEV" -eq 0 ]; then
         validate_tiger_beetle_completion_processor_name
+        validate_seat_configuration
     fi
 
     cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -741,6 +829,9 @@ run_deployment() {
         need_command aws
         prepare_aws_sso_session "$PROFILE"
         ensure_stack_not_in_progress
+        if [ "$DEV" -eq 1 ]; then
+            require_seat_development_baseline
+        fi
         if [ "$DEV" -eq 0 ]; then
             validate_existing_intake_name "$INTAKE_FUNCTION_NAME"
         fi
@@ -766,11 +857,9 @@ run_deployment() {
     if [ "$DRY_RUN" -eq 0 ] && [ "$CHECK_URL" -eq 1 ]; then
         need_command curl
     fi
-    if [ "$DEV" -eq 1 ]; then
-        [ "$(zig version)" = 0.16.0 ] || fail "development builds require Zig 0.16.0"
-        [ -f ../zig/lib/std/Io/net/HostName.zig ] ||
-            fail "required sibling Zig standard library missing: ../zig/lib/std/Io/net/HostName.zig"
-    fi
+    [ "$(zig version)" = 0.16.0 ] || fail "Lambda builds require Zig 0.16.0"
+    [ -f ../zig/lib/std/Io/net/HostName.zig ] ||
+        fail "required sibling Zig standard library missing: ../zig/lib/std/Io/net/HostName.zig"
 
     LOCAL_FORKS=()
     if [ "$USE_LOCAL_LIBS" -eq 1 ]; then
@@ -844,7 +933,9 @@ run_deployment() {
             --resource-id IntakeFunction \
             --resource-id QueryFunction \
             --resource-id TigerBeetleProcessor \
-            --resource-id TigerBeetleCompletionProcessor <<< 'Y' ||
+            --resource-id TigerBeetleCompletionProcessor \
+            --resource-id SeatReservationProcessor \
+            --resource-id SeatReservationCompletionProcessor <<< 'Y' ||
             fail "development code sync failed; some functions may already have updated"
     else
         deploy_stack_and_resolve_controller_outputs

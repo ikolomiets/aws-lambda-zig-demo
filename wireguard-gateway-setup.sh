@@ -56,6 +56,13 @@ Options:
                          TigerBeetle processor name. Defaults to tiger-beetle-processor.
   --tiger-beetle-completion-processor-name NAME
                          Completion processor name. Defaults to tiger-beetle-completion-processor.
+  --seat-reservation-processor-name NAME
+                         Seat submission Lambda name.
+  --seat-reservation-completion-processor-name NAME
+                         Seat completion Lambda name.
+  --existing-ledger-counter-table-name NAME
+                         Reference an existing counter table in this account and Region.
+  --ledger-counter-id ID  Select the counter record. Defaults to global.
   --tigerbeetle-cluster-id ID
                          Unsigned decimal cluster ID. Defaults to 0.
   --tigerbeetle-addresses ADDRESSES
@@ -2108,6 +2115,8 @@ parse_wireguard_options() {
                     --profile | --region | --stack-name | \
                         --intake-function-name | --query-function-name | \
                         --tiger-beetle-processor-name | --tiger-beetle-completion-processor-name | \
+                        --seat-reservation-processor-name | --seat-reservation-completion-processor-name | \
+                        --existing-ledger-counter-table-name | --ledger-counter-id | \
                         --tigerbeetle-cluster-id | \
                         --tigerbeetle-addresses | --lambda-principal)
                         need_value "$1" "${2:-}"

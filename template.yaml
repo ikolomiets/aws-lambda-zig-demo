@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Deploy intake and query Lambdas plus TigerBeetle and Completion processors with an optional WireGuard gateway.
+Description: Deploy six operation and seat Lambdas with an optional WireGuard gateway.
 
 # Opt-in network parameters intentionally default to empty and are guarded by a Rule.
 Metadata:
@@ -34,6 +34,32 @@ Parameters:
     AllowedPattern: '^[0-9]{1,39}$'
     ConstraintDescription: Must be an unsigned decimal 128-bit cluster ID.
     Description: TigerBeetle cluster ID used by the TigerBeetle processor.
+  SeatReservationProcessorName:
+    Type: String
+    Default: seat-reservation-processor
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[A-Za-z0-9_-]+$'
+    Description: Name of the seat submission Lambda.
+  SeatReservationCompletionProcessorName:
+    Type: String
+    Default: seat-reservation-completion-processor
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '^[A-Za-z0-9_-]+$'
+    Description: Name of the seat completion Lambda.
+  ExistingLedgerCounterTableName:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[A-Za-z0-9_.-]{3,255}$'
+    Description: Existing counter table in this account and Region; empty creates an owned table.
+  LedgerCounterId:
+    Type: String
+    Default: global
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
+    Description: Selected counter record; share both table and ID for one ledger sequence.
   TigerBeetleAddresses:
     Type: String
     Default: 10.200.0.2:3000
@@ -159,12 +185,44 @@ Rules:
         AssertDescription: LambdaRouteTableId is required while TigerBeetle processor VPC cleanup resources are retained.
 
 Conditions:
+  OwnLedgerCounterTable: !Equals [!Ref ExistingLedgerCounterTableName, ""]
   WireGuardGatewayEnabled: !Equals [!Ref EnableWireGuardGateway, "true"]
   TigerBeetleProcessorVpcCleanupResourcesRetained: !Or
     - !Condition WireGuardGatewayEnabled
     - !Equals [!Ref RetainTigerBeetleProcessorVpcCleanupResources, "true"]
 
 Resources:
+  SeatEventsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenant
+          AttributeType: S
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant
+          KeyType: HASH
+        - AttributeName: event_id
+          KeyType: RANGE
+
+  LedgerCounterTable:
+    Type: AWS::DynamoDB::Table
+    Condition: OwnLedgerCounterTable
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: counter_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: counter_id
+          KeyType: HASH
+
   OperationsTable:
     Type: AWS::DynamoDB::Table
     DeletionPolicy: Delete
@@ -198,6 +256,16 @@ Resources:
     Properties:
       VisibilityTimeout: 90
 
+  SeatReservationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 90
+
+  SeatReservationCompletionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 90
+
   IntakeFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -221,11 +289,14 @@ Resources:
             - Effect: Allow
               Action:
                 - sqs:SendMessage
-              Resource: !GetAtt TigerBeetleQueue.Arn
+              Resource:
+                - !GetAtt TigerBeetleQueue.Arn
+                - !GetAtt SeatReservationQueue.Arn
       Environment:
         Variables:
           LAMBDA_PRINCIPAL: !Ref LambdaPrincipal
           TigerBeetleQueue: !Ref TigerBeetleQueue
+          SeatReservationQueue: !Ref SeatReservationQueue
           OPERATIONS_TABLE_NAME: !Ref OperationsTable
           PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 
@@ -341,7 +412,9 @@ Resources:
               - Effect: Allow
                 Action:
                   - sqs:SendMessage
-                Resource: !GetAtt CompletionQueue.Arn
+                Resource:
+                  - !GetAtt CompletionQueue.Arn
+                  - !GetAtt SeatReservationCompletionQueue.Arn
         - !If
           - TigerBeetleProcessorVpcCleanupResourcesRetained
           - PolicyName: TigerBeetleProcessorVpcAccess
@@ -464,6 +537,97 @@ Resources:
       MaximumBatchingWindowInSeconds: 0
       FunctionResponseTypes:
         - ReportBatchItemFailures
+
+  SeatReservationProcessor:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref SeatReservationProcessorName
+      Description: SQS-driven seat submission without native linkage or VPC attachment.
+      CodeUri: seat-reservation-processor.zip
+      Runtime: provided.al2023
+      Handler: bootstrap
+      Architectures: [arm64]
+      MemorySize: 128
+      Timeout: 15
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+              Resource: !GetAtt SeatReservationQueue.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !GetAtt SeatEventsTable.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !If
+                - OwnLedgerCounterTable
+                - !GetAtt LedgerCounterTable.Arn
+                - !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ExistingLedgerCounterTableName}
+            - Effect: Allow
+              Action: [sqs:SendMessage]
+              Resource:
+                - !GetAtt TigerBeetleQueue.Arn
+                - !GetAtt SeatReservationCompletionQueue.Arn
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref SeatEventsTable
+          LEDGER_COUNTER_TABLE_NAME: !If
+            - OwnLedgerCounterTable
+            - !Ref LedgerCounterTable
+            - !Ref ExistingLedgerCounterTableName
+          LEDGER_COUNTER_ID: !Ref LedgerCounterId
+          TigerBeetleQueue: !Ref TigerBeetleQueue
+          SeatReservationCompletionQueue: !Ref SeatReservationCompletionQueue
+
+  SeatReservationProcessorQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref SeatReservationProcessor
+      EventSourceArn: !GetAtt SeatReservationQueue.Arn
+      Enabled: true
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 0
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  SeatReservationCompletionProcessor:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Ref SeatReservationCompletionProcessorName
+      Description: SQS-driven seat finalization with atomic Event and Operation updates.
+      CodeUri: seat-reservation-completion-processor.zip
+      Runtime: provided.al2023
+      Handler: bootstrap
+      Architectures: [arm64]
+      MemorySize: 128
+      Timeout: 15
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+              Resource: !GetAtt SeatReservationCompletionQueue.Arn
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource:
+                - !GetAtt SeatEventsTable.Arn
+                - !GetAtt OperationsTable.Arn
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref SeatEventsTable
+          OPERATIONS_TABLE_NAME: !Ref OperationsTable
+
+  SeatReservationCompletionProcessorQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref SeatReservationCompletionProcessor
+      EventSourceArn: !GetAtt SeatReservationCompletionQueue.Arn
+      Enabled: true
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 0
+      FunctionResponseTypes: [ReportBatchItemFailures]
 
   TigerBeetleProcessorSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -716,6 +880,36 @@ Resources:
       InstanceId: !Ref WireGuardGatewayInstance
 
 Outputs:
+  SeatReservationProcessorName:
+    Description: Deployed seat submission Lambda name.
+    Value: !Ref SeatReservationProcessor
+  SeatReservationProcessorArn:
+    Description: Deployed seat submission Lambda ARN.
+    Value: !GetAtt SeatReservationProcessor.Arn
+  SeatReservationCompletionProcessorName:
+    Description: Deployed seat completion Lambda name.
+    Value: !Ref SeatReservationCompletionProcessor
+  SeatReservationCompletionProcessorArn:
+    Description: Deployed seat completion Lambda ARN.
+    Value: !GetAtt SeatReservationCompletionProcessor.Arn
+  SeatEventsTableName:
+    Description: Physical durable Events table in this account and Region.
+    Value: !Ref SeatEventsTable
+  LedgerCounterTableName:
+    Description: Actual owned or referenced physical counter table.
+    Value: !If
+      - OwnLedgerCounterTable
+      - !Ref LedgerCounterTable
+      - !Ref ExistingLedgerCounterTableName
+  LedgerCounterId:
+    Description: Configured counter ID; share this and the physical table for one sequence.
+    Value: !Ref LedgerCounterId
+  SeatReservationQueueUrl:
+    Description: Internal seat submission queue URL.
+    Value: !Ref SeatReservationQueue
+  SeatReservationCompletionQueueUrl:
+    Description: Internal seat completion queue URL.
+    Value: !Ref SeatReservationCompletionQueue
   IntakeFunctionName:
     Description: Deployed operation intake Lambda function name.
     Value: !Ref IntakeFunction

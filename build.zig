@@ -84,6 +84,14 @@ fn resolve_tiger_beetle_processor_target(
 }
 
 pub fn build(b: *std.Build) void {
+    const optimize = b.standardOptimizeOption(.{
+        .preferred_optimize_mode = .ReleaseSafe,
+    });
+    // Set this before any dependency resolves, including source-path discovery.
+    if (b.release_mode == .any) {
+        std.debug.assert(optimize == .ReleaseSafe);
+        b.release_mode = .safe;
+    }
     const dependency_paths = b.addSystemCommand(&.{ "printf", "%s\t%s\n" });
     for (b.available_deps) |dependency| {
         dependency_paths.addArg(dependency[0]);
@@ -99,14 +107,6 @@ pub fn build(b: *std.Build) void {
     b.step("fmt-check", "Check formatting of project Zig sources and tests")
         .dependOn(&fmt_check.step);
 
-    const optimize = b.standardOptimizeOption(.{
-        .preferred_optimize_mode = .ReleaseSafe,
-    });
-    // Propagate the project's preferred mode to dependencies for bare `--release` builds.
-    if (b.release_mode == .any) {
-        std.debug.assert(optimize == .ReleaseSafe);
-        b.release_mode = .safe;
-    }
     const tigerbeetle_c_artifacts = b.dependency("tigerbeetle_c_artifacts", .{});
     const lambda_arch = b.option(
         lambda.Arch,
@@ -295,6 +295,91 @@ pub fn build(b: *std.Build) void {
         .dest_sub_path = "bootstrap",
     });
     b.getInstallStep().dependOn(&install_tiger_beetle_completion_processor.step);
+
+    const lambda_seat = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/seat_reservation.zig"),
+        .imports = &.{
+            .{ .name = "operation", .module = lambda_operation },
+            .{ .name = "processor_message", .module = lambda_processor_message },
+        },
+    });
+    const lambda_seat_persistence = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/seat_reservation_persistence.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
+            .{ .name = "dynamodb", .module = lambda_dynamodb },
+            .{ .name = "operation", .module = lambda_operation },
+            .{ .name = "operation_persistence", .module = lambda_operation_persistence },
+            .{ .name = "seat_reservation", .module = lambda_seat },
+        },
+    });
+    const lambda_ledger_counter = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/ledger_counter.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
+            .{ .name = "dynamodb", .module = lambda_dynamodb },
+        },
+    });
+    const lambda_seat_submission = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .strip = true,
+        .single_threaded = true,
+        .root_source_file = b.path("src/seat_reservation_processor.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
+            .{ .name = "dynamodb", .module = lambda_dynamodb },
+            .{ .name = "aws-lambda", .module = lambda_runtime },
+            .{ .name = "operation", .module = lambda_operation },
+            .{ .name = "processor_message", .module = lambda_processor_message },
+            .{ .name = "seat_reservation", .module = lambda_seat },
+            .{ .name = "seat_reservation_persistence", .module = lambda_seat_persistence },
+            .{ .name = "ledger_counter", .module = lambda_ledger_counter },
+            .{ .name = "sqs_queue", .module = lambda_sqs_queue },
+        },
+    });
+    const lambda_seat_completion = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .strip = true,
+        .single_threaded = true,
+        .root_source_file = b.path("src/seat_reservation_completion_processor.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
+            .{ .name = "dynamodb", .module = lambda_dynamodb },
+            .{ .name = "aws-lambda", .module = lambda_runtime },
+            .{ .name = "operation", .module = lambda_operation },
+            .{ .name = "operation_persistence", .module = lambda_operation_persistence },
+            .{ .name = "processor_message", .module = lambda_processor_message },
+            .{ .name = "seat_reservation", .module = lambda_seat },
+            .{ .name = "seat_reservation_persistence", .module = lambda_seat_persistence },
+            .{ .name = "seat_reservation_processor", .module = lambda_seat_submission },
+        },
+    });
+    const seat_submission_lambda = b.addExecutable(.{
+        .name = "seat-reservation-processor-bootstrap",
+        .root_module = lambda_seat_submission,
+    });
+    const seat_completion_lambda = b.addExecutable(.{
+        .name = "seat-reservation-completion-processor-bootstrap",
+        .root_module = lambda_seat_completion,
+    });
+    const install_seat_submission = b.addInstallArtifact(seat_submission_lambda, .{
+        .dest_dir = .{ .override = .{ .custom = "bin/seat_reservation_processor" } },
+        .dest_sub_path = "bootstrap",
+    });
+    const install_seat_completion = b.addInstallArtifact(seat_completion_lambda, .{
+        .dest_dir = .{ .override = .{ .custom = "bin/seat_reservation_completion_processor" } },
+        .dest_sub_path = "bootstrap",
+    });
+    b.getInstallStep().dependOn(&install_seat_submission.step);
+    b.getInstallStep().dependOn(&install_seat_completion.step);
 
     const tiger_beetle_processor_mod = b.createModule(.{
         .target = tiger_beetle_processor_target,
@@ -878,6 +963,8 @@ pub fn build(b: *std.Build) void {
 
     const development_deployment_test = b.addSystemCommand(&.{"bash"});
     development_deployment_test.addFileArg(b.path("tests/deploy_development_test.sh"));
+    const lambda_logs_test = b.addSystemCommand(&.{"bash"});
+    lambda_logs_test.addFileArg(b.path("tests/lambda_logs_test.sh"));
     const events_wrapper_test = b.addSystemCommand(&.{"bash"});
     events_wrapper_test.addFileArg(b.path("tests/events_wrapper_test.sh"));
     b.step("test-events-wrapper", "Run mocked Events wrapper tests")
@@ -896,6 +983,7 @@ pub fn build(b: *std.Build) void {
     deploy_test_step.dependOn(&gateway_interface_test.step);
     deploy_test_step.dependOn(&processor_interface_test.step);
     deploy_test_step.dependOn(&development_deployment_test.step);
+    deploy_test_step.dependOn(&lambda_logs_test.step);
     deploy_test_step.dependOn(&events_wrapper_test.step);
     deploy_test_step.dependOn(&ledger_counter_wrapper_test.step);
 

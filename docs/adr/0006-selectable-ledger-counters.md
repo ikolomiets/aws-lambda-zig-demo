@@ -26,4 +26,4 @@ implements the shared allocator API and host tooling. The
 [Seat Reservation reference](../SEAT_RESERVATION.md#global-ledger-allocator) and
 [deployment guide](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#global-ledger-counter-utility)
 own the current contracts. Seat submission uses the trusted configured binding;
-SAM resource wiring remains separate implementation work.
+SAM exposes the actual owned or referenced counter table and configured ID.

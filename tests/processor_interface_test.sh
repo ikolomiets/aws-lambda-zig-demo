@@ -70,6 +70,15 @@ parse_wireguard_options --tiger-beetle-processor-name=equal-tb --tiger-beetle-co
 parse_deployment_options "${COMMON_DEPLOYMENT_ARGS[@]}"
 [ "$TIGER_BEETLE_PROCESSOR_NAME" = equal-tb ] && [ "$TIGER_BEETLE_COMPLETION_PROCESSOR_NAME" = equal-completion ] ||
     fail_test "WireGuard did not forward equals processor arguments"
+parse_wireguard_options --seat-reservation-processor-name chosen-seat \
+    --seat-reservation-completion-processor-name chosen-seat-completion \
+    --existing-ledger-counter-table-name shared-ledgers --ledger-counter-id sequence.B
+parse_deployment_options "${COMMON_DEPLOYMENT_ARGS[@]}"
+[ "$SEAT_RESERVATION_PROCESSOR_NAME" = chosen-seat ] &&
+    [ "$SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME" = chosen-seat-completion ] &&
+    [ "$EXISTING_LEDGER_COUNTER_TABLE_NAME" = shared-ledgers ] &&
+    [ "$LEDGER_COUNTER_ID" = sequence.B ] ||
+    fail_test "WireGuard did not forward seat configuration"
 
 # Keep override argument boundaries intact, including synthetic values with spaces.
 for overrides in empty populated; do
@@ -90,9 +99,9 @@ for overrides in empty populated; do
     contains "$output" 'TigerBeetleProcessorName=env-tb'
     contains "$output" 'TigerBeetleCompletionProcessorName=env-completion'
     if [ "$overrides" = empty ]; then
-        contains "$output" 'ArgumentCount=8'
-    else
         contains "$output" 'ArgumentCount=11'
+    else
+        contains "$output" 'ArgumentCount=14'
         contains "$output" $'EnableWireGuardGateway=true\nWireGuardPrivateKeyParameterName=/fixture path/with spaces\nWireGuardGatewayPublicKey=fixture+key='
     fi
 done

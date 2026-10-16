@@ -4,7 +4,7 @@ A 100% Zig implementation of AWS Lambda functions and runtime, integrated with
 DynamoDB and SQS to create an asynchronous operation-processing framework backed
 by TigerBeetle over a WireGuard VPN.
 
-The project builds custom `provided.al2023` intake, query, TigerBeetle processor, and Completion processor
+The project builds custom `provided.al2023` intake, query, TigerBeetle processor, Completion processor, seat submission, and seat completion
 bootstraps and a host-native PASETO v4.public utility named `paseto`. The
 stack-aware `persistence.sh` and `queue.sh` commands manage Operations in
 DynamoDB and SQS, while `lambda_logs.sh` downloads any function's CloudWatch
@@ -44,8 +44,9 @@ and metadata validation. The host `events` binary and `events.sh` wrapper insert
 validated creating Event metadata and read tenant-scoped records; this utility
 does not provision native resources or run a seat workflow.
 The host `ledger-counter` binary and `ledger-counter.sh` wrapper provide explicit
-first-time initialization, inspection and allocation through one shared global
-ledger sequence. See the [counter utility guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#global-ledger-counter-utility).
+first-time initialization, inspection and allocation through explicitly selected
+Ledger Counters. SAM exposes the actual counter table and selected ID, defaulting
+to `global`; consumers requiring one sequence share both binding components. See the [counter utility guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#global-ledger-counter-utility).
 
 ## Requirements for Zig on AWS Lambda
 
@@ -91,12 +92,14 @@ Verify the ARM64 Linux executables:
 file zig-out/bin/intake/bootstrap \
   zig-out/bin/query/bootstrap \
   zig-out/bin/tiger_beetle_processor/bootstrap \
-  zig-out/bin/tiger_beetle_completion_processor/bootstrap
+  zig-out/bin/tiger_beetle_completion_processor/bootstrap \
+  zig-out/bin/seat_reservation_processor/bootstrap \
+  zig-out/bin/seat_reservation_completion_processor/bootstrap
 ```
 
-Intake, query, and the Completion processor are statically linked and single-threaded. TigerBeetle processor is
+Intake, query, native completion and both seat processors are statically linked and single-threaded. TigerBeetle processor is
 multithread-capable for the TigerBeetle callback thread and is a dynamically
-linked glibc executable. All four are stripped.
+linked glibc executable. All six are stripped.
 
 ```text
 intake/query/tiger-beetle-completion-processor: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
@@ -107,13 +110,18 @@ Package the executables for Lambda when preparing artifacts manually (`deploy.sh
 automatically):
 
 ```sh
+rm -f intake-lambda.zip query-lambda.zip tiger-beetle-processor.zip \
+  tiger-beetle-completion-processor.zip seat-reservation-processor.zip \
+  seat-reservation-completion-processor.zip
 zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
 zip -qj query-lambda.zip zig-out/bin/query/bootstrap
 zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
 zip -qj tiger-beetle-completion-processor.zip zig-out/bin/tiger_beetle_completion_processor/bootstrap
+zip -qj seat-reservation-processor.zip zig-out/bin/seat_reservation_processor/bootstrap
+zip -qj seat-reservation-completion-processor.zip zig-out/bin/seat_reservation_completion_processor/bootstrap
 ```
 
-All four zip archives are intentionally ignored by Git because they are generated
+All six zip archives are intentionally ignored by Git because they are generated
 deployment artifacts.
 
 ## PASETO Authentication
@@ -531,7 +539,7 @@ different value when the function should see a narrower principal string.
 configuration. It is public key material; keep the corresponding private key
 only in the signing environment.
 
-`deploy.sh` builds and packages all four bootstraps, preserves any existing WireGuard state,
+`deploy.sh` builds and packages all six bootstraps, preserves any existing WireGuard state,
 and defaults the TigerBeetle processor and Completion processor names to `tiger-beetle-processor` and `tiger-beetle-completion-processor`.
 Override them with `TIGER_BEETLE_PROCESSOR_NAME`, `TIGER_BEETLE_COMPLETION_PROCESSOR_NAME`, or the matching
 `--tiger-beetle-processor-name` and `--tiger-beetle-completion-processor-name` options. Both deployment helpers accept these options.
@@ -727,10 +735,10 @@ or CloudFront.
 - `src/paseto_cli.zig`: host PASETO v4.public CLI and its tests.
 - `persistence.sh`: stack-aware persistence command and credential setup.
 - `queue.sh`: stack-aware queue command and credential setup.
-- `lambda_logs.sh`: explicit four-handler CloudWatch log download helper.
-- `build.zig`: Zig build graph for all four bootstraps, local commands, and tests.
+- `lambda_logs.sh`: explicit six-handler CloudWatch log download helper.
+- `build.zig`: Zig build graph for all six bootstraps, local commands, and tests.
 - `build.zig.zon`: package metadata and pinned dependencies.
-- `template.yaml`: SAM template for all four Lambdas, two Function URLs, two queue mappings, permissions, and the optional EC2 WireGuard gateway.
+- `template.yaml`: SAM template for all six Lambdas, two Function URLs, four queue mappings, permissions, and the optional EC2 WireGuard gateway.
 - `docs/EC2-WireGuard-Gateway.md`: implemented gateway architecture, lifecycle, security, and ownership reference.
 - `docs/`: the SAM deployment guide, ADRs, and the Zig style reference.
 - `AGENTS.md`: repository guidance for coding agents.

@@ -119,7 +119,7 @@ test_completion_parameter_preserves_stack_state() (
     assert_contains "$overrides" " TigerBeetleCompletionProcessorName=completion-explicit "
     assert_contains "$overrides" " EnableWireGuardGateway=true "
     assert_contains "$overrides" " VpcId=vpc-00000001 "
-    [ "${#SAM_PARAMETER_OVERRIDES[@]}" -eq 10 ] ||
+    [ "${#SAM_PARAMETER_OVERRIDES[@]}" -eq 13 ] ||
         fail_test "completion parameter propagation changed preserved stack state"
 )
 
@@ -134,7 +134,9 @@ test_deployed_function_name_outputs() (
         printf 'IntakeFunctionName|intake-existing\t'
         printf 'QueryFunctionName|query-existing\t'
         printf 'TigerBeetleProcessorName|tiger-beetle-existing\t'
-        printf 'TigerBeetleCompletionProcessorName|%s\n' "$MOCK_COMPLETION_OUTPUT"
+        printf 'TigerBeetleCompletionProcessorName|%s\t' "$MOCK_COMPLETION_OUTPUT"
+        printf 'SeatReservationProcessorName|seat-reservation-processor\t'
+        printf 'SeatReservationCompletionProcessorName|seat-reservation-completion-processor\n'
     }
 
     MOCK_COMPLETION_OUTPUT=completion-existing
@@ -149,7 +151,7 @@ test_deployed_function_name_outputs() (
     assert_contains "$output" "TigerBeetleCompletionProcessorName does not match"
 )
 
-test_four_lambda_artifacts() (
+test_six_lambda_artifacts() (
     local artifact_tmp artifact_output expected_file_calls expected_zip_calls
 
     artifact_tmp="$(mktemp -d "${TMPDIR:-/tmp}/deploy-artifact-test.XXXXXX")"
@@ -163,7 +165,9 @@ test_four_lambda_artifacts() (
         intake-lambda.zip \
         query-lambda.zip \
         tiger-beetle-processor.zip \
-        tiger-beetle-completion-processor.zip
+        tiger-beetle-completion-processor.zip \
+        seat-reservation-processor.zip \
+        seat-reservation-completion-processor.zip
     do
         printf 'stale archive\n' >"$archive"
     done
@@ -177,7 +181,9 @@ test_four_lambda_artifacts() (
                 ;;
             zig-out/bin/intake/bootstrap | \
                 zig-out/bin/query/bootstrap | \
-                zig-out/bin/tiger_beetle_completion_processor/bootstrap)
+                zig-out/bin/tiger_beetle_completion_processor/bootstrap | \
+                zig-out/bin/seat_reservation_processor/bootstrap | \
+                zig-out/bin/seat_reservation_completion_processor/bootstrap)
                 printf '%s\n' \
                     "$1: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped"
                 ;;
@@ -199,22 +205,26 @@ test_four_lambda_artifacts() (
     }
 
     artifact_output="$(validate_lambda_bootstraps)" ||
-        fail_test "four-bootstrap artifact validation failed"
+        fail_test "six-bootstrap artifact validation failed"
     assert_contains "$artifact_output" "zig-out/bin/tiger_beetle_completion_processor/bootstrap"
     package_lambda_archives
 
     expected_file_calls='zig-out/bin/intake/bootstrap
 zig-out/bin/query/bootstrap
 zig-out/bin/tiger_beetle_completion_processor/bootstrap
+zig-out/bin/seat_reservation_processor/bootstrap
+zig-out/bin/seat_reservation_completion_processor/bootstrap
 zig-out/bin/tiger_beetle_processor/bootstrap'
     [ "$(<"$MOCK_FILE_CALLS")" = "$expected_file_calls" ] ||
-        fail_test "bootstrap validation did not retain the four expected paths"
+        fail_test "bootstrap validation did not retain the six expected paths"
     expected_zip_calls='intake-lambda.zip|zig-out/bin/intake/bootstrap
 query-lambda.zip|zig-out/bin/query/bootstrap
 tiger-beetle-processor.zip|zig-out/bin/tiger_beetle_processor/bootstrap
-tiger-beetle-completion-processor.zip|zig-out/bin/tiger_beetle_completion_processor/bootstrap'
+tiger-beetle-completion-processor.zip|zig-out/bin/tiger_beetle_completion_processor/bootstrap
+seat-reservation-processor.zip|zig-out/bin/seat_reservation_processor/bootstrap
+seat-reservation-completion-processor.zip|zig-out/bin/seat_reservation_completion_processor/bootstrap'
     [ "$(<"$MOCK_ZIP_CALLS")" = "$expected_zip_calls" ] ||
-        fail_test "packaging did not retain the four expected archive mappings"
+        fail_test "packaging did not retain the six expected archive mappings"
 )
 
 test_setup_action_parsing() (
@@ -617,7 +627,7 @@ test_source_guards
 test_tiger_beetle_completion_processor_name_options
 test_completion_parameter_preserves_stack_state
 test_deployed_function_name_outputs
-test_four_lambda_artifacts
+test_six_lambda_artifacts
 test_setup_action_parsing
 test_enabled_stack_fills_only_unspecified_values
 test_ipv6_egress_ownership_state

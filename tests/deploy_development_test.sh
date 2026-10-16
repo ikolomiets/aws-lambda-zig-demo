@@ -133,10 +133,15 @@ PASETO
                     *Parameters*)
                         printf 'EnableWireGuardGateway|false\tRetainTigerBeetleProcessorVpcCleanupResources|false\n'
                         ;;
+                    length*SeatReservationProcessorName*)
+                        printf '%s\n' "${MOCK_SEAT_BASELINE_COUNT:-2}"
+                        ;;
                     *IntakeFunctionName*)
                         printf 'IntakeFunctionName|intake-lambda\tQueryFunctionName|query-lambda\t'
                         printf 'TigerBeetleProcessorName|tiger-beetle-processor\t'
-                        printf 'TigerBeetleCompletionProcessorName|tiger-beetle-completion-processor\n'
+                        printf 'TigerBeetleCompletionProcessorName|tiger-beetle-completion-processor\t'
+                        printf 'SeatReservationProcessorName|%s\t' "${SEAT_RESERVATION_PROCESSOR_NAME:-seat-reservation-processor}"
+                        printf 'SeatReservationCompletionProcessorName|%s\n' "${SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME:-seat-reservation-completion-processor}"
                         ;;
                     *IntakeFunctionUrl*) printf 'https://intake.example.invalid/\n' ;;
                     *QueryFunctionUrl*) printf 'https://query.example.invalid/\n' ;;
@@ -204,6 +209,9 @@ sam validate --lint --template-file template.yaml --region ca-central-1'
     assert_contains "$stages" "$expected"
     assert_contains "$calls" 'sam deploy --template-file template.yaml --stack-name mock-stack'
     assert_contains "$calls" 'EnableWireGuardGateway=false RetainTigerBeetleProcessorVpcCleanupResources=false'
+    assert_contains "$calls" 'SeatReservationProcessorName=seat-reservation-processor'
+    assert_contains "$calls" 'SeatReservationCompletionProcessorName=seat-reservation-completion-processor'
+    assert_contains "$calls" 'LedgerCounterId=global'
     assert_contains "$calls" 'paseto issue --subject deploy-query-test-'
     [ "$(sed -n '1p' "$MOCK_CALL_LOG")" = 'aws sso login --profile dev-selected' ] ||
         fail_test 'full deployment did not authenticate first'
@@ -215,6 +223,21 @@ sam validate --lint --template-file template.yaml --region ca-central-1'
         fail_test 'full deployment removed development caches'
 }
 
+test_selected_seat_configuration() {
+    local calls
+    new_checkout selected-seat
+    SEAT_RESERVATION_PROCESSOR_NAME=seat-submit-chosen \
+        SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME=seat-complete-chosen \
+        run_script --seat-reservation-processor-name seat-submit-chosen \
+        --seat-reservation-completion-processor-name=seat-complete-chosen \
+        --existing-ledger-counter-table-name shared-ledgers --ledger-counter-id=sequence.B || \
+        fail_test "selected seat configuration failed: $(cat "$CHECKOUT/output.log")"
+    calls="$(cat "$MOCK_CALL_LOG")"
+    assert_contains "$calls" 'SeatReservationProcessorName=seat-submit-chosen'
+    assert_contains "$calls" 'SeatReservationCompletionProcessorName=seat-complete-chosen'
+    assert_contains "$calls" 'ExistingLedgerCounterTableName=shared-ledgers LedgerCounterId=sequence.B'
+}
+
 test_development_dry_run() {
     local calls
     new_checkout dev-dry
@@ -224,6 +247,12 @@ test_development_dry_run() {
     assert_contains "$calls" 'zig build fmt-check --cache-dir .zig-cache-dev --global-cache-dir .zig-global-cache-dev'
     assert_contains "$calls" 'zig build --cache-dir .zig-cache-dev --global-cache-dir .zig-global-cache-dev --release -Darch=arm'
     assert_contains "$calls" 'zip -qj tiger-beetle-completion-processor.zip'
+    assert_contains "$calls" 'file zig-out/bin/seat_reservation_processor/bootstrap'
+    assert_contains "$calls" 'file zig-out/bin/seat_reservation_completion_processor/bootstrap'
+    assert_contains "$calls" 'zip -qj seat-reservation-processor.zip zig-out/bin/seat_reservation_processor/bootstrap'
+    assert_contains "$calls" 'zip -qj seat-reservation-completion-processor.zip zig-out/bin/seat_reservation_completion_processor/bootstrap'
+    assert_contains "$calls" 'unzip -Z1 seat-reservation-processor.zip'
+    assert_contains "$calls" 'unzip -Z1 seat-reservation-completion-processor.zip'
     assert_not_contains "$calls" 'zig build test'
     assert_not_contains "$calls" 'aws '
     assert_not_contains "$calls" 'sam '
@@ -269,6 +298,7 @@ test_development_code_sync() {
         fail_test "development sync failed: $(cat "$CHECKOUT/output.log")"
     calls="$(cat "$MOCK_CALL_LOG")"
     assert_contains "$calls" 'sam sync --template-file template.yaml --stack-name dev-code-stack --region us-east-1 --profile dev-selected --code --no-watch --no-dependency-layer --resource-id IntakeFunction --resource-id QueryFunction --resource-id TigerBeetleProcessor --resource-id TigerBeetleCompletionProcessor'
+    assert_contains "$calls" '--resource-id SeatReservationProcessor --resource-id SeatReservationCompletionProcessor'
     assert_not_contains "$calls" 'sam deploy '
     assert_not_contains "$calls" 'sam validate '
     assert_not_contains "$calls" 'zig build test '
@@ -288,6 +318,8 @@ test_development_rejects_configuration_and_lifecycle_options() {
     for option in \
         --intake-function-name --query-function-name \
         --tiger-beetle-processor-name --tiger-beetle-completion-processor-name \
+        --seat-reservation-processor-name --seat-reservation-completion-processor-name \
+        --existing-ledger-counter-table-name --ledger-counter-id \
         --tigerbeetle-cluster-id --tigerbeetle-addresses --lambda-principal
     do
         new_checkout invalid
@@ -314,6 +346,23 @@ test_development_rejects_configuration_and_lifecycle_options() {
     fi
     [ ! -s "$MOCK_CALL_LOG" ] || fail_test 'development controller rejection performed work'
     assert_contains "$(cat "$CHECKOUT/output.log")" 'full deployment'
+}
+
+test_missing_seat_baseline_and_invalid_configuration() {
+    local counter_id
+    new_checkout missing-seat-baseline
+    if MOCK_SEAT_BASELINE_COUNT=0 run_script --dev; then
+        fail_test 'development sync accepted a four-function baseline'
+    fi
+    assert_contains "$(cat "$CHECKOUT/output.log")" 'full deployment'
+    assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'sam sync'
+    for counter_id in '' '-global' 'a/b' 'é' "$(printf '%129s' a | tr ' ' a)"; do
+        new_checkout invalid-counter-id
+        if LEDGER_COUNTER_ID="$counter_id" run_script --dry-run; then
+            fail_test 'invalid configured counter ID accepted'
+        fi
+        [ ! -s "$MOCK_CALL_LOG" ] || fail_test 'invalid counter ID performed work'
+    done
 }
 
 test_development_gates_and_failure_propagation() {
@@ -434,6 +483,8 @@ test_full_dry_run_and_failed_build_cleanup() {
 }
 
 test_full_deployment_baseline
+test_selected_seat_configuration
+test_missing_seat_baseline_and_invalid_configuration
 test_development_dry_run
 test_local_forks_reach_all_build_steps
 test_development_code_sync

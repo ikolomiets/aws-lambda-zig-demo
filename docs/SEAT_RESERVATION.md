@@ -8,17 +8,18 @@ The independent [ledger counter](../src/ledger_counter.zig) and host
 `ledger-counter` utility initialize, inspect and allocate global ledgers.
 The [submission](../src/seat_reservation_processor.zig) and
 [completion](../src/seat_reservation_completion_processor.zig) handlers implement
-local rejections, native Event creation, reservations and availability observations through
-authenticated intake and query. Confirmation execution, and SAM
-provisioning of the two handlers, remain separate slices.
+local rejections, native Event creation, reservations, confirmations and availability
+observations through authenticated intake and query. SAM provisions both handlers,
+their queues and durable tables; the [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md#4-understand-what-the-template-creates)
+owns resources, IAM, configured allocator binding and operator setup.
 
 ## Rejection workflow
 
 When configured with `SeatReservationQueue`, intake routes the exact name
 `SeatReservation` through its existing name-based mechanism. It persists a
 `SUBMITTED` Operation with the verified PASETO subject as tenant, then publishes
-the original Body and null Context. The current SAM template still provisions
-the existing four functions; it does not configure this seat route.
+the original Body and null Context. SAM configures this seat route alongside
+the existing native route.
 
 Each seat invocation accepts exactly one SQS record. Submission rejects incoming
 Result Queue overrides and non-null incoming Context. Whole-request schema and
