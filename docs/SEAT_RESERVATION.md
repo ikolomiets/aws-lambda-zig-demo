@@ -47,8 +47,7 @@ The original input becomes arbitrary Context, including invalid scalar or null
 input. It must fit the shared 4 KiB Context bound. An internal message whose input
 cannot be carried within that bound is diagnosed as unusable. No local rejection
 allocates a ledger, writes an Event or dispatches native work. Admitted creation,
-availability checks and reservations dispatch native work as described below.
-Admitted confirm commands remain retryable pending their native implementation.
+availability checks, reservations and confirmations dispatch native work as described below.
 
 Completion rejects Result Queue overrides. Local completion accepts an unambiguous
 admission-failure Body containing exactly `code`. Native three-list and mixed
@@ -202,6 +201,54 @@ evidence and immutable winning Results through the authenticated composed pipeli
 The separate local native suite proves concurrent all-or-nothing bounds, class
 independence, expiry from native creation, replay without renewal and delayed
 success after expiry:
+
+```sh
+TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle
+```
+
+## Confirmation workflow
+
+An owned ready Event admits `confirm_seats` for one configured class. Submission
+generates a fresh posting transfer ID and sends exactly one `post_pending_transfer`
+with the supplied `pending_id`, alias `confirm-${tag}`, amount 2^128−1, explicit
+nonzero Availability debit and Allocation credit IDs, the Event ledger, and code 2.
+There is no timeout. The maximum-u128 amount posts the entire held quantity.
+Context contains exactly the original command, Event ID, class and pending ID;
+the generated posting ID stays out of Context and the public Result.
+
+Completion rereads the tenant-scoped ready Event and requires exactly one transfer
+outcome with the matching alias and no account creations or lookups. `created`,
+matching `exists` replay, and `pending_transfer_already_posted` establish the same
+effective success. Explicit debit, credit, ledger and code fields bind even an
+already-posted reference to the authorized Event and class. A repeat confirmation
+can use a new posting ID without posting the hold twice.
+
+Success contains exactly `event_id`, `class` and `reservation_id`, naming the input
+pending transfer. It contains no confirmed quantity. Native
+`pending_transfer_expired` becomes code-only `reservation_expired`. Missing,
+non-pending, or debit/credit/ledger/code-mismatched references all become code-only
+`invalid_reservation`, without disclosing which association failed. Already-voided
+references and `id_already_failed` become `operation_rejected`; the original reason
+for a consumed posting ID is not reconstructed.
+
+Missing or closed configured accounts, generated-ID conflicts, invalid server
+configuration, singleton `linked_event_failed`, malformed/truncated outcomes,
+root diagnostics and unknown statuses are inconsistencies. They are diagnosed and
+acknowledged without finalizing the Operation. This classification takes precedence
+over the definite-rejection fallback.
+
+Dispatch, native execution and publication uncertainty retain source retry
+eligibility. Replaying constructed native work preserves the posting ID and every
+field; retrying submission may choose a fresh ID. Guarded Operation-only completion
+preserves the first valid terminal Result, even if another valid completion
+proposes a different success or failure. Confirmation never changes Event metadata.
+
+Deterministic tests cover the authenticated pipeline, strict schema/ownership,
+complete evidence, repeat posting, uncertain boundaries and immutable Results.
+The separate local native suite proves full posting, effective already-posted
+success, expired/invalid references and tenant/event/class/credit/ledger/code
+association rejection before and after posting. Run it only against the authorized
+local replica:
 
 ```sh
 TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle

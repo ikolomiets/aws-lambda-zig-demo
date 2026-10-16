@@ -251,10 +251,9 @@ fn complete_native(
         if (err == error.OutOfMemory) return err;
         return error.InvalidNativeEvidence;
     };
-    if (context.command == .reserve_seats or context.command == .check_seats) {
+    if (context.command != .create_event) {
         return complete_ready(arena, message, &context, options, backend);
     }
-    if (context.command != .create_event) return error.InvalidNativeEvidence;
     const saved = events.read_event(arena, options.events_table, &.{
         .tenant = message.tenant,
         .event_id = message.operation_id,
@@ -285,6 +284,7 @@ fn complete_ready(
 ) !void {
     const event_id = switch (context.command) {
         .reserve_seats => |reserve| reserve.event_id,
+        .confirm_seats => |confirm| confirm.event_id,
         .check_seats => |id| id,
         else => unreachable,
     };
@@ -297,6 +297,7 @@ fn complete_ready(
     };
     const projected = (switch (context.command) {
         .reserve_seats => seat.reservation_result(&message.body, &saved, context),
+        .confirm_seats => seat.confirmation_result(&message.body, &saved, context),
         .check_seats => seat.availability_result(arena, &message.body, &saved),
         else => unreachable,
     }) catch |err| {

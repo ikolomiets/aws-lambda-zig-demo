@@ -1489,6 +1489,173 @@ fn reservation_event(
     return event;
 }
 
+fn confirm_native(
+    arena: std.mem.Allocator,
+    client: *tigerbeetle.Client,
+    event: *const seat.Event,
+    options: struct { pending_id: u128, posting_id: u128, status: []const u8 },
+) !seat.Result {
+    const command: seat.Command = .{ .confirm_seats = .{
+        .event_id = event.event_id,
+        .class = event.classes[0].tag,
+        .pending_id = options.pending_id,
+    } };
+    const message = try native_seat_result(arena, client, event, &command, options.posting_id);
+    const transfers = message.body.object.get("create_transfers").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), transfers.len);
+    try std.testing.expectEqualStrings(
+        options.status,
+        transfers[0].object.get("error_code").?.string,
+    );
+    return seat.confirmation_result(&message.body, event, &.{
+        .command = command,
+        .reservation_id = null,
+    });
+}
+
+fn confirmation_hold(event: *const seat.Event, id: u128) tigerbeetle.Transfer {
+    var hold = make_transfer(id, event.classes[0].tb_account_id, event.allocation_account_id);
+    hold.ledger = event.ledger;
+    hold.code = 2;
+    hold.amount = 1;
+    hold.flags = tigerbeetle.transfer_pending;
+    hold.timeout = event.timeout_seconds;
+    return hold;
+}
+
+test "Seat confirmation posts fully and accepts matching replay or already posted" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const ns = try TestNamespace.init();
+    const client = try local_client();
+    defer client.destroy();
+    const event = try reservation_event(arena, client, &ns, 60);
+    var hold = confirmation_hold(&event, ns.id(8400));
+    hold.amount = 4;
+    try expect_transfers(client, &.{hold}, &.{transfer_created});
+    const statuses = [_][]const u8{ "created", "exists", "pending_transfer_already_posted" };
+    for (statuses, [_]u16{ 8401, 8401, 8402 }) |status, posting_offset| {
+        const result = try confirm_native(arena, client, &event, .{
+            .pending_id = hold.id,
+            .posting_id = ns.id(posting_offset),
+            .status = status,
+        });
+        try std.testing.expectEqual(hold.id, result.success.confirm_seats.pending_id);
+        const debit = try observe(client, hold.debit_account_id);
+        const credit = try observe(client, hold.credit_account_id);
+        try std.testing.expectEqual(@as(u128, 0), debit.debits_pending);
+        try std.testing.expectEqual(@as(u128, 4), debit.debits_posted);
+        try std.testing.expectEqual(@as(u128, 0), credit.credits_pending);
+        try std.testing.expectEqual(@as(u128, 4), credit.credits_posted);
+    }
+}
+
+test "Seat confirmation checks tenant event class credit ledger and code before and after posting" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const ns = try TestNamespace.init();
+    const foreign_ns = try TestNamespace.init();
+    const sibling_ns = try TestNamespace.init();
+    const client = try local_client();
+    defer client.destroy();
+    const event = try reservation_event(arena, client, &ns, 60);
+    var foreign = try reservation_event(arena, client, &foreign_ns, 60);
+    foreign.tenant = "other-theatre";
+    var sibling = try reservation_event(arena, client, &sibling_ns, 60);
+    sibling.event_id = 3;
+    var wrong_ledger = event;
+    wrong_ledger.ledger += 1;
+    var holds = [_]tigerbeetle.Transfer{
+        confirmation_hold(&foreign, ns.id(8410)),
+        confirmation_hold(&sibling, ns.id(8411)),
+        confirmation_hold(&event, ns.id(8412)),
+        confirmation_hold(&event, ns.id(8413)),
+        confirmation_hold(&event, ns.id(8414)),
+        confirmation_hold(&event, ns.id(8415)),
+    };
+    holds[2].debit_account_id = event.classes[1].tb_account_id;
+    holds[3].credit_account_id = foreign.allocation_account_id;
+    holds[4].code = 3;
+    try expect_transfers(client, &holds, &([_]u32{transfer_created} ** 6));
+    const statuses = [_][]const u8{
+        "pending_transfer_has_different_debit_account_id",
+        "pending_transfer_has_different_debit_account_id",
+        "pending_transfer_has_different_debit_account_id",
+        "pending_transfer_has_different_credit_account_id",
+        "pending_transfer_has_different_code",
+        "pending_transfer_has_different_ledger",
+    };
+    for (holds, statuses, 0..) |hold, status, index| {
+        const selected = if (index == 5) &wrong_ledger else &event;
+        for ([_]bool{ false, true }) |posted| {
+            if (posted) {
+                var post = post_transfer(ns.id(8430) + index, hold.id, std.math.maxInt(u128));
+                post.debit_account_id = hold.debit_account_id;
+                post.credit_account_id = hold.credit_account_id;
+                post.ledger = hold.ledger;
+                post.code = hold.code;
+                try expect_transfers(client, &.{post}, &.{transfer_created});
+            }
+            const before = try observe(client, hold.debit_account_id);
+            const result = try confirm_native(arena, client, selected, .{
+                .pending_id = hold.id,
+                .posting_id = ns.id(8450) + index * 2 + @intFromBool(posted),
+                .status = status,
+            });
+            try std.testing.expectEqual(seat.FailureCode.invalid_reservation, result.failure);
+            try std.testing.expectEqualDeep(before, try observe(client, hold.debit_account_id));
+        }
+    }
+}
+
+test "Seat confirmation maps native expired missing nonpending and voided references" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const ns = try TestNamespace.init();
+    const client = try local_client();
+    defer client.destroy();
+    const event = try reservation_event(arena, client, &ns, 1);
+    const hold = confirmation_hold(&event, ns.id(8470));
+    try expect_transfers(client, &.{hold}, &.{transfer_created});
+    try wait_pending_cleanup(client, hold.debit_account_id);
+    const expired = try confirm_native(arena, client, &event, .{
+        .pending_id = hold.id,
+        .posting_id = ns.id(8471),
+        .status = "pending_transfer_expired",
+    });
+    try std.testing.expectEqual(seat.FailureCode.reservation_expired, expired.failure);
+    const missing = try confirm_native(arena, client, &event, .{
+        .pending_id = ns.id(8472),
+        .posting_id = ns.id(8473),
+        .status = "pending_transfer_not_found",
+    });
+    try std.testing.expectEqual(seat.FailureCode.invalid_reservation, missing.failure);
+    const nonpending = try confirm_native(arena, client, &event, .{
+        .pending_id = event.classes[0].tb_account_id,
+        .posting_id = ns.id(8474),
+        .status = "pending_transfer_not_pending",
+    });
+    try std.testing.expectEqual(seat.FailureCode.invalid_reservation, nonpending.failure);
+    var voided_hold = hold;
+    voided_hold.id = ns.id(8475);
+    voided_hold.timeout = 60;
+    try expect_transfers(client, &.{voided_hold}, &.{transfer_created});
+    try expect_transfers(
+        client,
+        &.{void_transfer(ns.id(8476), voided_hold.id)},
+        &.{transfer_created},
+    );
+    const voided = try confirm_native(arena, client, &event, .{
+        .pending_id = voided_hold.id,
+        .posting_id = ns.id(8477),
+        .status = "pending_transfer_already_voided",
+    });
+    try std.testing.expectEqual(seat.FailureCode.operation_rejected, voided.failure);
+}
+
 const ConcurrentReservation = struct {
     client: *tigerbeetle.Client,
     hold: tigerbeetle.Transfer,

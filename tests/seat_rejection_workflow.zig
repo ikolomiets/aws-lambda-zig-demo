@@ -19,6 +19,413 @@ const request = "{\"id\":\"" ++ uuid ++ "\",\"name\":\"SeatReservation\",\"body\
     "\"class\":\"general\",\"quantity\":2}}";
 const ack = "{\"batchItemFailures\":[]}";
 
+const confirm_request = "{\"id\":\"" ++ uuid ++ "\",\"name\":\"SeatReservation\",\"body\":{" ++
+    "\"command\":\"confirm_seats\",\"event_id\":\"00000000-0000-0000-0000-000000000002\"," ++
+    "\"class\":\"general\",\"pending_id\":\"77\"}}";
+
+fn confirm_output(arena: Allocator, effects: *Effects) ![]const u8 {
+    const first = effects.sent.items.len;
+    _ = try intake.test_support.submit(arena, &.{
+        .input = confirm_request,
+        .subject = "theatre",
+        .operation_name = "SeatReservation",
+    }, effects);
+    return native_attempt(arena, effects, effects.sent.items[first].body);
+}
+
+test "authenticated confirmation posts the whole matching hold and returns its pending ID" {
+    for ([_]u32{
+        tigerbeetle.transfer_created,
+        tigerbeetle.transfer_exists,
+        c.TB_CREATE_TRANSFER_PENDING_TRANSFER_ALREADY_POSTED,
+    }) |status| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        var effects = try Effects.init(arena);
+        effects.event.?.state = .ready;
+        effects.transfer_statuses = &.{status};
+        const output = try confirm_output(arena, &effects);
+        const message = try messages.decode(arena, output);
+        try std.testing.expectEqualStrings("77", message.context.object.get("pending_id").?.string);
+        try std.testing.expectEqual(@as(u32, 4), message.context.object.count());
+        const posting = effects.transfers[0];
+        try std.testing.expectEqual(@as(u128, 101), posting.id);
+        try std.testing.expectEqual(@as(u128, 77), posting.pending_id);
+        try std.testing.expectEqual(@as(u128, 13), posting.debit_account_id);
+        try std.testing.expectEqual(@as(u128, 12), posting.credit_account_id);
+        try std.testing.expectEqual(std.math.maxInt(u128), posting.amount);
+        try std.testing.expectEqual(@as(u32, 1001), posting.ledger);
+        try std.testing.expectEqual(@as(u16, 2), posting.code);
+        try std.testing.expectEqual(@as(u16, c.TB_TRANSFER_POST_PENDING_TRANSFER), posting.flags);
+        try std.testing.expectEqual(@as(u32, 0), posting.timeout);
+        try std.testing.expectEqualStrings(ack, try complete_seat_message(arena, &effects, output));
+        const saved = try effects.read(arena, 1);
+        var buffer: [operation.result_size_max]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            "{\"type\":\"SUCCESS\",\"payload\":{\"event_id\":" ++
+                "\"00000000-0000-0000-0000-000000000002\",\"class\":\"general\"," ++
+                "\"reservation_id\":\"77\"}}",
+            try operation.writeCompletionJSON(&buffer, &saved.state.completed),
+        );
+        const visible = try query.test_support.query_with_backend(arena, 1, "theatre", &effects);
+        try std.testing.expect(std.mem.indexOf(u8, visible, "reservation_id") != null);
+        const foreign = try query.test_support.query_with_backend(arena, 1, "other", &effects);
+        try std.testing.expect(std.mem.indexOf(u8, foreign, "reservation_id") == null);
+        try std.testing.expectEqual(@as(usize, 0), effects.transactions);
+        try std.testing.expectEqual(@as(u32, 1000), effects.high_water);
+        try std.testing.expectEqual(seat.EventState.ready, effects.event.?.state);
+    }
+}
+
+test "confirmation replay and a fresh already posted attempt keep the original reservation ID" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    var effects = try Effects.init(arena);
+    effects.event.?.state = .ready;
+    _ = try confirm_output(arena, &effects);
+    const posting = effects.transfers[0];
+    effects.transfer_statuses = &.{tigerbeetle.transfer_exists};
+    try std.testing.expectEqualStrings(ack, try native.test_support.invoke(
+        arena,
+        try sqs_event(arena, effects.sent.items[1].body),
+        &effects,
+    ));
+    try std.testing.expectEqualDeep(posting, effects.transfers[0]);
+    try std.testing.expectEqualStrings(ack, try complete_seat_message(
+        arena,
+        &effects,
+        effects.sent.items[3].body,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), effects.diagnostics.items.len);
+    effects.transfer_statuses = &.{c.TB_CREATE_TRANSFER_PENDING_TRANSFER_ALREADY_POSTED};
+    const fresh = try native_attempt(arena, &effects, effects.sent.items[0].body);
+    try std.testing.expectEqual(@as(u128, 102), effects.transfers[0].id);
+    try std.testing.expectEqual(@as(u128, 77), effects.transfers[0].pending_id);
+    const before = effects.diagnostics.items.len;
+    try std.testing.expectEqualStrings(ack, try complete_seat_message(arena, &effects, fresh));
+    try std.testing.expectEqual(before, effects.diagnostics.items.len);
+    const saved = try effects.read(arena, 1);
+    try std.testing.expectEqualStrings(
+        "77",
+        saved.state.completed.success.object.get("reservation_id").?.string,
+    );
+}
+
+test "confirmation returns bounded expired invalid and definite rejection outcomes" {
+    const cases = .{
+        .{ c.TB_CREATE_TRANSFER_PENDING_TRANSFER_EXPIRED, "reservation_expired" },
+        .{ c.TB_CREATE_TRANSFER_PENDING_TRANSFER_NOT_FOUND, "invalid_reservation" },
+        .{ c.TB_CREATE_TRANSFER_PENDING_TRANSFER_NOT_PENDING, "invalid_reservation" },
+        .{
+            c.TB_CREATE_TRANSFER_PENDING_TRANSFER_HAS_DIFFERENT_DEBIT_ACCOUNT_ID,
+            "invalid_reservation",
+        },
+        .{
+            c.TB_CREATE_TRANSFER_PENDING_TRANSFER_HAS_DIFFERENT_CREDIT_ACCOUNT_ID,
+            "invalid_reservation",
+        },
+        .{ c.TB_CREATE_TRANSFER_PENDING_TRANSFER_HAS_DIFFERENT_LEDGER, "invalid_reservation" },
+        .{ c.TB_CREATE_TRANSFER_PENDING_TRANSFER_HAS_DIFFERENT_CODE, "invalid_reservation" },
+        .{ c.TB_CREATE_TRANSFER_PENDING_TRANSFER_ALREADY_VOIDED, "operation_rejected" },
+        .{ c.TB_CREATE_TRANSFER_ID_ALREADY_FAILED, "operation_rejected" },
+    };
+    inline for (cases) |case| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        var effects = try Effects.init(arena);
+        effects.event.?.state = .ready;
+        effects.transfer_statuses = &.{case[0]};
+        const output = try confirm_output(arena, &effects);
+        try std.testing.expectEqualStrings(ack, try complete_seat_message(arena, &effects, output));
+        const saved = try effects.read(arena, 1);
+        try std.testing.expect(saved.state == .completed);
+        var buffer: [operation.result_size_max]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            "{\"type\":\"FAILURE\",\"payload\":{\"code\":\"" ++ case[1] ++ "\"}}",
+            try operation.writeCompletionJSON(&buffer, &saved.state.completed),
+        );
+        const visible = try query.test_support.query_with_backend(arena, 1, "theatre", &effects);
+        try std.testing.expect(std.mem.indexOf(u8, visible, case[1]) != null);
+        try std.testing.expectEqual(@as(usize, 0), effects.diagnostics.items.len);
+        try std.testing.expectEqual(seat.EventState.ready, effects.event.?.state);
+    }
+}
+
+const inconsistent_confirmation_statuses = [_][]const u8{
+    "linked_event_failed",
+    "linked_event_chain_open",
+    "unknown",
+    "new_status",
+    "exists_with_different_flags",
+    "exists_with_different_pending_id",
+    "exists_with_different_debit_account_id",
+    "exists_with_different_credit_account_id",
+    "exists_with_different_ledger",
+    "exists_with_different_code",
+    "exists_with_different_amount",
+    "exists_with_different_timeout",
+    "debit_account_not_found",
+    "credit_account_not_found",
+    "debit_account_already_closed",
+    "credit_account_already_closed",
+    "accounts_must_have_the_same_ledger",
+    "transfer_must_have_the_same_ledger_as_accounts",
+    "ledger_must_not_be_zero",
+    "code_must_not_be_zero",
+    "flags_are_mutually_exclusive",
+    "pending_id_must_be_different",
+    "timeout_reserved_for_pending_transfer",
+    "exceeds_pending_transfer_amount",
+    "pending_transfer_has_different_amount",
+    "overflows_debits_posted",
+    "overflows_credits_posted",
+    "exceeds_credits",
+    "exceeds_debits",
+};
+
+test "confirmation rejects incomplete conflicting and inconclusive evidence without a Result" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    var effects = try Effects.init(arena);
+    effects.event.?.state = .ready;
+    const output = try confirm_output(arena, &effects);
+    const entries = [_][]const u8{
+        "[]",
+        "[null]",
+        "[{}]",
+        "[{\"error_code\":null,\"alias\":\"confirm-general\"}]",
+        "[{\"error_code\":\"created\",\"alias\":\"wrong\"}]",
+        "[{\"error_code\":\"created\",\"alias\":\"confirm-general\",\"id\":\"101\"}]",
+        "[{\"error_code\":\"created\",\"alias\":\"confirm-general\"}," ++
+            "{\"error_code\":\"pending_transfer_expired\",\"alias\":\"confirm-general\"}]",
+    };
+    for (entries) |entry| {
+        var message = try messages.decode(arena, output);
+        message.body = try seat.parse_value(arena, try std.fmt.allocPrint(
+            arena,
+            "{{\"create_accounts\":[],\"create_transfers\":{s},\"lookup_accounts\":[]}}",
+            .{entry},
+        ), messages.body_size_max);
+        try expect_invalid_reservation(arena, &effects, &message);
+    }
+    for (inconsistent_confirmation_statuses) |status| {
+        var message = try messages.decode(arena, output);
+        const entry = &message.body.object.getPtr("create_transfers").?.array.items[0];
+        try entry.object.put(arena, "error_code", .{ .string = status });
+        try expect_invalid_reservation(arena, &effects, &message);
+    }
+    for ([_][]const u8{ "create_accounts", "lookup_accounts" }) |family| {
+        var message = try messages.decode(arena, output);
+        try message.body.object.getPtr(family).?.array.append(.null);
+        try expect_invalid_reservation(arena, &effects, &message);
+    }
+    for ([_][]const u8{ "command", "pending_id", "class", "event_id" }) |field| {
+        var message = try messages.decode(arena, output);
+        _ = message.context.object.orderedRemove(field);
+        try expect_invalid_reservation(arena, &effects, &message);
+    }
+    var message = try messages.decode(arena, output);
+    try message.context.object.put(arena, "posting_id", .{ .string = "101" });
+    try expect_invalid_reservation(arena, &effects, &message);
+    message = try messages.decode(arena, output);
+    message.body = try seat.parse_value(arena, "{\"error\":\"ResponseLost\"}", 4096);
+    try expect_invalid_reservation(arena, &effects, &message);
+    try std.testing.expectEqual(@as(usize, 0), effects.updates);
+}
+
+test "confirmation authorizes ownership readiness and class before generating native work" {
+    const expected = [_][]const u8{
+        "event_unavailable",
+        "event_unavailable",
+        "event_not_ready",
+        "event_failed",
+        "unknown_class",
+    };
+    for (expected, 0..) |code, scenario| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        var effects = try Effects.init(arena);
+        switch (scenario) {
+            0 => effects.event = null,
+            1 => effects.event.?.tenant = "foreign",
+            2 => effects.event.?.state = .creating,
+            3 => effects.event.?.state = .failed,
+            4 => effects.event.?.state = .ready,
+            else => unreachable,
+        }
+        const output = try submitted_rejection(
+            arena,
+            &effects,
+            "{\"command\":\"confirm_seats\",\"event_id\":" ++
+                "\"00000000-0000-0000-0000-000000000002\"," ++
+                "\"class\":\"nonexistent\",\"pending_id\":\"77\"}",
+        );
+        try std.testing.expectEqualStrings("seat-completion", effects.sent.items[1].queue);
+        try std.testing.expectEqualStrings(ack, try complete_seat_message(arena, &effects, output));
+        const saved = try effects.read(arena, 1);
+        try std.testing.expectEqualStrings(
+            code,
+            saved.state.completed.failure.object.get("code").?.string,
+        );
+        const visible = try query.test_support.query_with_backend(arena, 1, "theatre", &effects);
+        try std.testing.expect(std.mem.indexOf(u8, visible, code) != null);
+        try std.testing.expectEqual(@as(u128, 100), effects.next_id);
+        try std.testing.expectEqual(@as(u32, 1000), effects.high_water);
+        try std.testing.expectEqual(@as(usize, 2), effects.sent.items.len);
+    }
+}
+
+test "confirmation schema rejects non scalar and caller controlled native fields before reads" {
+    const invalid_fields = .{
+        .{ "class", "[\"general\"]" },
+        .{ "class", "{\"general\":1}" },
+        .{ "class", "null" },
+        .{ "pending_id", "77" },
+        .{ "pending_id", "\"077\"" },
+        .{ "pending_id", "\"0\"" },
+        .{ "pending_id", "\"340282366920938463463374607431768211455\"" },
+        .{ "pending_id", "null" },
+        .{ "event_id", "\"bad\"" },
+        .{ "quantity", "2" },
+        .{ "ledger", "1001" },
+        .{ "tenant", "\"foreign\"" },
+        .{ "debit_account_id", "\"13\"" },
+        .{ "posting_id", "\"101\"" },
+    };
+    inline for (invalid_fields) |invalid| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        var effects = try Effects.init(arena);
+        var input = try seat.parse_value(arena, confirm_request, 4096);
+        const body = input.object.getPtr("body").?;
+        try body.object.put(arena, invalid[0], try seat.parse_value(arena, invalid[1], 4096));
+        effects.read_error = error.MustNotRead;
+        const output = try submitted_rejection(
+            arena,
+            &effects,
+            try seat.encode_bounded(arena, body.*, 4096),
+        );
+        effects.read_error = null;
+        try std.testing.expectEqualStrings(ack, try complete_seat_message(arena, &effects, output));
+        const saved = try effects.read(arena, 1);
+        try std.testing.expectEqualStrings(
+            "invalid_request",
+            saved.state.completed.failure.object.get("code").?.string,
+        );
+        try std.testing.expectEqual(@as(u128, 100), effects.next_id);
+        try std.testing.expectEqual(@as(u32, 1000), effects.high_water);
+        try std.testing.expectEqual(@as(usize, 2), effects.sent.items.len);
+    }
+}
+
+fn expect_native_retry_after_restart(arena: Allocator, effects: *Effects, work: []const u8) !void {
+    var invocation = std.heap.ArenaAllocator.init(arena);
+    defer invocation.deinit();
+    const response = try native.test_support.invoke(
+        invocation.allocator(),
+        try sqs_event(arena, work),
+        effects,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, response, "source-1") != null);
+}
+
+test "confirmation uncertainty retains source retry eligibility" {
+    for ([_]bool{ false, true }) |after_effect| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        var effects = try Effects.init(arena);
+        effects.event.?.state = .ready;
+        _ = try intake.test_support.submit(arena, &.{
+            .input = confirm_request,
+            .subject = "theatre",
+            .operation_name = "SeatReservation",
+        }, &effects);
+        const source = effects.sent.items[0].body;
+        effects.send_error = error.ResponseLost;
+        effects.send_before_error = after_effect;
+        {
+            var invocation = std.heap.ArenaAllocator.init(arena);
+            defer invocation.deinit();
+            const response = try submission.handle_invocation(
+                invocation.allocator(),
+                try sqs_event(arena, source),
+                &.{
+                    .events_table = "Events",
+                    .native_queue = "native",
+                    .completion_queue = "seat-completion",
+                },
+                &effects,
+            );
+            try std.testing.expect(std.mem.indexOf(u8, response, "source-1") != null);
+        }
+        effects.send_error = null;
+        const work_index = effects.sent.items.len;
+        // Retry constructs a fresh posting even when the first send may have succeeded.
+        const output = try native_attempt(arena, &effects, source);
+        const work = effects.sent.items[work_index].body;
+        try std.testing.expectEqual(@as(u128, 102), effects.transfers[0].id);
+        effects.native_funding_error = error.ResponseLost;
+        effects.native_transfer_before_error = after_effect;
+        try expect_native_retry_after_restart(arena, &effects, work);
+        effects.native_funding_error = null;
+        effects.transfer_statuses = &.{c.TB_CREATE_TRANSFER_PENDING_TRANSFER_ALREADY_POSTED};
+        effects.native_send_error = error.ResponseLost;
+        effects.native_send_before_error = after_effect;
+        try expect_native_retry_after_restart(arena, &effects, work);
+        effects.native_send_error = null;
+        const completion_index = effects.sent.items.len;
+        try std.testing.expectEqualStrings(ack, try native.test_support.invoke(
+            arena,
+            try sqs_event(arena, work),
+            &effects,
+        ));
+        const repeated = effects.sent.items[completion_index].body;
+        effects.write_error = error.ResponseLost;
+        effects.commit_before_error = after_effect;
+        const response = try complete_seat_message(arena, &effects, repeated);
+        try std.testing.expectEqual(after_effect, std.mem.eql(u8, ack, response));
+        effects.write_error = null;
+        try std.testing.expectEqualStrings(ack, try complete_seat_message(
+            arena,
+            &effects,
+            repeated,
+        ));
+        const winner = effects.operation_item.?;
+        try std.testing.expectEqualStrings(ack, try complete_seat_message(arena, &effects, output));
+        try std.testing.expectEqual(winner.ptr, effects.operation_item.?.ptr);
+        try std.testing.expectEqual(@as(usize, 0), effects.diagnostics.items.len);
+    }
+}
+
+test "confirmation keeps the first valid success or failure across competing completions" {
+    for ([_]bool{ false, true }) |failure_first| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        var effects = try Effects.init(arena);
+        effects.event.?.state = .ready;
+        const success = try confirm_output(arena, &effects);
+        effects.transfer_statuses = &.{c.TB_CREATE_TRANSFER_PENDING_TRANSFER_EXPIRED};
+        const failure = try native_attempt(arena, &effects, effects.sent.items[0].body);
+        const first = if (failure_first) failure else success;
+        const later = if (failure_first) success else failure;
+        try std.testing.expectEqualStrings(ack, try complete_seat_message(arena, &effects, first));
+        const winner = effects.operation_item.?;
+        try std.testing.expectEqualStrings(ack, try complete_seat_message(arena, &effects, later));
+        try std.testing.expectEqual(winner.ptr, effects.operation_item.?.ptr);
+        const saved = try effects.read(arena, 1);
+        try std.testing.expectEqual(failure_first, saved.state.completed == .failure);
+        try std.testing.expectEqual(@as(usize, 0), effects.diagnostics.items.len);
+    }
+}
+
 fn reserve_output(arena: Allocator, effects: *Effects) ![]const u8 {
     const first = effects.sent.items.len;
     _ = try intake.test_support.submit(arena, &.{
@@ -26,10 +433,10 @@ fn reserve_output(arena: Allocator, effects: *Effects) ![]const u8 {
         .subject = "theatre",
         .operation_name = "SeatReservation",
     }, effects);
-    return reserve_attempt(arena, effects, effects.sent.items[first].body);
+    return native_attempt(arena, effects, effects.sent.items[first].body);
 }
 
-fn reserve_attempt(arena: Allocator, effects: *Effects, input: []const u8) ![]const u8 {
+fn native_attempt(arena: Allocator, effects: *Effects, input: []const u8) ![]const u8 {
     const first = effects.sent.items.len;
     try std.testing.expectEqualStrings(ack, try submission.handle_invocation(
         arena,
@@ -127,7 +534,7 @@ test "fresh reservation attempts can leave abandoned holds and the first Result 
         effects.event.?.state = .ready;
         const delayed = try reserve_output(arena, &effects);
         if (capacity_failure) effects.transfer_statuses = &.{c.TB_CREATE_TRANSFER_EXCEEDS_CREDITS};
-        const winner = try reserve_attempt(arena, &effects, effects.sent.items[0].body);
+        const winner = try native_attempt(arena, &effects, effects.sent.items[0].body);
         try std.testing.expectEqual(@as(u128, 102), effects.transfers[0].id);
         try std.testing.expectEqualStrings(ack, try complete_seat_message(arena, &effects, winner));
         const before = try query.test_support.query_with_backend(arena, 1, "theatre", &effects);
@@ -361,6 +768,7 @@ const Effects = struct {
     change_configuration: bool = false,
     transactions: usize = 0,
     native_funding_error: ?anyerror = null,
+    native_transfer_before_error: bool = false,
     native_send_error: ?anyerror = null,
     native_send_before_error: bool = false,
     lookup_accounts: []const tigerbeetle.Account = &.{},
@@ -387,8 +795,9 @@ const Effects = struct {
         input: []const tigerbeetle.Transfer,
         output: []tigerbeetle.CreateTransferResult,
     ) !usize {
-        if (self.native_funding_error) |err| return err;
+        if (!self.native_transfer_before_error) if (self.native_funding_error) |err| return err;
         @memcpy(self.transfers[0..input.len], input);
+        if (self.native_funding_error) |err| return err;
         for (output[0..input.len], 0..) |*entry, index| {
             entry.* = std.mem.zeroes(tigerbeetle.CreateTransferResult);
             if (self.transfer_statuses) |statuses| {

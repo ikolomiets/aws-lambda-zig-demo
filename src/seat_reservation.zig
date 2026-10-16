@@ -536,6 +536,64 @@ pub fn reservation_result(
     return error.InvalidNativeEvidence;
 }
 
+/// A posting confirms the entire matching hold; its generated ID is not a reservation ID.
+pub fn confirmation_result(
+    body: *const std.json.Value,
+    event: *const Event,
+    context: *const Context,
+) !Result {
+    if (context.command != .confirm_seats) return error.InvalidNativeEvidence;
+    if (context.reservation_id != null) return error.InvalidNativeEvidence;
+    try validate_command(&context.command);
+    try validate_event(event);
+    try validate_command_event(&context.command, event);
+    if (event.state != .ready) return error.InvalidNativeEvidence;
+    try exact_fields(body, &.{ "create_accounts", "create_transfers", "lookup_accounts" });
+    _ = try outcome_list(body, "create_accounts", 0);
+    _ = try outcome_list(body, "lookup_accounts", 0);
+    const transfers = try outcome_list(body, "create_transfers", 1);
+    std.debug.assert(transfers.len == 1);
+    const entry = &transfers[0];
+    try exact_fields(entry, &.{ "error_code", "alias" });
+    var alias_buffer: [64]u8 = undefined;
+    const alias = try std.fmt.bufPrint(
+        &alias_buffer,
+        "confirm-{s}",
+        .{context.command.confirm_seats.class.slice()},
+    );
+    if (!std.mem.eql(u8, alias, try string_value(try required(entry, "alias")))) {
+        return error.InvalidNativeEvidence;
+    }
+    const status = try string_value(try required(entry, "error_code"));
+    if (std.mem.eql(u8, status, "created") or std.mem.eql(u8, status, "exists") or
+        std.mem.eql(u8, status, "pending_transfer_already_posted"))
+    {
+        return .{ .success = .{ .confirm_seats = context.command.confirm_seats } };
+    }
+    if (std.mem.eql(u8, status, "pending_transfer_expired")) {
+        return .{ .failure = .reservation_expired };
+    }
+    const invalid_reference_statuses = [_][]const u8{
+        "pending_transfer_not_found",
+        "pending_transfer_not_pending",
+        "pending_transfer_has_different_debit_account_id",
+        "pending_transfer_has_different_credit_account_id",
+        "pending_transfer_has_different_ledger",
+        "pending_transfer_has_different_code",
+    };
+    for (invalid_reference_statuses) |invalid| {
+        if (std.mem.eql(u8, status, invalid)) return .{ .failure = .invalid_reservation };
+    }
+    if (std.mem.eql(u8, status, "pending_transfer_already_voided") or
+        std.mem.eql(u8, status, "id_already_failed"))
+    {
+        return .{ .failure = .operation_rejected };
+    }
+    // Other pinned rejections contradict the server-generated posting or saved
+    // accounts. Unknown statuses cannot establish a definite business outcome.
+    return error.InvalidNativeEvidence;
+}
+
 /// A check is a complete observation of the configured accounts, never a reservation.
 pub fn availability_result(
     arena: Allocator,

@@ -187,7 +187,7 @@ fn process_record(
         .accepted => |*accepted| {
             const dispatch = switch (accepted.command) {
                 .create_event => create_event(arena, &message, &accepted.command, options, backend),
-                .reserve_seats, .check_seats => dispatch_native(
+                .reserve_seats, .confirm_seats, .check_seats => dispatch_native(
                     arena,
                     &message,
                     &accepted.command,
@@ -195,7 +195,6 @@ fn process_record(
                     options,
                     backend,
                 ),
-                else => return true,
             };
             dispatch catch |err| {
                 if (err == error.InvalidItem or err == error.EventConflict) {
@@ -258,7 +257,10 @@ fn dispatch_native(
     options: *const Options,
     backend: anytype,
 ) !void {
-    const attempt_id = if (command.* == .reserve_seats) try backend.generate_id() else 0;
+    const attempt_id = switch (command.*) {
+        .reserve_seats, .confirm_seats => try backend.generate_id(),
+        .create_event, .check_seats => 0,
+    };
     const body = try seat.encode_native_body(arena, &.{
         .command = command,
         .event = saved,
