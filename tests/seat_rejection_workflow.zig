@@ -19,6 +19,186 @@ const request = "{\"id\":\"" ++ uuid ++ "\",\"name\":\"SeatReservation\",\"body\
     "\"class\":\"general\",\"quantity\":2}}";
 const ack = "{\"batchItemFailures\":[]}";
 
+test "warm seat handlers reuse ready metadata across arenas and observe fresh balances" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    var effects = try ready_check_effects(storage.allocator());
+    var admission_cache: events.ReadyCache = undefined;
+    try admission_cache.init(std.testing.allocator, events.ReadyCache.budget_bytes_max);
+    defer admission_cache.deinit();
+    var completion_cache: events.ReadyCache = undefined;
+    try completion_cache.init(std.testing.allocator, events.ReadyCache.budget_bytes_max);
+    defer completion_cache.deinit();
+    // Every invocation releases its own arena; only process-owned resources survive.
+    for (0..3) |index| {
+        var request_storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer request_storage.deinit();
+        const arena = request_storage.allocator();
+        if (index == 2) @constCast(&effects.lookup_accounts[0]).debits_pending = 5;
+        const result = try cached_check_cycle(
+            arena,
+            &effects,
+            &admission_cache,
+            &completion_cache,
+            index + 10,
+        );
+        const expected = if (index == 2)
+            "{\"type\":\"SUCCESS\",\"payload\":{\"event_id\":\"00000000-0000-" ++
+                "0000-0000-000000000002\",\"classes\":{\"general\":{\"total\":10,\"available\":5}}}}"
+        else
+            "{\"type\":\"SUCCESS\",\"payload\":{\"event_id\":\"00000000-0000-" ++
+                "0000-0000-000000000002\",\"classes\":{\"general\":{\"total\":10,\"available\":10}}}}";
+        try std.testing.expectEqualStrings(expected, result);
+        try std.testing.expectEqual(@as(usize, 2), effects.event_reads);
+    }
+}
+
+fn cached_check_cycle(
+    arena: Allocator,
+    effects: *Effects,
+    admission_cache: *events.ReadyCache,
+    completion_cache: *events.ReadyCache,
+    operation_id: u128,
+) ![]const u8 {
+    const input = try std.fmt.allocPrint(
+        arena,
+        "{{\"id\":\"{s}\",\"name\":\"SeatReservation\",\"body\":{s}}}",
+        .{ try seat.uuid_text(arena, operation_id), check_body },
+    );
+    const first = effects.sent.items.len;
+    _ = try intake.test_support.submit(arena, &.{
+        .input = input,
+        .subject = "theatre",
+        .operation_name = "SeatReservation",
+    }, effects);
+    try std.testing.expectEqualStrings(ack, try submission.handle_invocation(
+        arena,
+        try sqs_event(arena, effects.sent.items[first].body),
+        &.{
+            .events_table = "Events",
+            .completion_queue = "seat-completion",
+            .native_queue = "native",
+            .ready_cache = admission_cache,
+        },
+        effects,
+    ));
+    try std.testing.expectEqualStrings(ack, try native.test_support.invoke(
+        arena,
+        try sqs_event(arena, effects.sent.items[first + 1].body),
+        effects,
+    ));
+    try std.testing.expectEqualStrings(ack, try completion.handle_invocation(
+        arena,
+        try sqs_event(arena, effects.sent.items[first + 2].body),
+        &.{
+            .operations_table = "Operations",
+            .now = 100,
+            .ready_cache = completion_cache,
+        },
+        effects,
+    ));
+    const visible = try query.test_support.query_with_backend(arena, operation_id, "theatre", effects);
+    try std.testing.expect(std.mem.indexOf(u8, visible, "available") != null);
+    const saved = try effects.read(arena, operation_id);
+    const buffer = try arena.create([operation.result_size_max]u8);
+    return operation.writeCompletionJSON(buffer, &saved.state.completed);
+}
+
+test "warm submission observes uncached absence and readiness before disclosing classes" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    var effects = try Effects.init(arena);
+    const saved = effects.event;
+    var cache: events.ReadyCache = undefined;
+    try cache.init(std.testing.allocator, events.ReadyCache.budget_bytes_max);
+    defer cache.deinit();
+    const expected_reads = [_]usize{ 1, 2, 3, 3, 4, 5 };
+    for ([_][]const u8{
+        "event_unavailable", "event_not_ready",   "unknown_class",
+        "unknown_class",     "event_unavailable", "event_unavailable",
+    }, 0..) |expected, index| {
+        if (index == 0) effects.event = null;
+        if (index == 1) effects.event = saved;
+        if (index == 2) effects.event.?.state = .ready;
+        var request_storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer request_storage.deinit();
+        const request_arena = request_storage.allocator();
+        const input = try std.fmt.allocPrint(
+            request_arena,
+            "{{\"id\":\"{s}\",\"name\":\"SeatReservation\",\"body\":{{" ++
+                "\"command\":\"reserve_seats\",\"event_id\":\"00000000-0000-" ++
+                "0000-0000-000000000002\",\"class\":\"absent\",\"quantity\":1}}}}",
+            .{try seat.uuid_text(request_arena, index + 10)},
+        );
+        const first = effects.sent.items.len;
+        _ = try intake.test_support.submit(request_arena, &.{
+            .input = input,
+            .subject = if (index >= 4) "foreign" else "theatre",
+            .operation_name = "SeatReservation",
+        }, &effects);
+        try std.testing.expectEqualStrings(ack, try submission.handle_invocation(
+            request_arena,
+            try sqs_event(request_arena, effects.sent.items[first].body),
+            &.{
+                .events_table = "Events",
+                .completion_queue = "seat-completion",
+                .ready_cache = &cache,
+            },
+            &effects,
+        ));
+        const rejection = try messages.decode(request_arena, effects.sent.items[first + 1].body);
+        try std.testing.expectEqualStrings(expected, rejection.body.object.get("code").?.string);
+        try std.testing.expectEqual(expected_reads[index], effects.event_reads);
+    }
+    try std.testing.expectEqual(@as(usize, 0), effects.updates);
+    try std.testing.expectEqual(@as(u128, 100), effects.next_id);
+}
+
+test "warm completion observes uncached state transitions and rejects foreign cache reuse" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    var effects = try ready_check_effects(arena);
+    const output = try check_output(arena, &effects);
+    const saved = effects.event;
+    var cache: events.ReadyCache = undefined;
+    try cache.init(std.testing.allocator, events.ReadyCache.budget_bytes_max);
+    defer cache.deinit();
+    for (0..4) |index| {
+        if (index == 0) effects.event = null;
+        if (index == 1) {
+            effects.event = saved;
+            effects.event.?.state = .creating;
+        }
+        if (index == 2) effects.event.?.state = .ready;
+        var request_storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer request_storage.deinit();
+        const request_arena = request_storage.allocator();
+        try std.testing.expectEqualStrings(ack, try completion.handle_invocation(
+            request_arena,
+            try sqs_event(request_arena, output),
+            &.{ .operations_table = "Operations", .now = 100, .ready_cache = &cache },
+            &effects,
+        ));
+        try std.testing.expectEqual(@as(usize, @min(index + 2, 4)), effects.event_reads);
+        const operation_saved = try effects.read(request_arena, 1);
+        try std.testing.expectEqual(index >= 2, operation_saved.state == .completed);
+    }
+    var foreign = try messages.decode(arena, output);
+    foreign.tenant = "foreign";
+    const updates = effects.updates;
+    try std.testing.expectEqualStrings(ack, try completion.handle_invocation(
+        arena,
+        try sqs_event(arena, try messages.encode(arena, &foreign)),
+        &.{ .operations_table = "Operations", .now = 100, .ready_cache = &cache },
+        &effects,
+    ));
+    try std.testing.expectEqual(updates, effects.updates);
+    try std.testing.expectEqual(@as(usize, 5), effects.event_reads);
+    try std.testing.expectEqual(@as(usize, 3), effects.diagnostics.items.len);
+}
+
 const confirm_request = "{\"id\":\"" ++ uuid ++ "\",\"name\":\"SeatReservation\",\"body\":{" ++
     "\"command\":\"confirm_seats\",\"event_id\":\"00000000-0000-0000-0000-000000000002\"," ++
     "\"class\":\"general\",\"pending_id\":\"77\"}}";
@@ -753,6 +933,7 @@ const Effects = struct {
     commit_before_error: bool = false,
     log_error: bool = false,
     updates: usize = 0,
+    event_reads: usize = 0,
     high_water: u32 = 1000,
     next_id: u128 = 100,
     accounts: [33]tigerbeetle.Account = undefined,
@@ -936,6 +1117,7 @@ const Effects = struct {
         try std.testing.expect(input.consistent_read.?);
         if (self.read_error) |err| return err;
         if (std.mem.eql(u8, input.table_name, "Events")) {
+            self.event_reads += 1;
             if (self.event) |*event| {
                 const tenant = input.key[0].value.s.?;
                 if (try seat.canonical_uuid(input.key[1].value.s.?) != event.event_id) return null;

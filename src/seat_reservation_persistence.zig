@@ -5,6 +5,7 @@ const seat = @import("seat_reservation");
 const operation = @import("operation");
 const operations = @import("operation_persistence");
 const Allocator = std.mem.Allocator;
+pub const ReadyCache = @import("seat_event_cache.zig").ReadyCache;
 pub const Attribute = aws.map.MapEntry(dynamodb.types.AttributeValue);
 
 const event_fields = [_][]const u8{
@@ -269,6 +270,24 @@ pub fn read_event(
     return event;
 }
 
+/// Each cache belongs to one process and one immutable Events table binding.
+/// Creation and transactional pair reads remain authoritative and bypass this path.
+pub fn read_cached_event(
+    arena: Allocator,
+    table: []const u8,
+    key: *const seat.EventKey,
+    cache: ?*ReadyCache,
+    backend: anytype,
+) !seat.Event {
+    try validate_table_name(table);
+    if (cache) |ready| {
+        if (try ready.get(key)) |event| return event;
+    }
+    const event = try read_event(arena, table, key, backend);
+    if (cache) |ready| try ready.put(&event);
+    return event;
+}
+
 pub fn read_request(
     arena: Allocator,
     table: []const u8,
@@ -448,6 +467,10 @@ pub fn validate_table_name(table: []const u8) !void {
         if (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-' or byte == '.') continue;
         return error.InvalidConfiguration;
     }
+}
+
+test {
+    _ = @import("seat_event_cache.zig");
 }
 
 test "typed Event items preserve String keys native IDs and numeric configuration" {

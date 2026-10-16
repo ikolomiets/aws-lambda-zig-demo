@@ -15,6 +15,7 @@ pub const Options = struct {
     completion_queue: []const u8,
     native_queue: []const u8 = "",
     response_allocator: ?Allocator = null,
+    ready_cache: ?*events.ReadyCache = null,
 };
 pub const Stage = enum { submission, completion };
 pub const diagnostic_size_max = 8192;
@@ -40,6 +41,7 @@ fn handler(context: lambda.Context, input: []const u8) ![]const u8 {
         .events_table = resources.events.table_name,
         .completion_queue = resources.completion_queue,
         .native_queue = resources.native_queue,
+        .ready_cache = &resources.ready_cache,
     }, resources);
 }
 
@@ -51,6 +53,7 @@ const Runtime = struct {
     native_queue: []const u8,
     counter: ledger_counter.Counter,
     io: std.Io,
+    ready_cache: events.ReadyCache,
 
     fn init(self: *Runtime, process_init: std.process.Init) !void {
         self.io = process_init.io;
@@ -72,10 +75,13 @@ const Runtime = struct {
         try self.events.init(process_init.gpa, &self.config, process_init.environ_map);
         errdefer self.events.deinit();
         try self.counter.init(process_init.gpa, &self.config, process_init.environ_map);
+        errdefer self.counter.deinit();
+        try self.ready_cache.init(process_init.gpa, events.ReadyCache.budget_bytes_max);
         sqs_queue.Sender.init(&self.sender, process_init.gpa, &self.config);
     }
 
     fn deinit(self: *Runtime) void {
+        self.ready_cache.deinit();
         self.sender.deinit();
         self.counter.deinit();
         self.events.deinit();
@@ -337,10 +343,11 @@ fn admission(
     };
     var saved: ?seat.Event = null;
     if (event_id) |id| {
-        saved = events.read_event(
+        saved = events.read_cached_event(
             arena,
             options.events_table,
             &.{ .tenant = message.tenant, .event_id = id },
+            options.ready_cache,
             backend,
         ) catch |err| {
             if (err == error.EventUnavailable) return .{ .rejected = .event_unavailable };

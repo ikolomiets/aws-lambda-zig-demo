@@ -15,6 +15,7 @@ pub const Options = struct {
     events_table: []const u8 = "Events",
     now: operation.UnixSeconds,
     response_allocator: ?Allocator = null,
+    ready_cache: ?*events.ReadyCache = null,
 };
 var runtime: ?*Runtime = null;
 
@@ -37,6 +38,7 @@ fn handler(context: lambda.Context, input: []const u8) ![]const u8 {
         .operations_table = resources.persistence.table_name,
         .events_table = resources.events_table,
         .now = std.Io.Clock.real.now(context.io).toSeconds(),
+        .ready_cache = &resources.ready_cache,
     }, resources);
 }
 
@@ -44,6 +46,7 @@ const Runtime = struct {
     config: aws.Config,
     persistence: operations.Persistence,
     events_table: []const u8,
+    ready_cache: events.ReadyCache,
 
     fn init(self: *Runtime, process_init: std.process.Init) !void {
         self.events_table = process_init.environ_map.get("EVENTS_TABLE_NAME") orelse
@@ -57,9 +60,12 @@ const Runtime = struct {
         );
         errdefer self.config.deinit();
         try self.persistence.init(process_init.gpa, &self.config, process_init.environ_map);
+        errdefer self.persistence.deinit();
+        try self.ready_cache.init(process_init.gpa, events.ReadyCache.budget_bytes_max);
     }
 
     fn deinit(self: *Runtime) void {
+        self.ready_cache.deinit();
         self.persistence.deinit();
         self.config.deinit();
     }
@@ -288,10 +294,10 @@ fn complete_ready(
         .check_seats => |id| id,
         else => unreachable,
     };
-    const saved = events.read_event(arena, options.events_table, &.{
+    const saved = events.read_cached_event(arena, options.events_table, &.{
         .tenant = message.tenant,
         .event_id = event_id,
-    }, backend) catch |err| {
+    }, options.ready_cache, backend) catch |err| {
         if (err == error.EventUnavailable) return error.InvalidNativeEvidence;
         return err;
     };

@@ -394,6 +394,25 @@ item, including returned identity. Missing and foreign Events return the same
 malformed IDs, invalid states, duplicate accounts, and invalid class Maps return
 `InvalidItem`. Decoded Events own tenant and class storage in the caller's arena.
 
+Each warm seat submission and completion process owns a separate tenant/Event LRU
+for validated `ready` metadata. The cache accounts for its object and its entire
+single backing allocation within 1 MiB, including keys, values, alignment padding,
+unused slot capacity, and list bookkeeping. Fixed slots reserve space for a
+64-byte tenant and all 31 classes; lookups compare the complete tenant bytes and
+u128 Event ID. Hits promote the entry, and insertion into a full cache evicts the
+least recently used entry. A slot that exceeds the available budget bypasses
+caching. Allocation failure during process initialization is an operating error;
+hits, insertion and eviction allocate no additional cache storage.
+
+Cached tenant and class bytes belong to the process, independently of request
+arenas, and remain until eviction or process teardown without timer expiry. This
+relies on the immutable configuration of terminal ready Events. Authorization
+still precedes readiness and class disclosure on hits. Absence, `creating`, and
+`failed` states are never cached, so later admission observes initialization
+transitions. Balances and availability observations are never cached: every check
+still submits native account lookups. Creation and atomic finalization/readback
+use authoritative reads independently of the cache.
+
 Creation accepts only validated `creating` metadata and uses
 `attribute_not_exists(#tenant) AND attribute_not_exists(#event_id)`. It never
 replaces an existing item. A conflict or lost put response triggers a strongly
