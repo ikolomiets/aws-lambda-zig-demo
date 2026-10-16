@@ -187,7 +187,7 @@ fn process_record(
         .accepted => |*accepted| {
             const dispatch = switch (accepted.command) {
                 .create_event => create_event(arena, &message, &accepted.command, options, backend),
-                .check_seats => dispatch_native(
+                .reserve_seats, .check_seats => dispatch_native(
                     arena,
                     &message,
                     &accepted.command,
@@ -258,12 +258,17 @@ fn dispatch_native(
     options: *const Options,
     backend: anytype,
 ) !void {
+    const attempt_id = if (command.* == .reserve_seats) try backend.generate_id() else 0;
     const body = try seat.encode_native_body(arena, &.{
         .command = command,
         .event = saved,
-        .attempt_id = 0,
+        .attempt_id = attempt_id,
     });
-    const context = try seat.encode_context(arena, command, null);
+    const context = try seat.encode_context(
+        arena,
+        command,
+        if (command.* == .reserve_seats) attempt_id else null,
+    );
     const output = try messages.encode(arena, &.{
         .operation_id = message.operation_id,
         .tenant = message.tenant,

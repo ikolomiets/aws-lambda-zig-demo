@@ -493,6 +493,49 @@ pub fn creation_result(arena: Allocator, body: *const std.json.Value, event: *co
     return .{ .success = .{ .create_event = event.event_id } };
 }
 
+/// Context names the submitted hold; only complete native evidence proves its outcome.
+pub fn reservation_result(
+    body: *const std.json.Value,
+    event: *const Event,
+    context: *const Context,
+) !Result {
+    if (context.command != .reserve_seats) return error.InvalidNativeEvidence;
+    try validate_command(&context.command);
+    try validate_event(event);
+    try validate_command_event(&context.command, event);
+    if (event.state != .ready) return error.InvalidNativeEvidence;
+    const reservation_id = context.reservation_id orelse return error.InvalidNativeEvidence;
+    try validate_native_id(reservation_id);
+    try exact_fields(body, &.{ "create_accounts", "create_transfers", "lookup_accounts" });
+    _ = try outcome_list(body, "create_accounts", 0);
+    _ = try outcome_list(body, "lookup_accounts", 0);
+    const transfers = try outcome_list(body, "create_transfers", 1);
+    std.debug.assert(transfers.len == 1);
+    const entry = &transfers[0];
+    try exact_fields(entry, &.{ "error_code", "alias" });
+    var alias_buffer: [64]u8 = undefined;
+    const alias = try std.fmt.bufPrint(
+        &alias_buffer,
+        "reserve-{s}",
+        .{context.command.reserve_seats.class.slice()},
+    );
+    if (!std.mem.eql(u8, alias, try string_value(try required(entry, "alias")))) {
+        return error.InvalidNativeEvidence;
+    }
+    const status = try string_value(try required(entry, "error_code"));
+    if (std.mem.eql(u8, status, "created") or std.mem.eql(u8, status, "exists")) {
+        return .{ .success = .{ .reserve_seats = .{
+            .request = context.command.reserve_seats,
+            .reservation_id = reservation_id,
+        } } };
+    }
+    if (std.mem.eql(u8, status, "exceeds_credits")) return .{ .failure = .insufficient_seats };
+    if (std.mem.eql(u8, status, "id_already_failed")) return .{ .failure = .operation_rejected };
+    // Every other pinned rejection contradicts this server-constructed pending
+    // transfer or its saved accounts. Unknown statuses are inconclusive evidence.
+    return error.InvalidNativeEvidence;
+}
+
 /// A check is a complete observation of the configured accounts, never a reservation.
 pub fn availability_result(
     arena: Allocator,

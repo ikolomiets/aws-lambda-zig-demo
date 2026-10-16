@@ -8,8 +8,8 @@ The independent [ledger counter](../src/ledger_counter.zig) and host
 `ledger-counter` utility initialize, inspect and allocate global ledgers.
 The [submission](../src/seat_reservation_processor.zig) and
 [completion](../src/seat_reservation_completion_processor.zig) handlers implement
-local rejections, native Event creation and availability observations through
-authenticated intake and query. Reservation and confirmation execution, and SAM
+local rejections, native Event creation, reservations and availability observations through
+authenticated intake and query. Confirmation execution, and SAM
 provisioning of the two handlers, remain separate slices.
 
 ## Rejection workflow
@@ -46,9 +46,9 @@ A local failure goes only to the configured `SeatReservationCompletionQueue`:
 The original input becomes arbitrary Context, including invalid scalar or null
 input. It must fit the shared 4 KiB Context bound. An internal message whose input
 cannot be carried within that bound is diagnosed as unusable. No local rejection
-allocates a ledger, writes an Event or dispatches native work. Admitted creation
-and availability checks dispatch native work as described below. Admitted reserve
-and confirm commands remain retryable pending their native implementations.
+allocates a ledger, writes an Event or dispatches native work. Admitted creation,
+availability checks and reservations dispatch native work as described below.
+Admitted confirm commands remain retryable pending their native implementation.
 
 Completion rejects Result Queue overrides. Local completion accepts an unambiguous
 admission-failure Body containing exactly `code`. Native three-list and mixed
@@ -157,6 +157,55 @@ contradictory pairs. The separate local SDK probe exercises runtime finalization
 and winner readback. `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle`
 proves native funding, intact replay and the three account bounds against the local
 replica; the offline fakes do not establish those native guarantees.
+
+## Reservation workflow
+
+`reserve_seats` accepts exactly `command`, canonical `event_id`, scalar `class`
+and positive u32 `quantity`. Submission authorizes the owning tenant and ready
+Event before disclosing class existence. The actual serializers admit the entire
+native Body, flat Context, Result and envelope with maximum-width identifiers
+before generating an ID or publishing work. No ledger allocation or Event write
+occurs. One generated pending transfer debits the class's Availability Account
+and credits the Event's Allocation Account for the full quantity, with code 2,
+the saved ledger and timeout, and alias `reserve-${tag}`. Its ID is exactly the
+flat Context's `reservation_id`; the native processor need not echo it.
+
+Completion requires the authorized ready Event, valid reserve Context, exactly
+one transfer outcome with the expected alias and only `error_code`/`alias`, and
+empty account-creation and lookup lists. `created` or matching `exists` proves
+success. `exceeds_credits` produces `insufficient_seats`; `id_already_failed`
+produces `operation_rejected`. Other statuses contradict the generated pending
+command or configured accounts, or provide unknown/inconclusive evidence. Missing
+or closed accounts, generated-ID conflicts, singleton `linked_event_failed`,
+extra/truncated outcomes and malformed Context are diagnosed and acknowledged
+without finalizing the Operation. Context alone proves no native effect.
+
+Valid evidence finalizes only the matching Operation under the identity, state
+and absent-Result guards, with authoritative winner readback after conflicts or
+uncertainty. Success contains only `event_id`, `class`, integer `quantity` and
+decimal-string `reservation_id`; failure contains only `code`. Authenticated
+query reveals the Result only to the owner. Later completions preserve the first
+valid Result and its timestamps, even when another attempt has a different ID or
+outcome. Reservations never change Event state.
+
+Fresh submission retries can generate different pending IDs and leave abandoned
+holds, including when a competing failure wins the Operation Result. No saved
+per-Operation plan or reservation ownership record coordinates these effects.
+Replaying a constructed native message preserves its ID and all fields. A hold's
+timeout starts at native creation, follows native time and never renews on replay.
+Cleanup may lag expiry. A delayed success can therefore name an already-expired
+hold; it promises no remaining lifetime and contains no synthetic expiry timestamp.
+
+`zig build test-seat-workflow` covers success, capacity failure, matching replay,
+fresh competing attempts, uncertain dispatch/publication/finalization, invalid
+evidence and immutable winning Results through the authenticated composed pipeline.
+The separate local native suite proves concurrent all-or-nothing bounds, class
+independence, expiry from native creation, replay without renewal and delayed
+success after expiry:
+
+```sh
+TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle
+```
 
 ## Availability workflow
 

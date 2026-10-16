@@ -37,3 +37,17 @@ A terminal Result does not establish exactly-once native effects or reverse anot
 attempt's effects; subsequent native execution must allow abandoned holds and retain
 stable saved initialization identities. Recovery remains bounded by Operation retention.
 The [seat reference](../SEAT_RESERVATION.md) owns the implemented wire and delivery contract.
+
+Reserve submission generates a fresh pending transfer ID after whole-command
+admission and carries that exact ID in flat Context. Complete singleton native
+evidence establishes success; Context alone does not. Retries of submission may
+create different holds, so one Operation can leave abandoned holds even when a
+capacity rejection wins its immutable Result. Operation finalization does not
+cancel those holds or choose which native attempt may execute.
+
+Replaying a constructed native message retains every transfer field and ID.
+The timeout begins at native creation and replay never renews it. Native cleanup
+can lag the deadline, and delayed completion can persist success after the hold
+has expired. Results therefore identify a successfully created hold without
+promising remaining lifetime or synthesizing an expiry timestamp. Avoiding saved
+plans and reservation ownership storage keeps this limitation explicit.

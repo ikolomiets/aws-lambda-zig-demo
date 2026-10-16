@@ -251,21 +251,8 @@ fn complete_native(
         if (err == error.OutOfMemory) return err;
         return error.InvalidNativeEvidence;
     };
-    if (context.command == .check_seats) {
-        const saved = events.read_event(arena, options.events_table, &.{
-            .tenant = message.tenant,
-            .event_id = context.command.check_seats,
-        }, backend) catch |err| {
-            if (err == error.EventUnavailable) return error.InvalidNativeEvidence;
-            return err;
-        };
-        const projected = seat.availability_result(arena, &message.body, &saved) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            return error.InvalidNativeEvidence;
-        };
-        const result_json = try seat.encode_result(arena, &projected);
-        try finalize_operation(arena, message, result_json, options, backend);
-        return;
+    if (context.command == .reserve_seats or context.command == .check_seats) {
+        return complete_ready(arena, message, &context, options, backend);
     }
     if (context.command != .create_event) return error.InvalidNativeEvidence;
     const saved = events.read_event(arena, options.events_table, &.{
@@ -287,6 +274,37 @@ fn complete_native(
         .operations_table = options.operations_table,
         .now = options.now,
     }, &saved, &result, backend);
+}
+
+fn complete_ready(
+    arena: Allocator,
+    message: *const messages.Message,
+    context: *const seat.Context,
+    options: *const Options,
+    backend: anytype,
+) !void {
+    const event_id = switch (context.command) {
+        .reserve_seats => |reserve| reserve.event_id,
+        .check_seats => |id| id,
+        else => unreachable,
+    };
+    const saved = events.read_event(arena, options.events_table, &.{
+        .tenant = message.tenant,
+        .event_id = event_id,
+    }, backend) catch |err| {
+        if (err == error.EventUnavailable) return error.InvalidNativeEvidence;
+        return err;
+    };
+    const projected = (switch (context.command) {
+        .reserve_seats => seat.reservation_result(&message.body, &saved, context),
+        .check_seats => seat.availability_result(arena, &message.body, &saved),
+        else => unreachable,
+    }) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidNativeEvidence;
+    };
+    const result_json = try seat.encode_result(arena, &projected);
+    try finalize_operation(arena, message, result_json, options, backend);
 }
 
 fn read_winner(
