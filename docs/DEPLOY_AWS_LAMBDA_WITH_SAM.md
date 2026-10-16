@@ -1570,6 +1570,9 @@ The public key is not required in development mode because the deployed
 configuration supplies it. Run `zig build test` separately for the full local
 release gates. The mode has no measured speed guarantee.
 
+Development sync never invokes the separately authorized
+[deployed seat scenarios](#seat-workflow-evidence-and-deployed-scenarios).
+
 Development mode invokes no deployment controller, WireGuard lifecycle action,
 or counter setup. It rejects explicit function-name, TigerBeetle configuration,
 counter-table/counter-ID, and Lambda-principal flags, lifecycle options including `--cleanup`, and custom
@@ -2046,6 +2049,112 @@ validation, execution, Result limits, and recovery contract.
 TigerBeetleCompletionProcessor receives one Processor Message per invocation. It interprets the
 native Body and conditionally completes the Operation selected by its UUID. Conflicts acknowledge;
 transient failures retry that single message. Earlier completed Operations are unaffected.
+
+### Seat workflow evidence and deployed scenarios
+
+Keep these evidence levels separate when recording validation:
+
+| Level | Command and what it establishes |
+| --- | --- |
+| Deterministic pipeline | `zig build test-seat-workflow` exercises authenticated handlers, codecs, persistence builders, delivery/recovery and exact public Results with external effects controlled. `zig build test-seat-scenarios` tests runner control flow using local command mocks. Both are in `zig build test`; neither contacts AWS. |
+| Pinned SDK / DynamoDB Local | The separate [transaction probe](SEAT_TRANSACTIONS.md), `./tests/seat_transactions_test.sh`, executes shared builders through the pinned SDK against isolated loopback DynamoDB Local 3.3.0 with dummy credentials. Its service behavior and simulations remain distinct from AWS. |
+| Authorized local native | `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` exercises the local replica's funding, reservation bounds, replay, confirmation and expiry. It requires the separately authorized local replica and establishes no cloud delivery or IAM behavior. |
+| Deployed | The separately invoked [runner](../seat_scenarios.py) exercises the selected development stack through its public intake/query and host read utilities. Only an executed, passing run establishes deployed behavior for its covered paths. |
+
+The deployed runner requires an existing compatible **six-function full-deployment
+baseline**: `IntakeFunction`, `QueryFunction`, `SeatReservationProcessor`,
+`TigerBeetleProcessor`, `SeatReservationCompletionProcessor`, and
+`TigerBeetleCompletionProcessor`, with their current queues, mappings, IAM and
+runtime configuration. The selected counter binding must already be initialized;
+native connectivity and gateway configuration must already work. Build the host
+utilities beforehand using the [ordinary build](#2-build-and-package-the-zig-lambdas).
+The runner requires Python 3.9+, AWS CLI, curl, and executable
+`zig-out/bin/paseto`, `dynamodb`, `events`, and `ledger-counter`. It never builds,
+packages, deploys, synchronizes, logs in, or initializes a counter.
+
+Help is credential-free and performs no AWS calls, utility execution, or discovery:
+
+```sh
+python3 seat_scenarios.py --help
+```
+
+After explicit authorization to exercise the intended **development** stack,
+authenticate the chosen profile and export `PASETO_PRIVATE_KEY` matching its
+deployed public key. All selectors and the cloud authorization flag are mandatory;
+inherited `PROFILE`, `REGION`, and `STACK_NAME` do not select the target. For example:
+
+```sh
+python3 seat_scenarios.py --authorize-cloud \
+  --profile '<authorized-development-profile>' --region ca-central-1 \
+  --stack-name '<authorized-development-stack>' \
+  --output-dir '.scratch/seat-scenario-run-unique'
+```
+
+Use a new output directory on every invocation; its parent must exist. The flag
+authorizes this invocation's reads and seat workflow effects. Discovery also
+requires it; there is no cloud-inspection dry run. The selected profile supplies
+temporary credentials through `aws configure export-credentials --format process`.
+Operator access requires `cloudformation:DescribeStacks`,
+`cloudformation:DescribeStackResource`, and `dynamodb:GetItem` on the Operations,
+Events, and actual counter tables. The PASETO private key supplies public handler
+authentication. These operator reads do not certify the Lambda roles' permissions.
+Environment endpoint overrides are rejected, and AWS CLI configured endpoint
+overrides are disabled for discovery. Read utilities receive empty shared config
+and credentials files (`/dev/null`) with the exported credentials and explicit
+Region; a profile-level SDK endpoint override cannot redirect inspection.
+
+The runner discovers `IntakeFunctionUrl`, `QueryFunctionUrl`, `SeatEventsTableName`,
+`LedgerCounterTableName`, and `LedgerCounterId` from the selected stack's outputs.
+It discovers `OperationsTable` through its physical resource, since there is no
+Operations table-name output. The counter table output works for owned and
+referenced tables; the ID output is required even for the default `global`.
+Every counter read passes `--counter-id` explicitly to the direct utility, so an
+inherited `LEDGER_COUNTER_ID` cannot redirect inspection. No native cluster-ID
+discovery participates. Utilities receive the discovered table names and chosen
+profile/Region explicitly through their environment.
+
+Each invocation generates two fresh token subjects and nine unique Operation UUIDs.
+Creation's UUID is the new Event ID. The owner creates general/premium capacities
+3/2 with a 300-second reservation timeout, checks initial availability, reserves two
+general seats, checks the hold, confirms it, and checks remaining availability 1/2.
+Every terminal public Result is compared against its exact allowed projection,
+then read back with `dynamodb read`. `events read` verifies ready metadata and
+the allocated ledger; counter reads bracket creation without assuming a gapless
+sequence or exclusive allocator use. Missing authentication must produce 401.
+The second tenant sees the owner's Operation as the same static 404 as a missing
+Operation, cannot reuse its UUID at intake (409), and receives exact
+`event_unavailable` Results for foreign check/reserve/confirm requests.
+
+The entire invocation has a 300-second deadline, including subprocesses; commands
+are individually limited to 30 seconds and HTTP requests to 10 seconds without
+redirects or automatic retries. Each Operation polls at most 30 times, waiting two
+seconds between reads. `--poll-attempts` accepts 1–60, `--poll-seconds` accepts 0–5,
+and `--timeout-seconds` accepts 1–300. A stalled command, timeout, unexpected HTTP
+status, malformed output, wrong Result or failed utility stops the run nonzero.
+There is no automatic resubmission or recovery. These bounds may expose a slow
+stack as a failed scenario; inspect it before deciding whether to run again.
+
+The private output directory contains `manifest.json`, validated terminal public
+Operations, ready Event metadata, and before/after counter observations. The
+manifest records generated tenants/Operation IDs and `running`, `failed`, or
+`passed`; failures include stage, Operation UUID where applicable, and a sanitized
+reason. A stopped invocation may retain `running`. Raw service errors, stack outputs,
+table names, Function URLs, credentials, signing keys and bearer tokens are not
+captured. Do not redirect AWS discovery/debug output into fixtures or publish local
+deployment output. An unrun runner, mocked pass, or incomplete/failed manifest is
+**not a passing cloud result**. Record executed revision, time and covered paths
+alongside local evidence; this scenario does not prove all IAM permissions,
+failure/redelivery paths or deployed recovery.
+
+Each run retains a permanent Event, native accounts/funding and confirmed seat
+transfers, consumes at least one ledger value (gaps are allowed), and leaves nine
+disposable Operations subject to their existing 24-hour TTL. Interrupted runs may
+retain creating Events or unconfirmed holds. The runner never resets/decrements
+counters, deletes metadata or Operations, or cleans up native state. Unique
+identities provide repeatability; cleanup is a separate authorized lifecycle action.
+Deleting or expiring an Operation removes the completion/recovery anchor; permanent
+Event metadata cannot reconstruct it or authorize repair. Keep local evidence as
+needed, without treating it as a durable execution journal.
 
 ## 9. Download Lambda logs
 

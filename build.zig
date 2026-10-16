@@ -995,6 +995,11 @@ pub fn build(b: *std.Build) void {
     b.step("test-tracker", "Run temporary-tree Markdown tracker command tests")
         .dependOn(&tracker_test.step);
 
+    const seat_scenarios_test = b.addSystemCommand(&.{"python3"});
+    seat_scenarios_test.addFileArg(b.path("tests/seat_scenarios_test.py"));
+    b.step("test-seat-scenarios", "Run offline deployed seat scenario runner tests")
+        .dependOn(&seat_scenarios_test.step);
+
     const documentation_test = b.addSystemCommand(&.{"python3"});
     documentation_test.addFileArg(b.path("tests/documentation_check_test.py"));
     b.step("test-docs", "Run temporary-repository documentation command tests")
@@ -1028,6 +1033,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&local_check_test.step);
     test_step.dependOn(&documentation_test.step);
     test_step.dependOn(&tracker_test.step);
+    test_step.dependOn(&seat_scenarios_test.step);
     test_step.dependOn(&run_seat_reservation_tests.step);
     test_step.dependOn(&run_seat_persistence_tests.step);
     test_step.dependOn(&run_seat_workflow_tests.step);

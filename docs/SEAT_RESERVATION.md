@@ -97,6 +97,10 @@ describes caller-retry and 24-hour Operation-retention limits.
 The separate [SDK transaction probe](SEAT_TRANSACTIONS.md)
 establishes executable persistence composition evidence. The
 [consistency ADR](adr/0007-seat-completion-consistency.md) records the recovery decision.
+The deployment guide separates these checks from authorized local native and
+[deployed scenario evidence](DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-workflow-evidence-and-deployed-scenarios).
+The deployed runner requires an existing six-function baseline and explicit cloud
+authorization; neither the offline suite nor development sync invokes it.
 
 ## Event creation workflow
 
