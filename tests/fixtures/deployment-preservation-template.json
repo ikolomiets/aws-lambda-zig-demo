@@ -1,0 +1,43 @@
+{
+  "TemplateBody": {
+    "Conditions": {"OwnLedgerCounterTable": {"Fn::Equals": [{"Ref": "ExistingLedgerCounterTableName"}, ""]}},
+    "Resources": {
+      "OperationsTable": {
+        "Type": "AWS::DynamoDB::Table",
+        "Properties": {
+          "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+          "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+          "TimeToLiveSpecification": {"AttributeName": "expires_at", "Enabled": true}
+        }
+      },
+      "SeatEventsTable": {
+        "Type": "AWS::DynamoDB::Table",
+        "Properties": {
+          "AttributeDefinitions": [{"AttributeName": "tenant", "AttributeType": "S"}, {"AttributeName": "event_id", "AttributeType": "S"}],
+          "KeySchema": [{"AttributeName": "tenant", "KeyType": "HASH"}, {"AttributeName": "event_id", "KeyType": "RANGE"}]
+        }
+      },
+      "LedgerCounterTable": {
+        "Type": "AWS::DynamoDB::Table",
+        "Condition": "OwnLedgerCounterTable",
+        "Properties": {
+          "AttributeDefinitions": [{"AttributeName": "counter_id", "AttributeType": "S"}],
+          "KeySchema": [{"AttributeName": "counter_id", "KeyType": "HASH"}]
+        }
+      },
+      "SeatReservationProcessor": {"Properties": {"Environment": {"Variables": {
+        "EVENTS_TABLE_NAME": {"Ref": "SeatEventsTable"},
+        "LEDGER_COUNTER_TABLE_NAME": {"Fn::If": ["OwnLedgerCounterTable", {"Ref": "LedgerCounterTable"}, {"Ref": "ExistingLedgerCounterTableName"}]},
+        "LEDGER_COUNTER_ID": {"Ref": "LedgerCounterId"}
+      }}}},
+      "SeatReservationCompletionProcessor": {"Properties": {"Environment": {"Variables": {
+        "EVENTS_TABLE_NAME": {"Ref": "SeatEventsTable"},
+        "OPERATIONS_TABLE_NAME": {"Ref": "OperationsTable"}
+      }}}}
+    },
+    "Outputs": {
+      "LedgerCounterTableName": {"Value": {"Fn::If": ["OwnLedgerCounterTable", {"Ref": "LedgerCounterTable"}, {"Ref": "ExistingLedgerCounterTableName"}]}},
+      "LedgerCounterId": {"Value": {"Ref": "LedgerCounterId"}}
+    }
+  }
+}

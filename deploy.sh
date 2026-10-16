@@ -34,6 +34,9 @@ Usage: ./deploy.sh [options]
 Build, package, validate, and deploy the Zig Lambdas with AWS SAM. Existing
 WireGuard gateway parameters are preserved. Use wireguard-gateway-setup.sh to
 enable, reconfigure, or disable the gateway.
+Full deployments inspect the exact change set before execution, preserve table
+and allocator identities, and verify selected counter setup without repairing it.
+First-time setup is explicit: ledger-counter.sh --counter-id ID init.
 
 Options:
   --profile NAME         AWS CLI profile. Defaults to $PROFILE or dev.
@@ -408,25 +411,228 @@ build_sam_parameter_overrides() {
     fi
 }
 
-deploy_stack_phase() {
-    local phase_description="$1"
+load_preserved_allocator_binding() {
+    local stack_json binding owned_table
+    PRESERVED_COUNTER_TABLE=''
+    PRESERVED_COUNTER_ID=''
+    PRESERVED_COUNTER_REFERENCE=''
+    DEPLOYMENT_WAITER=stack-update-complete
+    stack_json="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+        --output json --profile "$PROFILE" --region "$REGION" 2>&1)" || {
+        case "$stack_json" in
+            *"(ValidationError)"*"Stack with id $STACK_NAME does not exist"*)
+                DEPLOYMENT_WAITER=stack-create-complete
+                return 0
+                ;;
+            *) fail "could not inspect the established allocator binding" ;;
+        esac
+    }
+    jq -e '(.Stacks | type == "array" and length == 1) and
+        (.Stacks[0].Outputs | type == "array") and
+        (.Stacks[0].Parameters | type == "array")' <<<"$stack_json" >/dev/null ||
+        fail "ambiguous stack inspection; nothing executed"
+    case "$(jq -r '.Stacks[0].StackStatus' <<<"$stack_json")" in
+        REVIEW_IN_PROGRESS) DEPLOYMENT_WAITER=stack-create-complete ;;
+        *_IN_PROGRESS) fail "stack $STACK_NAME has an active lifecycle operation; wait before retrying" ;;
+        CREATE_COMPLETE | UPDATE_COMPLETE | UPDATE_ROLLBACK_COMPLETE | IMPORT_COMPLETE | IMPORT_ROLLBACK_COMPLETE) ;;
+        *) fail "stack $STACK_NAME is not ready for deployment" ;;
+    esac
+    binding="$(jq -ce '
+        .Stacks[0] |
+        def output($key): [.Outputs[]? | select(.OutputKey == $key) | .OutputValue];
+        def parameter($key): [.Parameters[]? | select(.ParameterKey == $key) | .ParameterValue];
+        output("LedgerCounterTableName") as $tables |
+        output("LedgerCounterId") as $ids |
+        parameter("LedgerCounterId") as $configured |
+        parameter("ExistingLedgerCounterTableName") as $references |
+        if ($tables | length) == 0 and ($ids | length) == 0 and
+           ($configured | length) == 0 and ($references | length) == 0 and
+           (output("SeatReservationProcessorName") | length) == 0 then
+            {table: "", id: "", reference: ""}
+        elif ($tables | length) == 1 and ($ids | length) <= 1 and
+             ($configured | length) <= 1 and ($references | length) <= 1 then
+            {table: $tables[0],
+             id: (if ($ids | length) == 0 then "global" else $ids[0] end),
+             reference: (if ($references | length) == 0 then "" else $references[0] end)} |
+            select(.id == (if ($configured | length) == 0 then "global" else $configured[0] end)) |
+            select(.table | type == "string" and test("^[A-Za-z0-9_.-]{3,255}$")) |
+            select(.id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")) |
+            select(.reference == "" or .reference == .table)
+        else empty end
+    ' <<<"$stack_json")" || fail "invalid or incomplete established allocator binding"
+    PRESERVED_COUNTER_TABLE="$(jq -r '.table' <<<"$binding")"
+    PRESERVED_COUNTER_ID="$(jq -r '.id' <<<"$binding")"
+    PRESERVED_COUNTER_REFERENCE="$(jq -r '.reference' <<<"$binding")"
+    [ -n "$PRESERVED_COUNTER_TABLE" ] || return 0
+    [ "$LEDGER_COUNTER_ID" = "$PRESERVED_COUNTER_ID" ] ||
+        fail "refusing to change the established counter ID; another initialized ID is a different allocator"
+    [ -z "$EXISTING_LEDGER_COUNTER_TABLE_NAME" ] ||
+        [ "$EXISTING_LEDGER_COUNTER_TABLE_NAME" = "$PRESERVED_COUNTER_REFERENCE" ] ||
+        fail "refusing to change the established counter table ownership or physical binding"
+    if [ -z "$PRESERVED_COUNTER_REFERENCE" ]; then
+        owned_table="$(aws cloudformation describe-stack-resource --stack-name "$STACK_NAME" \
+            --logical-resource-id LedgerCounterTable \
+            --query StackResourceDetail.PhysicalResourceId --output text \
+            --profile "$PROFILE" --region "$REGION")" ||
+            fail "could not verify the owned counter table identity"
+        [ "$owned_table" = "$PRESERVED_COUNTER_TABLE" ] ||
+            fail "owned counter table does not match the established allocator"
+    fi
+}
 
+verify_deployment_counter() {
+    # The shared CLI owns consistent reads, record validation and absent-only init.
+    # Always select explicitly so inherited utility settings cannot redirect a read.
+    ./ledger-counter.sh --profile "$PROFILE" --region "$REGION" \
+        --stack-name "$STACK_NAME" --counter-id "$LEDGER_COUNTER_ID" read ||
+        fail "selected allocator setup is missing, corrupt, or unavailable; deployment never initializes or repairs it; see the deployment guide for explicit first-time setup of a new binding"
+}
+
+inspect_deployment_template() {
+    local changeset_id="$1" proposed_template
+    proposed_template="$(aws cloudformation get-template --stack-name "$STACK_NAME" \
+        --change-set-name "$changeset_id" --template-stage Processed --output json \
+        --profile "$PROFILE" --region "$REGION")" ||
+        fail "could not inspect the processed change-set template; nothing executed"
+    jq -e '
+        .TemplateBody | if type == "string" then fromjson else . end |
+        def binding: {"Fn::If": ["OwnLedgerCounterTable",
+            {"Ref": "LedgerCounterTable"}, {"Ref": "ExistingLedgerCounterTableName"}]};
+        def table($name; $attributes; $keys):
+            .Resources[$name] | .Type == "AWS::DynamoDB::Table" and
+            .Properties.AttributeDefinitions == $attributes and
+            .Properties.KeySchema == $keys and .Properties.TableName == null;
+        table("OperationsTable"; [{AttributeName:"id",AttributeType:"S"}];
+            [{AttributeName:"id",KeyType:"HASH"}]) and
+        table("SeatEventsTable";
+            [{AttributeName:"tenant",AttributeType:"S"},{AttributeName:"event_id",AttributeType:"S"}];
+            [{AttributeName:"tenant",KeyType:"HASH"},{AttributeName:"event_id",KeyType:"RANGE"}]) and
+        table("LedgerCounterTable"; [{AttributeName:"counter_id",AttributeType:"S"}];
+            [{AttributeName:"counter_id",KeyType:"HASH"}]) and
+        .Resources.OperationsTable.Properties.TimeToLiveSpecification == {AttributeName:"expires_at",Enabled:true} and
+        .Resources.SeatEventsTable.Properties.TimeToLiveSpecification == null and
+        .Resources.LedgerCounterTable.Properties.TimeToLiveSpecification == null and
+        .Resources.SeatEventsTable.Condition == null and
+        .Resources.OperationsTable.Condition == null and
+        .Resources.LedgerCounterTable.Condition == "OwnLedgerCounterTable" and
+        .Conditions.OwnLedgerCounterTable == {"Fn::Equals":[{"Ref":"ExistingLedgerCounterTableName"},""]} and
+        .Outputs.LedgerCounterTableName.Value == binding and
+        .Outputs.LedgerCounterId.Value == {"Ref":"LedgerCounterId"} and
+        .Resources.SeatReservationProcessor.Properties.Environment.Variables.LEDGER_COUNTER_TABLE_NAME == binding and
+        .Resources.SeatReservationProcessor.Properties.Environment.Variables.LEDGER_COUNTER_ID == {"Ref":"LedgerCounterId"} and
+        .Resources.SeatReservationProcessor.Properties.Environment.Variables.EVENTS_TABLE_NAME == {"Ref":"SeatEventsTable"} and
+        .Resources.SeatReservationCompletionProcessor.Properties.Environment.Variables.EVENTS_TABLE_NAME == {"Ref":"SeatEventsTable"} and
+        .Resources.SeatReservationCompletionProcessor.Properties.Environment.Variables.OPERATIONS_TABLE_NAME == {"Ref":"OperationsTable"}
+    ' <<<"$proposed_template" >/dev/null ||
+        fail "refusing changed table schemas or allocator wiring in the proposed template; nothing executed"
+}
+
+inspect_deployment_changeset() {
+    local changeset_id="$1" page next_token='' seen_tokens=$'\n'
+    local expected_reference="$EXISTING_LEDGER_COUNTER_TABLE_NAME"
+    local pagination=(--no-paginate)
+    if [ -n "$PRESERVED_COUNTER_TABLE" ]; then
+        expected_reference="$PRESERVED_COUNTER_REFERENCE"
+    fi
+
+    while :; do
+        page="$(aws cloudformation describe-change-set \
+            --change-set-name "$changeset_id" --stack-name "$STACK_NAME" \
+            "${pagination[@]}" --output json \
+            --profile "$PROFILE" --region "$REGION")" ||
+            fail "could not inspect the proposed change set; nothing executed"
+        jq -e --arg id "$changeset_id" --arg stack "$STACK_NAME" \
+            --arg counter_id "$LEDGER_COUNTER_ID" \
+            --arg reference "$expected_reference" '
+            .ChangeSetId == $id and .StackName == $stack and
+            .Status == "CREATE_COMPLETE" and .ExecutionStatus == "AVAILABLE" and
+            ([.Parameters[] | select(.ParameterKey == "LedgerCounterId") | .ParameterValue] == [$counter_id]) and
+            ([.Parameters[] | select(.ParameterKey == "ExistingLedgerCounterTableName") | .ParameterValue] == [$reference]) and
+            (.Changes | type == "array") and
+            all(.Changes[];
+                .Type == "Resource" and (.ResourceChange | type == "object") and
+                (.ResourceChange | if .ResourceType == "AWS::DynamoDB::Table" then
+                    .Action == "Add" or
+                    (.Action == "Modify" and .Replacement == "False" and
+                     (.Details | type == "array" and length > 0) and
+                     all(.Details[];
+                         .Target.RequiresRecreation == "Never" and
+                         (.Target.Attribute == "Tags" or
+                          (.Target.Attribute == "Properties" and
+                           (.Target.Name | IN("BillingMode", "ProvisionedThroughput",
+                             "PointInTimeRecoverySpecification", "SSESpecification",
+                             "TableClass", "DeletionProtectionEnabled", "Tags"))))))
+                else
+                    (.ResourceType | type == "string") and
+                    (.Action | IN("Add", "Modify", "Remove"))
+                end)) and
+            (.NextToken == null or (.NextToken | type == "string" and length > 0))
+        ' <<<"$page" >/dev/null ||
+            fail "refusing unsafe or ambiguous change set: table removal, replacement, or schema change; nothing executed"
+        next_token="$(jq -r '.NextToken // empty' <<<"$page")" ||
+            fail "could not read change-set pagination"
+        [ -n "$next_token" ] || break
+        case "$seen_tokens" in
+            *$'\n'"$next_token"$'\n'*) fail "repeated change-set pagination token; nothing executed" ;;
+        esac
+        seen_tokens+="$next_token"$'\n'
+        pagination=(--no-paginate --next-token "$next_token")
+    done
+}
+
+deploy_stack_phase() {
+    local phase_description="$1" sam_output changeset_id
+
+    need_command jq
     build_sam_parameter_overrides
+    load_preserved_allocator_binding
+    if [ -n "$PRESERVED_COUNTER_TABLE" ]; then
+        verify_deployment_counter
+    fi
     DEPLOYMENT_ERROR_PHASE="$phase_description"
     printf '==> %s for stack %s in %s\n' \
         "$phase_description" "$STACK_NAME" "$REGION"
-    sam deploy \
+    sam_output="$(sam deploy \
         --template-file template.yaml \
         --stack-name "$STACK_NAME" \
         --region "$REGION" \
         --profile "$PROFILE" \
         --capabilities CAPABILITY_IAM \
         --resolve-s3 \
+        --use-json \
         --no-confirm-changeset \
+        --no-execute-changeset \
         --no-fail-on-empty-changeset \
         --no-progressbar \
         --parameter-overrides \
-        "${SAM_PARAMETER_OVERRIDES[@]}"
+        "${SAM_PARAMETER_OVERRIDES[@]}" 2>&1)" ||
+        fail "SAM could not prepare a change set: $sam_output"
+    printf '%s\n' "$sam_output"
+    # Use SAM's returned ARN, never a name/latest-change-set lookup that can race.
+    changeset_id="$(sed -n 's/^Changeset created successfully\. \(arn:[^[:space:]]*:changeSet\/[^[:space:]]*\)$/\1/p' <<<"$sam_output")"
+    if [ -z "$changeset_id" ]; then
+        case $'\n'"$sam_output"$'\n' in
+            *$'\n'"No changes to deploy. Stack $STACK_NAME is up to date"$'\n'*)
+                [ -n "$PRESERVED_COUNTER_TABLE" ] || fail "stack exposes no allocator binding"
+                printf '==> Empty infrastructure change set; this does not establish Lambda code equality.\n'
+                return 0
+                ;;
+            *) fail "SAM returned no unambiguous change-set ID; nothing executed" ;;
+        esac
+    fi
+    [[ "$changeset_id" != *[[:space:]]* ]] ||
+        fail "SAM returned multiple change-set IDs; nothing executed"
+    inspect_deployment_changeset "$changeset_id"
+    inspect_deployment_template "$changeset_id"
+    aws cloudformation execute-change-set --change-set-name "$changeset_id" \
+        --stack-name "$STACK_NAME" --profile "$PROFILE" --region "$REGION" ||
+        fail "could not execute the inspected change set"
+    aws cloudformation wait "$DEPLOYMENT_WAITER" --stack-name "$STACK_NAME" \
+        --profile "$PROFILE" --region "$REGION" ||
+        fail "the inspected change set did not reach a successful terminal state"
+    load_preserved_allocator_binding
+    [ -n "$PRESERVED_COUNTER_TABLE" ] || fail "deployed stack exposes no allocator binding"
+    verify_deployment_counter
 }
 
 report_cloudformation_outcome() {

@@ -41,7 +41,7 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 
 - AWS CLI v2 and SAM CLI are installed.
 - `zip`, `unzip`, and `file` are installed for package validation.
-- `jq` is installed for `lambda_logs.sh` and shell regression tests.
+- `jq` 1.6 or newer is installed for deployment guards, `lambda_logs.sh`, and shell regression tests.
 - Python 3.9 or newer is installed for the Python regression suites in
   `zig build test`, which normal `deploy.sh` runs before packaging.
 - You have an IAM Identity Center / SSO profile named `dev`.
@@ -1068,6 +1068,10 @@ remove the local gateway files after the direct deployment is configured.
 
 ## 6. Deploy with SAM guided mode
 
+Use `./deploy.sh` for guarded full deployments and ordinary redeployments. The
+direct SAM commands below describe manual setup; they bypass the helper's
+[durable-data guards](#durable-data-guards-and-first-time-counter-setup).
+
 Run:
 
 ```sh
@@ -1457,6 +1461,69 @@ to `../aws-lambda-zig`; override it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
 Both deployment modes run `zig build fmt-check` with their selected local and
 global caches and any `--use-local-libs` package forks. This target checks build
 files, Zig sources, and tests before the remaining test/build steps.
+
+### Durable-data guards and first-time counter setup
+
+Full deployment creates a JSON proposal with
+`sam deploy --use-json --no-execute-changeset`.
+The helper takes the exact ARN returned by SAM, explicitly reads every page
+with `DescribeChangeSet`, and reads that change set's processed template with
+`GetTemplate`. It refuses table removal, definite or conditional replacement,
+missing/unknown replacement information, key/attribute/TTL changes, ambiguous
+table changes, and changes to the table references used by the seat processors.
+The processed template must retain the documented schemas and allocator wiring.
+Unknown or malformed responses, failed inspection, repeated pagination tokens,
+and an unrecognized SAM response stop execution. The helper executes only the
+inspected ARN and waits for stack creation or update to finish. An empty SAM
+change set succeeds, but does not establish that deployed Lambda code equals
+local code after development sync.
+
+An established allocator is the physical table together with its selected
+case-sensitive counter ID. Both remain stable through full deployment and
+WireGuard controller phases. The helper verifies the owned logical table's
+physical identity or the explicit referenced table, the stack's selected ID,
+and the proposed parameters and runtime wiring. Switching to another table or
+another ID is refused even if the replacement record already exists. Omitting
+the referenced-table option preserves a stack's existing reference. A selected
+non-default ID must still be supplied with `--ledger-counter-id` or
+`LEDGER_COUNTER_ID`; omission defaults to `global`. Native cluster selection is
+independent and never initializes, resets, or selects a counter.
+
+Before updating an established binding, normal deployment invokes the shared
+counter utility's strongly consistent `read` with an explicit selected ID. It
+also verifies setup after successful infrastructure execution. It never invokes
+`init` or `allocate`, repairs missing state, or cleans up data before deploying.
+A missing, corrupt, or unavailable selected record fails the run while leaving
+other counters untouched. Inspect an established allocator failure and recover
+its original state; initialization is only for a deliberately new binding.
+
+A first deployment can create the owned table before failing its setup check.
+The deployed infrastructure remains available for explicit first-time setup.
+For a newly selected binding only, initialize it and repeat the same deployment:
+
+```sh
+./ledger-counter.sh --profile dev --region ca-central-1 \
+  --stack-name aws-lambda-zig-demo --counter-id global init
+./deploy.sh --profile dev --region ca-central-1 --stack-name aws-lambda-zig-demo
+```
+
+For an explicitly selected ID, pass that same ID to `init` and to deployment's
+`--ledger-counter-id`. Setup uses the shared absent-only insertion at 1000 and
+validates existing state without replacing it; the first allocation is 1001.
+For a referenced table, its owner can perform first-time setup with the direct
+binary before deployment, or use the wrapper after stack outputs exist. All
+participants requiring one sequence use the same table/ID across native clusters.
+
+The deployment identity needs `cloudformation:DescribeStacks`,
+`cloudformation:DescribeStackResource`, `cloudformation:DescribeChangeSet`,
+`cloudformation:GetTemplate`, and `cloudformation:ExecuteChangeSet`, in addition
+to its existing packaging/change-set/resource permissions. Counter verification
+also needs AWS CLI credential export and `dynamodb:GetItem` on the selected
+table. Explicit setup separately needs `dynamodb:PutItem` and `GetItem` on that
+table. These operator permissions do not change runtime IAM: seat submission
+retains `GetItem`/`UpdateItem` counter access and cannot initialize a counter.
+The guards have mocked offline coverage; they do not establish live AWS IAM,
+connectivity, or delivery evidence.
 
 ### Development code updates
 
@@ -2224,8 +2291,11 @@ or cloud-side validation and is outside the ordinary offline suite.
 The host `ledger-counter` utility discovers the selected stack's actual owned
 or referenced table through `LedgerCounterTableName`, and its configured record
 through `LedgerCounterId`. The direct binary also accepts explicit table
-configuration. `deploy.sh` does not inspect, initialize or allocate counter state.
-Run explicit first-time setup for the intended new binding before seat creation.
+configuration. Full `deploy.sh` verifies selected setup through the shared read
+contract; it never initializes or allocates counter state. Run
+[explicit first-time setup](#durable-data-guards-and-first-time-counter-setup)
+for the intended new binding before seat creation. Development sync performs
+no counter setup or inspection.
 
 The shared [global allocator contract](SEAT_RESERVATION.md#global-ledger-allocator)
 supports independent records with String partition key `counter_id` and Number

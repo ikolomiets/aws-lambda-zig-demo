@@ -61,6 +61,20 @@ printf 'paseto %s\n' "$*" >>"$MOCK_CALL_LOG"
 printf 'mock-token\n'
 PASETO
                 chmod +x zig-out/bin/paseto
+                cat >zig-out/bin/ledger-counter <<'COUNTER'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'ledger-counter %s table=%s\n' "$*" "$LEDGER_COUNTER_TABLE_NAME" >>"$MOCK_CALL_LOG"
+[ "${MOCK_COUNTER_FAILURE:-0}" = 0 ] || exit 2
+id="$2"
+if [ "$3" = init ]; then
+    jq --arg id "$id" 'if has($id) then . else .[$id] = 1000 end' "$MOCK_COUNTER_STATE" >"$MOCK_COUNTER_STATE.tmp"
+    mv "$MOCK_COUNTER_STATE.tmp" "$MOCK_COUNTER_STATE"
+fi
+jq -e --arg id "$id" '.[$id] | type == "number" and . >= 1000 and . <= 4294967295 and floor == .' "$MOCK_COUNTER_STATE" >/dev/null
+jq --arg id "$id" '{counter_id:$id,high_water:.[$id]}' "$MOCK_COUNTER_STATE"
+COUNTER
+                chmod +x zig-out/bin/ledger-counter
                 ;;
         esac
         ;;
@@ -78,6 +92,24 @@ PASETO
     zip) printf 'archive\n' >"$2" ;;
     unzip) printf '%s\n' "${MOCK_ARCHIVE_CONTENTS:-bootstrap}" ;;
     sam)
+        if [ "$1" = deploy ]; then
+            selected_id=global
+            reference="${MOCK_EXISTING_COUNTER_REFERENCE:-}"
+            for argument in "$@"; do
+                case "$argument" in
+                    LedgerCounterId=*) selected_id="${argument#*=}" ;;
+                    ExistingLedgerCounterTableName=*) reference="${argument#*=}" ;;
+                esac
+            done
+            jq -n --arg id "${MOCK_PROPOSED_COUNTER_ID-$selected_id}" \
+                --arg reference "${MOCK_PROPOSED_REFERENCE-$reference}" \
+                '[{ParameterKey:"LedgerCounterId",ParameterValue:$id},{ParameterKey:"ExistingLedgerCounterTableName",ParameterValue:$reference}]' >"$MOCK_PARAMETERS"
+            case "${MOCK_SAM_RESULT:-created}" in
+                created) printf 'Changeset created successfully. arn:aws:cloudformation:ca-central-1:example:changeSet/proposed/exact-id\n' ;;
+                empty) printf 'No changes to deploy. Stack mock-stack is up to date\n' ;;
+                ambiguous) printf 'unexpected SAM response\n' ;;
+            esac
+        fi
         if [ "$1" = sync ] && [ "${MOCK_SAM_CONFIRMATION:-0}" -eq 1 ]; then
             read -r reply || exit 95
             [ "$reply" = Y ] || exit 96
@@ -103,6 +135,7 @@ PASETO
     aws)
         query=''
         logical_id=''
+        next_token=''
         arguments="$*"
         service="$1"
         operation="$2"
@@ -111,6 +144,7 @@ PASETO
             case "$1" in
                 --query) query="$2"; shift 2 ;;
                 --logical-resource-id) logical_id="$2"; shift 2 ;;
+                --next-token) next_token="$2"; shift 2 ;;
                 *) shift ;;
             esac
         done
@@ -123,6 +157,23 @@ PASETO
                 ;;
             'cloudformation describe-stacks')
                 case "$query" in
+                    '')
+                        if [ -n "${MOCK_STACK_INSPECTION_ERROR:-}" ]; then
+                            printf '%s\n' "$MOCK_STACK_INSPECTION_ERROR" >&2
+                            exit 1
+                        fi
+                        if [ "${MOCK_STACK_MISSING_UNTIL_EXECUTION:-0}" = 1 ] && [ ! -f "$MOCK_STACK_JSON" ]; then
+                            printf 'An error occurred (ValidationError) when calling the DescribeStacks operation: Stack with id mock-stack does not exist\n' >&2
+                            exit 1
+                        fi
+                        if [ -f "$MOCK_STACK_JSON" ]; then
+                            cat "$MOCK_STACK_JSON"
+                        else
+                            jq -n --arg id "${MOCK_EXISTING_COUNTER_ID-global}" \
+                                --arg reference "${MOCK_EXISTING_COUNTER_REFERENCE-}" \
+                                '{Stacks:[{StackStatus:"UPDATE_COMPLETE",Parameters:[{ParameterKey:"LedgerCounterId",ParameterValue:$id},{ParameterKey:"ExistingLedgerCounterTableName",ParameterValue:$reference}],Outputs:[{OutputKey:"LedgerCounterTableName",OutputValue:(if $reference == "" then "mock-counters" else $reference end)},{OutputKey:"LedgerCounterId",OutputValue:$id}]}]}'
+                        fi
+                        ;;
                     'Stacks[0].StackStatus')
                         if [ "${MOCK_STACK_STATUS:-}" = missing ]; then
                             printf 'Stack does not exist\n' >&2
@@ -145,6 +196,7 @@ PASETO
                         ;;
                     *IntakeFunctionUrl*) printf 'https://intake.example.invalid/\n' ;;
                     *QueryFunctionUrl*) printf 'https://query.example.invalid/\n' ;;
+                    *LedgerCounterTableName*) printf '%s\n' "${MOCK_EXISTING_COUNTER_REFERENCE:-mock-counters}" ;;
                     *) printf 'unexpected AWS query: %s\n' "$query" >&2; exit 91 ;;
                 esac
                 ;;
@@ -152,10 +204,30 @@ PASETO
                 case "$logical_id" in
                     IntakeFunction) printf 'intake-lambda\n' ;;
                     OperationsTable) printf 'mock-operations\n' ;;
+                    LedgerCounterTable) printf 'mock-counters\n' ;;
                     TigerBeetleQueue) printf 'https://queue.example.invalid/\n' ;;
                     *) exit 92 ;;
                 esac
                 ;;
+            'cloudformation describe-change-set')
+                [ "${MOCK_CHANGESET_FAILURE_TOKEN:-never}" != "$next_token" ] || exit 42
+                if [ -n "$next_token" ]; then
+                    page="$MOCK_CHANGESET_PAGES/$next_token.json"
+                else
+                    page="$MOCK_CHANGESET_PAGES/first.json"
+                fi
+                jq --slurpfile parameters "$MOCK_PARAMETERS" '. + {Parameters:$parameters[0]}' "$page"
+                ;;
+            'cloudformation get-template') cat "$MOCK_PROPOSED_TEMPLATE" ;;
+            'configure export-credentials')
+                printf 'export AWS_ACCESS_KEY_ID=mock-key\nexport AWS_SECRET_ACCESS_KEY=mock-secret\nexport AWS_SESSION_TOKEN=mock-session\n'
+                ;;
+            'cloudformation execute-change-set')
+                if [ -n "${MOCK_STACK_AFTER_EXECUTION:-}" ]; then
+                    cp "$MOCK_STACK_AFTER_EXECUTION" "$MOCK_STACK_JSON"
+                fi
+                ;;
+            'cloudformation wait') ;;
             'dynamodb wait') ;;
             'dynamodb describe-table')
                 case "$query" in
@@ -179,6 +251,17 @@ new_checkout() {
     CHECKOUT="$TEST_TMP_DIR/$1"
     mkdir -p "$CHECKOUT"
     cp "$REPOSITORY_ROOT/deploy.sh" "$CHECKOUT/deploy.sh"
+    cp "$REPOSITORY_ROOT/ledger-counter.sh" "$CHECKOUT/ledger-counter.sh"
+    MOCK_STACK_JSON="$CHECKOUT/stack.json"
+    MOCK_COUNTER_STATE="$CHECKOUT/counters.json"
+    MOCK_PARAMETERS="$CHECKOUT/parameters.json"
+    MOCK_PROPOSED_TEMPLATE="$CHECKOUT/template.json"
+    MOCK_CHANGESET_PAGES="$CHECKOUT/pages"
+    export MOCK_STACK_JSON MOCK_COUNTER_STATE MOCK_PARAMETERS MOCK_PROPOSED_TEMPLATE MOCK_CHANGESET_PAGES
+    printf '{"global":1205,"other-sequence":6400,"sequence.B":2048}\n' >"$MOCK_COUNTER_STATE"
+    cp "$REPOSITORY_ROOT/tests/fixtures/deployment-preservation-template.json" "$MOCK_PROPOSED_TEMPLATE"
+    mkdir -p "$MOCK_CHANGESET_PAGES"
+    printf '%s\n' '{"ChangeSetId":"arn:aws:cloudformation:ca-central-1:example:changeSet/proposed/exact-id","StackName":"mock-stack","Status":"CREATE_COMPLETE","ExecutionStatus":"AVAILABLE","Changes":[{"Type":"Resource","ResourceChange":{"ResourceType":"AWS::Lambda::Function","Action":"Modify"}}]}' >"$MOCK_CHANGESET_PAGES/first.json"
     MOCK_CALL_LOG="$CHECKOUT/calls.log"
     : >"$MOCK_CALL_LOG"
     export MOCK_CALL_LOG
@@ -208,6 +291,7 @@ sam validate --template-file template.yaml --region ca-central-1
 sam validate --lint --template-file template.yaml --region ca-central-1'
     assert_contains "$stages" "$expected"
     assert_contains "$calls" 'sam deploy --template-file template.yaml --stack-name mock-stack'
+    assert_contains "$calls" '--no-execute-changeset'
     assert_contains "$calls" 'EnableWireGuardGateway=false RetainTigerBeetleProcessorVpcCleanupResources=false'
     assert_contains "$calls" 'SeatReservationProcessorName=seat-reservation-processor'
     assert_contains "$calls" 'SeatReservationCompletionProcessorName=seat-reservation-completion-processor'
@@ -226,7 +310,8 @@ sam validate --lint --template-file template.yaml --region ca-central-1'
 test_selected_seat_configuration() {
     local calls
     new_checkout selected-seat
-    SEAT_RESERVATION_PROCESSOR_NAME=seat-submit-chosen \
+    MOCK_EXISTING_COUNTER_ID=sequence.B MOCK_EXISTING_COUNTER_REFERENCE=shared-ledgers \
+        SEAT_RESERVATION_PROCESSOR_NAME=seat-submit-chosen \
         SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME=seat-complete-chosen \
         run_script --seat-reservation-processor-name seat-submit-chosen \
         --seat-reservation-completion-processor-name=seat-complete-chosen \
@@ -236,6 +321,231 @@ test_selected_seat_configuration() {
     assert_contains "$calls" 'SeatReservationProcessorName=seat-submit-chosen'
     assert_contains "$calls" 'SeatReservationCompletionProcessorName=seat-complete-chosen'
     assert_contains "$calls" 'ExistingLedgerCounterTableName=shared-ledgers LedgerCounterId=sequence.B'
+}
+
+test_allocator_rebinding_is_refused() {
+    local id table
+    for id in absent-sequence other-sequence; do
+        new_checkout "id-rebinding-$id"
+        if run_script --ledger-counter-id "$id"; then
+            fail_test 'full deployment switched an established counter ID'
+        fi
+        assert_contains "$(cat "$CHECKOUT/output.log")" 'refusing to change the established counter ID'
+        assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'sam deploy'
+    done
+    for table in another-table mock-counters; do
+        new_checkout "table-rebinding-$table"
+        if run_script --existing-ledger-counter-table-name "$table"; then
+            fail_test 'full deployment changed owned/referenced table identity'
+        fi
+        assert_contains "$(cat "$CHECKOUT/output.log")" 'refusing to change the established counter table'
+        assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'cloudformation execute-change-set'
+    done
+}
+
+update_json() {
+    jq "$2" "$1" >"$1.tmp"
+    mv "$1.tmp" "$1"
+}
+
+two_page_changeset() {
+    cp "$MOCK_CHANGESET_PAGES/first.json" "$MOCK_CHANGESET_PAGES/second.json"
+    update_json "$MOCK_CHANGESET_PAGES/first.json" '.NextToken = "second"'
+}
+
+assert_deployment_refused() {
+    if run_script --no-url-check "$@"; then
+        fail_test "unsafe deployment succeeded: $(cat "$CHECKOUT/output.log")"
+    fi
+    assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'cloudformation execute-change-set'
+    assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'ledger-counter --counter-id global init'
+}
+
+test_repeated_paginated_deployment_preserves_data() {
+    local calls first_inspection execution second_inspection
+    new_checkout repeated-deployment
+    two_page_changeset
+    update_json "$MOCK_CHANGESET_PAGES/second.json" '.Changes = [{Type:"Resource",ResourceChange:{LogicalResourceId:"SeatEventsTable",PhysicalResourceId:"saved-events",ResourceType:"AWS::DynamoDB::Table",Action:"Modify",Replacement:"False",Details:[{Target:{Attribute:"Tags",RequiresRecreation:"Never"}}]}}]'
+    cp "$MOCK_COUNTER_STATE" "$CHECKOUT/original-counters.json"
+    run_script --no-url-check || fail_test "first preserved deployment failed: $(cat "$CHECKOUT/output.log")"
+    calls="$(cat "$MOCK_CALL_LOG")"
+    assert_contains "$calls" 'cloudformation describe-change-set --change-set-name arn:aws:cloudformation:ca-central-1:example:changeSet/proposed/exact-id'
+    assert_contains "$calls" '--no-paginate --next-token second'
+    assert_contains "$calls" 'cloudformation execute-change-set --change-set-name arn:aws:cloudformation:ca-central-1:example:changeSet/proposed/exact-id'
+    first_inspection="$(sed -n '/describe-change-set/=' "$MOCK_CALL_LOG" | head -n 1)"
+    second_inspection="$(sed -n '/--next-token second/=' "$MOCK_CALL_LOG")"
+    execution="$(sed -n '/execute-change-set/=' "$MOCK_CALL_LOG")"
+    [ "$first_inspection" -lt "$second_inspection" ] && [ "$second_inspection" -lt "$execution" ] ||
+        fail_test 'executed before inspecting every page'
+    run_script --no-url-check --tigerbeetle-cluster-id 7 ||
+        fail_test 'native cluster change did not preserve the allocator'
+    cmp "$MOCK_COUNTER_STATE" "$CHECKOUT/original-counters.json" || fail_test 'redeployment changed persistent counters'
+    calls="$(cat "$MOCK_CALL_LOG")"
+    assert_not_contains "$calls" ' init'
+    assert_not_contains "$calls" 'delete-table'
+    assert_not_contains "$calls" 'delete-stack'
+    assert_not_contains "$calls" 'delete-item'
+}
+
+test_every_unsafe_table_change_is_refused() {
+    local logical_id change
+    for logical_id in OperationsTable SeatEventsTable LedgerCounterTable; do
+        for change in \
+            '{Action:"Remove"}' \
+            '{Action:"Modify",Replacement:"True"}' \
+            '{Action:"Modify",Replacement:"Conditional"}' \
+            '{Action:"Modify",Replacement:"Unknown"}' \
+            '{Action:"Modify"}' \
+            '{Action:"Modify",Replacement:"False",Details:[]}' \
+            '{Action:"Modify",Replacement:"False",Details:[{Target:{Attribute:"Properties",Name:"KeySchema",RequiresRecreation:"Never"}}]}' \
+            '{Action:"Modify",Replacement:"False",Details:[{Target:{Attribute:"Properties",Name:"AttributeDefinitions",RequiresRecreation:"Never"}}]}' \
+            '{Action:"Modify",Replacement:"False",Details:[{Target:{Attribute:"Properties",Name:"TableName",RequiresRecreation:"Never"}}]}' \
+            '{Action:"Modify",Replacement:"False",Details:[{Target:{Attribute:"Properties",Name:"TimeToLiveSpecification",RequiresRecreation:"Never"}}]}' \
+            '{Action:"Modify",Replacement:"False",Details:[{Target:{Attribute:"Properties",RequiresRecreation:"Never"}}]}'; do
+            new_checkout unsafe-table
+            two_page_changeset
+            update_json "$MOCK_CHANGESET_PAGES/second.json" \
+                ".Changes = [{Type:\"Resource\",ResourceChange:({LogicalResourceId:\"$logical_id\",ResourceType:\"AWS::DynamoDB::Table\"} + $change)}]"
+            assert_deployment_refused
+            assert_contains "$(cat "$CHECKOUT/output.log")" 'refusing unsafe or ambiguous change set'
+        done
+    done
+}
+
+test_processed_template_and_inspection_fail_closed() {
+    local mutation failure
+    for mutation in \
+        '.TemplateBody.Resources.SeatEventsTable.Properties.KeySchema[0].AttributeName = "other"' \
+        '.TemplateBody.Resources.SeatEventsTable.Properties.TimeToLiveSpecification = {AttributeName:"expires_at",Enabled:true}' \
+        '.TemplateBody.Resources.SeatReservationProcessor.Properties.Environment.Variables.LEDGER_COUNTER_ID = "other-sequence"' \
+        '.TemplateBody.Resources.SeatReservationProcessor.Properties.Environment.Variables.LEDGER_COUNTER_TABLE_NAME = "other-table"' \
+        '.TemplateBody.Outputs.LedgerCounterTableName.Value = "other-table"' \
+        '.TemplateBody.Conditions.OwnLedgerCounterTable = false'; do
+        new_checkout unsafe-template
+        update_json "$MOCK_PROPOSED_TEMPLATE" "$mutation"
+        assert_deployment_refused
+    done
+    for mutation in \
+        '.ChangeSetId = "another-id"' \
+        '.StackName = "another-stack"' \
+        '.Status = "FAILED"' \
+        '.ExecutionStatus = "OBSOLETE"' \
+        '.Changes = null' \
+        '.NextToken = 42'; do
+        new_checkout ambiguous-inspection
+        update_json "$MOCK_CHANGESET_PAGES/first.json" "$mutation"
+        assert_deployment_refused
+    done
+    new_checkout repeated-pagination
+    two_page_changeset
+    update_json "$MOCK_CHANGESET_PAGES/second.json" '.NextToken = "second"'
+    assert_deployment_refused
+    new_checkout failed-second-page
+    two_page_changeset
+    MOCK_CHANGESET_FAILURE_TOKEN=second assert_deployment_refused
+    for failure in aws:cloudformation:describe-change-set aws:cloudformation:get-template aws:configure:export-credentials; do
+        new_checkout failed-inspection
+        MOCK_FAILURE="$failure" assert_deployment_refused
+    done
+    new_checkout malformed-json
+    printf 'not json\n' >"$MOCK_CHANGESET_PAGES/first.json"
+    assert_deployment_refused
+    new_checkout ambiguous-sam
+    MOCK_SAM_RESULT=ambiguous assert_deployment_refused
+}
+
+test_selected_setup_and_missing_or_corrupt_counters() {
+    local value
+    for value in null '"corrupt"' 999 4294967296 1000.5; do
+        new_checkout bad-counter
+        update_json "$MOCK_COUNTER_STATE" ".global = $value"
+        cp "$MOCK_COUNTER_STATE" "$CHECKOUT/before.json"
+        assert_deployment_refused
+        cmp "$MOCK_COUNTER_STATE" "$CHECKOUT/before.json" || fail_test 'deployment repaired a bad counter'
+        assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'sam deploy'
+    done
+    new_checkout selected-explicit-setup
+    update_json "$MOCK_COUNTER_STATE" 'del(.["sequence.B"])'
+    MOCK_EXISTING_COUNTER_ID=sequence.B MOCK_EXISTING_COUNTER_REFERENCE=shared-ledgers \
+        assert_deployment_refused --ledger-counter-id sequence.B
+    cp "$MOCK_COUNTER_STATE" "$CHECKOUT/unselected.json"
+    env PATH="$TEST_TMP_DIR/bin:$PATH" MOCK_EXISTING_COUNTER_REFERENCE=shared-ledgers \
+        bash "$CHECKOUT/ledger-counter.sh" --profile dev-selected --stack-name mock-stack \
+        --counter-id sequence.B init >"$CHECKOUT/setup.json" || fail_test 'explicit selected setup failed'
+    jq -e '.counter_id == "sequence.B" and .high_water == 1000' "$CHECKOUT/setup.json" >/dev/null ||
+        fail_test 'setup did not initialize only the selected ID at 1000'
+    jq 'del(.["sequence.B"])' "$MOCK_COUNTER_STATE" >"$CHECKOUT/after-unselected.json"
+    cmp "$CHECKOUT/unselected.json" "$CHECKOUT/after-unselected.json" || fail_test 'setup changed another counter'
+    MOCK_EXISTING_COUNTER_ID=sequence.B MOCK_EXISTING_COUNTER_REFERENCE=shared-ledgers \
+        run_script --no-url-check --ledger-counter-id sequence.B --tigerbeetle-cluster-id 9 || fail_test 'selected setup did not unblock deployment'
+    MOCK_EXISTING_COUNTER_ID=sequence.B MOCK_EXISTING_COUNTER_REFERENCE=shared-ledgers \
+        run_script --no-url-check --ledger-counter-id sequence.B --tigerbeetle-cluster-id 10 || fail_test 'shared binding changed with native cluster selection'
+    jq -e '.global == 1205 and .["other-sequence"] == 6400 and .["sequence.B"] == 1000' "$MOCK_COUNTER_STATE" >/dev/null ||
+        fail_test 'shared deployments changed independent counters'
+    new_checkout uncertain-counter
+    MOCK_COUNTER_FAILURE=1 assert_deployment_refused
+}
+
+test_empty_changeset_preserves_setup() {
+    new_checkout empty-changeset
+    MOCK_SAM_RESULT=empty run_script --no-url-check || fail_test 'empty change set was not successful'
+    assert_contains "$(cat "$CHECKOUT/output.log")" 'does not establish Lambda code equality'
+    assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'cloudformation execute-change-set'
+    assert_contains "$(cat "$MOCK_CALL_LOG")" 'ledger-counter --counter-id global read table=mock-counters'
+}
+
+test_first_deployment_requires_explicit_setup() {
+    new_checkout first-deployment
+    MOCK_STACK_MISSING_UNTIL_EXECUTION=1
+    export MOCK_STACK_MISSING_UNTIL_EXECUTION
+    MOCK_STACK_AFTER_EXECUTION="$CHECKOUT/created-stack.json"
+    export MOCK_STACK_AFTER_EXECUTION
+    jq -n '{Stacks:[{StackStatus:"CREATE_COMPLETE",Parameters:[{ParameterKey:"LedgerCounterId",ParameterValue:"global"},{ParameterKey:"ExistingLedgerCounterTableName",ParameterValue:""}],Outputs:[{OutputKey:"LedgerCounterTableName",OutputValue:"mock-counters"},{OutputKey:"LedgerCounterId",OutputValue:"global"}]}]}' >"$MOCK_STACK_AFTER_EXECUTION"
+    update_json "$MOCK_COUNTER_STATE" 'del(.global)'
+    if run_script --no-url-check; then
+        fail_test 'first deployment silently initialized its new counter'
+    fi
+    assert_contains "$(cat "$MOCK_CALL_LOG")" 'cloudformation wait stack-create-complete'
+    assert_contains "$(cat "$CHECKOUT/output.log")" 'selected allocator setup is missing'
+    jq -e 'has("global") | not' "$MOCK_COUNTER_STATE" >/dev/null || fail_test 'first deployment repaired missing setup'
+    env PATH="$TEST_TMP_DIR/bin:$PATH" bash "$CHECKOUT/ledger-counter.sh" \
+        --stack-name mock-stack --counter-id global init >"$CHECKOUT/setup.json" || fail_test 'new owned allocator setup failed'
+    run_script --no-url-check || fail_test 'repeat after explicit setup failed'
+    assert_contains "$(cat "$MOCK_CALL_LOG")" 'cloudformation wait stack-update-complete'
+    unset MOCK_STACK_AFTER_EXECUTION
+    unset MOCK_STACK_MISSING_UNTIL_EXECUTION
+}
+
+test_proposed_binding_and_active_states_are_refused() {
+    local status mutation
+    new_checkout proposed-id-change
+    MOCK_PROPOSED_COUNTER_ID=other-sequence assert_deployment_refused
+    new_checkout proposed-table-change
+    MOCK_PROPOSED_REFERENCE=other-table assert_deployment_refused
+    for status in UPDATE_IN_PROGRESS UPDATE_COMPLETE_CLEANUP_IN_PROGRESS UPDATE_ROLLBACK_IN_PROGRESS DELETE_IN_PROGRESS; do
+        new_checkout active-state
+        MOCK_STACK_STATUS="$status" assert_deployment_refused
+        assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'sam deploy'
+    done
+    new_checkout incomplete-binding
+    printf '{"Stacks":[{"StackStatus":"UPDATE_COMPLETE","Parameters":[],"Outputs":[{"OutputKey":"SeatReservationProcessorName","OutputValue":"seat"}]}]}\n' >"$MOCK_STACK_JSON"
+    assert_deployment_refused
+    new_checkout ambiguous-stack-error
+    MOCK_STACK_INSPECTION_ERROR='Role does not exist' assert_deployment_refused
+    assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'sam deploy'
+    for mutation in \
+        '.Stacks[0].Outputs[1].OutputValue = null' \
+        '.Stacks[0].Parameters[0].ParameterValue = null' \
+        '.Stacks[0].Parameters[1].ParameterValue = null'; do
+        new_checkout null-binding
+        jq -n '{Stacks:[{StackStatus:"UPDATE_COMPLETE",Parameters:[{ParameterKey:"LedgerCounterId",ParameterValue:"global"},{ParameterKey:"ExistingLedgerCounterTableName",ParameterValue:""}],Outputs:[{OutputKey:"LedgerCounterTableName",OutputValue:"mock-counters"},{OutputKey:"LedgerCounterId",OutputValue:"global"}]}]}' >"$MOCK_STACK_JSON"
+        update_json "$MOCK_STACK_JSON" "$mutation"
+        assert_deployment_refused
+        assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'sam deploy'
+    done
+    new_checkout json-string-template
+    update_json "$MOCK_PROPOSED_TEMPLATE" '.TemplateBody |= tojson'
+    run_script --no-url-check || fail_test 'JSON-string processed template was refused'
 }
 
 test_development_dry_run() {
@@ -482,6 +792,14 @@ test_full_dry_run_and_failed_build_cleanup() {
     assert_not_contains "$(cat "$MOCK_CALL_LOG")" 'zip '
 }
 
+test_allocator_rebinding_is_refused
+test_repeated_paginated_deployment_preserves_data
+test_every_unsafe_table_change_is_refused
+test_processed_template_and_inspection_fail_closed
+test_selected_setup_and_missing_or_corrupt_counters
+test_empty_changeset_preserves_setup
+test_first_deployment_requires_explicit_setup
+test_proposed_binding_and_active_states_are_refused
 test_full_deployment_baseline
 test_selected_seat_configuration
 test_missing_seat_baseline_and_invalid_configuration
