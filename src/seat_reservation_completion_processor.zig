@@ -179,7 +179,7 @@ fn process_record(
     const outcome = if (message.body == .object and message.body.object.contains("code"))
         complete_local(arena, &message, options, backend)
     else
-        complete_creation(arena, &message, options, backend);
+        complete_native(arena, &message, options, backend);
     outcome catch |err| {
         switch (err) {
             error.InvalidNativeEvidence,
@@ -214,6 +214,16 @@ fn complete_local(
 ) !void {
     const code = seat.local_failure(&message.body) catch return error.InvalidLocalFailure;
     const result_json = try seat.encode_result(arena, &.{ .failure = code });
+    try finalize_operation(arena, message, result_json, options, backend);
+}
+
+fn finalize_operation(
+    arena: Allocator,
+    message: *const messages.Message,
+    result_json: []const u8,
+    options: *const Options,
+    backend: anytype,
+) !void {
     const result = try operation.parseCompletionJSON(arena, result_json);
     const update = try operations.seat_completion_update(
         arena,
@@ -230,7 +240,7 @@ fn complete_local(
     };
 }
 
-fn complete_creation(
+fn complete_native(
     arena: Allocator,
     message: *const messages.Message,
     options: *const Options,
@@ -241,6 +251,22 @@ fn complete_creation(
         if (err == error.OutOfMemory) return err;
         return error.InvalidNativeEvidence;
     };
+    if (context.command == .check_seats) {
+        const saved = events.read_event(arena, options.events_table, &.{
+            .tenant = message.tenant,
+            .event_id = context.command.check_seats,
+        }, backend) catch |err| {
+            if (err == error.EventUnavailable) return error.InvalidNativeEvidence;
+            return err;
+        };
+        const projected = seat.availability_result(arena, &message.body, &saved) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.InvalidNativeEvidence;
+        };
+        const result_json = try seat.encode_result(arena, &projected);
+        try finalize_operation(arena, message, result_json, options, backend);
+        return;
+    }
     if (context.command != .create_event) return error.InvalidNativeEvidence;
     const saved = events.read_event(arena, options.events_table, &.{
         .tenant = message.tenant,

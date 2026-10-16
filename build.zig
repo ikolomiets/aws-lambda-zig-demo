@@ -781,6 +781,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = tigerbeetle_import_name, .module = tigerbeetle_host },
             .{ .name = tigerbeetle_c_import_name, .module = tigerbeetle_c_host },
+            .{ .name = "seat_reservation", .module = host_seat_reservation },
+            .{ .name = "processor_message", .module = host_processor_message },
+            .{ .name = "tiger_beetle_processor", .module = tiger_beetle_processor_test_mod },
         },
     });
     const tigerbeetle_integration_tests = b.addTest(.{

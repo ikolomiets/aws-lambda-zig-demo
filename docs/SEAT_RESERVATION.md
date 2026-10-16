@@ -8,9 +8,9 @@ The independent [ledger counter](../src/ledger_counter.zig) and host
 `ledger-counter` utility initialize, inspect and allocate global ledgers.
 The [submission](../src/seat_reservation_processor.zig) and
 [completion](../src/seat_reservation_completion_processor.zig) handlers implement
-local rejections and native Event creation through authenticated intake and query.
-Reservation, confirmation and availability execution, and SAM provisioning of the
-two handlers, remain separate slices.
+local rejections, native Event creation and availability observations through
+authenticated intake and query. Reservation and confirmation execution, and SAM
+provisioning of the two handlers, remain separate slices.
 
 ## Rejection workflow
 
@@ -47,8 +47,8 @@ The original input becomes arbitrary Context, including invalid scalar or null
 input. It must fit the shared 4 KiB Context bound. An internal message whose input
 cannot be carried within that bound is diagnosed as unusable. No local rejection
 allocates a ledger, writes an Event or dispatches native work. Admitted creation
-dispatches initialization as described below. Other admitted commands remain
-retryable pending their native command implementations.
+and availability checks dispatch native work as described below. Admitted reserve
+and confirm commands remain retryable pending their native implementations.
 
 Completion rejects Result Queue overrides. Local completion accepts an unambiguous
 admission-failure Body containing exactly `code`. Native three-list and mixed
@@ -157,6 +157,55 @@ contradictory pairs. The separate local SDK probe exercises runtime finalization
 and winner readback. `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle`
 proves native funding, intact replay and the three account bounds against the local
 replica; the offline fakes do not establish those native guarantees.
+
+## Availability workflow
+
+`check_seats` accepts exactly `command` and `event_id`. Submission reads the
+tenant-owned Event and authorizes readiness before native dispatch. Missing and
+foreign Events both return `event_unavailable`; creating and failed Events return
+`event_not_ready` and `event_failed` only to their owner. Callers cannot select a
+subset. Submission looks up every configured Availability Account in unsigned
+class-tag byte order, with each class tag as its alias, preserving the original
+command as Context and routing native output to seat completion.
+
+Completion requires empty creation lists and exactly one found lookup per class,
+in the same order. It checks every alias and all native account fields: the saved
+account ID and ledger, code 1, `debits_must_not_exceed_credits`, zero user data,
+reserved and pending credits, and a positive native creation timestamp. The
+persisted `linked` flag is required on every class except the last, matching the
+complete initialization chain; no other flags are permitted. Canonical
+decimal strings preserve the native u128/u64 fields. Posted credits must equal
+the configured total. Total is `credits_posted`; available is
+`credits_posted - debits_posted - debits_pending`, using checked subtraction.
+Missing, wrong or closed accounts, impossible balances, null placeholders,
+diagnostics, incomplete evidence and extra entries are unrecoverable
+inconsistencies. They acknowledge with a bounded diagnostic and leave both the
+Event and Operation unchanged; no zero balances or partial Result are invented.
+
+Valid evidence finalizes only the matching Operation, using the same guarded
+identity/state/absent-Result update and authoritative valid-winner readback as
+local rejection. Its `SUCCESS` payload contains exactly `event_id` and `classes`,
+mapping every tag to integer `total` and `available` in class order. A delayed or
+duplicate completion cannot replace the first valid saved observation. Checks
+allocate no ledger or native identity and never change Event state.
+
+Availability is an observation, not a hold or a reservation guarantee. Concurrent
+reservations can change supply after a lookup. Native expiry cleanup can lag the
+hold's deadline; a lookup may still subtract expired pending debits until cleanup
+reclaims them. Completion and query can deliver an older observation later.
+
+`zig build test-seat-workflow` exercises authenticated intake, submission, the
+native adapter, completion and owner query with one and 31 classes, reordered
+native replies, invalid evidence, tenant isolation and competing observations.
+The separate local native suite runs the real adapter and domain projection after
+funding, holds, full posting and eventual expiry cleanup:
+
+```sh
+TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle
+```
+
+These checks establish local behavior; they do not establish AWS delivery or
+service configuration.
 
 ## Commands
 
@@ -357,7 +406,7 @@ zig build fmt-check
 
 All deterministic suites also run in `zig build test`; the wrapper uses mocked
 AWS credentials and resource resolution. These checks establish local contracts,
-ownership and recovery behavior. The composed rejection suite establishes local
+ownership and recovery behavior. The composed workflow suite establishes local
 seat handler integration; these tests do not establish live AWS IAM, DynamoDB
 service behavior or native accounting guarantees.
 

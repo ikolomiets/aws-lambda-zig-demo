@@ -175,24 +175,37 @@ fn process_record(
         diagnose(arena, .submission, "InvalidSubmissionEnvelope", sqs_id, input, &message, backend);
         return false;
     }
-    const code = admission(arena, &message, options, backend) catch |err| {
+    const decision = admission(arena, &message, options, backend) catch |err| {
         if (err == error.InvalidItem) {
             diagnose(arena, .submission, "InvalidEventMetadata", sqs_id, input, &message, backend);
             return false;
         }
         return true;
     };
-    const rejection = code orelse {
-        const command = try seat.command_from_value(arena, &message.body);
-        if (command != .create_event) return true;
-        create_event(arena, &message, &command, options, backend) catch |err| {
-            if (err == error.InvalidItem or err == error.EventConflict) {
-                diagnose(arena, .submission, @errorName(err), sqs_id, input, &message, backend);
-                return false;
-            }
-            return true;
-        };
-        return false;
+    const rejection = switch (decision) {
+        .rejected => |code| code,
+        .accepted => |*accepted| {
+            const dispatch = switch (accepted.command) {
+                .create_event => create_event(arena, &message, &accepted.command, options, backend),
+                .check_seats => dispatch_native(
+                    arena,
+                    &message,
+                    &accepted.command,
+                    &accepted.event.?,
+                    options,
+                    backend,
+                ),
+                else => return true,
+            };
+            dispatch catch |err| {
+                if (err == error.InvalidItem or err == error.EventConflict) {
+                    diagnose(arena, .submission, @errorName(err), sqs_id, input, &message, backend);
+                    return false;
+                }
+                return true;
+            };
+            return false;
+        },
     };
     var body: std.json.ObjectMap = .empty;
     try body.put(arena, "code", .{ .string = @tagName(rejection) });
@@ -234,9 +247,20 @@ fn create_event(
     try seat.validate_configuration(&command.create_event, &saved);
     // Permanent terminal Events never restart native initialization.
     if (saved.state != .creating) return;
+    try dispatch_native(arena, message, command, &saved, options, backend);
+}
+
+fn dispatch_native(
+    arena: Allocator,
+    message: *const messages.Message,
+    command: *const seat.Command,
+    saved: *const seat.Event,
+    options: *const Options,
+    backend: anytype,
+) !void {
     const body = try seat.encode_native_body(arena, &.{
         .command = command,
-        .event = &saved,
+        .event = saved,
         .attempt_id = 0,
     });
     const context = try seat.encode_context(arena, command, null);
@@ -279,19 +303,24 @@ fn insert_event(
     return events.insert(arena, options.events_table, &candidate, backend);
 }
 
+const Admission = union(enum) {
+    rejected: seat.FailureCode,
+    accepted: struct { command: seat.Command, event: ?seat.Event },
+};
+
 fn admission(
     arena: Allocator,
     message: *const messages.Message,
     options: *const Options,
     backend: anytype,
-) !?seat.FailureCode {
+) !Admission {
     _ = seat.bounded_size(message.body, operation.body_size_max) catch |err| {
         if (err == error.OutOfMemory) return err;
-        return .invalid_request;
+        return .{ .rejected = .invalid_request };
     };
     const command = seat.command_from_value(arena, &message.body) catch |err| {
         if (err == error.OutOfMemory) return err;
-        return .invalid_request;
+        return .{ .rejected = .invalid_request };
     };
     const event_id: ?u128 = switch (command) {
         .create_event => null,
@@ -307,7 +336,7 @@ fn admission(
             &.{ .tenant = message.tenant, .event_id = id },
             backend,
         ) catch |err| {
-            if (err == error.EventUnavailable) return .event_unavailable;
+            if (err == error.EventUnavailable) return .{ .rejected = .event_unavailable };
             return err;
         };
     }
@@ -316,14 +345,14 @@ fn admission(
         .tenant = message.tenant,
         .result_queue = options.completion_queue,
     }) catch |err| return switch (err) {
-        error.EventUnavailable => .event_unavailable,
-        error.EventNotReady => .event_not_ready,
-        error.EventFailed => .event_failed,
-        error.UnknownClass => .unknown_class,
+        error.EventUnavailable => .{ .rejected = .event_unavailable },
+        error.EventNotReady => .{ .rejected = .event_not_ready },
+        error.EventFailed => .{ .rejected = .event_failed },
+        error.UnknownClass => .{ .rejected = .unknown_class },
         error.OutOfMemory => err,
-        else => .invalid_request,
+        else => .{ .rejected = .invalid_request },
     };
-    return null;
+    return .{ .accepted = .{ .command = command, .event = saved } };
 }
 
 pub fn encode_response(arena: Allocator, sqs_id: []const u8, retry: bool) ![]const u8 {

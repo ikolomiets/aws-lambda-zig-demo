@@ -493,6 +493,98 @@ pub fn creation_result(arena: Allocator, body: *const std.json.Value, event: *co
     return .{ .success = .{ .create_event = event.event_id } };
 }
 
+/// A check is a complete observation of the configured accounts, never a reservation.
+pub fn availability_result(
+    arena: Allocator,
+    body: *const std.json.Value,
+    event: *const Event,
+) !Result {
+    try validate_event(event);
+    if (event.state != .ready) return error.InvalidNativeEvidence;
+    try exact_fields(body, &.{ "create_accounts", "create_transfers", "lookup_accounts" });
+    _ = try outcome_list(body, "create_accounts", 0);
+    _ = try outcome_list(body, "create_transfers", 0);
+    const entries = try outcome_list(body, "lookup_accounts", event.classes.len);
+    const classes = try arena.alloc(Availability, event.classes.len);
+    for (entries, event.classes, classes, 0..) |*entry, *class, *observation, index| {
+        try exact_fields(entry, &.{ "error_code", "alias", "account" });
+        if (try required(entry, "error_code") != .null) return error.InvalidNativeEvidence;
+        if (!std.mem.eql(u8, class.tag.slice(), try string_value(try required(entry, "alias")))) {
+            return error.InvalidNativeEvidence;
+        }
+        const account = try required(entry, "account");
+        observation.* = try account_availability(&account, event, index);
+    }
+    return .{ .success = .{ .check_seats = .{
+        .event_id = event.event_id,
+        .classes = classes,
+    } } };
+}
+
+fn account_availability(
+    account: *const std.json.Value,
+    event: *const Event,
+    class_index_value: usize,
+) !Availability {
+    std.debug.assert(class_index_value < event.classes.len);
+    const class = &event.classes[class_index_value];
+    try exact_fields(account, &.{
+        "id",             "debits_pending", "debits_posted", "credits_pending",
+        "credits_posted", "user_data_128",  "user_data_64",  "user_data_32",
+        "reserved",       "ledger",         "code",          "flags",
+        "timestamp",
+    });
+    if (try native_id(try string_value(try required(account, "id"))) != class.tb_account_id) {
+        return error.InvalidNativeEvidence;
+    }
+    if (try positive_u32(try required(account, "ledger")) != event.ledger) {
+        return error.InvalidNativeEvidence;
+    }
+    if (try positive_u32(try required(account, "code")) != 1) return error.InvalidNativeEvidence;
+    if (try unsigned_field(u128, account, "user_data_128") != 0) return error.InvalidNativeEvidence;
+    if (try unsigned_field(u64, account, "user_data_64") != 0) return error.InvalidNativeEvidence;
+    for ([_][]const u8{ "user_data_32", "reserved" }) |name| {
+        const value = try required(account, name);
+        if (value != .integer) return error.InvalidNativeEvidence;
+        if (value.integer != 0) return error.InvalidNativeEvidence;
+    }
+    const flags = try required(account, "flags");
+    if (flags != .array) return error.InvalidNativeEvidence;
+    // TigerBeetle persists the linked bit added to every initialization account
+    // except the final Availability Account in the complete creation chain.
+    const expected_flags: []const []const u8 = if (class_index_value + 1 < event.classes.len)
+        &.{ "linked", "debits_must_not_exceed_credits" }
+    else
+        &.{"debits_must_not_exceed_credits"};
+    if (flags.array.items.len != expected_flags.len) return error.InvalidNativeEvidence;
+    for (flags.array.items, expected_flags) |value, expected| {
+        if (!std.mem.eql(u8, try string_value(value), expected)) return error.InvalidNativeEvidence;
+    }
+    if (try unsigned_field(u64, account, "timestamp") == 0) return error.InvalidNativeEvidence;
+    if (try unsigned_field(u128, account, "credits_pending") != 0) {
+        return error.InvalidNativeEvidence;
+    }
+    const total = try unsigned_field(u128, account, "credits_posted");
+    if (total != class.total) return error.InvalidNativeEvidence;
+    const posted = try unsigned_field(u128, account, "debits_posted");
+    const pending = try unsigned_field(u128, account, "debits_pending");
+    const unposted = std.math.sub(u128, total, posted) catch return error.InvalidNativeEvidence;
+    const available = std.math.sub(u128, unposted, pending) catch
+        return error.InvalidNativeEvidence;
+    std.debug.assert(available <= total);
+    return .{ .tag = class.tag, .total = @intCast(total), .available = @intCast(available) };
+}
+
+fn unsigned_field(comptime T: type, object: *const std.json.Value, name: []const u8) !T {
+    const text = try string_value(try required(object, name));
+    if (text.len == 0) return error.InvalidNativeEvidence;
+    if (text.len > 1 and text[0] == '0') return error.InvalidNativeEvidence;
+    for (text) |byte| {
+        if (byte < '0' or byte > '9') return error.InvalidNativeEvidence;
+    }
+    return std.fmt.parseInt(T, text, 10) catch return error.InvalidNativeEvidence;
+}
+
 fn outcome_list(
     body: *const std.json.Value,
     name: []const u8,

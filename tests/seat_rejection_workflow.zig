@@ -48,6 +48,7 @@ const Effects = struct {
     change_configuration: bool = false,
     transactions: usize = 0,
     native_funding_error: ?anyerror = null,
+    lookup_accounts: []const tigerbeetle.Account = &.{},
 
     pub fn createAccounts(
         self: *Effects,
@@ -84,8 +85,13 @@ const Effects = struct {
         return input.len;
     }
 
-    pub fn lookupAccounts(_: *Effects, _: []const u128, _: []tigerbeetle.Account) !usize {
-        return error.UnexpectedLookup;
+    pub fn lookupAccounts(
+        self: *Effects,
+        _: []const u128,
+        output: []tigerbeetle.Account,
+    ) !usize {
+        @memcpy(output[0..self.lookup_accounts.len], self.lookup_accounts);
+        return self.lookup_accounts.len;
     }
 
     pub fn sendCompletion(
@@ -837,6 +843,364 @@ test "creation response encoding failure after atomic commit preserves the termi
     try std.testing.expect((try effects.read(arena, 1)).state == .completed);
     try std.testing.expectEqualStrings(ack, try complete_creation(arena, &effects, output));
     try std.testing.expectEqual(@as(usize, 1), effects.transactions);
+}
+
+const check_body = "{\"command\":\"check_seats\",\"event_id\":\"00000000-0000-" ++
+    "0000-0000-000000000002\"}";
+
+fn check_output(arena: Allocator, effects: *Effects) ![]const u8 {
+    const input = "{\"id\":\"" ++ uuid ++ "\",\"name\":\"SeatReservation\",\"body\":" ++
+        check_body ++ "}";
+    const first = effects.sent.items.len;
+    _ = try intake.test_support.submit(arena, &.{
+        .input = input,
+        .subject = "theatre",
+        .operation_name = "SeatReservation",
+    }, effects);
+    try std.testing.expectEqualStrings(ack, try submission.handle_invocation(
+        arena,
+        try sqs_event(arena, effects.sent.items[first].body),
+        &.{
+            .events_table = "Events",
+            .completion_queue = "seat-completion",
+            .native_queue = "native",
+        },
+        effects,
+    ));
+    try std.testing.expectEqualStrings("native", effects.sent.items[first + 1].queue);
+    const work = try messages.decode(arena, effects.sent.items[first + 1].body);
+    const lookups = work.body.object.get("lookup_accounts").?.array.items;
+    try std.testing.expectEqual(effects.event.?.classes.len, lookups.len);
+    for (effects.event.?.classes, lookups) |*class, lookup| {
+        try std.testing.expectEqualStrings(class.tag.slice(), lookup.object.get("alias").?.string);
+        try std.testing.expectEqual(
+            class.tb_account_id,
+            try seat.native_id(lookup.object.get("id").?.string),
+        );
+    }
+    try std.testing.expectEqualStrings(ack, try native.test_support.invoke(
+        arena,
+        try sqs_event(arena, effects.sent.items[first + 1].body),
+        effects,
+    ));
+    return effects.sent.items[first + 2].body;
+}
+
+test "authenticated availability observes all seats through native completion and owner query" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    var effects = try ready_check_effects(arena);
+    const account = @constCast(&effects.lookup_accounts[0]);
+    account.debits_pending = 3;
+    account.debits_posted = 2;
+    const output = try check_output(arena, &effects);
+    try std.testing.expectEqualStrings(ack, try complete_creation(arena, &effects, output));
+    const saved = try effects.read(arena, 1);
+    const expected = "{\"type\":\"SUCCESS\",\"payload\":{\"event_id\":\"" ++
+        "00000000-0000-0000-0000-000000000002\",\"classes\":{\"general\":" ++
+        "{\"total\":10,\"available\":5}}}}";
+    var buffer: [operation.result_size_max]u8 = undefined;
+    try std.testing.expectEqualStrings(expected, try operation.writeCompletionJSON(
+        &buffer,
+        &saved.state.completed,
+    ));
+    const visible = try query.test_support.query_with_backend(arena, 1, "theatre", &effects);
+    try std.testing.expect(std.mem.indexOf(u8, visible, "available") != null);
+    const foreign = try query.test_support.query_with_backend(arena, 1, "other", &effects);
+    try std.testing.expect(std.mem.indexOf(u8, foreign, "available") == null);
+    try std.testing.expectEqual(@as(usize, 0), effects.transactions);
+    try std.testing.expectEqual(@as(u32, 1000), effects.high_water);
+    try std.testing.expectEqual(seat.EventState.ready, effects.event.?.state);
+}
+
+test "31-class availability preserves byte order escaped tags and maximum integer totals" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    var effects = try Effects.init(arena);
+    const classes = try arena.alloc(seat.EventClass, 31);
+    var accounts: [31]tigerbeetle.Account = undefined;
+    for (classes, &accounts, 0..) |*class, *account, index| {
+        const tag = try std.fmt.allocPrint(arena, "{d:0>2}" ++ "\"" ** 52, .{index});
+        class.* = .{
+            .tag = try seat.Tag.init(tag),
+            .total = std.math.maxInt(u32),
+            .tb_account_id = seat.native_id_max - index,
+        };
+        account.* = std.mem.zeroes(tigerbeetle.Account);
+        account.id = class.tb_account_id;
+        account.ledger = 1001;
+        account.code = 1;
+        account.flags = c.TB_ACCOUNT_DEBITS_MUST_NOT_EXCEED_CREDITS;
+        if (index + 1 < classes.len) account.flags |= c.TB_ACCOUNT_LINKED;
+        account.credits_posted = std.math.maxInt(u32);
+        account.debits_posted = std.math.maxInt(u32) - 1;
+        account.timestamp = std.math.maxInt(u64);
+    }
+    effects.event.?.classes = classes;
+    effects.event.?.state = .ready;
+    // The adapter must restore request order from a reversed native reply.
+    std.mem.reverse(tigerbeetle.Account, &accounts);
+    effects.lookup_accounts = &accounts;
+    const output = try check_output(arena, &effects);
+    var missing_link = try messages.decode(arena, output);
+    const first = &missing_link.body.object.getPtr("lookup_accounts").?.array.items[0];
+    const flags = first.object.getPtr("account").?.object.getPtr("flags").?;
+    flags.array.items = flags.array.items[1..];
+    try std.testing.expectEqualStrings(ack, try complete_creation(
+        arena,
+        &effects,
+        try messages.encode(arena, &missing_link),
+    ));
+    try std.testing.expect((try effects.read(arena, 1)).state == .submitted);
+    try std.testing.expectEqualStrings(ack, try complete_creation(arena, &effects, output));
+    const saved = try effects.read(arena, 1);
+    try std.testing.expect(saved.state == .completed);
+    const observed = saved.state.completed.success.object.get("classes").?.object;
+    try std.testing.expectEqual(@as(usize, 31), observed.count());
+    for (classes, observed.keys(), observed.values()) |*class, tag, value| {
+        try std.testing.expectEqualStrings(class.tag.slice(), tag);
+        try std.testing.expectEqual(@as(i64, 4_294_967_295), value.object.get("total").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), value.object.get("available").?.integer);
+    }
+    const response = try seat.parse_value(arena, try query.test_support.query_with_backend(
+        arena,
+        1,
+        "theatre",
+        &effects,
+    ), messages.encoded_size_max);
+    const visible = try operation.parseOutputJSON(arena, response.object.get("body").?.string);
+    const visible_classes = visible.state.completed.success.object.get("classes").?.object;
+    try std.testing.expectEqual(@as(usize, 31), visible_classes.count());
+}
+
+test "availability admission hides foreign events and rejects subsets before native work" {
+    const Case = struct {
+        state: ?seat.EventState = .ready,
+        tenant: []const u8 = "theatre",
+        body: []const u8 = check_body,
+        code: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .state = null, .code = "event_unavailable" },
+        .{ .tenant = "foreign", .code = "event_unavailable" },
+        .{ .tenant = "foreign", .state = .failed, .code = "event_unavailable" },
+        .{ .state = .creating, .code = "event_not_ready" },
+        .{ .state = .failed, .code = "event_failed" },
+        .{
+            .body = "{\"command\":\"check_seats\",\"event_id\":\"00000000-0000-" ++
+                "0000-0000-000000000002\",\"classes\":[\"general\"]}",
+            .code = "invalid_request",
+        },
+    };
+    for (cases) |case| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        var effects = try Effects.init(arena);
+        if (case.state) |state| {
+            effects.event.?.state = state;
+            effects.event.?.tenant = case.tenant;
+        } else effects.event = null;
+        const output = try submitted_rejection(arena, &effects, case.body);
+        try std.testing.expectEqualStrings(ack, try complete_creation(arena, &effects, output));
+        const saved = try effects.read(arena, 1);
+        const code = saved.state.completed.failure.object.get("code").?.string;
+        try std.testing.expectEqualStrings(case.code, code);
+        try std.testing.expectEqualStrings("seat-completion", effects.sent.items[1].queue);
+        try std.testing.expectEqual(@as(u32, 1000), effects.high_water);
+        try std.testing.expectEqual(@as(usize, 0), effects.transactions);
+    }
+}
+
+fn ready_check_effects(arena: Allocator) !Effects {
+    var effects = try Effects.init(arena);
+    effects.event.?.state = .ready;
+    const accounts = try arena.alloc(tigerbeetle.Account, 1);
+    accounts[0] = std.mem.zeroes(tigerbeetle.Account);
+    accounts[0].id = 13;
+    accounts[0].ledger = 1001;
+    accounts[0].code = 1;
+    accounts[0].flags = c.TB_ACCOUNT_DEBITS_MUST_NOT_EXCEED_CREDITS;
+    accounts[0].credits_posted = 10;
+    accounts[0].timestamp = 1;
+    effects.lookup_accounts = accounts;
+    return effects;
+}
+
+const InvalidAvailabilityCase = struct {
+    target: enum { body, entry, account, context },
+    field: []const u8,
+    value: ?[]const u8 = null,
+};
+const invalid_availability_cases = [_]InvalidAvailabilityCase{
+    .{ .target = .body, .field = "error", .value = "{}" },
+    .{ .target = .body, .field = "create_accounts" },
+    .{ .target = .body, .field = "create_accounts", .value = "[{}]" },
+    .{ .target = .body, .field = "create_transfers", .value = "[{}]" },
+    .{ .target = .body, .field = "lookup_accounts", .value = "[]" },
+    .{ .target = .body, .field = "lookup_accounts", .value = "[null]" },
+    .{ .target = .body, .field = "lookup_accounts", .value = "[null,null]" },
+    .{ .target = .entry, .field = "error_code" },
+    .{ .target = .entry, .field = "error_code", .value = "\"unknown\"" },
+    .{ .target = .entry, .field = "error_code", .value = "\"created\"" },
+    .{ .target = .entry, .field = "alias" },
+    .{ .target = .entry, .field = "alias", .value = "\"other\"" },
+    .{ .target = .entry, .field = "alias", .value = "null" },
+    .{ .target = .entry, .field = "message", .value = "\"Account was not found.\"" },
+    .{ .target = .entry, .field = "account" },
+    .{ .target = .entry, .field = "account", .value = "null" },
+    .{ .target = .account, .field = "unexpected", .value = "0" },
+    .{ .target = .account, .field = "timestamp" },
+    .{ .target = .account, .field = "timestamp", .value = "\"0\"" },
+    .{ .target = .account, .field = "timestamp", .value = "\"18446744073709551616\"" },
+    .{ .target = .account, .field = "id", .value = "\"12\"" },
+    .{ .target = .account, .field = "ledger", .value = "1002" },
+    .{ .target = .account, .field = "ledger", .value = "\"1001\"" },
+    .{ .target = .account, .field = "code", .value = "2" },
+    .{ .target = .account, .field = "flags", .value = "[]" },
+    .{
+        .target = .account,
+        .field = "flags",
+        .value = "[\"linked\",\"debits_must_not_exceed_credits\"]",
+    },
+    .{
+        .target = .account,
+        .field = "flags",
+        .value = "[\"debits_must_not_exceed_credits\",\"closed\"]",
+    },
+    .{
+        .target = .account,
+        .field = "flags",
+        .value = "[\"debits_must_not_exceed_credits\",\"debits_must_not_exceed_credits\"]",
+    },
+    .{ .target = .account, .field = "user_data_128", .value = "\"1\"" },
+    .{ .target = .account, .field = "user_data_64", .value = "\"1\"" },
+    .{ .target = .account, .field = "user_data_32", .value = "1" },
+    .{ .target = .account, .field = "reserved", .value = "1" },
+    .{ .target = .account, .field = "credits_pending", .value = "\"1\"" },
+    .{ .target = .account, .field = "credits_posted", .value = "\"0\"" },
+    .{ .target = .account, .field = "credits_posted", .value = "\"11\"" },
+    .{ .target = .account, .field = "debits_posted", .value = "\"11\"" },
+    .{ .target = .account, .field = "debits_pending", .value = "\"11\"" },
+    .{
+        .target = .account,
+        .field = "debits_pending",
+        .value = "\"340282366920938463463374607431768211455\"",
+    },
+    .{
+        .target = .account,
+        .field = "debits_pending",
+        .value = "\"340282366920938463463374607431768211456\"",
+    },
+    .{ .target = .account, .field = "debits_pending", .value = "\"01\"" },
+    .{ .target = .account, .field = "debits_pending", .value = "\"+1\"" },
+    .{ .target = .account, .field = "debits_pending", .value = "\"-1\"" },
+    .{ .target = .account, .field = "debits_pending", .value = "1" },
+    .{ .target = .context, .field = "classes", .value = "[]" },
+    .{
+        .target = .context,
+        .field = "event_id",
+        .value = "\"00000000-0000-0000-0000-000000000003\"",
+    },
+};
+
+test "malformed availability evidence acknowledges without inventing a terminal Result" {
+    for (&invalid_availability_cases) |*case| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        var effects = try ready_check_effects(arena);
+        var message = try messages.decode(arena, try check_output(arena, &effects));
+        const entry = &message.body.object.getPtr("lookup_accounts").?.array.items[0];
+        const object = switch (case.target) {
+            .body => &message.body.object,
+            .entry => &entry.object,
+            .account => &entry.object.getPtr("account").?.object,
+            .context => &message.context.object,
+        };
+        if (case.value) |value| {
+            try object.put(arena, case.field, try seat.parse_value(arena, value, 4096));
+        } else try std.testing.expect(object.swapRemove(case.field));
+        try std.testing.expectEqualStrings(ack, try complete_creation(
+            arena,
+            &effects,
+            try messages.encode(arena, &message),
+        ));
+        try std.testing.expectEqual(@as(usize, 1), effects.diagnostics.items.len);
+        try std.testing.expectEqual(@as(usize, 0), effects.updates);
+        try std.testing.expect((try effects.read(arena, 1)).state == .submitted);
+        try std.testing.expectEqual(seat.EventState.ready, effects.event.?.state);
+    }
+}
+
+test "delayed availability and lost write responses preserve the first complete observation" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    var effects = try ready_check_effects(arena);
+    const account = @constCast(&effects.lookup_accounts[0]);
+    const first = try check_output(arena, &effects);
+    account.debits_pending = 4;
+    // Retry submission creates a newer observation while the first one is delayed.
+    const second = try check_output(arena, &effects);
+    effects.write_error = error.LostWriteResponse;
+    effects.commit_before_error = true;
+    try std.testing.expectEqualStrings(ack, try complete_creation(arena, &effects, second));
+    effects.write_error = null;
+    const winner = effects.operation_item.?;
+    try std.testing.expectEqualStrings(ack, try complete_creation(arena, &effects, first));
+    try std.testing.expectEqualStrings(ack, try complete_creation(arena, &effects, second));
+    try std.testing.expectEqual(winner.ptr, effects.operation_item.?.ptr);
+    const saved = try effects.read(arena, 1);
+    const observed = saved.state.completed.success.object.get("classes").?.object.get("general").?;
+    try std.testing.expectEqual(@as(i64, 6), observed.object.get("available").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), effects.transactions);
+}
+
+test "missing native accounts and overcommitted balances never synthesize availability" {
+    for ([_]bool{ true, false }) |missing| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        var effects = try ready_check_effects(arena);
+        if (missing) {
+            effects.lookup_accounts = &.{};
+        } else {
+            const account = @constCast(&effects.lookup_accounts[0]);
+            account.debits_posted = 6;
+            account.debits_pending = 5;
+        }
+        const output = try check_output(arena, &effects);
+        try std.testing.expectEqualStrings(ack, try complete_creation(arena, &effects, output));
+        try std.testing.expectEqual(@as(usize, 1), effects.diagnostics.items.len);
+        try std.testing.expectEqual(@as(usize, 0), effects.updates);
+        try std.testing.expect((try effects.read(arena, 1)).state == .submitted);
+    }
+}
+
+test "availability retries uncertain reads and writes and accepts a zero-seat observation" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    var effects = try ready_check_effects(arena);
+    const account = @constCast(&effects.lookup_accounts[0]);
+    account.debits_posted = 6;
+    account.debits_pending = 4;
+    const output = try check_output(arena, &effects);
+    effects.write_error = error.ServiceUnavailable;
+    try std.testing.expect(!std.mem.eql(u8, ack, try complete_creation(arena, &effects, output)));
+    try std.testing.expect((try effects.read(arena, 1)).state == .submitted);
+    effects.write_error = null;
+    effects.read_error = error.ServiceUnavailable;
+    try std.testing.expect(!std.mem.eql(u8, ack, try complete_creation(arena, &effects, output)));
+    effects.read_error = null;
+    try std.testing.expectEqualStrings(ack, try complete_creation(arena, &effects, output));
+    const saved = try effects.read(arena, 1);
+    const observed = saved.state.completed.success.object.get("classes").?.object.get("general").?;
+    try std.testing.expectEqual(@as(i64, 0), observed.object.get("available").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), effects.diagnostics.items.len);
 }
 
 fn sqs_event(arena: Allocator, body: []const u8) ![]const u8 {
