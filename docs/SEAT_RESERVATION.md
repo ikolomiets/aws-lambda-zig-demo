@@ -90,7 +90,10 @@ zig build build-seat-processors test-seat-workflow
 or packaging Lambda artifacts. The composed deterministic tests exercise real
 authenticated handlers, domain codecs and persistence builders with external
 effects faked, including invocation restarts and ambiguous outcomes. They run in
-the ordinary offline suite. The separate [SDK transaction probe](SEAT_TRANSACTIONS.md)
+the ordinary offline suite. The [recovery evidence matrix](SEAT_WORKFLOW_EVIDENCE.md)
+maps failure boundaries and cross-command contracts to their owning tests and
+describes caller-retry and 24-hour Operation-retention limits.
+The separate [SDK transaction probe](SEAT_TRANSACTIONS.md)
 establishes executable persistence composition evidence. The
 [consistency ADR](adr/0007-seat-completion-consistency.md) records the recovery decision.
 

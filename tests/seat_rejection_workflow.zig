@@ -18,6 +18,389 @@ const request = "{\"id\":\"" ++ uuid ++ "\",\"name\":\"SeatReservation\",\"body\
     "\"command\":\"reserve_seats\",\"event_id\":\"00000000-0000-0000-0000-000000000002\"," ++
     "\"class\":\"general\",\"quantity\":2}}";
 const ack = "{\"batchItemFailures\":[]}";
+const retry_response = "{\"batchItemFailures\":[{\"itemIdentifier\":\"source-1\"}]}";
+
+test "intake caller retry requeues only the same submitted Operation and preserves a winner" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    var effects = try Effects.init(storage.allocator());
+    effects.event.?.state = .ready;
+    effects.send_error = error.SendUnavailable;
+    try std.testing.expectEqual(@as(i64, 503), try restarted_intake(&effects, request));
+    try std.testing.expectEqual(@as(usize, 0), effects.sent.items.len);
+    const submitted = try effects.read(effects.arena, 1);
+    try std.testing.expect(submitted.state == .submitted);
+    try std.testing.expectEqual(@as(?i64, 87_400), submitted.expires_at);
+    try expect_queried_state(&effects, "SUBMITTED", null);
+
+    // No outbox delivers the saved Operation: recovery requires the original caller.
+    effects.send_error = null;
+    const conflicting = try std.mem.replaceOwned(
+        u8,
+        effects.arena,
+        request,
+        "quantity\":2",
+        "quantity\":3",
+    );
+    try std.testing.expectEqual(@as(i64, 409), try restarted_intake(&effects, conflicting));
+    try std.testing.expectEqual(@as(usize, 0), effects.sent.items.len);
+    try std.testing.expectEqual(@as(i64, 200), try restarted_intake(&effects, request));
+    const source = effects.sent.items[0].body;
+    const message = try messages.decode(effects.arena, source);
+    try std.testing.expectEqualStrings("theatre", message.tenant);
+    try std.testing.expect(message.context == .null);
+    try std.testing.expect(message.result_queue == null);
+    try expect_restarted_sqs(&effects, .submission, source, ack);
+    try std.testing.expectEqualStrings("native", effects.sent.items[1].queue);
+    try expect_restarted_sqs(&effects, .native, effects.sent.items[1].body, ack);
+    try std.testing.expectEqualStrings("seat-completion", effects.sent.items[2].queue);
+    try expect_restarted_sqs(&effects, .completion, effects.sent.items[2].body, ack);
+    try expect_queried_state(&effects, "COMPLETED", "reservation_id");
+    const winner = effects.operation_item;
+    try std.testing.expectEqual(@as(i64, 200), try restarted_intake(&effects, request));
+    try std.testing.expectEqual(@as(usize, 3), effects.sent.items.len);
+    try std.testing.expectEqualDeep(winner, effects.operation_item);
+}
+
+test "intake failures before and after writes or sends retain the caller retry limitation" {
+    const Fault = enum { write_before, write_after, send_after };
+    for (std.enums.values(Fault)) |fault| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        var effects = try Effects.init(storage.allocator());
+        if (fault == .send_after) {
+            effects.send_error = error.ResponseLost;
+            effects.send_before_error = true;
+        } else {
+            effects.write_error = error.ResponseLost;
+            effects.commit_before_error = fault == .write_after;
+        }
+        const expected_status: i64 = if (fault == .send_after) 503 else 500;
+        try std.testing.expectEqual(expected_status, try restarted_intake(&effects, request));
+        try std.testing.expectEqual(fault != .write_before, effects.operation_item != null);
+        const sent_count: usize = if (fault == .send_after) 1 else 0;
+        try std.testing.expectEqual(sent_count, effects.sent.items.len);
+        if (fault != .write_before) try expect_queried_state(&effects, "SUBMITTED", null);
+
+        effects.write_error = null;
+        effects.send_error = null;
+        try std.testing.expectEqual(@as(i64, 200), try restarted_intake(&effects, request));
+        try std.testing.expectEqual(sent_count + 1, effects.sent.items.len);
+        const source = effects.sent.items[sent_count].body;
+        if (fault == .send_after) {
+            try std.testing.expectEqualStrings(effects.sent.items[0].body, source);
+        }
+        try expect_restarted_sqs(&effects, .submission, source, ack);
+        const output = effects.sent.items[sent_count + 1].body;
+        try std.testing.expectEqualStrings(
+            "seat-completion",
+            effects.sent.items[sent_count + 1].queue,
+        );
+        try expect_restarted_sqs(&effects, .completion, output, ack);
+        try expect_queried_state(&effects, "COMPLETED", "code");
+        try std.testing.expectEqualStrings("event_not_ready", (try effects.read(effects.arena, 1))
+            .state.completed.failure.object.get("code").?.string);
+        try std.testing.expectEqual(@as(u32, 1000), effects.high_water);
+        try std.testing.expectEqual(seat.EventState.creating, effects.event.?.state);
+    }
+}
+
+test "native competing sources stop publishing at the first failed or uncertain send" {
+    for ([_]bool{ false, true }) |sent_before_error| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        var effects = try Effects.init(storage.allocator());
+        effects.event.?.state = .ready;
+        try std.testing.expectEqual(@as(i64, 200), try restarted_intake(&effects, request));
+        const source = effects.sent.items[0].body;
+        for (0..3) |_| {
+            try expect_restarted_sqs(&effects, .submission, source, ack);
+        }
+        const work = [_][]const u8{
+            effects.sent.items[1].body, effects.sent.items[2].body, effects.sent.items[3].body,
+        };
+        effects.native_send_error = error.ResponseLost;
+        effects.native_send_before_error = sent_before_error;
+        effects.native_send_fail_at = 2;
+        try expect_native_batch(
+            &effects,
+            &work,
+            "{\"batchItemFailures\":[{\"itemIdentifier\":\"source-2\"}," ++
+                "{\"itemIdentifier\":\"source-3\"}]}",
+        );
+        const published_count: usize = if (sent_before_error) 2 else 1;
+        try std.testing.expectEqual(4 + published_count, effects.sent.items.len);
+        try std.testing.expectEqual(@as(usize, 2), effects.native_send_attempts);
+        const holds = effects.transfers[0..3].*;
+        try std.testing.expectEqual(@as(u128, 101), holds[0].id);
+        try std.testing.expectEqual(@as(u128, 102), holds[1].id);
+        try std.testing.expectEqual(@as(u128, 103), holds[2].id);
+        try std.testing.expectEqual(@as(usize, 3), effects.created_transfers.count());
+        const winner = effects.sent.items[4].body;
+        try expect_restarted_sqs(&effects, .completion, winner, ack);
+        try expect_queried_state(&effects, "COMPLETED", "reservation_id");
+        effects.native_send_error = null;
+        effects.transfer_statuses = &.{ tigerbeetle.transfer_exists, tigerbeetle.transfer_exists };
+        try expect_native_batch(&effects, work[1..], ack);
+        try std.testing.expectEqualDeep(holds[1], effects.transfers[0]);
+        try std.testing.expectEqualDeep(holds[2], effects.transfers[1]);
+        try std.testing.expectEqual(@as(usize, 3), effects.created_transfers.count());
+        for (effects.sent.items[5..]) |output| {
+            try std.testing.expectEqualStrings("seat-completion", output.queue);
+            try expect_restarted_sqs(&effects, .completion, output.body, ack);
+        }
+        const saved = try effects.read(effects.arena, 1);
+        try std.testing.expectEqualStrings(
+            "101",
+            saved.state.completed.success.object.get("reservation_id").?.string,
+        );
+        try std.testing.expectEqual(seat.EventState.ready, effects.event.?.state);
+    }
+}
+
+fn expect_native_batch(effects: *Effects, bodies: []const []const u8, expected: []const u8) !void {
+    var invocation = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer invocation.deinit();
+    const arena = invocation.allocator();
+    const response = try native.test_support.invoke(arena, try sqs_batch(arena, bodies), effects);
+    try std.testing.expectEqualStrings(expected, response);
+}
+
+fn sqs_batch(arena: Allocator, bodies: []const []const u8) ![]const u8 {
+    std.debug.assert(bodies.len <= 10);
+    const Record = struct {
+        messageId: []const u8,
+        body: []const u8,
+        receiptHandle: []const u8 = "receipt",
+        attributes: std.json.Value = .{ .object = .empty },
+        messageAttributes: std.json.Value = .{ .object = .empty },
+        md5OfBody: []const u8 = "md5",
+        eventSource: []const u8 = "aws:sqs",
+        eventSourceARN: []const u8 = "arn",
+        awsRegion: []const u8 = "ca-central-1",
+    };
+    const records = try arena.alloc(Record, bodies.len);
+    for (bodies, records, 1..) |body, *record, index| {
+        record.* = .{
+            .messageId = try std.fmt.allocPrint(arena, "source-{d}", .{index}),
+            .body = body,
+        };
+    }
+    return std.json.Stringify.valueAlloc(arena, .{ .Records = records }, .{});
+}
+
+test "native initialization uncertainty replays complete chains across restarts" {
+    for ([_]bool{ false, true }) |funding_phase| {
+        for ([_]bool{ false, true }) |applied| {
+            var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer storage.deinit();
+            var effects = try Effects.init(storage.allocator());
+            effects.event = null;
+            try std.testing.expectEqual(
+                @as(i64, 200),
+                try restarted_intake(&effects, create_request),
+            );
+            try expect_restarted_sqs(&effects, .submission, effects.sent.items[0].body, ack);
+            const work = effects.sent.items[1].body;
+            const saved = try seat.clone_event(effects.arena, &effects.event.?);
+            if (funding_phase) {
+                effects.native_funding_error = error.ResponseLost;
+                effects.native_transfer_before_error = applied;
+            } else {
+                effects.native_account_error = error.ResponseLost;
+                effects.native_account_before_error = applied;
+            }
+            try expect_restarted_sqs(&effects, .native, work, retry_response);
+            try std.testing.expectEqual(
+                @as(usize, if (funding_phase or applied) 4 else 0),
+                effects.created_accounts.count(),
+            );
+            try std.testing.expectEqual(
+                @as(usize, if (funding_phase and applied) 2 else 0),
+                effects.created_transfers.count(),
+            );
+            try std.testing.expectEqual(@as(usize, 2), effects.sent.items.len);
+            try std.testing.expectEqualDeep(saved, effects.event.?);
+            try expect_queried_state(&effects, "SUBMITTED", null);
+            effects.native_account_error = null;
+            effects.native_funding_error = null;
+            if (funding_phase or applied) {
+                effects.account_statuses = &.{ tigerbeetle.account_exists, 1, 1, 1 };
+            }
+            if (funding_phase and applied) {
+                effects.transfer_statuses = &.{ tigerbeetle.transfer_exists, 1 };
+            }
+            try expect_restarted_sqs(&effects, .native, work, ack);
+            try std.testing.expectEqual(@as(usize, 4), effects.created_accounts.count());
+            try std.testing.expectEqual(@as(usize, 2), effects.created_transfers.count());
+            for (saved.classes) |class| {
+                const funding = effects.created_transfers.get(class.tb_account_id).?;
+                try std.testing.expectEqual(saved.capacity_account_id, funding.debit_account_id);
+                try std.testing.expectEqual(class.tb_account_id, funding.credit_account_id);
+                try std.testing.expectEqual(@as(u128, class.total), funding.amount);
+            }
+            try expect_restarted_sqs(&effects, .completion, effects.sent.items[2].body, ack);
+            try std.testing.expectEqual(seat.EventState.ready, effects.event.?.state);
+            try expect_queried_state(&effects, "COMPLETED", "event_id");
+        }
+    }
+}
+
+test "uncertain Event insertion retries failed readback without replacing the durable identities" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    var effects = try Effects.init(storage.allocator());
+    effects.event = null;
+    try std.testing.expectEqual(@as(i64, 200), try restarted_intake(&effects, create_request));
+    const source = effects.sent.items[0].body;
+    effects.insertion_error = error.ResponseLost;
+    effects.insertion_before_error = true;
+    effects.insertion_read_error = error.TemporaryReadFailure;
+    try expect_restarted_sqs(&effects, .submission, source, retry_response);
+    try std.testing.expectEqual(@as(usize, 1), effects.sent.items.len);
+    const saved = try seat.clone_event(effects.arena, &effects.event.?);
+    try std.testing.expectEqual(@as(u32, 1001), saved.ledger);
+    effects.read_error = null;
+    effects.insertion_error = null;
+    try expect_queried_state(&effects, "SUBMITTED", null);
+    try expect_restarted_sqs(&effects, .submission, source, ack);
+    try std.testing.expectEqual(@as(u32, 1001), effects.high_water);
+    try std.testing.expectEqualDeep(saved, effects.event.?);
+    try expect_restarted_sqs(&effects, .native, effects.sent.items[1].body, ack);
+    try expect_restarted_sqs(&effects, .completion, effects.sent.items[2].body, ack);
+    try expect_queried_state(&effects, "COMPLETED", "event_id");
+    try std.testing.expectEqual(seat.EventState.ready, effects.event.?.state);
+}
+
+test "allocation failure never guesses a ledger and only applied increments leave gaps" {
+    for ([_]bool{ false, true }) |applied| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        var effects = try Effects.init(storage.allocator());
+        effects.event = null;
+        try std.testing.expectEqual(@as(i64, 200), try restarted_intake(&effects, create_request));
+        const source = effects.sent.items[0].body;
+        effects.allocation_error = error.ResponseLost;
+        effects.allocation_before_error = applied;
+        try expect_restarted_sqs(&effects, .submission, source, retry_response);
+        try std.testing.expect(effects.event == null);
+        try std.testing.expectEqual(@as(u32, if (applied) 1001 else 1000), effects.high_water);
+        try std.testing.expectEqual(@as(usize, 1), effects.sent.items.len);
+        try expect_queried_state(&effects, "SUBMITTED", null);
+        effects.allocation_error = null;
+        try expect_restarted_sqs(&effects, .submission, source, ack);
+        try std.testing.expectEqual(@as(u32, if (applied) 1002 else 1001), effects.event.?.ledger);
+        try expect_restarted_sqs(&effects, .native, effects.sent.items[1].body, ack);
+        try std.testing.expectEqual(effects.event.?.ledger, effects.accounts[0].ledger);
+        try expect_restarted_sqs(&effects, .completion, effects.sent.items[2].body, ack);
+        try expect_queried_state(&effects, "COMPLETED", "event_id");
+        try std.testing.expectEqual(seat.EventState.ready, effects.event.?.state);
+    }
+}
+
+test "deleted Operations never authorize reconstruction or repair from delayed seat evidence" {
+    for ([_]bool{ false, true }) |creation| {
+        for ([_]bool{ false, true }) |completed_before_deletion| {
+            var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer storage.deinit();
+            var effects = try Effects.init(storage.allocator());
+            if (creation) effects.event = null else effects.event.?.state = .ready;
+            const input = if (creation) create_request else request;
+            try std.testing.expectEqual(@as(i64, 200), try restarted_intake(&effects, input));
+            try expect_restarted_sqs(&effects, .submission, effects.sent.items[0].body, ack);
+            try expect_restarted_sqs(&effects, .native, effects.sent.items[1].body, ack);
+            const output = effects.sent.items[2].body;
+            if (completed_before_deletion) {
+                try expect_restarted_sqs(&effects, .completion, output, ack);
+            }
+            const saved = try seat.clone_event(effects.arena, &effects.event.?);
+            // Model deletion, including TTL cleanup. There is no recovery guarantee
+            // beyond the 24-hour retention window, even if native evidence survives.
+            effects.operation_item = null;
+            try expect_restarted_sqs(&effects, .completion, output, ack);
+            try std.testing.expect(effects.operation_item == null);
+            try std.testing.expectEqualDeep(saved, effects.event.?);
+            try std.testing.expectEqual(@as(usize, 1), effects.diagnostics.items.len);
+            try std.testing.expectEqual(
+                @as(usize, if (creation) 2 else 1),
+                effects.created_transfers.count(),
+            );
+            var invocation = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer invocation.deinit();
+            const arena = invocation.allocator();
+            const response = try query.test_support.query_with_backend(
+                arena,
+                1,
+                "theatre",
+                &effects,
+            );
+            const http = try seat.parse_value(arena, response, messages.body_size_max);
+            try std.testing.expectEqual(@as(i64, 404), http.object.get("statusCode").?.integer);
+        }
+    }
+}
+
+// Release every handler's request arena before the next invocation. Only the fake
+// external services own durable bytes; these helpers never simulate an internal hop.
+fn restarted_intake(effects: *Effects, input: []const u8) !i64 {
+    var invocation = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer invocation.deinit();
+    const arena = invocation.allocator();
+    const response = try intake.test_support.submit(arena, &.{
+        .input = input,
+        .subject = "theatre",
+        .operation_name = "SeatReservation",
+    }, effects);
+    const value = try seat.parse_value(arena, response, messages.body_size_max);
+    return value.object.get("statusCode").?.integer;
+}
+
+fn expect_restarted_sqs(
+    effects: *Effects,
+    stage: enum { submission, native, completion },
+    input: []const u8,
+    expected: []const u8,
+) !void {
+    var invocation = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer invocation.deinit();
+    const arena = invocation.allocator();
+    const event = try sqs_event(arena, input);
+    const response = switch (stage) {
+        .submission => try submission.handle_invocation(arena, event, &.{
+            .events_table = "Events",
+            .completion_queue = "seat-completion",
+            .native_queue = "native",
+        }, effects),
+        .native => try native.test_support.invoke(arena, event, effects),
+        .completion => try completion.handle_invocation(arena, event, &.{
+            .events_table = "Events",
+            .operations_table = "Operations",
+            .now = 1001,
+        }, effects),
+    };
+    try std.testing.expectEqualStrings(expected, response);
+}
+
+fn expect_queried_state(effects: *Effects, state: []const u8, result_field: ?[]const u8) !void {
+    var invocation = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer invocation.deinit();
+    const arena = invocation.allocator();
+    const response = try query.test_support.query_with_backend(arena, 1, "theatre", effects);
+    const http = try seat.parse_value(arena, response, messages.body_size_max);
+    try std.testing.expectEqual(@as(i64, 200), http.object.get("statusCode").?.integer);
+    const visible = try seat.parse_value(
+        arena,
+        http.object.get("body").?.string,
+        messages.body_size_max,
+    );
+    try std.testing.expectEqualStrings(state, visible.object.get("state").?.string);
+    if (result_field) |field| {
+        try std.testing.expect(visible.object.get("result").?.object
+            .get("payload").?.object.contains(field));
+    } else {
+        try std.testing.expect(!visible.object.contains("result"));
+    }
+}
 
 test "warm seat handlers reuse ready metadata across arenas and observe fresh balances" {
     var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -944,14 +1327,21 @@ const Effects = struct {
     allocation_before_error: bool = false,
     insertion_error: ?anyerror = null,
     insertion_before_error: bool = false,
+    insertion_read_error: ?anyerror = null,
     insertion_winner: ?seat.Event = null,
     pair_read_error: ?anyerror = null,
     change_configuration: bool = false,
     transactions: usize = 0,
     native_funding_error: ?anyerror = null,
+    native_account_error: ?anyerror = null,
+    native_account_before_error: bool = false,
     native_transfer_before_error: bool = false,
     native_send_error: ?anyerror = null,
     native_send_before_error: bool = false,
+    native_send_fail_at: usize = 1,
+    native_send_attempts: usize = 0,
+    created_accounts: std.AutoHashMapUnmanaged(u128, tigerbeetle.Account) = .empty,
+    created_transfers: std.AutoHashMapUnmanaged(u128, tigerbeetle.Transfer) = .empty,
     lookup_accounts: []const tigerbeetle.Account = &.{},
 
     pub fn createAccounts(
@@ -959,6 +1349,7 @@ const Effects = struct {
         input: []const tigerbeetle.Account,
         output: []tigerbeetle.CreateAccountResult,
     ) !usize {
+        if (!self.native_account_before_error) if (self.native_account_error) |err| return err;
         @memcpy(self.accounts[0..input.len], input);
         for (output[0..input.len], 0..) |*entry, index| {
             entry.* = std.mem.zeroes(tigerbeetle.CreateAccountResult);
@@ -968,6 +1359,15 @@ const Effects = struct {
                 entry.status = tigerbeetle.account_created;
             }
         }
+        for (input, output[0..input.len]) |account, result| {
+            if (result.status != tigerbeetle.account_created) continue;
+            if (self.created_accounts.get(account.id)) |saved| {
+                try std.testing.expectEqualDeep(saved, account);
+            } else {
+                try self.created_accounts.put(self.arena, account.id, account);
+            }
+        }
+        if (self.native_account_error) |err| return err;
         return input.len;
     }
 
@@ -978,7 +1378,6 @@ const Effects = struct {
     ) !usize {
         if (!self.native_transfer_before_error) if (self.native_funding_error) |err| return err;
         @memcpy(self.transfers[0..input.len], input);
-        if (self.native_funding_error) |err| return err;
         for (output[0..input.len], 0..) |*entry, index| {
             entry.* = std.mem.zeroes(tigerbeetle.CreateTransferResult);
             if (self.transfer_statuses) |statuses| {
@@ -987,6 +1386,15 @@ const Effects = struct {
                 entry.status = tigerbeetle.transfer_created;
             }
         }
+        for (input, output[0..input.len]) |transfer, result| {
+            if (result.status != tigerbeetle.transfer_created) continue;
+            if (self.created_transfers.get(transfer.id)) |saved| {
+                try std.testing.expectEqualDeep(saved, transfer);
+            } else {
+                try self.created_transfers.put(self.arena, transfer.id, transfer);
+            }
+        }
+        if (self.native_funding_error) |err| return err;
         return input.len;
     }
 
@@ -1005,12 +1413,17 @@ const Effects = struct {
         route: ?[]const u8,
         body: []const u8,
     ) !void {
-        if (!self.native_send_before_error) if (self.native_send_error) |err| return err;
+        self.native_send_attempts += 1;
+        const send_error = if (self.native_send_attempts >= self.native_send_fail_at)
+            self.native_send_error
+        else
+            null;
+        if (!self.native_send_before_error) if (send_error) |err| return err;
         try self.sent.append(self.arena, .{
             .queue = try self.arena.dupe(u8, route.?),
             .body = try self.arena.dupe(u8, body),
         });
-        if (self.native_send_error) |err| return err;
+        if (send_error) |err| return err;
     }
 
     pub fn transact_write(
@@ -1079,6 +1492,7 @@ const Effects = struct {
         if (self.event != null) return error.ConditionConflict;
         if (!self.insertion_before_error) if (self.insertion_error) |err| return err;
         self.event = try events.decode_item(self.arena, input.item);
+        if (self.insertion_read_error) |err| self.read_error = err;
         if (self.insertion_error) |err| return err;
     }
 
@@ -1104,9 +1518,34 @@ const Effects = struct {
         arena: Allocator,
         source: *const operation.Operation,
     ) !operation.Operation {
+        if (!self.commit_before_error) if (self.write_error) |err| return err;
+        if (self.operation_item) |item| {
+            const saved = try operations.decode_item(arena, item);
+            if (saved.id == source.id) {
+                if (!std.mem.eql(u8, saved.tenant, source.tenant)) return error.OperationConflict;
+                if (!operation.verifyHash(&saved, &source.hash.?)) return error.OperationConflict;
+                return saved;
+            }
+        }
         const creation = try operations.create_request(self.arena, "Operations", source);
-        self.operation_item = creation.item;
-        return operations.decode_item(arena, creation.item);
+        self.operation_item = try self.copy_operation_item(creation.item);
+        if (self.write_error) |err| return err;
+        return operations.decode_item(arena, self.operation_item.?);
+    }
+
+    fn copy_operation_item(
+        self: *Effects,
+        item: []const events.Attribute,
+    ) ![]const events.Attribute {
+        const owned = try self.arena.dupe(events.Attribute, item);
+        for (owned) |*field| {
+            switch (field.value) {
+                .s => |value| field.value = .{ .s = try self.arena.dupe(u8, value.?) },
+                .n => |value| field.value = .{ .n = try self.arena.dupe(u8, value.?) },
+                else => unreachable,
+            }
+        }
+        return owned;
     }
 
     pub fn get(
@@ -1172,14 +1611,7 @@ const Effects = struct {
         }
         updated[item.len] = .{ .key = "result", .value = attribute(values, ":result") };
         // The service owns bytes independently of the invocation request arena.
-        for (updated) |*field| {
-            switch (field.value) {
-                .s => |text| field.value = .{ .s = try self.arena.dupe(u8, text.?) },
-                .n => |text| field.value = .{ .n = try self.arena.dupe(u8, text.?) },
-                else => unreachable,
-            }
-        }
-        self.operation_item = updated;
+        self.operation_item = try self.copy_operation_item(updated);
         if (self.write_error) |err| return err;
     }
 
@@ -2112,17 +2544,7 @@ test "availability retries uncertain reads and writes and accepts a zero-seat ob
 }
 
 fn sqs_event(arena: Allocator, body: []const u8) ![]const u8 {
-    return std.json.Stringify.valueAlloc(arena, .{ .Records = &.{.{
-        .messageId = "source-1",
-        .receiptHandle = "receipt",
-        .body = body,
-        .attributes = std.json.Value{ .object = .empty },
-        .messageAttributes = std.json.Value{ .object = .empty },
-        .md5OfBody = "md5",
-        .eventSource = "aws:sqs",
-        .eventSourceARN = "arn",
-        .awsRegion = "ca-central-1",
-    }} }, .{});
+    return sqs_batch(arena, &.{body});
 }
 
 test "authenticated SeatReservation intake publishes a creating Event rejection" {

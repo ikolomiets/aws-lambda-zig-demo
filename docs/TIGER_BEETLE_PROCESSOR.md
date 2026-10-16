@@ -346,6 +346,11 @@ imports, including `lambda_test_mod`, `query_test_mod`,
 The existing `zig build test-tigerbeetle-processor` target selects these tests;
 `zig build test` also includes them.
 
+The [seat workflow evidence matrix](SEAT_WORKFLOW_EVIDENCE.md) covers the composed
+authenticated seat pipeline, including competing source publications, lost native
+responses, durable completion winners and Operation deletion. Its scripted native
+effects remain separate from local native accounting and SDK transaction evidence.
+
 Locate the test, helper callers, and host wiring by symbols before reading their
 surrounding declarations:
 
