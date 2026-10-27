@@ -84,20 +84,13 @@ optional `LEDGER_COUNTER_ID` (default `global`), `TigerBeetleQueue` and
 Both use the existing SDK configuration and SQS/persistence mechanics.
 
 ```sh
-zig build build-seat-processors test-seat-workflow
+zig build build-seat-processors
 ```
 
 `build-seat-processors` compiles the host runtime entry points without installing
-or packaging Lambda artifacts. The composed deterministic tests exercise real
-authenticated handlers, domain codecs and persistence builders with external
-effects faked, including invocation restarts and ambiguous outcomes. They run in
-the ordinary offline suite. The [recovery evidence matrix](SEAT_WORKFLOW_EVIDENCE.md)
-maps failure boundaries and cross-command contracts to their owning tests and
-describes caller-retry and 24-hour Operation-retention limits.
-The separate [SDK transaction suite](../tests/seat_transactions.zig)
-establishes executable persistence composition evidence. The
-[consistency ADR](adr/0007-seat-completion-consistency.md) records the recovery decision.
-The deployment guide separates these checks from authorized local native and
+or packaging Lambda artifacts. The [consistency ADR](adr/0007-seat-completion-consistency.md)
+records the recovery decision.
+The deployment guide describes authorized local native and
 [deployed scenario evidence](DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-workflow-evidence-and-deployed-scenarios).
 The deployed runner requires an existing six-function baseline and explicit cloud
 authorization; neither the offline suite nor development sync invokes it.
@@ -158,12 +151,9 @@ initialization; creating Events retain uncertainty until valid evidence complete
 them. A failed Event requires a new creation Operation/Event. There is no repair
 transition, separate-write fallback, outbox, or automatic recovery after Operation deletion.
 
-The composed offline workflow checks races, duplicate/competing completions,
-allocation gaps, lost dispatch/transaction responses, partial initialization and
-contradictory pairs. The separate local SDK probe exercises runtime finalization
-and winner readback. `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle`
+`TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle`
 proves native funding, intact replay and the three account bounds against the local
-replica; the offline fakes do not establish those native guarantees.
+replica.
 
 ## Reservation workflow
 
@@ -203,9 +193,6 @@ timeout starts at native creation, follows native time and never renews on repla
 Cleanup may lag expiry. A delayed success can therefore name an already-expired
 hold; it promises no remaining lifetime and contains no synthetic expiry timestamp.
 
-`zig build test-seat-workflow` covers success, capacity failure, matching replay,
-fresh competing attempts, uncertain dispatch/publication/finalization, invalid
-evidence and immutable winning Results through the authenticated composed pipeline.
 The separate local native suite proves concurrent all-or-nothing bounds, class
 independence, expiry from native creation, replay without renewal and delayed
 success after expiry:
@@ -251,8 +238,6 @@ field; retrying submission may choose a fresh ID. Guarded Operation-only complet
 preserves the first valid terminal Result, even if another valid completion
 proposes a different success or failure. Confirmation never changes Event metadata.
 
-Deterministic tests cover the authenticated pipeline, strict schema/ownership,
-complete evidence, repeat posting, uncertain boundaries and immutable Results.
 The separate local native suite proves full posting, effective already-posted
 success, expired/invalid references and tenant/event/class/credit/ledger/code
 association rejection before and after posting. Run it only against the authorized
@@ -298,9 +283,6 @@ reservations can change supply after a lookup. Native expiry cleanup can lag the
 hold's deadline; a lookup may still subtract expired pending debits until cleanup
 reclaims them. Completion and query can deliver an older observation later.
 
-`zig build test-seat-workflow` exercises authenticated intake, submission, the
-native adapter, completion and owner query with one and 31 classes, reordered
-native replies, invalid evidence, tenant isolation and competing observations.
 The separate local native suite runs the real adapter and domain projection after
 funding, holds, full posting and eventual expiry cleanup:
 
@@ -528,8 +510,7 @@ zig build fmt-check
 ```
 
 All deterministic suites also run in `zig build test`. These checks establish local contracts,
-ownership and recovery behavior. The composed workflow suite establishes local
-seat handler integration; these tests do not establish live AWS IAM, DynamoDB
+ownership and recovery behavior; they do not establish live AWS IAM, DynamoDB
 service behavior or native accounting guarantees.
 
 The [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-event-metadata-utility)

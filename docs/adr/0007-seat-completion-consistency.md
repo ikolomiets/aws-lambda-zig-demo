@@ -15,10 +15,9 @@ uncertainty remains retryable; diagnosed inconsistencies produce bounded ERROR
 output and acknowledge without inventing a public Result.
 
 Durable Event identities remain separate from disposable Operations, as described in
-[ADR 0004](0004-seat-event-identities.md). The shared Event and Operation update
-builders compose atomically in the isolated [SDK transaction suite](../../tests/seat_transactions.zig).
-Runtime creation completion uses that transaction to guard the full saved Event
-configuration and creating state together with the submitted, absent-Result Operation
+[ADR 0004](0004-seat-event-identities.md). Runtime creation completion uses a
+transaction to guard the full saved Event configuration and creating state together
+with the submitted, absent-Result Operation
 identity. Ready/success and permanently failed/failure commit together. Account and
 funding chains remain separate native phases, so incomplete or uncertain native
 initialization stays creating. Stable saved identities permit complete-chain replay;

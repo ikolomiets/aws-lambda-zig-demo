@@ -17,7 +17,6 @@ Read sources relevant to the task:
 | Global ledger allocation and counter tooling | `src/ledger_counter.zig`, `src/ledger_counter_cli.zig`, `ledger-counter.sh`, [seat reference](docs/SEAT_RESERVATION.md#global-ledger-allocator), [counter setup and discovery](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#global-ledger-counter-utility) |
 | Queue transport and Completion messages | `src/sqs_queue.zig`, `src/processor_message.zig`, [minimal Processor Messages ADR](docs/adr/0003-minimal-processor-messages.md) |
 | Seat SQS processors | `src/seat_reservation_processor.zig`, `src/seat_reservation_completion_processor.zig`, [seat reference](docs/SEAT_RESERVATION.md) |
-| Cross-handler behavior, recovery tests, or evidence assessment | [Workflow coverage index](docs/SEAT_WORKFLOW_EVIDENCE.md), [composed workflow suite](tests/seat_rejection_workflow.zig) |
 | SQS processors | `src/tiger_beetle_processor.zig`, `src/tiger_beetle_completion_processor.zig`, [processor contract](docs/TIGER_BEETLE_PROCESSOR.md) |
 | TigerBeetle client wrapper | `src/tigerbeetle.zig`, [wrapper design](docs/ZIG_WRAPPER_FOR_TIGERBEETLE.md) |
 | SDK/client dependency internals | `build.zig.zon`, `zig build dependency-paths` with the active cache/fork options; [dependency source discovery](README.md#dependency-source-discovery) |

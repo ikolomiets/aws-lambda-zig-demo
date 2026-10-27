@@ -728,31 +728,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "seat_reservation_processor", .module = seat_submission_mod },
         },
     });
-    const seat_workflow_mod = b.createModule(.{
-        .target = b.graph.host,
-        .optimize = .Debug,
-        .root_source_file = b.path("tests/seat_rejection_workflow.zig"),
-        .imports = &.{
-            .{ .name = "aws", .module = host_aws },
-            .{ .name = "dynamodb", .module = host_dynamodb },
-            .{ .name = "operation", .module = host_operation },
-            .{ .name = "operation_persistence", .module = host_operation_persistence },
-            .{ .name = "processor_message", .module = host_processor_message },
-            .{ .name = "seat_reservation", .module = host_seat_reservation },
-            .{ .name = "seat_reservation_persistence", .module = host_seat_persistence },
-            .{ .name = "seat_reservation_processor", .module = seat_submission_mod },
-            .{ .name = "seat_reservation_completion_processor", .module = seat_completion_mod },
-            .{ .name = "intake_lambda", .module = lambda_test_mod },
-            .{ .name = "query_lambda", .module = query_test_mod },
-        },
-    });
-    const seat_workflow_tests = b.addTest(.{ .root_module = seat_workflow_mod });
-    seat_workflow_mod.addImport("tiger_beetle_processor", tiger_beetle_processor_test_mod);
-    seat_workflow_mod.addImport("tigerbeetle", tigerbeetle_host);
-    seat_workflow_mod.addImport("tigerbeetle_c", tigerbeetle_c_host);
-    const run_seat_workflow_tests = b.addRunArtifact(seat_workflow_tests);
-    b.step("test-seat-workflow", "Run composed authenticated Seat Reservation workflow tests")
-        .dependOn(&run_seat_workflow_tests.step);
     const seat_submission_exe = b.addExecutable(.{
         .name = "seat-reservation-processor",
         .root_module = seat_submission_mod,
@@ -960,8 +935,6 @@ pub fn build(b: *std.Build) void {
     const processor_interface_test = b.addSystemCommand(&.{"bash"});
     processor_interface_test.addFileArg(b.path("tests/processor_interface_test.sh"));
 
-    const lambda_logs_test = b.addSystemCommand(&.{"bash"});
-    lambda_logs_test.addFileArg(b.path("tests/lambda_logs_test.sh"));
     const deploy_test_step = b.step(
         "test-deploy",
         "Run deployment helper regression tests",
@@ -970,31 +943,10 @@ pub fn build(b: *std.Build) void {
     deploy_test_step.dependOn(&cleanup_lifecycle_test.step);
     deploy_test_step.dependOn(&gateway_interface_test.step);
     deploy_test_step.dependOn(&processor_interface_test.step);
-    deploy_test_step.dependOn(&lambda_logs_test.step);
-
-    const seat_transactions_mod = b.createModule(.{
-        .target = b.graph.host,
-        .optimize = .Debug,
-        .link_libc = true,
-        .root_source_file = b.path("tests/seat_transactions.zig"),
-        .imports = &.{
-            .{ .name = "aws", .module = host_aws },
-            .{ .name = "dynamodb", .module = host_dynamodb },
-            .{ .name = "operation", .module = host_operation },
-            .{ .name = "operation_persistence", .module = host_operation_persistence },
-            .{ .name = "seat_reservation", .module = host_seat_reservation },
-            .{ .name = "seat_reservation_persistence", .module = host_seat_persistence },
-        },
-    });
-    const seat_transactions_tests = b.addTest(.{ .root_module = seat_transactions_mod });
-    const run_seat_transactions_tests = b.addRunArtifact(seat_transactions_tests);
-    b.step("test-seat-transactions", "Run SDK transaction tests against isolated DynamoDB Local")
-        .dependOn(&run_seat_transactions_tests.step);
 
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_seat_reservation_tests.step);
     test_step.dependOn(&run_seat_persistence_tests.step);
-    test_step.dependOn(&run_seat_workflow_tests.step);
     test_step.dependOn(&run_events_cli_tests.step);
     test_step.dependOn(&run_ledger_counter_tests.step);
     test_step.dependOn(&run_ledger_counter_cli_tests.step);

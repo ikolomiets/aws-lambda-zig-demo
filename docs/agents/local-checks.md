@@ -58,16 +58,15 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | Check | Scope and additional prerequisites |
 | --- | --- |
 | `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
-| `zig build test` | Full offline Zig and mocked deployment-helper suite, including composed workflows; excludes the SDK/local-database probe, live replica and separate ABI checks |
-| `zig build test-deploy` | Mocked regression tests for cleanup lifecycle, gateway discovery and interfaces, processor interfaces and Lambda log selection; requires Bash and `jq`, with no AWS credentials or network access |
+| `zig build test` | Full offline Zig and mocked deployment-helper suite; excludes the live replica and separate ABI checks |
+| `zig build test-deploy` | Mocked regression tests for cleanup lifecycle, gateway discovery and interfaces, and processor interfaces; requires Bash and `jq`, with no AWS credentials or network access |
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
 | `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli` | Host counter build and deterministic global allocation/tooling tests |
-| `zig build build-seat-processors test-seat-workflow` | Compile host seat invocation adapters and run the [composed workflow suite](../../tests/seat_rejection_workflow.zig) with controlled external effects; covers cross-handler completion and recovery, without live services. See the [coverage index](../SEAT_WORKFLOW_EVIDENCE.md). |
+| `zig build build-seat-processors` | Compile host seat invocation adapters without live services or Lambda packaging |
 | `zig build test-tigerbeetle-processor` | Processor parsing and invocation tests |
 | `zig build test-tigerbeetle-wrapper` | Offline wrapper tests |
 | `zig build test-tigerbeetle-c-abi` | Native C ABI smoke test on Apple Silicon macOS |
 | `zig build test-tigerbeetle-c-abi-linux test-tigerbeetle-wrapper-linux` | Compile ARM64 glibc Linux ABI and wrapper tests; does not execute them |
-| `zig build test-seat-transactions` | Separate [pinned-SDK/DynamoDB Local suite](../../tests/seat_transactions.zig); requires an externally prepared, empty isolated database selected through `SEAT_TRANSACTION_ENDPOINT=http://127.0.0.1:<port>`. Database setup and cleanup are external to the repository. Uses dummy credentials; excluded from the ordinary offline suite. |
 | `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` | Live native integration tests against the separately authorized local development replica; establishes no AWS behavior |
 | `zig build --release -Darch=arm` | Stripped ReleaseSafe ARM64 Lambda bootstraps and host CLI tools; requires the [patched sibling Zig library](../../AGENTS.md#build-and-validation). Building does not refresh zip packages; use the [packaging procedure](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#2-build-and-package-the-zig-lambdas) when deployable packages are requested. |
 | `sam validate --template-file template.yaml --region ca-central-1` | SAM template validation when the template changes; requires SAM CLI |
