@@ -42,7 +42,7 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 - AWS CLI v2 and SAM CLI are installed.
 - `zip`, `unzip`, and `file` are installed for package validation.
 - `jq` 1.6 or newer is installed for deployment guards, `lambda_logs.sh`, and shell regression tests.
-- Python 3.9 or newer is installed for the Python regression suites in
+- Python 3.9 or newer is installed for mocked shell regression tests in
   `zig build test`, which normal `deploy.sh` runs before packaging.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
@@ -142,9 +142,9 @@ for script in deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh; do
 done
 ```
 
-Run the full local test graph before packaging. This includes the Zig tests,
-mocked deployment-helper tests, and Python tracker, documentation-checker, and
-local-gate regression suites. The Python suites require Python 3.9 or newer:
+Run the full local test graph before packaging. This includes the Zig tests and
+mocked deployment-helper tests. Some shell harnesses use Python 3.9 or newer
+for assertions and command mocks:
 
 ```sh
 zig build test
@@ -156,8 +156,8 @@ To run only the deployment-helper regression tests, use:
 zig build test-deploy
 ```
 
-The deployment-helper tests replace AWS commands with shell mocks, so they
-require Bash and `jq`, with no AWS credentials or network access. `deploy.sh` invokes only
+The deployment-helper tests mock AWS commands, so they require Bash, `jq`, and
+Python 3.9 or newer, with no AWS credentials or network access. `deploy.sh` invokes only
 `zig build test`, which includes these tests exactly once.
 
 Build the stripped ReleaseSafe Lambda executables for AWS Lambda ARM64. ARM64
@@ -2056,7 +2056,7 @@ Keep these evidence levels separate when recording validation:
 
 | Level | Command and what it establishes |
 | --- | --- |
-| Deterministic pipeline | `zig build test-seat-workflow` exercises authenticated handlers, codecs, persistence builders, delivery/recovery and exact public Results with external effects controlled. `zig build test-seat-scenarios` tests runner control flow using local command mocks. Both are in `zig build test`; neither contacts AWS. |
+| Deterministic pipeline | `zig build test-seat-workflow` exercises authenticated handlers, codecs, persistence builders, delivery/recovery and exact public Results with external effects controlled. It is in `zig build test` and does not contact AWS. |
 | Pinned SDK / DynamoDB Local | The separate [transaction probe](SEAT_TRANSACTIONS.md), `./tests/seat_transactions_test.sh`, executes shared builders through the pinned SDK against isolated loopback DynamoDB Local 3.3.0 with dummy credentials. Its service behavior and simulations remain distinct from AWS. |
 | Authorized local native | `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` exercises the local replica's funding, reservation bounds, replay, confirmation and expiry. It requires the separately authorized local replica and establishes no cloud delivery or IAM behavior. |
 | Deployed | The separately invoked [runner](../seat_scenarios.py) exercises the selected development stack through its public intake/query and host read utilities. Only an executed, passing run establishes deployed behavior for its covered paths. |

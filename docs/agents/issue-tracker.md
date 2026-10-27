@@ -58,17 +58,18 @@ question body or duplicate them in the map.
 
 ## Command usage
 
-[tracker.py](../../tracker.py) uses Python 3.9 or newer and its standard library.
-Run these commands from the repository root:
+The optional local `.scratch/tracker.py` utility uses Python 3.9 or newer and its
+standard library. It is ignored by Git and is not included in a fresh clone.
+When available, run these commands from the repository root:
 
 ```sh
-python3 tracker.py validate
-python3 tracker.py frontier '<effort>' '<parent-id>'
-python3 tracker.py complete '<effort>' '<issue-id>' --resolution 'YYYY-MM-DD-resolution.md'
+python3 .scratch/tracker.py validate
+python3 .scratch/tracker.py frontier '<effort>' '<parent-id>'
+python3 .scratch/tracker.py complete '<effort>' '<issue-id>' --resolution 'YYYY-MM-DD-resolution.md'
 ```
 
 `validate` discovers `.scratch/*/issues/*.md`, including ignored local efforts,
-without a registry. A missing tracker or an empty effort reports `Validated 0 issues.`
+without a registry. A missing issue root or an empty effort reports `Validated 0 issues.`
 `frontier` selects children of the named map or specification, ordering numeric
 `order` then ID. It prints titles and paths relative to the tracker root, and prints
 nothing when no work is ready. Maps use `wayfinder:map`; specifications use
@@ -118,8 +119,8 @@ above instead of successful completion.
 All commands accept `--root '<tracker-root>'` before the operation for temporary
 trees or another checkout. Success exits 0, tracker failures exit 1, and invalid
 command arguments exit 2. No command contacts services or examines Git/code to
-infer acceptance. Test the command with `python3 tests/tracker_test.py` or
-`zig build test-tracker`; the same temporary-tree tests are in `zig build test`.
+infer acceptance. The utility defaults to its containing `.scratch/` directory
+and runs separately from `zig build test`.
 
 Research worktrees may retain uncommitted findings on a `research/<name>` branch; record the
 branch and worktree in the ticket's comments and keep the reviewable asset in `docs/research/`.

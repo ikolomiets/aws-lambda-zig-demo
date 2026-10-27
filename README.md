@@ -53,9 +53,8 @@ to `global`; consumers requiring one sequence share both binding components. See
 - Zig 0.16.0 or newer within the supported 0.16.x line.
 - AWS CLI v2 and AWS SAM CLI for the SAM deployment flow and stack queries.
 - `jq` for the Lambda log helper and shell regression tests.
-- Python 3.9 or newer for documentation checks, tracker validation, and the
-  regression suites in `zig build test`. Normal `deploy.sh` runs that test graph
-  before packaging.
+- Python 3.9 or newer for mocked shell regression tests and the deployed
+  scenario runner.
 - An AWS profile with permission to create Lambda, IAM, and CloudFormation
   resources.
 
@@ -750,14 +749,8 @@ Run checks directly during development. See [local checks](docs/agents/local-che
 for the complete offline sequence, supported hosts, prerequisites, and pinned-package
 provisioning.
 
-Check documentation links, anchors, and current repository command names with:
-
-```sh
-python3 check_docs.py
-```
-
-See the [documentation check scope](docs/agents/documentation-checks.md) for historical
-evidence handling, fixture tests, and manual option/prerequisite/schema review.
+Review documentation links, anchors, command names, and prerequisites using the
+[documentation review guide](docs/agents/documentation-checks.md).
 
 The [Seat Reservation rejection workflow](docs/SEAT_RESERVATION.md#rejection-workflow)
 has a composed deterministic `test-seat-workflow` target in the offline suite and

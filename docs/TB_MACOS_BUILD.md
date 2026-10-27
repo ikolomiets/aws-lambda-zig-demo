@@ -7,8 +7,6 @@ Apple Silicon Mac running macOS 26.6.1. The checkout was at commit
 The commands below are historical evidence from that TigerBeetle checkout. Their
 relative entry points belong to that checkout, rather than this Lambda repository.
 
-<!-- doc-check: commands=historical -->
-
 The normal source-build command is:
 
 ```sh
