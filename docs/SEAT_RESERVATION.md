@@ -1,17 +1,88 @@
-# Seat Reservation contracts, Event metadata and global ledgers
+# Seat Reservation specification
+
+## Purpose and scope
+
+This document is the maintained specification for the exact Operation name
+`SeatReservation`. Authenticated callers use the existing asynchronous intake
+and query interface to create tenant-owned Seat Events, reserve quantities,
+confirm holds, and inspect availability without supplying native accounting
+commands. TigerBeetle supplies balance enforcement and pending-transfer expiry.
+
+Creation configures 1–31 Seat Classes together. Reservation holds a positive
+quantity in exactly one class; confirmation posts that hold's full quantity.
+An availability check reports every configured class. The verified PASETO
+subject determines Operation Tenant and Event ownership. There is no finer
+customer or reservation ownership boundary within an authorized Event/class.
+
+The specification excludes assigned seats, payments, pricing, customer UI,
+cancellation/refunds, capacity edits, partial confirmation, and requests spanning
+multiple classes for reservation or confirmation. It also excludes restricting
+raw TigerBeetle access or isolating its cluster. The
+[native processor boundary](TIGER_BEETLE_PROCESSOR.md#framework-boundary) has no
+tenant-scoped native resource authorization; the seat path's ownership and
+configured-capacity guarantees assume other native writers do not alter its
+accounts or supply.
+
+The [glossary](../GLOSSARY.md#seat-reservation-language) owns vocabulary, and the
+[processor contract](TIGER_BEETLE_PROCESSOR.md) owns shared native execution and
+Processor Message behavior. Existing [ADRs](adr/) retain architectural rationale,
+including [Event identities](adr/0004-seat-event-identities.md),
+[selected counters](adr/0006-selectable-ledger-counters.md), and
+[completion consistency](adr/0007-seat-completion-consistency.md). The
+[deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md) owns resource configuration,
+permissions, builds/packages, utilities, deployment modes, setup, cleanup, and
+execution procedures. Current seat requirements are maintained here without
+depending on local planning tickets.
+
+## Guarantees and limits
+
+- [Reservations](#reservation-workflow) succeed or fail for the whole requested
+  quantity. Native bounds arbitrate concurrent requests, and classes retain
+  independent supply. An [availability observation](#availability-workflow)
+  promises no later reservation outcome.
+- [Admission](#rejection-workflow) authorizes the Event before revealing readiness
+  or class existence. Missing and foreign Events are indistinguishable. Complete
+  schema and size admission precedes allocation, Event writes, and native work.
+- [Creation](#event-creation-workflow) saves the winning identities before
+  dispatch and finalizes Event readiness/failure with its Operation Result in
+  one DynamoDB transaction. Account creation and funding remain separate native
+  phases. Uncertain initialization stays `creating`; failed Events stay failed.
+- The first valid persisted terminal Result is immutable across competing
+  attempts. A terminal Result does not establish exactly-once native effects.
+  Fresh submission retries can leave abandoned holds; native replay never
+  renews their timeout, and delayed success can identify an expired hold.
+- Intake writes before queue publication, and recovery from a write/send gap
+  depends on a matching caller retry. Recovery is bounded by Operation retention
+  and deletion; the existing 24-hour TTL remains. No durable per-Operation plan,
+  reservation ownership store, outbox, background reconciliation, durable
+  quarantine, automatic diagnostic replay, or retry-exhaustion DLQ is provided.
+- Event and counter identities outlive disposable Operations. Counter gaps are
+  permitted; uncertain allocations cannot be inferred from later reads.
+  [Allocation](#global-ledger-allocator) excludes reset, recycling, automatic
+  repair, loss/rollback recovery, restore reconciliation, and exhaustion
+  migration. Broader resilience and monitoring/repair systems are outside this
+  contract.
+
+## Implementation boundaries
 
 The pure [seat domain module](../src/seat_reservation.zig) defines typed commands,
 Context, public Results, native input serialization, and pre-effect size admission.
-The [shared persistence module](../src/seat_reservation_persistence.zig) reads and
-inserts tenant-owned Event metadata. The host `events` utility uses these modules.
+It performs no AWS transport, queue publication, or native calls. The
+[shared persistence module](../src/seat_reservation_persistence.zig) owns
+authoritative Event reads, absent-only insertion and saved-winner resolution,
+atomic creation finalization, and coherent pair readback. Shared
+[Operation persistence](../src/operation_persistence.zig) constructs guarded
+Operation updates; seat completion orchestrates Operation-only writes and winner
+readback. The host `events` utility uses the domain and Event persistence modules.
 The independent [ledger counter](../src/ledger_counter.zig) and host
-`ledger-counter` utility initialize, inspect and allocate global ledgers.
+`ledger-counter` utility initialize and inspect selected Ledger Counters and
+allocate ledger values from them.
 The [submission](../src/seat_reservation_processor.zig) and
 [completion](../src/seat_reservation_completion_processor.zig) handlers implement
 local rejections, native Event creation, reservations, confirmations and availability
-observations through authenticated intake and query. SAM provisions both handlers,
-their queues and durable tables; the [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md#4-understand-what-the-template-creates)
-owns resources, IAM, configured allocator binding and operator setup.
+observations through authenticated intake and query. Native client access and its
+callback thread remain in TigerBeetle Processor. These boundaries use the existing
+small effect adapters and shared SQS sender without a generic workflow framework.
 
 ## Rejection workflow
 
@@ -77,23 +148,10 @@ original body length, escaped preview and explicit `truncated` boolean within
 8 KiB. Non-ASCII/control bytes in previews use visible byte escapes. Diagnostic
 delivery does not determine acknowledgement and creates no public Result.
 
-The submission runtime uses `EVENTS_TABLE_NAME`, `LEDGER_COUNTER_TABLE_NAME`,
-optional `LEDGER_COUNTER_ID` (default `global`), `TigerBeetleQueue` and
-`SeatReservationCompletionQueue`. Completion uses `EVENTS_TABLE_NAME` and
-`OPERATIONS_TABLE_NAME` in the same account and Region.
-Both use the existing SDK configuration and SQS/persistence mechanics.
-
-```sh
-zig build build-seat-processors
-```
-
-`build-seat-processors` compiles the host runtime entry points without installing
-or packaging Lambda artifacts. The [consistency ADR](adr/0007-seat-completion-consistency.md)
-records the recovery decision.
-The deployment guide describes authorized local native and
-[deployed scenario evidence](DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-workflow-evidence-and-deployed-scenarios).
-The deployed runner requires an existing six-function baseline and explicit cloud
-authorization; neither the offline suite nor development sync invokes it.
+The deployment guide owns [runtime configuration and permissions](DEPLOY_AWS_LAMBDA_WITH_SAM.md#4-understand-what-the-template-creates),
+[host processor compilation](DEPLOY_AWS_LAMBDA_WITH_SAM.md#local-seat-processor-compilation),
+and [native/deployed execution procedures](DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-workflow-evidence-and-deployed-scenarios).
+The [consistency ADR](adr/0007-seat-completion-consistency.md) records the recovery decision.
 
 ## Event creation workflow
 
@@ -151,10 +209,6 @@ initialization; creating Events retain uncertainty until valid evidence complete
 them. A failed Event requires a new creation Operation/Event. There is no repair
 transition, separate-write fallback, outbox, or automatic recovery after Operation deletion.
 
-`TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle`
-proves native funding, intact replay and the three account bounds against the local
-replica.
-
 ## Reservation workflow
 
 `reserve_seats` accepts exactly `command`, canonical `event_id`, scalar `class`
@@ -193,14 +247,6 @@ timeout starts at native creation, follows native time and never renews on repla
 Cleanup may lag expiry. A delayed success can therefore name an already-expired
 hold; it promises no remaining lifetime and contains no synthetic expiry timestamp.
 
-The separate local native suite proves concurrent all-or-nothing bounds, class
-independence, expiry from native creation, replay without renewal and delayed
-success after expiry:
-
-```sh
-TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle
-```
-
 ## Confirmation workflow
 
 An owned ready Event admits `confirm_seats` for one configured class. Submission
@@ -238,15 +284,6 @@ field; retrying submission may choose a fresh ID. Guarded Operation-only complet
 preserves the first valid terminal Result, even if another valid completion
 proposes a different success or failure. Confirmation never changes Event metadata.
 
-The separate local native suite proves full posting, effective already-posted
-success, expired/invalid references and tenant/event/class/credit/ledger/code
-association rejection before and after posting. Run it only against the authorized
-local replica:
-
-```sh
-TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle
-```
-
 ## Availability workflow
 
 `check_seats` accepts exactly `command` and `event_id`. Submission reads the
@@ -282,16 +319,6 @@ Availability is an observation, not a hold or a reservation guarantee. Concurren
 reservations can change supply after a lookup. Native expiry cleanup can lag the
 hold's deadline; a lookup may still subtract expired pending debits until cleanup
 reclaims them. Completion and query can deliver an older observation later.
-
-The separate local native suite runs the real adapter and domain projection after
-funding, holds, full posting and eventual expiry cleanup:
-
-```sh
-TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle
-```
-
-These checks establish local behavior; they do not establish AWS delivery or
-service configuration.
 
 ## Commands
 
@@ -501,20 +528,44 @@ size gate and do not make extra Event attributes valid. Shared envelope tests
 also cover raw exact/over bounds and separate SDK SQS and Lambda event escaping;
 the existing native serializer tests prove the generic complete-Result bound.
 
-Run the focused credential-free checks:
+## Verification requirements
 
-```sh
-zig build build-events test-seat-reservation test-seat-persistence test-events-cli
-zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli
-zig build fmt-check
-```
+Verification exercises real codecs, domain logic, persistence request builders,
+and the composed authenticated intake → seat submission → native processing
+adapter → seat completion → authenticated query workflow. Only external effects
+are replaced in deterministic composition; stateful fakes retain external state
+across simulated invocation restarts. Assertions cover emitted requests, durable
+state, public Results, and source acknowledgements together. Focused boundary
+tests cover malformed input, serializer limits, and memory ownership.
 
-All deterministic suites also run in `zig build test`. These checks establish local contracts,
-ownership and recovery behavior; they do not establish live AWS IAM, DynamoDB
-service behavior or native accounting guarantees.
+| Area | Required scenarios |
+| --- | --- |
+| Admission and messages | All four schemas, decoded duplicates, normalized numbers, UTF-8/tag/ID limits, exact/over byte bounds and transport escaping; invalid input has no allocation, Event write or native dispatch; trusted tenant and explicit Context survive normal and diagnostic hops. |
+| Ownership and cache | Missing/foreign equivalence; authorization before readiness/class disclosure, including cache hits; ready-only entries, full 1 MiB accounting, LRU eviction, oversized-entry bypass and request-arena independence; balances remain uncached. |
+| Allocation and Event insertion | Independent and shared bindings, default/explicit selection, bounds/exhaustion, wrong returned IDs and backing-storage ownership; absent-only setup at 1000, first allocation 1001, explicit uncertainty and no guessed allocation; races resolve to saved Event identities and reconstruct intact initialization chains. |
+| Accounting and observations | Initial funding and account bounds; concurrent all-or-nothing reservations and class independence; full confirmation and effective already-posted success; tenant/Event/class/account/ledger/code mismatches before and after posting; expiry without renewal, delayed success and conservative availability after expiry. |
+| Completion and persistence | Exact native families/counts/positions/aliases/fields; invalid evidence creates no public Result; identity/state/absent-Result guards without hash comparison; immutable winners, delayed admission failures, atomic ready/success or failed/failure, coherent readback and contradictory pairs. |
+| Uncertain effects and delivery | Failure before an effect and committed effect followed by lost response at intake write/send, allocation, insertion, dispatch, result publication and finalization; restarts, competing completions, readback errors and response-encoding failure; ordered publication stops at the first failed/uncertain send; acknowledgements reflect publication/persistence or diagnosed unrecoverable input, independently of diagnostic delivery. |
+| Utilities and deployment | Shared validation, bounded I/O, JSON stdout/sanitized stderr, credential-free help and selection precedence; guarded preservation of table/ID bindings, explicit setup and owner-scoped cleanup; deployment procedures follow the guide. |
 
-The [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-event-metadata-utility)
-owns utility invocation, environment, permissions and deployment prerequisites.
-The [global ledger ADR](adr/0005-global-ledger-allocation.md) records the allocator scope.
-The [Event identity ADR](adr/0004-seat-event-identities.md) records the durable
-identity decision.
+These are verification obligations, not a record of executed passes. Injected
+effects establish deterministic contracts; they do not certify service behavior.
+Service-backed transaction evidence uses the pinned SDK and shared update/readback
+builders against an isolated loopback DynamoDB service with dummy credentials and
+no cloud fallback: commit, cancellation by either failed condition with neither
+record changed, decoded diagnostics, coherent readback, immutable replay and the
+failed-Event variant. Simulations and local execution do not establish AWS
+transaction contention behavior.
+
+Native evidence requires the authorized local TigerBeetle replica at
+`127.0.0.1:3000`; fakes cannot establish its accounting, matching, replay or expiry
+guarantees. Deployed evidence separately exercises real IAM, mappings, routing,
+connectivity and service behavior on an explicitly authorized stack. Evidence
+records identify the executed revision, service versions, covered scenarios and
+limits; missing prerequisites and unexecuted layers remain gaps.
+
+The [local-check guide](agents/local-checks.md#select-checks-by-affected-behavior)
+owns focused and offline check commands. The deployment guide owns
+[host utility procedures](DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-event-metadata-utility),
+[counter procedures](DEPLOY_AWS_LAMBDA_WITH_SAM.md#global-ledger-counter-utility),
+and [native/deployed execution procedures](DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-workflow-evidence-and-deployed-scenarios).

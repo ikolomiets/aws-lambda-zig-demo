@@ -2,8 +2,6 @@
 
 Status: Accepted.
 
-Supersedes [0005: Allocate ledgers through one global counter binding](0005-global-ledger-allocation.md).
-
 One LedgerCounter table supports multiple independent Ledger Counters identified
 by unique String `counter_id` values. The physical table and selected ID define
 an allocator binding; omitted selection uses `"global"`, preserving the existing
@@ -19,11 +17,9 @@ updated value, explicit uncertainty, permitted gaps, and independent retention
 from Operations. Existing allocator bindings remain durable deployment identity;
 choosing another ID is not a repair or reset of an established sequence.
 
-The [selectable-counter amendment](../../.scratch/seat-reservation/comments/seat-spec/2026-10-14-selectable-ledger-counters.md)
-records selection, validation, compatibility and affected work.
-[Support selectable independent ledger counters](../../.scratch/seat-reservation/issues/05-selectable-ledger-counters.md)
-implements the shared allocator API and host tooling. The
-[Seat Reservation reference](../SEAT_RESERVATION.md#global-ledger-allocator) and
+The [Seat Reservation specification](../SEAT_RESERVATION.md#global-ledger-allocator)
+owns selection, validation, compatibility and the shared allocator API. The
 [deployment guide](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#global-ledger-counter-utility)
-own the current contracts. Seat submission uses the trusted configured binding;
-SAM exposes the actual owned or referenced counter table and configured ID.
+owns host tooling and operational procedures. Seat submission uses the trusted
+configured binding; SAM exposes the actual owned or referenced counter table
+and configured ID.
