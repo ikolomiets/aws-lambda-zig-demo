@@ -52,9 +52,8 @@ to `global`; consumers requiring one sequence share both binding components. See
 
 - Zig 0.16.0 or newer within the supported 0.16.x line.
 - AWS CLI v2 and AWS SAM CLI for the SAM deployment flow and stack queries.
-- `jq` for the Lambda log helper and shell regression tests.
-- Python 3.9 or newer for mocked shell regression tests and the deployed
-  scenario runner.
+- `jq` for the Lambda log helper, deployed scenario runner, and shell regression tests.
+- Bash 3.2 or newer and curl for the deployed scenario runner.
 - An AWS profile with permission to create Lambda, IAM, and CloudFormation
   resources.
 

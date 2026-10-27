@@ -41,9 +41,8 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 
 - AWS CLI v2 and SAM CLI are installed.
 - `zip`, `unzip`, and `file` are installed for package validation.
-- `jq` 1.6 or newer is installed for deployment guards, `lambda_logs.sh`, and shell regression tests.
-- Python 3.9 or newer is installed for mocked shell regression tests in
-  `zig build test`, which normal `deploy.sh` runs before packaging.
+- `jq` 1.6 or newer is installed for deployment guards, `lambda_logs.sh`, deployed seat scenarios, and shell regression tests.
+- Bash 3.2 or newer and curl are installed when running deployed seat scenarios.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
@@ -143,8 +142,7 @@ done
 ```
 
 Run the full local test graph before packaging. This includes the Zig tests and
-mocked deployment-helper tests. Some shell harnesses use Python 3.9 or newer
-for assertions and command mocks:
+mocked deployment-helper tests:
 
 ```sh
 zig build test
@@ -156,9 +154,9 @@ To run only the deployment-helper regression tests, use:
 zig build test-deploy
 ```
 
-The deployment-helper tests mock AWS commands, so they require Bash, `jq`, and
-Python 3.9 or newer, with no AWS credentials or network access. `deploy.sh` invokes only
-`zig build test`, which includes these tests exactly once.
+The deployment-helper tests mock AWS commands, so they require Bash and `jq`,
+with no AWS credentials or network access. `deploy.sh` invokes only `zig build test`,
+which includes these tests exactly once.
 
 Build the stripped ReleaseSafe Lambda executables for AWS Lambda ARM64. ARM64
 is also the project build default; `-Darch=arm` keeps the deployment command
@@ -2059,7 +2057,7 @@ Keep these evidence levels separate when recording validation:
 | Deterministic pipeline | `zig build test-seat-workflow` exercises authenticated handlers, codecs, persistence builders, delivery/recovery and exact public Results with external effects controlled. It is in `zig build test` and does not contact AWS. |
 | Pinned SDK / DynamoDB Local | The separate [transaction probe](SEAT_TRANSACTIONS.md), `./tests/seat_transactions_test.sh`, executes shared builders through the pinned SDK against isolated loopback DynamoDB Local 3.3.0 with dummy credentials. Its service behavior and simulations remain distinct from AWS. |
 | Authorized local native | `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` exercises the local replica's funding, reservation bounds, replay, confirmation and expiry. It requires the separately authorized local replica and establishes no cloud delivery or IAM behavior. |
-| Deployed | The separately invoked [runner](../seat_scenarios.py) exercises the selected development stack through its public intake/query and host read utilities. Only an executed, passing run establishes deployed behavior for its covered paths. |
+| Deployed | The separately invoked [runner](../seat_scenarios.sh) exercises the selected development stack through its public intake/query and host read utilities. Only an executed, passing run establishes deployed behavior for its covered paths. |
 
 The [2026-10-16 AWS validation report](SEAT_AWS_VALIDATION_2026_10_16.md)
 records an executed six-function development-stack exercise, transaction contention
@@ -2072,14 +2070,14 @@ baseline**: `IntakeFunction`, `QueryFunction`, `SeatReservationProcessor`,
 runtime configuration. The selected counter binding must already be initialized;
 native connectivity and gateway configuration must already work. Build the host
 utilities beforehand using the [ordinary build](#2-build-and-package-the-zig-lambdas).
-The runner requires Python 3.9+, AWS CLI, curl, and executable
+The runner requires Bash 3.2+, jq 1.6+, AWS CLI, curl, and executable
 `zig-out/bin/paseto`, `dynamodb`, `events`, and `ledger-counter`. It never builds,
 packages, deploys, synchronizes, logs in, or initializes a counter.
 
 Help is credential-free and performs no AWS calls, utility execution, or discovery:
 
 ```sh
-python3 seat_scenarios.py --help
+./seat_scenarios.sh --help
 ```
 
 After explicit authorization to exercise the intended **development** stack,
@@ -2088,7 +2086,7 @@ deployed public key. All selectors and the cloud authorization flag are mandator
 inherited `PROFILE`, `REGION`, and `STACK_NAME` do not select the target. For example:
 
 ```sh
-python3 seat_scenarios.py --authorize-cloud \
+./seat_scenarios.sh --authorize-cloud \
   --profile '<authorized-development-profile>' --region ca-central-1 \
   --stack-name '<authorized-development-stack>' \
   --output-dir '.scratch/seat-scenario-run-unique'
@@ -2366,10 +2364,8 @@ details.
 Run local deterministic utility checks with:
 
 ```sh
-zig build test-seat-reservation test-seat-persistence test-events-cli test-events-wrapper
-for script in events.sh tests/events_wrapper_test.sh; do
-  bash -n "$script" || exit
-done
+zig build test-seat-reservation test-seat-persistence test-events-cli
+bash -n events.sh
 ```
 
 These tests are part of the ordinary `zig build test` graph and contact no AWS
@@ -2542,17 +2538,15 @@ and upstream service details. Output failure after mutation may also consume a g
 Run the credential-free deterministic checks:
 
 ```sh
-zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli test-ledger-counter-wrapper
-for script in ledger-counter.sh tests/ledger_counter_wrapper_test.sh; do
-  bash -n "$script" || exit
-done
+zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli
+bash -n ledger-counter.sh
 ```
 
 These suites also run in `zig build test`. They exercise real typed request
 builders/serialization with controlled external effects, interleaved global
 and independent selected-ID allocation, bounds, corrupt/missing state, wrong
-returned keys, response uncertainty, table/ID ownership and selection precedence
-through mocked wrapper discovery. They do not establish live DynamoDB, AWS IAM,
+returned keys, response uncertainty, table/ID ownership and explicit/configured
+selection. They do not establish live DynamoDB, AWS IAM,
 seat processor integration or cloud deployment behavior.
 
 ### Troubleshoot persistence command configuration

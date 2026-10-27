@@ -31,7 +31,7 @@ complete run.
 ## Host and package prerequisites
 
 Use an ARM64 macOS or ARM64 glibc Linux host, Zig **0.16.0**, Bash (tested with
-**3.2 and 5.3**), `jq`, Python **3.9 or newer**, and `find`.
+**3.2 and 5.3**), `jq`, and `find`.
 The native TigerBeetle archive in the pinned packages targets glibc 2.27 or newer.
 
 Provision every pinned dependency from [build.zig.zon](../../build.zig.zon),
@@ -59,9 +59,9 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | --- | --- |
 | `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
 | `zig build test` | Full offline Zig and mocked deployment-helper suite, including composed workflows; excludes the SDK/local-database probe, live replica and separate ABI checks |
-| `zig build test-deploy` | Mocked deployment regression tests, including durable-data guards, owned-resource cleanup and six-function code updates; requires Bash, `jq`, and Python 3.9+, with no AWS credentials or network access |
-| `zig build build-events test-seat-reservation test-seat-persistence test-events-cli test-events-wrapper` | Host Events build and deterministic seat/domain/persistence/tooling tests |
-| `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli test-ledger-counter-wrapper` | Host counter build and deterministic global allocation/tooling tests |
+| `zig build test-deploy` | Mocked deployment regression tests, including durable-data guards, cleanup lifecycle and six-function code updates; requires Bash and `jq`, with no AWS credentials or network access |
+| `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
+| `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli` | Host counter build and deterministic global allocation/tooling tests |
 | `zig build build-seat-processors test-seat-workflow` | Compile host seat invocation adapters and run the [composed workflow suite](../../tests/seat_rejection_workflow.zig) with controlled external effects; covers cross-handler completion and recovery, without live services. See the [coverage index](../SEAT_WORKFLOW_EVIDENCE.md). |
 | `zig build test-tigerbeetle-processor` | Processor parsing and invocation tests |
 | `zig build test-tigerbeetle-wrapper` | Offline wrapper tests |

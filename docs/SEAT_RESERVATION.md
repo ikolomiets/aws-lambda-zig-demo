@@ -522,13 +522,12 @@ the existing native serializer tests prove the generic complete-Result bound.
 Run the focused credential-free checks:
 
 ```sh
-zig build build-events test-seat-reservation test-seat-persistence test-events-cli test-events-wrapper
-zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli test-ledger-counter-wrapper
+zig build build-events test-seat-reservation test-seat-persistence test-events-cli
+zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli
 zig build fmt-check
 ```
 
-All deterministic suites also run in `zig build test`; the wrapper uses mocked
-AWS credentials and resource resolution. These checks establish local contracts,
+All deterministic suites also run in `zig build test`. These checks establish local contracts,
 ownership and recovery behavior. The composed workflow suite establishes local
 seat handler integration; these tests do not establish live AWS IAM, DynamoDB
 service behavior or native accounting guarantees.

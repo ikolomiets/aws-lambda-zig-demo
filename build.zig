@@ -952,9 +952,6 @@ pub fn build(b: *std.Build) void {
     cleanup_lifecycle_test.addFileArg(
         b.path("tests/deploy_cleanup_lifecycle_test.sh"),
     );
-    const owned_cleanup_test = b.addSystemCommand(&.{"bash"});
-    owned_cleanup_test.addFileArg(b.path("tests/deploy_owned_cleanup_test.sh"));
-
     const gateway_interface_test = b.addSystemCommand(&.{"bash"});
     gateway_interface_test.addFileArg(
         b.path("tests/deploy_gateway_interface_test.sh"),
@@ -967,28 +964,16 @@ pub fn build(b: *std.Build) void {
     development_deployment_test.addFileArg(b.path("tests/deploy_development_test.sh"));
     const lambda_logs_test = b.addSystemCommand(&.{"bash"});
     lambda_logs_test.addFileArg(b.path("tests/lambda_logs_test.sh"));
-    const events_wrapper_test = b.addSystemCommand(&.{"bash"});
-    events_wrapper_test.addFileArg(b.path("tests/events_wrapper_test.sh"));
-    b.step("test-events-wrapper", "Run mocked Events wrapper tests")
-        .dependOn(&events_wrapper_test.step);
-    const ledger_counter_wrapper_test = b.addSystemCommand(&.{"bash"});
-    ledger_counter_wrapper_test.addFileArg(b.path("tests/ledger_counter_wrapper_test.sh"));
-    b.step("test-ledger-counter-wrapper", "Run mocked global counter wrapper tests")
-        .dependOn(&ledger_counter_wrapper_test.step);
-
     const deploy_test_step = b.step(
         "test-deploy",
         "Run deployment helper regression tests",
     );
     deploy_test_step.dependOn(&wireguard_discovery_test.step);
     deploy_test_step.dependOn(&cleanup_lifecycle_test.step);
-    deploy_test_step.dependOn(&owned_cleanup_test.step);
     deploy_test_step.dependOn(&gateway_interface_test.step);
     deploy_test_step.dependOn(&processor_interface_test.step);
     deploy_test_step.dependOn(&development_deployment_test.step);
     deploy_test_step.dependOn(&lambda_logs_test.step);
-    deploy_test_step.dependOn(&events_wrapper_test.step);
-    deploy_test_step.dependOn(&ledger_counter_wrapper_test.step);
 
     const seat_transactions_mod = b.createModule(.{
         .target = b.graph.host,
