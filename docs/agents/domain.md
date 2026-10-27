@@ -21,25 +21,32 @@ documents to consult for each area.
    source pointer. Discover filenames with `rg --files`, headings with
    `rg -n '^#{1,4} '`, and declarations or callers with a focused symbol search.
 2. Select the ranges that answer the question, including nearby callers when
-   they determine behavior. Start with about 80–150 source lines per excerpt,
-   adjusted for line length and content density. Use discovery searches to
-   locate symbols before selecting source excerpts.
+   they determine behavior and the relevant failure paths. Start with about
+   80–150 source lines per excerpt, adjusted for line length and content density.
 3. Aim for about 3,000 tokens of combined exploration output per batch, leaving
-   margin below the existing budget of about 6,000 tokens. Batch independent
-   reads when they answer the same question and their combined output fits;
-   count discovery output and all parallel reads toward the whole batch.
-   These defaults guide selection while preserving necessary context.
+   headroom within the actual enclosing tool-call and child-call output limits.
+   Parallel reads share that aggregate budget: count discovery output and every
+   read toward the batch total. Batch independent reads when they answer the
+   same question and their combined output fits. These defaults guide selection
+   while preserving necessary context.
 4. State the purpose and estimate the output before a full-file read. Read
-   mandatory long references and large collections in sequential, bounded
-   chunks, preserving required domain and safety material.
+   mandatory long references completely in sequential, bounded chunks; apply
+   the same approach to required large collections, preserving domain and
+   safety material.
 5. Match requested excerpts to the output limit by narrowing files, patterns
-   or ranges. Lowering the output cap alone leaves the request too broad and
-   causes truncation.
-6. If output truncates, recover the missing relevant range immediately before
-   drawing a conclusion. Record the answered question briefly in working
-   context; reuse unchanged excerpts for the same question. Read sources again
-   when they change or a new question needs more context, using working context
-   rather than a separately maintained inventory of files read.
-7. Stop exploration when the relevant current contract, implementation symbols
+   or ranges before lowering output limits. A lower cap alone leaves a broad
+   request subject to truncation.
+6. Discover tools by returning matching names and short descriptions first,
+   then request documentation only for the selected tools.
+7. Recover any omitted relevant ranges before drawing conclusions, including
+   when a tool reports truncation. Record the warning, recovered ranges and
+   answered question briefly in working context; reuse unchanged evidence for
+   the same question. Read sources again when they change or a new question
+   needs more context, using working context rather than a separately maintained
+   inventory of files read.
+8. For lengthy command output, retain the full local log outside version
+   control. Return the phase, exit status, relevant diagnostic excerpt and log
+   path so the evidence remains available after the tool output ends.
+9. Stop exploration when the relevant current contract, implementation symbols
    and validation path answer the question. Dated research supplies rationale
    and forwards to current authority.

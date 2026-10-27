@@ -490,8 +490,8 @@ lifecycle actions. Counter data has no TTL, and only the owning deployment may
 clean up its table. Deleting an owned table deletes every counter in it;
 referenced tables and their counters remain the owner's responsibility.
 Selecting another ID establishes another binding, rather than repairing or
-resetting the existing sequence. Public SeatReservation contracts are unchanged;
-trusted seat-runtime selection and SAM wiring remain separate implementation work.
+resetting the existing sequence. The [deployment configuration contract](DEPLOY_AWS_LAMBDA_WITH_SAM.md#4-understand-what-the-template-creates)
+defines trusted seat-runtime table/ID selection and SAM wiring.
 
 ## Size bounds and deterministic evidence
 

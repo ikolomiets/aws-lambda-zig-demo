@@ -17,7 +17,7 @@ explicitly. The command reads files, returns 0 for success or 1 for check/setup
 failures, and prints the source file, line, and broken destination or command name.
 Invalid command-line arguments return 2. It does not execute examples or contact services.
 The temporary-repository tests also run in `zig build test`; the documentation scan
-remains independently usable and runs in the [local check gate](local-checks.md).
+remains independently usable and runs in the [complete offline checks](local-checks.md#complete-offline-checks).
 
 ## Links and anchors
 
@@ -80,6 +80,11 @@ script, and integration prerequisites against the current
 [deployment guide](../DEPLOY_AWS_LAMBDA_WITH_SAM.md). Check table bindings, credentials,
 toolchain/package provisioning, and live-replica or cloud requirements before presenting
 an example as runnable. Passing this check establishes names and destinations only.
+
+When support becomes executable, reconcile deferred or support-status claims in
+the owning reference and linked evidence index with the implemented contract and
+its evidence limits. Historical reports retain their original revision, results
+and limitations; update current references rather than rewriting those reports.
 
 Review Processor Message semantics against the
 [processor contract](../TIGER_BEETLE_PROCESSOR.md),

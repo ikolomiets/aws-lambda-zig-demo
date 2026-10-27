@@ -17,6 +17,7 @@ Read sources relevant to the task:
 | Global ledger allocation and counter tooling | `src/ledger_counter.zig`, `src/ledger_counter_cli.zig`, `ledger-counter.sh`, [seat reference](docs/SEAT_RESERVATION.md#global-ledger-allocator), [counter setup and discovery](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#global-ledger-counter-utility) |
 | Queue transport and Completion messages | `src/sqs_queue.zig`, `src/processor_message.zig`, [minimal Processor Messages ADR](docs/adr/0003-minimal-processor-messages.md) |
 | Seat SQS processors | `src/seat_reservation_processor.zig`, `src/seat_reservation_completion_processor.zig`, [seat reference](docs/SEAT_RESERVATION.md) |
+| Cross-handler behavior, recovery tests, or evidence assessment | [Workflow coverage index](docs/SEAT_WORKFLOW_EVIDENCE.md), [composed workflow suite](tests/seat_rejection_workflow.zig) |
 | SQS processors | `src/tiger_beetle_processor.zig`, `src/tiger_beetle_completion_processor.zig`, [processor contract](docs/TIGER_BEETLE_PROCESSOR.md) |
 | TigerBeetle client wrapper | `src/tigerbeetle.zig`, [wrapper design](docs/ZIG_WRAPPER_FOR_TIGERBEETLE.md) |
 | SDK/client dependency internals | `build.zig.zon`, `zig build dependency-paths` with the active cache/fork options; [dependency source discovery](README.md#dependency-source-discovery) |
@@ -115,9 +116,10 @@ the AWS CLI query that retrieves it instead of recording the value itself.
 
 ## Build and Validation
 
-Before final validation or diagnosing check-environment failures, read the
-[local-check guide](docs/agents/local-checks.md). Use the complete offline gate
-after final fixes and the targeted checks below during implementation.
+Before selecting targeted checks, running final validation or diagnosing
+check-environment failures, read the [local-check guide](docs/agents/local-checks.md).
+Use its targeted checks during implementation and its complete offline checks
+after final fixes.
 
 The TigerBeetle processor build currently requires the sibling Zig standard
 library at `../zig/lib`. Before a Lambda build, check `zig version` (0.16.0) and
@@ -125,33 +127,6 @@ library at `../zig/lib`. Before a Lambda build, check `zig version` (0.16.0) and
 prerequisite failure. File presence does not verify the patch; consult the
 [hostname-connect workaround note](docs/ZIG_0_16_HOSTNAME_CONNECT_STALL.md) when
 setting up or diagnosing this build.
-
-Select checks by the affected behavior:
-
-| Check | Scope |
-| --- | --- |
-| `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
-| `zig build test` | Full local Zig and mocked deployment-helper suite; excludes the live replica and separate ABI checks |
-| `zig build test-deploy` | Mocked deployment regression tests; requires Bash and `jq` |
-| `zig build build-events test-seat-reservation test-seat-persistence test-events-cli test-events-wrapper` | Host Events build and deterministic seat/domain/persistence/tooling tests |
-| `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli test-ledger-counter-wrapper` | Host counter build and deterministic global allocation/tooling tests |
-| `zig build test-tigerbeetle-processor` | Processor parsing and invocation tests |
-| `zig build test-tigerbeetle-wrapper` | Offline wrapper tests |
-| `zig build test-tigerbeetle-c-abi` | Native C ABI smoke test on Apple Silicon macOS |
-| `zig build test-tigerbeetle-c-abi-linux test-tigerbeetle-wrapper-linux` | Compile ARM64 Linux ABI and wrapper tests; does not execute them |
-| `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` | Live integration tests against the local development replica |
-| `zig build --release -Darch=arm` | Stripped ReleaseSafe ARM64 Lambda bootstraps and host CLI tools |
-| `sam validate --template-file template.yaml --region ca-central-1` | SAM template validation when the template changes |
-| `sam validate --lint --template-file template.yaml --region ca-central-1` | Stricter SAM template validation |
-
-For shell changes, run `bash -n` on each affected script. To check the deployment
-helpers and shell tests together, use:
-
-```sh
-for script in deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh; do
-  bash -n "$script" || exit
-done
-```
 
 For Zig code or build changes, check formatting and build the affected targets,
 then select tests for the changed behavior. Documentation-only changes need link

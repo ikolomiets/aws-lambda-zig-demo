@@ -1,22 +1,34 @@
-# Local checks and pre-commit setup
+# Local checks
 
-From the repository root, run the standalone offline gate:
+Run checks directly from the repository root against the current working tree,
+including uncommitted development files.
 
-```sh
-./check.sh
+## Complete offline checks
+
+Use Bash for the shell-syntax loops:
+
+```bash
+zig build fmt-check --system zig-pkg
+for script in ./*.sh; do
+  bash -n "$script" || exit
+done
+while IFS= read -r -d '' script; do
+  bash -n "$script" || exit
+done < <(find tests -type f -name '*.sh' -print0)
+python3 check_docs.py
+python3 tracker.py validate
+zig build test --system zig-pkg
 ```
 
-[check.sh](../../check.sh) uses the current working tree, including uncommitted
-development files. It runs the existing complete `zig build fmt-check`, Bash syntax
-checks for every root shell entry point, tracked hook and recursively discovered
-shell harness under `tests/`, [documentation checking](documentation-checks.md),
-structural [tracker validation](issue-tracker.md), and the existing `zig build test`.
-It stops at the first required failure. The existing aggregate target owns the
-offline test graph; this command does not maintain a second list of tests.
+Run each command successfully before continuing. The sequence checks formatting,
+root shell entry points and recursive shell harnesses under `tests/`,
+[documentation](documentation-checks.md), structural [tracker validity](issue-tracker.md),
+and the existing aggregate offline test graph.
 
-Use focused checks during implementation and normally run this complete gate once
-after final fixes. Repeat or broaden validation when subsequent changes, failures
-or unresolved concerns warrant it, and record the reason for another complete run.
+Use focused checks during implementation and normally run this complete sequence
+once after final fixes. Repeat or broaden validation when subsequent changes,
+failures or unresolved concerns warrant it, and record the reason for another
+complete run.
 
 Tracker validation discovers actual ignored `.scratch/*/issues/*.md` efforts.
 A fresh clone without local issues reports `Validated 0 issues.` No registry or
@@ -25,11 +37,8 @@ access to another developer's ignored tickets is required.
 ## Host and package prerequisites
 
 Use an ARM64 macOS or ARM64 glibc Linux host, Zig **0.16.0**, Bash (tested with
-**3.2 and 5.3**), `jq`, Python **3.9 or newer**, and the ordinary host tools
-`dirname`, `find` and `uname`.
-Linux also requires `getconf` to identify glibc. The native TigerBeetle archive in
-the pinned packages targets glibc 2.27 or newer. Hook setup and invocation require
-Git; `git hook run` for activation verification requires Git 2.36 or newer.
+**3.2 and 5.3**), `jq`, Python **3.9 or newer**, and `find`.
+The native TigerBeetle archive in the pinned packages targets glibc 2.27 or newer.
 
 Provision every pinned dependency from [build.zig.zon](../../build.zig.zon),
 including transitive packages, before checking. Provisioning is a separate step
@@ -39,27 +48,46 @@ that requires network access:
 zig build --fetch
 ```
 
-The gate passes `--system zig-pkg` to Zig to disable package fetching. A missing
-tool, wrong Zig/Python version, unsupported host, missing package directory or
-build graph that cannot configure with provisioned packages fails as a setup
-error (exit 2). Required check failures also return a nonzero exit status.
-It never silently skips a check. To use another already provisioned package
-directory, set `CHECK_ZIG_PACKAGE_DIR`; relative paths resolve from the checkout:
-
-```sh
-CHECK_ZIG_PACKAGE_DIR=/path/to/provisioned-packages ./check.sh
-```
-
+Pass `--system zig-pkg` to Zig checks to use provisioned package sources without
+fetching. To use another already provisioned package directory, replace `zig-pkg`
+with that directory in each command. Relative paths resolve from the checkout.
 Build-cache environment settings such as `ZIG_LOCAL_CACHE_DIR` and
 `ZIG_GLOBAL_CACHE_DIR` still apply. Provisioning does not upgrade dependency pins.
 The patched sibling Zig standard library is a separate Lambda-build prerequisite;
-this gate does not build deployable Lambdas or refresh zip packages.
+the offline sequence does not build deployable Lambdas or refresh zip packages.
+
+## Select checks by affected behavior
+
+Use the host and package prerequisites above for Zig checks. The service and
+deployment checks below have additional prerequisites and distinct evidence scopes.
+
+| Check | Scope and additional prerequisites |
+| --- | --- |
+| `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
+| `zig build test` | Full offline Zig and mocked deployment-helper suite, including composed workflows and scenario-runner tests; excludes the SDK/local-database probe, live replica and separate ABI checks |
+| `zig build test-deploy` | Mocked deployment regression tests, including durable-data guards, owned-resource cleanup and six-function code updates; requires Bash and `jq`, with no AWS credentials or network access |
+| `zig build build-events test-seat-reservation test-seat-persistence test-events-cli test-events-wrapper` | Host Events build and deterministic seat/domain/persistence/tooling tests |
+| `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli test-ledger-counter-wrapper` | Host counter build and deterministic global allocation/tooling tests |
+| `zig build build-seat-processors test-seat-workflow` | Compile host seat invocation adapters and run the [composed workflow suite](../../tests/seat_rejection_workflow.zig) with controlled external effects; covers cross-handler completion and recovery, without live services. See the [coverage index](../SEAT_WORKFLOW_EVIDENCE.md). |
+| `zig build test-seat-scenarios` | Offline [scenario-runner tests](../../tests/seat_scenarios_test.py) using local command mocks; requires Python 3.9+ and uses no AWS credentials or deployed stack. Executed cloud evidence has separate [prerequisites and authorization](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-workflow-evidence-and-deployed-scenarios). |
+| `zig build test-tigerbeetle-processor` | Processor parsing and invocation tests |
+| `zig build test-tigerbeetle-wrapper` | Offline wrapper tests |
+| `zig build test-tigerbeetle-c-abi` | Native C ABI smoke test on Apple Silicon macOS |
+| `zig build test-tigerbeetle-c-abi-linux test-tigerbeetle-wrapper-linux` | Compile ARM64 glibc Linux ABI and wrapper tests; does not execute them |
+| `./tests/seat_transactions_test.sh` | Separate pinned-SDK/DynamoDB Local probe; requires Docker with a running daemon, the pinned database image and curl. The runner supplies the isolated loopback fixture required by `zig build test-seat-transactions`; see the [probe procedure](../SEAT_TRANSACTIONS.md). |
+| `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` | Live native integration tests against the separately authorized local development replica; establishes no AWS behavior |
+| `zig build --release -Darch=arm` | Stripped ReleaseSafe ARM64 Lambda bootstraps and host CLI tools; requires the [patched sibling Zig library](../../AGENTS.md#build-and-validation). Building does not refresh zip packages; use the [packaging procedure](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#2-build-and-package-the-zig-lambdas) when deployable packages are requested. |
+| `sam validate --template-file template.yaml --region ca-central-1` | SAM template validation when the template changes; requires SAM CLI |
+| `sam validate --lint --template-file template.yaml --region ca-central-1` | Stricter SAM template validation; requires SAM CLI with lint support |
+
+For shell changes, run `bash -n` on each affected script. The
+[complete offline checks](#complete-offline-checks) cover all root entry points
+and recursive shell harnesses under `tests/`.
 
 ## Diagnose check-environment failures
 
-1. Identify the checkout and failing phase from the command output. Standalone
-   checks accept uncommitted files; the hook's staged-input guards run before the
-   gate. Use `./check.sh` while developing.
+1. Identify the checkout and failing command from its output. Checks accept
+   uncommitted files and read the current working tree.
 2. Inspect the Bash executable selected by PATH and its version:
 
    ```sh
@@ -68,86 +96,25 @@ this gate does not build deployable Lambdas or refresh zip packages.
    ```
 
    For shell compatibility checks, put the selected Bash first on PATH for the
-   entire process tree. The runner and test harnesses launch nested `bash`
-   commands, so an absolute interpreter path for only the outer script is
-   insufficient. A Bash startup failure reports the selected executable and
-   the runner's Bash version.
-3. Inspect `CHECK_ZIG_PACKAGE_DIR` and the provisioned packages. Relative paths
-   resolve from the checkout containing `check.sh`. Reuse an existing provisioned
-   directory through the override above when checking another checkout; the
-   temporary-repository tests isolate inherited overrides and set their own
-   values for explicit override coverage.
+   entire process tree. The test harnesses launch nested `bash` commands, so an
+   absolute interpreter path for only the outer script is insufficient.
+3. Inspect the package directory passed to `--system`. Relative paths resolve
+   from the checkout. Reuse an existing provisioned directory when checking
+   another checkout.
 4. For documentation failures, inspect the reported destination in this checkout.
    Ordinary links require their targets even when an absent research document
-   appears in the archive registry; see [documentation checks](documentation-checks.md#links-and-anchors).
-
-## Hook activation and staged inputs
-
-The selected tracked hook is [.githooks/pre-commit](../../.githooks/pre-commit).
-Configure this checkout and inspect the effective path:
-
-```sh
-./setup-hooks.sh
-git config --show-origin --get core.hooksPath
-```
-
-[setup-hooks.sh](../../setup-hooks.sh) sets repository-local
-`core.hooksPath=.githooks`. It requires the hook and check command to be executable.
-Repeated setup with that same effective path is safe. A different or empty
-configured path (including inherited configuration), or any non-sample entry in
-the default hooks directory, stops setup without changing that arrangement.
-There is no force option. Review and integrate an existing workflow manually;
-this setup does not chain or overwrite other hooks.
-
-Before invoking the shared command, the hook rejects any tracked working-tree/index
-difference, including unstaged deletions and partially staged edits. It
-rejects `assume-unchanged` and `skip-worktree` index flags, which can hide those
-differences from Git. Clear such flags on affected paths before committing;
-the hook does not modify the index.
-
-The hook also rejects untracked inputs under `src/`, `tests/`, `docs/` and `.githooks/`, plus root
-Zig, manifest, shell, Python, Markdown, JSON and YAML files. This guard honors Git's
-standard ignore rules through `git ls-files --others --exclude-standard`, including
-root and nested `.gitignore` files, `.git/info/exclude`, and global excludes.
-Ignored files and directories, including `.DS_Store`, do not need to be staged.
-Tracked files remain subject to the working-tree/index guard even if an ignore
-rule matches them. Stage intended inputs or ignore incidental files before
-committing.
-
-Ignore rules only affect the untracked-input guard. The check suite still reads
-the working tree and may check ignored files in its input locations. Ignored
-tracker efforts are validated as local state and do not have to be staged.
-
-The hook checks the working tree only after these guards pass. It creates no staged
-snapshot and does not stage files. On a checkout whose tracked files match the index
-and whose relevant new files are staged, verify activation without creating a commit:
-
-```sh
-git hook run pre-commit
-```
-
-A successful invocation runs the gate and prints `Local offline checks passed.`
-An invocation during unstaged development rejects the inputs before running checks;
-use `./check.sh` for development validation.
+   appears in the archive registry; see
+   [documentation checks](documentation-checks.md#links-and-anchors).
 
 ## Validation scope
 
-Temporary-repository regression tests control external command effects and exercise
-the command, configured hook, staged-input guards, prerequisites and existing-hook
-setup. They create no commits and include deliberate formatting, shell syntax,
-link/anchor, command-target and tracker failures:
-
-```sh
-python3 tests/local_check_test.py
-zig build test-local-checks --system zig-pkg
-```
-
-These tests are also in the existing full offline suite. The gate executes no live
-replica tests, AWS/cloud commands, deployment or packaging steps, or documentation
-examples. Syntax-checking a live shell harness does not execute it. The deployment
-tests use mocked AWS commands. Separate ABI and live integration targets retain
-their existing explicit validation paths.
+The offline sequence executes no live replica tests, AWS/cloud commands,
+deployment or packaging steps, or documentation examples. Syntax-checking a live
+shell harness does not execute it. The deployment tests use mocked AWS commands.
+Separate ABI and live integration targets retain their existing explicit
+validation paths.
 
 Passing checks establishes formatting, tested behavior, names, destinations and
 structural tracker validity. Review command options, integration prerequisites and
-Processor Message schemas manually against the [documentation review scope](documentation-checks.md#manual-review).
+Processor Message schemas manually against the
+[documentation review scope](documentation-checks.md#manual-review).

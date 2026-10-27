@@ -57,9 +57,12 @@ the composed suite. The ordinary `zig build test` includes all these offline sui
 | Immutable completion | [Operation updates](../src/operation_persistence.zig), [Event transactions](../src/seat_reservation_persistence.zig): identity/state/absent-Result and full configuration guards. | Competing completions preserve the first valid Result; delayed local rejection retains its admission decision; contradictory creation pairs are diagnosed without repair. |
 | Cache and memory ownership | [Ready cache](../src/seat_event_cache.zig): complete 1 MiB accounting, LRU, bypass, tenant isolation and arena independence. | Warm submission/completion reuses only ready metadata, observes uncached transitions and fresh balances, and excludes foreign cache hits. |
 | Host utilities | [Events](../src/seat_events_cli.zig), [counter CLI](../src/ledger_counter_cli.zig), [queue CLI](../src/queue_cli.zig) and their shell harnesses: bounded I/O, shared persistence/codec behavior, conflicts, precedence, sanitized errors and credential-free help. | Utilities expose metadata and transport; they do not establish readiness or substitute for native completion evidence. |
-| Deployment helpers/resources | Mocked [cleanup](../tests/deploy_cleanup_lifecycle_test.sh) and [development deployment](../tests/deploy_development_test.sh) harnesses and the [deployment reference](DEPLOY_AWS_LAMBDA_WITH_SAM.md): lifecycle, code updates and data-preservation checks. | These checks make no deployed seat-routing or IAM claim. Seat Lambda/queue provisioning is a separate implementation slice. |
+| Deployment helpers/resources | Mocked [cleanup lifecycle](../tests/deploy_cleanup_lifecycle_test.sh), [durable-data guards and development updates](../tests/deploy_development_test.sh), and [owned-resource cleanup](../tests/deploy_owned_cleanup_test.sh): lifecycle, six-function code updates, guarded table/counter bindings and preservation of referenced resources. | SAM provisions both seat Lambdas, their queues/mappings and Events table, with an owned or referenced counter binding under the [resource contract](DEPLOY_AWS_LAMBDA_WITH_SAM.md#4-understand-what-the-template-creates). Mocks establish no deployed routing, delivery or IAM behavior. |
 
 ## Independent service evidence
+
+Record deterministic, SDK/DynamoDB Local, authorized local native and executed
+cloud results using the [deployment evidence levels](DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-workflow-evidence-and-deployed-scenarios).
 
 The [SDK/DynamoDB Local probe](SEAT_TRANSACTIONS.md) uses the pinned SDK, isolated
 loopback database and dummy credentials to execute shared transaction builders,

@@ -2061,6 +2061,10 @@ Keep these evidence levels separate when recording validation:
 | Authorized local native | `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` exercises the local replica's funding, reservation bounds, replay, confirmation and expiry. It requires the separately authorized local replica and establishes no cloud delivery or IAM behavior. |
 | Deployed | The separately invoked [runner](../seat_scenarios.py) exercises the selected development stack through its public intake/query and host read utilities. Only an executed, passing run establishes deployed behavior for its covered paths. |
 
+The [2026-10-16 AWS validation report](SEAT_AWS_VALIDATION_2026_10_16.md)
+records an executed six-function development-stack exercise, transaction contention
+and the observed regional concurrency limit, with its revision and evidence limits.
+
 The deployed runner requires an existing compatible **six-function full-deployment
 baseline**: `IntakeFunction`, `QueryFunction`, `SeatReservationProcessor`,
 `TigerBeetleProcessor`, `SeatReservationCompletionProcessor`, and

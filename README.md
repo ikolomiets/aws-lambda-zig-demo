@@ -53,8 +53,9 @@ to `global`; consumers requiring one sequence share both binding components. See
 - Zig 0.16.0 or newer within the supported 0.16.x line.
 - AWS CLI v2 and AWS SAM CLI for the SAM deployment flow and stack queries.
 - `jq` for the Lambda log helper and shell regression tests.
-- Python 3.9 or newer for the regression suites in `zig build test` and the
-  offline local check gate. Normal `deploy.sh` runs that test graph before packaging.
+- Python 3.9 or newer for documentation checks, tracker validation, and the
+  regression suites in `zig build test`. Normal `deploy.sh` runs that test graph
+  before packaging.
 - An AWS profile with permission to create Lambda, IAM, and CloudFormation
   resources.
 
@@ -745,23 +746,9 @@ or CloudFront.
 
 ## Development and Validation
 
-Run the complete offline local check gate during development:
-
-```sh
-./check.sh
-```
-
-It accepts uncommitted development files. See [local check setup](docs/agents/local-checks.md)
-for the gate's scope, supported hosts, prerequisites, pinned-package provisioning,
-and the tracked pre-commit hook. Activate the hook for this checkout with:
-
-```sh
-./setup-hooks.sh
-```
-
-Setup selects the local `core.hooksPath=.githooks` and refuses to replace an existing
-hook arrangement. Before checks, the hook requires tracked working-tree files to
-match the index and relevant untracked code/check inputs to be staged.
+Run checks directly during development. See [local checks](docs/agents/local-checks.md)
+for the complete offline sequence, supported hosts, prerequisites, and pinned-package
+provisioning.
 
 Check documentation links, anchors, and current repository command names with:
 
