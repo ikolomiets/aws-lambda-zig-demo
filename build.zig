@@ -960,8 +960,6 @@ pub fn build(b: *std.Build) void {
     const processor_interface_test = b.addSystemCommand(&.{"bash"});
     processor_interface_test.addFileArg(b.path("tests/processor_interface_test.sh"));
 
-    const development_deployment_test = b.addSystemCommand(&.{"bash"});
-    development_deployment_test.addFileArg(b.path("tests/deploy_development_test.sh"));
     const lambda_logs_test = b.addSystemCommand(&.{"bash"});
     lambda_logs_test.addFileArg(b.path("tests/lambda_logs_test.sh"));
     const deploy_test_step = b.step(
@@ -972,7 +970,6 @@ pub fn build(b: *std.Build) void {
     deploy_test_step.dependOn(&cleanup_lifecycle_test.step);
     deploy_test_step.dependOn(&gateway_interface_test.step);
     deploy_test_step.dependOn(&processor_interface_test.step);
-    deploy_test_step.dependOn(&development_deployment_test.step);
     deploy_test_step.dependOn(&lambda_logs_test.step);
 
     const seat_transactions_mod = b.createModule(.{

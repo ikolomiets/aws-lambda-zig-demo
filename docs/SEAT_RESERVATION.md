@@ -94,7 +94,7 @@ effects faked, including invocation restarts and ambiguous outcomes. They run in
 the ordinary offline suite. The [recovery evidence matrix](SEAT_WORKFLOW_EVIDENCE.md)
 maps failure boundaries and cross-command contracts to their owning tests and
 describes caller-retry and 24-hour Operation-retention limits.
-The separate [SDK transaction probe](SEAT_TRANSACTIONS.md)
+The separate [SDK transaction suite](../tests/seat_transactions.zig)
 establishes executable persistence composition evidence. The
 [consistency ADR](adr/0007-seat-completion-consistency.md) records the recovery decision.
 The deployment guide separates these checks from authorized local native and

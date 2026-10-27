@@ -2055,7 +2055,7 @@ Keep these evidence levels separate when recording validation:
 | Level | Command and what it establishes |
 | --- | --- |
 | Deterministic pipeline | `zig build test-seat-workflow` exercises authenticated handlers, codecs, persistence builders, delivery/recovery and exact public Results with external effects controlled. It is in `zig build test` and does not contact AWS. |
-| Pinned SDK / DynamoDB Local | The separate [transaction probe](SEAT_TRANSACTIONS.md), `./tests/seat_transactions_test.sh`, executes shared builders through the pinned SDK against isolated loopback DynamoDB Local 3.3.0 with dummy credentials. Its service behavior and simulations remain distinct from AWS. |
+| Pinned SDK / DynamoDB Local | The separate [transaction suite](../tests/seat_transactions.zig), `zig build test-seat-transactions`, executes shared builders through the pinned SDK against an externally prepared isolated loopback DynamoDB Local database with dummy credentials. Its [database prerequisite](agents/local-checks.md#select-checks-by-affected-behavior), service behavior and simulations remain distinct from AWS. |
 | Authorized local native | `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` exercises the local replica's funding, reservation bounds, replay, confirmation and expiry. It requires the separately authorized local replica and establishes no cloud delivery or IAM behavior. |
 | Deployed | The separately invoked [runner](../seat_scenarios.sh) exercises the selected development stack through its public intake/query and host read utilities. Only an executed, passing run establishes deployed behavior for its covered paths. |
 
@@ -2387,15 +2387,18 @@ the full ARM64 build separately installs both seat Lambda bootstraps, and SAM
 provisions their queues and mappings. Host tests do not establish live IAM,
 trigger delivery or connectivity.
 
-The separate [SDK transaction probe](SEAT_TRANSACTIONS.md) documents pinned Docker
-image provisioning, isolated loopback execution and debugging:
+The separate [SDK transaction suite](../tests/seat_transactions.zig) requires an
+externally prepared, empty isolated DynamoDB Local database. With that database
+available, run:
 
 ```sh
-./tests/seat_transactions_test.sh
+SEAT_TRANSACTION_ENDPOINT='http://127.0.0.1:<port>' \
+  zig build test-seat-transactions --system zig-pkg
 ```
 
-It uses dummy credentials and its own local database; it performs no deployment
-or cloud-side validation and is outside the ordinary offline suite.
+It uses dummy credentials and performs no deployment or cloud-side validation.
+Database setup and cleanup are external to the repository. The suite is outside
+the ordinary offline checks; see the [local validation prerequisites](agents/local-checks.md#select-checks-by-affected-behavior).
 
 ### Global ledger counter utility
 

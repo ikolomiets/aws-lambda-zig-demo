@@ -753,7 +753,9 @@ Review documentation links, anchors, command names, and prerequisites using the
 
 The [Seat Reservation rejection workflow](docs/SEAT_RESERVATION.md#rejection-workflow)
 has a composed deterministic `test-seat-workflow` target in the offline suite and
-a separate [local SDK transaction probe](docs/SEAT_TRANSACTIONS.md).
+a separate [local SDK transaction suite](tests/seat_transactions.zig), which requires
+an externally prepared isolated DynamoDB Local endpoint. See the
+[local validation prerequisites](docs/agents/local-checks.md#select-checks-by-affected-behavior).
 
 Run the complete formatting check for build files, Zig sources, and tests before
 committing Zig changes:

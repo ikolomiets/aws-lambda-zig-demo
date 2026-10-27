@@ -363,7 +363,7 @@ rg -n 'tiger_beetle_processor_test_mod|test-tigerbeetle-processor' build.zig
 Separate harnesses in `tests/` cover live integration
 ([tigerbeetle_integration.zig](../tests/tigerbeetle_integration.zig)), native ABI
 ([tigerbeetle_c_abi.zig](../tests/tigerbeetle_c_abi.zig)), and shell behavior
-([deployment](../tests/deploy_development_test.sh),
+([deployment lifecycle](../tests/deploy_cleanup_lifecycle_test.sh),
 [processor interface](../tests/processor_interface_test.sh), and
 [isolated replica](../tests/tigerbeetle_isolated_test.sh)). Deployment/interface
 shell tests mock external commands; the isolated-replica harness starts a local
