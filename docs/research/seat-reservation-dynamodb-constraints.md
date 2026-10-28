@@ -121,10 +121,10 @@ mechanism.
 ## Repository and pinned SDK observations
 
 These are static observations, not executed transaction validation. The later
-implementation prerequisite
-[Validate SDK transaction composition with a local persistence harness](../../.scratch/seat-reservation/issues/100-validate-sdk-transactions.md)
-requires the pinned SDK to combine the two real persistence modules' updates and
-pass local execution tests before the completion processor relies on them.
+implementation prerequisite to validate SDK transaction composition with a local
+persistence harness requires the pinned SDK to combine the two real persistence
+modules' updates and pass local execution tests before the completion processor
+relies on them.
 
 The baseline inspected is the research worktree branched from the repository;
 no implementation was changed. These observations come from local source, not
