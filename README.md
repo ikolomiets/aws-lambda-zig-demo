@@ -40,9 +40,11 @@ Body schema, replay obligations, complete Results and retry behavior; use it for
 processor contract.
 
 The [Seat Reservation contracts](docs/SEAT_RESERVATION.md) provide pure command
-and metadata validation. The host `events` binary and `events.sh` wrapper insert
-validated creating Event metadata and read tenant-scoped records; this utility
-does not provision native resources or run a seat workflow.
+and metadata validation. The host `events` binary inserts validated creating
+Event metadata and reads tenant-scoped records. The `events.sh` wrapper uses
+`PASETO_TOKEN` to submit public creation Operations with explicit `--class TAG=COUNT`
+arguments, and the host binary to read Event metadata. See the
+[Event utility guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-event-metadata-utility).
 The host `ledger-counter` binary and `ledger-counter.sh` wrapper provide explicit
 first-time initialization, inspection and allocation through explicitly selected
 Ledger Counters. SAM exposes the actual counter table and selected ID, defaulting

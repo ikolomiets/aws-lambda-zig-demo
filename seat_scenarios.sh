@@ -1,42 +1,57 @@
 #!/usr/bin/env bash
-# Explicitly authorized deployed Seat Reservation scenarios; never builds or deploys.
+# Deployed Seat Reservation scenarios; never builds or deploys.
 set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Usage: seat_scenarios.sh --authorize-cloud --profile PROFILE --region REGION
-       --stack-name STACK --output-dir NEW_DIRECTORY [options]
+Usage: seat_scenarios.sh [options]
 
 Exercise an existing development stack; retain sanitized evidence in a new directory.
-All target selectors and --authorize-cloud are required. PASETO_PRIVATE_KEY must
-match the deployed public key. Requires Bash 3.2+, jq 1.6+, AWS CLI, curl, and
-prebuilt zig-out/bin/{paseto,events,dynamodb,ledger-counter} utilities.
+Creates a Seat Event, reserves seats, and confirms them in the selected stack.
+Uses the existing AWS credential chain and the PASETO_TOKEN environment variable.
+Optional PASETO_FOREIGN_TOKEN enables cross-tenant checks (a different subject).
+Requires Bash 3.2+, jq 1.6+, AWS CLI, curl, and prebuilt
+zig-out/bin/{events,dynamodb,ledger-counter} utilities.
 
 Options:
-  --poll-attempts N       1-60 reads per Operation (default: 30)
-  --poll-seconds N        0-5 seconds between reads (default: 2; fractions allowed)
-  --timeout-seconds N     1-300 seconds for the entire run (default: 300; fractions allowed)
+  --profile PROFILE      Override AWS profile (otherwise AWS_PROFILE,
+                         AWS_DEFAULT_PROFILE, PROFILE, or the AWS CLI default)
+  --region REGION        Override AWS_REGION, AWS_DEFAULT_REGION, REGION
+                         (default: ca-central-1)
+  --stack-name STACK     Override STACK_NAME (default: aws-lambda-zig-demo)
+  --output-dir DIRECTORY Override OUTPUT_DIR; must be new with an existing parent
+                         (default: a new .scratch/seat-scenarios.XXXXXX directory)
+  --poll-attempts N      1-60 reads per Operation (default: 30)
+  --poll-seconds N       0-5 seconds between reads (default: 2; fractions allowed)
+  --timeout-seconds N    1-300 seconds for the entire run (default: 300; fractions allowed)
+  --authorize-cloud      Accepted for compatibility; no longer required
   -h, --help             Show help without executing utilities or contacting AWS
 USAGE
 }
 
-argument_error() { printf 'seat scenarios: %s\n' "$1" >&2; exit 2; }
-authorized=false profile= region= stack_name= output_dir=
+argument_error() { printf 'seat scenarios: %s\n\n' "$1" >&2; usage >&2; exit 2; }
+profile="${AWS_PROFILE:-${AWS_DEFAULT_PROFILE:-${PROFILE:-}}}"
+region="${AWS_REGION:-${AWS_DEFAULT_REGION:-${REGION:-ca-central-1}}}"
+stack_name="${STACK_NAME:-aws-lambda-zig-demo}"
+output_dir="${OUTPUT_DIR:-}"
+explicit_profile=false
 poll_attempts=30 poll_seconds=2 timeout_seconds=300
 while [ "$#" -gt 0 ]; do
     option="$1"
     case "$option" in
         -h|--help) usage; exit 0 ;;
-        --authorize-cloud) authorized=true; shift; continue ;;
+        --authorize-cloud) shift; continue ;;
         --profile|--region|--stack-name|--output-dir|--poll-attempts|--poll-seconds|--timeout-seconds)
-            [ "$#" -ge 2 ] || argument_error 'missing option value; use --help'
+            [ "$#" -ge 2 ] && [[ "$2" != --* && "$2" != -h ]] ||
+                argument_error 'missing option value'
             value="$2"; shift 2 ;;
         --profile=*|--region=*|--stack-name=*|--output-dir=*|--poll-attempts=*|--poll-seconds=*|--timeout-seconds=*)
             value="${option#*=}"; option="${option%%=*}"; shift ;;
-        *) argument_error 'invalid invocation; use --help' ;;
+        *) argument_error 'invalid invocation' ;;
     esac
+    [ -n "$value" ] || argument_error 'option values must be nonempty'
     case "$option" in
-        --profile) profile="$value" ;;
+        --profile) profile="$value"; explicit_profile=true ;;
         --region) region="$value" ;;
         --stack-name) stack_name="$value" ;;
         --output-dir) output_dir="$value" ;;
@@ -45,10 +60,19 @@ while [ "$#" -gt 0 ]; do
         --timeout-seconds) timeout_seconds="$value" ;;
     esac
 done
-[ "$authorized" = true ] || argument_error '--authorize-cloud is required'
-[[ "$profile" =~ [^[:space:]] && "$region" =~ [^[:space:]] && "$stack_name" =~ [^[:space:]] ]] ||
-    argument_error 'profile, region and stack name must be explicit and nonempty'
-[ -n "$output_dir" ] || argument_error '--output-dir is required'
+[[ -z "$profile" || "$profile" =~ [^[:space:]] ]] &&
+    [[ "$region" =~ [^[:space:]] && "$stack_name" =~ [^[:space:]] ]] ||
+    argument_error 'invalid profile, region or stack name'
+owner_token="${PASETO_TOKEN:-}"
+foreign_token="${PASETO_FOREIGN_TOKEN:-}"
+unset PASETO_TOKEN PASETO_FOREIGN_TOKEN PASETO_PRIVATE_KEY
+[[ "$owner_token" =~ ^v4\.public\.[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)?$ &&
+    "${#owner_token}" -le 16384 ]] || argument_error 'PASETO_TOKEN must be a v4.public token'
+if [ -n "$foreign_token" ]; then
+    [[ "$foreign_token" =~ ^v4\.public\.[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)?$ &&
+        "${#foreign_token}" -le 16384 && "$foreign_token" != "$owner_token" ]] ||
+        argument_error 'PASETO_FOREIGN_TOKEN must be a different v4.public token'
+fi
 command -v jq >/dev/null 2>&1 || argument_error 'missing command: jq'
 [[ "$poll_attempts" =~ ^[0-9]+$ ]] &&
     jq -en --arg n "$poll_attempts" '$n | tonumber | . >= 1 and . <= 60' >/dev/null 2>&1 ||
@@ -66,8 +90,14 @@ poll_seconds="$(jq -nr --arg n "$poll_seconds" '$n|tonumber')"
 timeout_seconds="$(jq -nr --arg n "$timeout_seconds" '$n|tonumber')"
 
 umask 077
-mkdir -m 700 -- "$output_dir" 2>/dev/null ||
-    argument_error 'output directory must be new and have an existing parent'
+if [ -z "$output_dir" ]; then
+    mkdir -p .scratch
+    output_dir="$(mktemp -d .scratch/seat-scenarios.XXXXXX)"
+else
+    mkdir -m 700 -- "$output_dir" 2>/dev/null ||
+        argument_error 'output directory must be new and have an existing parent'
+fi
+printf 'Seat scenario evidence: %s\n' "$output_dir"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 stage=prerequisites reason='invalid output or local I/O failure'
 manifest='{"evidence":"deployed","status":"running","operations":{}}'
@@ -153,11 +183,10 @@ command_run() {
     local tool="$1" executable="$1" status=0 bytes
     shift
     case "$tool" in
-        paseto|events|dynamodb|ledger-counter) executable="$root/zig-out/bin/$tool" ;;
+        events|dynamodb|ledger-counter) executable="$root/zig-out/bin/$tool" ;;
     esac
     (
         case "$tool" in
-            paseto) export PASETO_PRIVATE_KEY="$signing_key" ;;
             events|dynamodb|ledger-counter)
                 # The pinned SDK prioritizes profile endpoint_url over its ignore flag.
                 export AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null ;;
@@ -182,8 +211,12 @@ command_run() {
     RESPONSE="${RESPONSE%"${RESPONSE##*[!$' \t\r\n']}"}"
 }
 aws_run() {
-    command_run aws "$@" --profile "$profile" --no-cli-pager \
-        --cli-connect-timeout 5 --cli-read-timeout 10
+    if [ "$explicit_profile" = true ]; then
+        command_run aws "$@" --profile "$profile" --no-cli-pager \
+            --cli-connect-timeout 5 --cli-read-timeout 10
+    else
+        command_run aws "$@" --no-cli-pager --cli-connect-timeout 5 --cli-read-timeout 10
+    fi
 }
 new_uuid() {
     local hex variant
@@ -193,30 +226,32 @@ new_uuid() {
     UUID="${hex:0:8}-${hex:8:4}-4${hex:13:3}-$variant${hex:17:3}-${hex:20:12}"
 }
 
-[ -n "${PASETO_PRIVATE_KEY:-}" ] || fail 'PASETO_PRIVATE_KEY is required'
-signing_key="$PASETO_PRIVATE_KEY"
-unset PASETO_PRIVATE_KEY
 for tool in aws curl; do
     command -v "$tool" >/dev/null 2>&1 || fail "missing command: $tool"
 done
-for tool in paseto events dynamodb ledger-counter; do
+for tool in events dynamodb ledger-counter; do
     [ -x "$root/zig-out/bin/$tool" ] || fail "missing prebuilt host utility: $tool"
 done
 while IFS= read -r key; do
     [ -z "${!key}" ] || fail 'AWS endpoint overrides are not allowed'
 done < <(compgen -e | sed -n '/^AWS_ENDPOINT_URL/p')
-unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
-export AWS_PROFILE="$profile" AWS_REGION="$region" AWS_DEFAULT_REGION="$region"
+# Preserve inherited credentials while the AWS CLI resolves its credential chain.
+[ -z "$profile" ] || export AWS_PROFILE="$profile"
+unset AWS_DEFAULT_PROFILE
+export AWS_REGION="$region" AWS_DEFAULT_REGION="$region"
 export AWS_EC2_METADATA_DISABLED=true AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true AWS_MAX_ATTEMPTS=1
 : >"$work_dir/input"
 stage='credential export'
 aws_run configure export-credentials --format process
 parse_json
-check_json 'type == "object" and all(.AccessKeyId,.SecretAccessKey,.SessionToken; type == "string" and length > 0)' \
-    'credential export omitted temporary credentials'
+check_json 'type == "object" and all(.AccessKeyId,.SecretAccessKey; type == "string" and length > 0) and
+    (.SessionToken == null or (.SessionToken|type == "string"))' 'credential export omitted credentials'
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
 export AWS_ACCESS_KEY_ID="$(printf '%s' "$JSON" | jq -r .AccessKeyId)"
 export AWS_SECRET_ACCESS_KEY="$(printf '%s' "$JSON" | jq -r .SecretAccessKey)"
-export AWS_SESSION_TOKEN="$(printf '%s' "$JSON" | jq -r .SessionToken)"
+session_token="$(printf '%s' "$JSON" | jq -r '.SessionToken // empty')"
+[ -z "$session_token" ] || export AWS_SESSION_TOKEN="$session_token"
+unset session_token
 stage='stack discovery'
 aws_run cloudformation describe-stacks --stack-name "$stack_name" --region "$region" --output json
 parse_json
@@ -287,7 +322,22 @@ submit() {
     stage="$label intake (Operation $operation_id)"
     request="$(jq -cn --arg id "$operation_id" --argjson body "$body" '{id:$id,name:"SeatReservation",body:$body}')"
     http POST "$intake_url" "$token" "$request"
-    parse_json; operation
+    parse_json
+    if [ -z "$tenant" ]; then
+        # The authenticated handler supplies the subject; never decode unverified claims.
+        check_json '.tenant | type == "string" and (utf8bytelength >= 1 and utf8bytelength <= 64)' \
+            'invalid authenticated tenant'
+        tenant="$(printf '%s' "$JSON" | jq -r .tenant)"
+        case "$label" in
+            create) owner="$tenant" ;;
+            foreign_check)
+                [ "$tenant" != "$owner" ] || fail 'tenant tokens have the same subject'
+                foreign_tenant="$tenant" ;;
+        esac
+        manifest="$(printf '%s' "$manifest" | jq --arg tenant "$tenant" '.tenants += [$tenant]')"
+        save manifest "$manifest"
+    fi
+    operation
     stage="$label query (Operation $operation_id)"
     for ((attempt=0; attempt<poll_attempts; attempt++)); do
         http GET "${query_url%/}/$operation_id" "$token"
@@ -330,18 +380,12 @@ counter() {
     HIGH_WATER="$(printf '%s' "$JSON" | jq -r .high_water)"
 }
 
-new_uuid; owner="seat-$UUID"
-new_uuid; foreign_tenant="seat-$UUID"
-manifest="$(printf '%s' "$manifest" | jq --arg owner "$owner" --arg foreign "$foreign_tenant" '.tenants = [$owner,$foreign]')"
+owner= foreign_tenant=
+manifest="$(printf '%s' "$manifest" | jq '. + {tenants:[],tenant_isolation:"skipped"}')"
+if [ -n "$foreign_token" ]; then
+    manifest="$(printf '%s' "$manifest" | jq '.tenant_isolation = "pending"')"
+fi
 save manifest "$manifest"
-stage='token issuance'
-command_run paseto issue --subject "$owner" --ttl-seconds 900
-owner_token="$RESPONSE"
-command_run paseto issue --subject "$foreign_tenant" --ttl-seconds 900
-foreign_token="$RESPONSE"
-unset signing_key
-[[ "$owner_token" =~ ^v4\.public\.[A-Za-z0-9_.-]+$ && "$foreign_token" =~ ^v4\.public\.[A-Za-z0-9_.-]+$ &&
-    "$owner_token" != "$foreign_token" ]] || fail 'invalid or identical tenant tokens'
 stage='unauthenticated public requests'
 http POST "$intake_url" '' '{}' 401
 new_uuid; http GET "${query_url%/}/$UUID" '' '' 401
@@ -379,17 +423,22 @@ confirm_payload="$(jq -cn --arg id "$event_id" --arg pending "$pending_id" \
     '{event_id:$id,class:"general",reservation_id:$pending}')"
 submit confirm "$confirm_body" "$owner" "$owner_token" "$confirm_payload"
 submit final_check "$check_body" "$owner" "$owner_token" "$check_payload"
-stage='tenant isolation through public query and intake'
-http GET "${query_url%/}/$event_id" "$foreign_token" '' 404
-foreign_response="$RESPONSE"
-new_uuid; http GET "${query_url%/}/$UUID" "$foreign_token" '' 404
-[[ "$foreign_response" = $'Not Found\n' && "$RESPONSE" = "$foreign_response" ]] ||
-    fail 'cross-tenant query disclosed Operation data'
-request="$(jq -cn --arg id "$event_id" --argjson body "$check_body" '{id:$id,name:"SeatReservation",body:$body}')"
-http POST "$intake_url" "$foreign_token" "$request" 409
-submit foreign_check "$check_body" "$foreign_tenant" "$foreign_token" '{"code":"event_unavailable"}' FAILURE
-submit foreign_reserve "$reserve_body" "$foreign_tenant" "$foreign_token" '{"code":"event_unavailable"}' FAILURE
-submit foreign_confirm "$confirm_body" "$foreign_tenant" "$foreign_token" '{"code":"event_unavailable"}' FAILURE
+if [ -n "$foreign_token" ]; then
+    stage='tenant isolation through public query and intake'
+    http GET "${query_url%/}/$event_id" "$foreign_token" '' 404
+    foreign_response="$RESPONSE"
+    new_uuid; http GET "${query_url%/}/$UUID" "$foreign_token" '' 404
+    [[ "$foreign_response" = $'Not Found\n' && "$RESPONSE" = "$foreign_response" ]] ||
+        fail 'cross-tenant query disclosed Operation data'
+    request="$(jq -cn --arg id "$event_id" --argjson body "$check_body" '{id:$id,name:"SeatReservation",body:$body}')"
+    http POST "$intake_url" "$foreign_token" "$request" 409
+    submit foreign_check "$check_body" "$foreign_tenant" "$foreign_token" '{"code":"event_unavailable"}' FAILURE
+    submit foreign_reserve "$reserve_body" "$foreign_tenant" "$foreign_token" '{"code":"event_unavailable"}' FAILURE
+    submit foreign_confirm "$confirm_body" "$foreign_tenant" "$foreign_token" '{"code":"event_unavailable"}' FAILURE
+    manifest="$(printf '%s' "$manifest" | jq '.tenant_isolation = "passed"')"
+else
+    printf 'Tenant isolation checks skipped; set PASETO_FOREIGN_TOKEN to enable them.\n'
+fi
 manifest="$(printf '%s' "$manifest" | jq '.status = "passed"')"
 save manifest "$manifest"
-printf 'Deployed seat scenarios passed; sanitized evidence retained in the selected output directory.\n'
+printf 'Deployed seat scenarios passed; sanitized evidence retained in %s.\n' "$output_dir"

@@ -2069,7 +2069,7 @@ runtime configuration. The selected counter binding must already be initialized;
 native connectivity and gateway configuration must already work. Build the host
 utilities beforehand using the [ordinary build](#2-build-and-package-the-zig-lambdas).
 The runner requires Bash 3.2+, jq 1.6+, AWS CLI, curl, and executable
-`zig-out/bin/paseto`, `dynamodb`, `events`, and `ledger-counter`. It never builds,
+`zig-out/bin/dynamodb`, `events`, and `ledger-counter`. It never builds,
 packages, deploys, synchronizes, logs in, or initializes a counter.
 
 Help is credential-free and performs no AWS calls, utility execution, or discovery:
@@ -2078,26 +2078,44 @@ Help is credential-free and performs no AWS calls, utility execution, or discove
 ./seat_scenarios.sh --help
 ```
 
-After explicit authorization to exercise the intended **development** stack,
-authenticate the chosen profile and export `PASETO_PRIVATE_KEY` matching its
-deployed public key. All selectors and the cloud authorization flag are mandatory;
-inherited `PROFILE`, `REGION`, and `STACK_NAME` do not select the target. For example:
+Authenticate AWS using your existing environment or profile and export a valid
+`PASETO_TOKEN` signed for the deployed public key. Invoking the runner exercises
+the selected **development** stack, including creating a Seat Event and reserving
+and confirming seats. With the default stack and Region, run:
 
 ```sh
-./seat_scenarios.sh --authorize-cloud \
-  --profile '<authorized-development-profile>' --region ca-central-1 \
-  --stack-name '<authorized-development-stack>' \
-  --output-dir '.scratch/seat-scenario-run-unique'
+./seat_scenarios.sh
 ```
 
-Use a new output directory on every invocation; its parent must exist. The flag
-authorizes this invocation's reads and seat workflow effects. Discovery also
-requires it; there is no cloud-inspection dry run. The selected profile supplies
-temporary credentials through `aws configure export-credentials --format process`.
+Command-line options override the environment. Profile selection uses
+`AWS_PROFILE`, then `AWS_DEFAULT_PROFILE`, then `PROFILE`, otherwise the AWS CLI's
+default credential chain. Region selection uses `AWS_REGION`, then
+`AWS_DEFAULT_REGION`, then `REGION`, otherwise `ca-central-1`. `STACK_NAME` defaults
+to `aws-lambda-zig-demo`. An inherited profile does not override environment
+credentials; explicit `--profile` uses the AWS CLI's explicit profile selection.
+The runner exports the resolved credentials through
+`aws configure export-credentials --format process`, retaining support for both
+session credentials and credentials without a session token.
+
+By default, each invocation creates a private, unique
+`.scratch/seat-scenarios.XXXXXX` directory under the current working directory and
+prints its path. `OUTPUT_DIR` or `--output-dir` selects an explicit directory,
+which must be new and have an existing parent. All selectors remain available:
+
+```sh
+./seat_scenarios.sh --profile '<development-profile>' --region ca-central-1 \
+  --stack-name '<development-stack>' --output-dir './seat-scenario-run-unique'
+```
+
+`--authorize-cloud` is accepted for compatibility and is optional. The runner has
+no cloud-inspection dry run. Invalid arguments print the error and usage to stderr
+and exit with status 2 before contacting AWS.
 Operator access requires `cloudformation:DescribeStacks`,
 `cloudformation:DescribeStackResource`, and `dynamodb:GetItem` on the Operations,
-Events, and actual counter tables. The PASETO private key supplies public handler
-authentication. These operator reads do not certify the Lambda roles' permissions.
+Events, and actual counter tables. `PASETO_TOKEN` supplies public handler
+authentication; no private key or token-issuance utility is required. Tokens must
+remain valid throughout the run. These operator reads do not certify the Lambda
+roles' permissions.
 Environment endpoint overrides are rejected, and AWS CLI configured endpoint
 overrides are disabled for discovery. Read utilities receive empty shared config
 and credentials files (`/dev/null`) with the exported credentials and explicit
@@ -2110,20 +2128,26 @@ Operations table-name output. The counter table output works for owned and
 referenced tables; the ID output is required even for the default `global`.
 Every counter read passes `--counter-id` explicitly to the direct utility, so an
 inherited `LEDGER_COUNTER_ID` cannot redirect inspection. No native cluster-ID
-discovery participates. Utilities receive the discovered table names and chosen
-profile/Region explicitly through their environment.
+discovery participates. Utilities receive the discovered table names, resolved
+credentials and selected Region through their environment.
 
-Each invocation generates two fresh token subjects and nine unique Operation UUIDs.
-Creation's UUID is the new Event ID. The owner creates general/premium capacities
+Each invocation generates six unique Operation UUIDs for the owner workflow.
+Creation's UUID is the new Event ID. The owner subject comes from the authenticated
+intake response. The owner creates general/premium capacities
 3/2 with a 300-second reservation timeout, checks initial availability, reserves two
 general seats, checks the hold, confirms it, and checks remaining availability 1/2.
 Every terminal public Result is compared against its exact allowed projection,
 then read back with `dynamodb read`. `events read` verifies ready metadata and
 the allocated ledger; counter reads bracket creation without assuming a gapless
 sequence or exclusive allocator use. Missing authentication must produce 401.
-The second tenant sees the owner's Operation as the same static 404 as a missing
+
+Optionally export `PASETO_FOREIGN_TOKEN`, signed for a different subject, to enable
+cross-tenant checks and three additional Operations. Otherwise, these checks are
+skipped and the manifest records `tenant_isolation: "skipped"`. With the second
+token, the other tenant sees the owner's Operation as the same static 404 as a missing
 Operation, cannot reuse its UUID at intake (409), and receives exact
-`event_unavailable` Results for foreign check/reserve/confirm requests.
+`event_unavailable` Results for foreign check/reserve/confirm requests. The manifest
+records `tenant_isolation: "pending"` until all these checks pass, then `"passed"`.
 
 The entire invocation has a 300-second deadline, including subprocesses; commands
 are individually limited to 30 seconds and HTTP requests to 10 seconds without
@@ -2136,8 +2160,9 @@ stack as a failed scenario; inspect it before deciding whether to run again.
 
 The private output directory contains `manifest.json`, validated terminal public
 Operations, ready Event metadata, and before/after counter observations. The
-manifest records generated tenants/Operation IDs and `running`, `failed`, or
-`passed`; failures include stage, Operation UUID where applicable, and a sanitized
+manifest records authenticated tenants, generated Operation IDs, tenant-isolation
+coverage and `running`, `failed`, or `passed`; failures include stage, Operation
+UUID where applicable, and a sanitized
 reason. A stopped invocation may retain `running`. Raw service errors, stack outputs,
 table names, Function URLs, credentials, signing keys and bearer tokens are not
 captured. Do not redirect AWS discovery/debug output into fixtures or publish local
@@ -2147,9 +2172,10 @@ alongside local evidence; this scenario does not prove all IAM permissions,
 failure/redelivery paths or deployed recovery.
 
 Each run retains a permanent Event, native accounts/funding and confirmed seat
-transfers, consumes at least one ledger value (gaps are allowed), and leaves nine
-disposable Operations subject to their existing 24-hour TTL. Interrupted runs may
-retain creating Events or unconfirmed holds. The runner never resets/decrements
+transfers, consumes at least one ledger value (gaps are allowed), and leaves six
+disposable Operations, or nine with the optional cross-tenant checks. These
+Operations retain their existing 24-hour TTL. Interrupted runs may retain creating
+Events or unconfirmed holds. The runner never resets/decrements
 counters, deletes metadata or Operations, or cleans up native state. Unique
 identities provide repeatability; cleanup is a separate authorized lifecycle action.
 Deleting or expiring an Operation removes the completion/recovery anchor; permanent
@@ -2284,17 +2310,20 @@ TigerBeetle processor itself has no DynamoDB permissions.
 
 ### Seat Event metadata utility
 
-The host `events` utility uses the selected stack's `SeatEventsTable`. The wrapper
-discovers its physical table ID; the direct binary also accepts explicit table
-configuration. SAM provisions the table without TTL independently of Operations.
+The host `events` utility reads and inserts Event metadata in `SeatEventsTable`.
+The `events.sh` wrapper submits public creation Operations and reads metadata
+from the selected stack. SAM provisions the table without TTL independently of
+Operations.
 
 The table requires separate String keys `tenant` (partition) and `event_id`
 (sort), without TTL. The direct binary uses the pinned SDK's standard AWS
 credentials, profile, Region and endpoint configuration. Authenticate the
 selected identity before table commands; it needs table-scoped `dynamodb:PutItem`
-and `dynamodb:GetItem`. Wrapper execution also needs AWS CLI credential export
-and `cloudformation:DescribeStackResource`. These are operator permissions;
-this utility adds no Lambda IAM or SAM resources.
+and `dynamodb:GetItem`. Wrapper execution needs AWS CLI credential export;
+creation additionally needs `cloudformation:DescribeStacks` to discover the
+intake URL and a valid `PASETO_TOKEN`. Wrapper reads need
+`cloudformation:DescribeStackResource` and `dynamodb:GetItem`. These are operator
+permissions; this utility adds no Lambda IAM or SAM resources.
 
 Build the host binary independently and inspect credential-free help:
 
@@ -2304,9 +2333,10 @@ zig-out/bin/events --help
 ./events.sh --help
 ```
 
-`events create` inserts validated `creating` metadata absent-only; `events read`
-uses a strongly consistent tenant/Event key. Both commands require `--tenant`
-and `--event-id`. Creation accepts one complete logical Event document on stdin,
+The direct binary's `events create` inserts validated `creating` metadata
+absent-only; `events read` uses a strongly consistent tenant/Event key.
+Both commands require `--tenant` and `--event-id`. Creation accepts one complete
+logical Event document on stdin,
 whose tenant and event ID must match those arguments. See the
 [Seat Reservation reference](SEAT_RESERVATION.md) for exact fields and validation.
 The utility stores supplied ledger/account IDs. It does not allocate a ledger,
@@ -2334,41 +2364,83 @@ its IDs, ledger and current state. Different classes or timeout
 report a conflict. If readback cannot establish a saved winner, creation fails
 and the caller retries with the same tenant/Event identity.
 
-Only use stack-wrapper execution when the selected stack supplies the
-`SeatEventsTable` logical resource. The wrapper defaults to `PROFILE=dev`,
-`REGION=ca-central-1`, and `STACK_NAME=aws-lambda-zig-demo`. It also accepts
-`--profile`, `--region`, and
-`--stack-name` before the command. It exports the selected profile's temporary
-credentials, disables EC2 metadata discovery, resolves `SeatEventsTable` through
-CloudFormation's `describe-stack-resource` physical-ID result, and exports
-`EVENTS_TABLE_NAME` before forwarding arguments and stdin unchanged. Help also
-works as `create --help` or `read --help`, without AWS
-commands, credentials, resource discovery, or a built binary.
+The wrapper uses the same AWS selection as `seat_scenarios.sh`. Command-line
+`--profile`, `--region`, and `--stack-name` options before the command override
+the environment. Profile selection uses `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`,
+then `PROFILE`, otherwise the AWS CLI default credential chain. Region selection
+uses `AWS_REGION`, `AWS_DEFAULT_REGION`, then `REGION`, otherwise `ca-central-1`.
+`STACK_NAME` defaults to `aws-lambda-zig-demo`. An inherited profile preserves
+environment credentials; explicit `--profile` selects that profile through the
+AWS CLI. The wrapper exports resolved credentials using
+`aws configure export-credentials --format process`, supports credentials with
+or without a session token, and disables EC2 metadata discovery.
+
+Wrapper creation takes required, repeatable `--class TAG=COUNT` arguments instead
+of stdin JSON. There are no default seat classes or counts. It accepts 1–31
+distinct classes with positive u32 counts; tags follow the
+[public command contract](SEAT_RESERVATION.md#commands). `--timeout-seconds`
+defaults to 300 and accepts a positive u32 reservation timeout. `PASETO_TOKEN`
+authenticates a `SeatReservation` Operation containing `create_event` at the
+stack's `IntakeFunctionUrl`; the handler verifies the tenant, and processors
+allocate the ledger and native IDs. No host binary is required for creation.
+
+With AWS credentials and `PASETO_TOKEN` already exported:
 
 ```sh
+./events.sh create --class general=100 --class premium=25 --timeout-seconds 600
+
+# Select an Operation/Event UUID explicitly, including when retrying an uncertain POST.
+./events.sh create --class general=100 --class premium=25 --timeout-seconds 600 \
+  --event-id 00000000-0000-0000-0000-000000000001
+```
+
+Creation generates a fresh Operation/Event UUID unless `--event-id` is supplied.
+It prints the intake Operation JSON and does not wait for initialization.
+`SUBMITTED` does not establish readiness; use the authenticated
+[query GET](#8-test-query-get-and-intake-post) with the returned ID to observe
+completion. Retry uncertain requests with the same UUID, classes, and timeout.
+For administrative metadata insertion with supplied ledger/account IDs, invoke
+`zig-out/bin/events create` directly with the JSON document shown above.
+
+Wrapper reads require explicit `--tenant` and `--event-id` arguments. The tenant
+contains 1–64 UTF-8 bytes. Reads use AWS IAM for metadata access and do not parse
+or require `PASETO_TOKEN`. They resolve the `SeatEventsTable` logical resource
+through CloudFormation's `describe-stack-resource`, export `EVENTS_TABLE_NAME`,
+and run the host binary. Help also works as
+`create --help` or `read --help`, without AWS commands, credentials, resource
+discovery, or a built binary.
+
+```sh
+# Use the existing AWS environment; no token is required:
+./events.sh read --tenant tenant-a --event-id 00000000-0000-0000-0000-000000000001
+
+# Select the AWS profile, Region, and stack explicitly:
 ./events.sh --profile dev --region ca-central-1 --stack-name '<stack-name>' read \
   --tenant tenant-a --event-id 00000000-0000-0000-0000-000000000001
 ```
 
-Creation stdin is bounded at 16 KiB; commands accept at most six arguments,
-each at most 4,096 bytes, with tenant limited to 64 bytes. Logical metadata must
-fit 16 KiB and the SDK's typed-item encoding must fit 32 KiB. Success prints one
-complete JSON Event plus a newline. Exit `1` means an unavailable Event or a
-configuration conflict; exit `2` means invalid input/configuration, malformed
-storage, service failure, unresolved insertion, or output failure. Binary and
-wrapper diagnostics use fixed messages and omit input, credentials and service
-details.
+Direct-binary creation stdin is bounded at 16 KiB; commands accept at most six
+arguments, each at most 4,096 bytes, with tenant limited to 64 bytes. Logical
+metadata must fit 16 KiB and the SDK's typed-item encoding must fit 32 KiB.
+Success prints one complete JSON Event plus a newline. Direct-binary exit `1`
+means an unavailable Event or a configuration conflict; exit `2` means invalid
+input/configuration, malformed storage, service failure, unresolved insertion,
+or output failure. Binary and
+wrapper diagnostics omit credentials and service response bodies. Wrapper
+errors exit `2`; creation failures include the Operation UUID so an uncertain
+request can be retried with the same identity.
 
 Run local deterministic utility checks with:
 
 ```sh
 zig build test-seat-reservation test-seat-persistence test-events-cli
-bash -n events.sh
+bash tests/events_wrapper_test.sh
 ```
 
 These tests are part of the ordinary `zig build test` graph and contact no AWS
-service. They do not certify deployed permissions, resource resolution or native
-provisioning. No Lambda ZIP is required for the host utility.
+service. Wrapper tests mock AWS and intake HTTP calls. They do not certify
+deployed permissions, resource resolution or native provisioning.
+No Lambda ZIP is required for the host utility.
 
 ### Local seat processor compilation
 

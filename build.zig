@@ -935,6 +935,12 @@ pub fn build(b: *std.Build) void {
     const processor_interface_test = b.addSystemCommand(&.{"bash"});
     processor_interface_test.addFileArg(b.path("tests/processor_interface_test.sh"));
 
+    const seat_scenarios_test = b.addSystemCommand(&.{"bash"});
+    seat_scenarios_test.addFileArg(b.path("tests/seat_scenarios_test.sh"));
+
+    const events_wrapper_test = b.addSystemCommand(&.{"bash"});
+    events_wrapper_test.addFileArg(b.path("tests/events_wrapper_test.sh"));
+
     const deploy_test_step = b.step(
         "test-deploy",
         "Run deployment helper regression tests",
@@ -943,6 +949,8 @@ pub fn build(b: *std.Build) void {
     deploy_test_step.dependOn(&cleanup_lifecycle_test.step);
     deploy_test_step.dependOn(&gateway_interface_test.step);
     deploy_test_step.dependOn(&processor_interface_test.step);
+    deploy_test_step.dependOn(&seat_scenarios_test.step);
+    deploy_test_step.dependOn(&events_wrapper_test.step);
 
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_seat_reservation_tests.step);
