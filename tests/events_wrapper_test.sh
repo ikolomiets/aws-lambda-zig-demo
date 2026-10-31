@@ -9,15 +9,21 @@ while IFS= read -r key; do unset "$key"; done < <(compgen -e | sed -n '/^AWS_/p'
 unset PROFILE REGION STACK_NAME PASETO_TOKEN PASETO_FOREIGN_TOKEN PASETO_PRIVATE_KEY
 export AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null
 export PATH="$TEST_DIR/bin:$PATH" AWS_CALLS="$TEST_DIR/aws-calls" REQUEST_FILE="$TEST_DIR/request"
+export HTTP_CALLS="$TEST_DIR/http-calls" SLEEP_CALLS="$TEST_DIR/sleep-calls" QUERY_COUNT="$TEST_DIR/query-count"
+export SSO_MARKER="$TEST_DIR/sso-refreshed"
 export EVENT_ID=00000000-0000-0000-0000-000000000001
 : >"$AWS_CALLS"
+: >"$HTTP_CALLS"
+: >"$SLEEP_CALLS"
 fail_test() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 contains() { case "$1" in *"$2"*) ;; *) fail_test "missing: $2" ;; esac; }
 run_events() { bash "$TEST_DIR/repo/events.sh" "$@"; }
 reject() {
     : >"$AWS_CALLS"
+    : >"$HTTP_CALLS"
     if run_events "$@" >"$TEST_DIR/output" 2>&1; then fail_test 'accepted invalid arguments'; fi
     [ ! -s "$AWS_CALLS" ] || fail_test 'invalid arguments contacted AWS'
+    [ ! -s "$HTTP_CALLS" ] || fail_test 'invalid arguments contacted HTTP endpoints'
 }
 
 cat >"$TEST_DIR/bin/aws" <<'MOCK'
@@ -31,14 +37,33 @@ case "$1 $2" in
     'configure export-credentials')
         [ "${AWS_ACCESS_KEY_ID:-}" = "${EXPECTED_ACCESS_KEY:-}" ] || exit 93
         [ "${AWS_SESSION_TOKEN:-}" = "${EXPECTED_SESSION_TOKEN:-}" ] || exit 94
+        if [ "${EXPIRED_SSO:-false}" = true ] && [ ! -f "$SSO_MARKER" ]; then
+            printf 'Error when retrieving token from sso: Token has expired and refresh failed\n' >&2
+            exit 255
+        fi
+        if [ "${EXPORT_FAILURE:-false}" = true ]; then exit 255; fi
         if [ "${BAD_CREDENTIALS:-false}" = true ]; then printf '{}\n'; exit; fi
         if [ "${STATIC_CREDENTIALS:-false}" = true ]; then
             printf '%s\n' '{"AccessKeyId":"fixture-access","SecretAccessKey":"fixture-secret"}'
         else
             printf '%s\n' '{"AccessKeyId":"fixture-access","SecretAccessKey":"fixture-secret","SessionToken":"fixture-session"}'
         fi ;;
+    'configure get')
+        case "${SSO_CONFIG:-none}:$3" in
+            modern:sso_session) printf 'fixture-session\n' ;;
+            legacy:sso_start_url) printf 'https://sso.invalid/start\n' ;;
+            *) exit 1 ;;
+        esac ;;
+    'sso login')
+        if [ "${LOGIN_FAILURE:-false}" = true ]; then exit 255; fi
+        printf 'fixture SSO sign-in instructions\n'
+        : >"$SSO_MARKER" ;;
     'cloudformation describe-stack-resource') printf 'fixture-events\n' ;;
-    'cloudformation describe-stacks') printf '%s\n' "${INTAKE_URL:-https://intake.invalid/}" ;;
+    'cloudformation describe-stacks')
+        case "$*" in
+            *QueryFunctionUrl*) printf '%s\n' "${QUERY_URL:-https://query.invalid/}" ;;
+            *) printf '%s\n' "${INTAKE_URL:-https://intake.invalid/}" ;;
+        esac ;;
     *) exit 95 ;;
 esac
 MOCK
@@ -49,19 +74,59 @@ set -euo pipefail
 [ -z "${PASETO_TOKEN:-}${PASETO_FOREIGN_TOKEN:-}${PASETO_PRIVATE_KEY:-}" ] || exit 91
 config="$(cat)"
 url="$(printf '%s\n' "$config" | sed -n 's/^url = //p' | jq -r .)"
-[ "$url" = https://intake.invalid/ ] || exit 92
+method="$(printf '%s\n' "$config" | sed -n 's/^request = //p' | jq -r .)"
+printf '%s %s\n' "$method" "$url" >>"$HTTP_CALLS"
 header="$(printf '%s\n' "$config" | sed -n '/^header = .*Authorization:/s/^header = //p' | jq -r .)"
 [ "$header" = 'Authorization: Bearer v4.public.fixture' ] || exit 93
-printf '%s\n' "$config" | sed -n 's/^data = //p' | jq -r . >"$REQUEST_FILE"
-if [ "${CURL_FAILURE:-false}" = true ]; then exit 7; fi
-if [ "${BAD_RESPONSE:-false}" = true ]; then printf '{}\n200\n'; exit; fi
-jq -c '{id:.id,name:.name,tenant:"fixture-owner",state:"SUBMITTED"}' "$REQUEST_FILE"
-printf '%s\n' "${HTTP_STATUS:-200}"
+state=SUBMITTED
+tenant="${RESPONSE_TENANT-fixture-owner}"
+case "$method" in
+    POST)
+        [ "$url" = https://intake.invalid/ ] || exit 92
+        printf '%s\n' "$config" | sed -n 's/^data = //p' | jq -r . >"$REQUEST_FILE"
+        printf '0\n' >"$QUERY_COUNT"
+        if [ "${CURL_FAILURE:-false}" = true ]; then exit 7; fi
+        if [ "${BAD_RESPONSE:-false}" = true ]; then printf '{}\n200\n'; exit; fi
+        status="${HTTP_STATUS:-200}" ;;
+    GET)
+        operation_id="$(jq -r .id "$REQUEST_FILE")"
+        [ "$url" = "https://query.invalid/$operation_id" ] || exit 94
+        case "$config" in *'data = '*) exit 95 ;; esac
+        if [ "${QUERY_CURL_FAILURE:-false}" = true ]; then exit 7; fi
+        if [ "${BAD_QUERY_RESPONSE:-false}" = true ]; then printf '{}\n200\n'; exit; fi
+        if [ "${EXTRA_QUERY_RESPONSE:-false}" = true ]; then printf 'null\n'; fi
+        count="$(cat "$QUERY_COUNT")"
+        count=$((count + 1))
+        printf '%s\n' "$count" >"$QUERY_COUNT"
+        if [ "$count" -gt "${SUBMITTED_READS:-2}" ]; then state=COMPLETED; fi
+        tenant="${QUERY_TENANT:-$tenant}"
+        status="${QUERY_HTTP_STATUS:-200}" ;;
+    *) exit 96 ;;
+esac
+jq -c --arg state "$state" --arg tenant "$tenant" --arg type "${RESULT_TYPE:-SUCCESS}" \
+    --arg id "${QUERY_OPERATION_ID:-}" --arg name "${QUERY_OPERATION_NAME:-SeatReservation}" \
+    --argjson missing "${MISSING_RESULT:-false}" '
+    {id:.id,name:.name,tenant:$tenant,state:$state} +
+    (if $state == "COMPLETED" and ($missing|not) then
+        {result:{type:$type,payload:(if $type == "FAILURE" then {code:"event_unavailable"}
+            else {event_id:.body.event_id,classes:{general:{total:100,available:97}}} end)}}
+     else {} end)
+    | if $state == "COMPLETED" then
+        .name = $name | if $id != "" then .id = $id else . end
+      else . end
+    ' "$REQUEST_FILE"
+printf '%s\n' "$status"
 MOCK
-chmod +x "$TEST_DIR/bin/aws" "$TEST_DIR/bin/curl"
+cat >"$TEST_DIR/bin/sleep" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$#" -eq 1 ] && [ "$1" = 1 ] || exit 90
+printf '%s\n' "$1" >>"$SLEEP_CALLS"
+MOCK
+chmod +x "$TEST_DIR/bin/aws" "$TEST_DIR/bin/curl" "$TEST_DIR/bin/sleep"
 
 # Help and bad invocations require no credentials, binary, or cloud discovery.
-for args in help create read; do
+for args in help create read check_seats; do
     if [ "$args" = help ]; then run_events --help >/dev/null
     else run_events "$args" --help >/dev/null; fi
 done
@@ -79,6 +144,14 @@ reject create --class general=3 --tenant=override
 reject --profile= create --class general=3
 reject --region --stack-name stack create --class general=3
 reject read --event-id "$EVENT_ID"
+reject check_seats
+reject check_seats --tenant fixture-owner
+reject check_seats --event-id bad
+reject check_seats --event-id "$EVENT_ID" --event-id "$EVENT_ID"
+reject check_seats --event-id "$EVENT_ID" --class general=1
+reject check_seats --event-id "$EVENT_ID" --timeout-seconds 30
+PASETO_TOKEN= reject check_seats --event-id "$EVENT_ID"
+PASETO_TOKEN=malformed reject check_seats --event-id "$EVENT_ID"
 
 # Creation has no host-binary prerequisite and uses explicit classes, with no stdin.
 output="$(run_events create --class general=100 --class premium=25 --event-id "$EVENT_ID" </dev/null)"
@@ -90,11 +163,131 @@ calls="$(cat "$AWS_CALLS")"
 contains "$calls" 'configure export-credentials --format process'
 contains "$calls" 'profile= region=ca-central-1'
 case "$calls" in *--profile*) fail_test 'default chain forced a profile' ;; esac
+case "$calls" in *'sso login'*) fail_test 'valid credentials triggered SSO login' ;; esac
 
 output="$(run_events create --class='A=B=7' --class='é=2' --timeout-seconds=600)"
 jq -e '.body.classes == {"A=B":7,"é":2} and .body.timeout_seconds == 600 and
     (.id|test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))' \
     "$REQUEST_FILE" >/dev/null
+
+# Checks create distinct Operations without a host binary, then poll the same identity.
+: >"$AWS_CALLS"
+: >"$HTTP_CALLS"
+: >"$SLEEP_CALLS"
+output="$(run_events --stack-name check-stack check_seats \
+    --tenant ignored-owner --event-id "$EVENT_ID" </dev/null)"
+jq -e --arg event "$EVENT_ID" '.body == {command:"check_seats",event_id:$event} and
+    .name == "SeatReservation" and .id != $event and
+    (.id|test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+    (keys == ["body","id","name"])' "$REQUEST_FILE" >/dev/null
+operation_id="$(jq -r .id "$REQUEST_FILE")"
+printf '%s' "$output" | jq -se --arg id "$operation_id" --arg event "$EVENT_ID" 'length == 3 and
+    all(.[]; .id == $id and .tenant == "fixture-owner") and
+    map(.state) == ["SUBMITTED","SUBMITTED","COMPLETED"] and
+    .[-1].result == {type:"SUCCESS",payload:{event_id:$event,classes:{general:{total:100,available:97}}}}' >/dev/null
+[ "$(cat "$QUERY_COUNT")" = 3 ] || fail_test 'check did not poll until completion'
+[ "$(wc -l <"$SLEEP_CALLS" | tr -d ' ')" = 2 ] || fail_test 'check did not wait between submitted reads'
+[ "$(cat "$HTTP_CALLS")" = "$(printf 'POST https://intake.invalid/\nGET https://query.invalid/%s\nGET https://query.invalid/%s\nGET https://query.invalid/%s' \
+    "$operation_id" "$operation_id" "$operation_id")" ] || fail_test 'unexpected check HTTP calls'
+calls="$(cat "$AWS_CALLS")"
+contains "$calls" IntakeFunctionUrl
+contains "$calls" QueryFunctionUrl
+contains "$calls" '--stack-name check-stack'
+case "$calls" in *describe-stack-resource*) fail_test 'check read Event metadata' ;; esac
+
+# Each invocation observes seats through a new Operation, including terminal failures.
+previous_id="$operation_id"
+: >"$SLEEP_CALLS"
+output="$(SUBMITTED_READS=0 RESULT_TYPE=FAILURE run_events check_seats \
+    --tenant=ignored-owner --event-id="$EVENT_ID")"
+printf '%s' "$output" | jq -e --arg previous "$previous_id" '.id != $previous and
+    .tenant == "fixture-owner" and .state == "COMPLETED" and
+    .result == {type:"FAILURE",payload:{code:"event_unavailable"}}' >/dev/null
+[ ! -s "$SLEEP_CALLS" ] || fail_test 'check slept after completion'
+
+# Expired modern and legacy SSO sessions refresh using the selected identity.
+for source in cli aws default legacy chain; do
+    (
+        : >"$AWS_CALLS"
+        : >"$HTTP_CALLS"
+        rm -f "$SSO_MARKER"
+        export EXPIRED_SSO=true SSO_CONFIG=modern SUBMITTED_READS=0
+        case "$source" in
+            cli) export AWS_PROFILE=ignored ;;
+            aws) export AWS_PROFILE=selected AWS_DEFAULT_PROFILE=ignored PROFILE=ignored ;;
+            default) export AWS_DEFAULT_PROFILE=selected PROFILE=ignored ;;
+            legacy) export PROFILE=selected SSO_CONFIG=legacy ;;
+        esac
+        if [ "$source" = cli ]; then
+            output="$(run_events --profile selected check_seats --event-id "$EVENT_ID" 2>"$TEST_DIR/sso-stderr")" || {
+                fail_test "expired SSO check failed: $(cat "$TEST_DIR/sso-stderr")"
+            }
+        else
+            output="$(run_events check_seats --event-id "$EVENT_ID" 2>"$TEST_DIR/sso-stderr")" || {
+                fail_test "expired SSO check failed: $(cat "$TEST_DIR/sso-stderr")"
+            }
+        fi
+        printf '%s' "$output" | jq -se 'length == 1 and .[0].state == "COMPLETED"' >/dev/null
+        calls="$(cat "$AWS_CALLS")"
+        contains "$calls" 'sso login'
+        contains "$(cat "$TEST_DIR/sso-stderr")" 'fixture SSO sign-in instructions'
+        flow="$(sed -n -e '/configure export-credentials/s/.*/export/p' -e '/sso login/s/.*/login/p' "$AWS_CALLS")"
+        [ "$flow" = "$(printf 'export\nlogin\nexport')" ] || fail_test 'SSO recovery did not retry export exactly once'
+        if [ "$source" = cli ]; then
+            contains "$calls" 'sso login --profile selected'
+        else
+            case "$calls" in *--profile*) fail_test 'SSO recovery forced an inherited profile' ;; esac
+        fi
+        if [ "$source" = chain ]; then contains "$calls" 'profile= region=ca-central-1'
+        else contains "$calls" 'profile=selected region=ca-central-1'; fi
+    )
+done
+
+# Login and retry failures stop before HTTP, without leaking credentials or looping.
+for fault in 'SSO_CONFIG=none' 'LOGIN_FAILURE=true' 'EXPORT_FAILURE=true'; do
+    : >"$AWS_CALLS"
+    : >"$HTTP_CALLS"
+    rm -f "$SSO_MARKER"
+    if output="$(env EXPIRED_SSO=true SSO_CONFIG=modern "$fault" bash "$TEST_DIR/repo/events.sh" \
+        --profile selected check_seats --event-id "$EVENT_ID" 2>&1)"; then fail_test "accepted $fault"
+    else [ "$?" -eq 2 ] || fail_test "wrong exit code for $fault"; fi
+    [ ! -s "$HTTP_CALLS" ] || fail_test 'failed SSO recovery contacted HTTP endpoints'
+    case "$output" in *v4.public.fixture*|*fixture-secret*) fail_test 'SSO recovery disclosed credentials' ;; esac
+    flow="$(sed -n -e '/configure export-credentials/s/.*/export/p' -e '/sso login/s/.*/login/p' "$AWS_CALLS")"
+    case "$fault" in
+        SSO_CONFIG=none) expected_flow=export; contains "$output" 'AWS credential export failed' ;;
+        LOGIN_FAILURE=true) expected_flow="$(printf 'export\nlogin')"; contains "$output" 'AWS SSO login failed' ;;
+        EXPORT_FAILURE=true) expected_flow="$(printf 'export\nlogin\nexport')"; contains "$output" 'AWS credential export failed after SSO login' ;;
+    esac
+    [ "$flow" = "$expected_flow" ] || fail_test "unexpected SSO recovery flow for $fault"
+done
+
+# The authenticated intake supplies the tenant; the wrapper does not decode token claims.
+for tenant in another-owner 'é-tenant' $' tenant\n'; do
+    output="$(SUBMITTED_READS=0 RESPONSE_TENANT="$tenant" run_events check_seats --event-id "$EVENT_ID")"
+    printf '%s' "$output" | jq -e --arg tenant "$tenant" '.tenant == $tenant' >/dev/null
+done
+
+# Invalid endpoint discovery fails before intake; transport and identity errors stop polling.
+for endpoint in INTAKE_URL QUERY_URL; do
+    : >"$HTTP_CALLS"
+    if output="$(env "$endpoint=http://invalid/" bash "$TEST_DIR/repo/events.sh" check_seats \
+        --event-id "$EVENT_ID" 2>&1)"; then fail_test 'accepted invalid endpoint'; fi
+    [ ! -s "$HTTP_CALLS" ] || fail_test 'invalid endpoint submitted work'
+done
+for fault in 'CURL_FAILURE=true' 'BAD_RESPONSE=true' 'HTTP_STATUS=401' 'RESPONSE_TENANT=' \
+    "RESPONSE_TENANT=$(printf '%065d' 0)" \
+    'QUERY_CURL_FAILURE=true' 'BAD_QUERY_RESPONSE=true' 'QUERY_HTTP_STATUS=401' 'QUERY_TENANT=foreign' \
+    'EXTRA_QUERY_RESPONSE=true' 'MISSING_RESULT=true' 'RESULT_TYPE=INVALID' \
+    'QUERY_OPERATION_ID=foreign' 'QUERY_OPERATION_NAME=foreign'; do
+    : >"$SLEEP_CALLS"
+    if output="$(env "$fault" SUBMITTED_READS=0 bash "$TEST_DIR/repo/events.sh" check_seats \
+        --event-id "$EVENT_ID" 2>&1)"; then fail_test "accepted $fault"
+    else [ "$?" -eq 2 ] || fail_test "wrong exit code for $fault"; fi
+    contains "$output" "$(jq -r .id "$REQUEST_FILE")"
+    [ ! -s "$SLEEP_CALLS" ] || fail_test 'check retried a failed request'
+    case "$output" in *v4.public.fixture*|*fixture-secret*) fail_test 'failure disclosed credentials' ;; esac
+done
 
 cat >"$TEST_DIR/repo/zig-out/bin/events" <<'MOCK'
 #!/usr/bin/env bash

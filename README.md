@@ -43,7 +43,9 @@ The [Seat Reservation contracts](docs/SEAT_RESERVATION.md) provide pure command
 and metadata validation. The host `events` binary inserts validated creating
 Event metadata and reads tenant-scoped records. The `events.sh` wrapper uses
 `PASETO_TOKEN` to submit public creation Operations with explicit `--class TAG=COUNT`
-arguments, and the host binary to read Event metadata. See the
+arguments and `check_seats --event-id UUID` to query current
+availability through a new Operation, polling every second until completion.
+It uses the host binary to read Event metadata. See the
 [Event utility guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-event-metadata-utility).
 The host `ledger-counter` binary and `ledger-counter.sh` wrapper provide explicit
 first-time initialization, inspection and allocation through explicitly selected

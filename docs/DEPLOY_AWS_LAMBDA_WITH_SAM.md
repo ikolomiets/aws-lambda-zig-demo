@@ -2311,17 +2311,17 @@ TigerBeetle processor itself has no DynamoDB permissions.
 ### Seat Event metadata utility
 
 The host `events` utility reads and inserts Event metadata in `SeatEventsTable`.
-The `events.sh` wrapper submits public creation Operations and reads metadata
-from the selected stack. SAM provisions the table without TTL independently of
-Operations.
+The `events.sh` wrapper submits public creation and availability Operations and
+reads metadata from the selected stack. SAM provisions the table without TTL
+independently of Operations.
 
 The table requires separate String keys `tenant` (partition) and `event_id`
 (sort), without TTL. The direct binary uses the pinned SDK's standard AWS
 credentials, profile, Region and endpoint configuration. Authenticate the
 selected identity before table commands; it needs table-scoped `dynamodb:PutItem`
 and `dynamodb:GetItem`. Wrapper execution needs AWS CLI credential export;
-creation additionally needs `cloudformation:DescribeStacks` to discover the
-intake URL and a valid `PASETO_TOKEN`. Wrapper reads need
+creation and availability checks additionally need `cloudformation:DescribeStacks`
+to discover the Function URLs and a valid `PASETO_TOKEN`. Wrapper reads need
 `cloudformation:DescribeStackResource` and `dynamodb:GetItem`. These are operator
 permissions; this utility adds no Lambda IAM or SAM resources.
 
@@ -2375,6 +2375,15 @@ AWS CLI. The wrapper exports resolved credentials using
 `aws configure export-credentials --format process`, supports credentials with
 or without a session token, and disables EC2 metadata discovery.
 
+If credential export fails for a profile configured with `sso_session` or legacy
+`sso_start_url`, the wrapper runs
+[`aws sso login`](https://docs.aws.amazon.com/cli/latest/reference/sso/login.html)
+once using the same profile selection, then retries export once. Login can open
+the browser and require you to complete sign-in. Login instructions and progress
+go to stderr; stdout retains the command's JSON output. This recovery applies to
+`create`, `read` and `check_seats`. Non-SSO export failures, failed login and a
+failed retry exit `2` before resource discovery or Operation submission.
+
 Wrapper creation takes required, repeatable `--class TAG=COUNT` arguments instead
 of stdin JSON. There are no default seat classes or counts. It accepts 1–31
 distinct classes with positive u32 counts; tags follow the
@@ -2402,13 +2411,45 @@ completion. Retry uncertain requests with the same UUID, classes, and timeout.
 For administrative metadata insertion with supplied ledger/account IDs, invoke
 `zig-out/bin/events create` directly with the JSON document shown above.
 
+Wrapper availability checks require `--event-id` and accept the shared profile,
+Region and stack selectors. `PASETO_TOKEN` supplies the tenant; `--tenant` is
+ignored if supplied. With AWS credentials and `PASETO_TOKEN` already exported:
+
+```sh
+./events.sh check_seats --event-id 00000000-0000-0000-0000-000000000001
+
+./events.sh --profile dev --region ca-central-1 --stack-name '<stack-name>' check_seats \
+  --event-id 00000000-0000-0000-0000-000000000001
+```
+
+Each invocation generates a fresh Operation UUID, independently of the Event UUID,
+and submits a `SeatReservation` Operation whose Body contains exactly
+`command: "check_seats"` and `event_id`. The handler derives the tenant from the
+verified token. The wrapper takes that tenant from the authenticated intake
+response and verifies it on subsequent query responses, without decoding token
+claims or sending a tenant override in the public Body. No host binary is
+required. Both `IntakeFunctionUrl` and `QueryFunctionUrl` are resolved before
+submission.
+
+After submission, the wrapper immediately queries the new Operation and waits
+one second between subsequent reads while its state is `SUBMITTED`. It has no
+overall polling limit. Each query prints its Operation JSON on one line, including
+`SUBMITTED` observations. The final line contains the completed Operation and its
+`result`; the command exits `0` for either a `SUCCESS` or `FAILURE` Result. Successful
+availability Results contain `total` and `available` for every Seat Class; see the
+[availability workflow](SEAT_RESERVATION.md#availability-workflow) for observation
+semantics. HTTP, transport and malformed or mismatched Operation responses stop
+the command with exit `2`; diagnostics include the Operation UUID after an HTTP
+attempt so callers can use the [query GET](#8-test-query-get-and-intake-post) to
+inspect an uncertain request.
+
 Wrapper reads require explicit `--tenant` and `--event-id` arguments. The tenant
 contains 1–64 UTF-8 bytes. Reads use AWS IAM for metadata access and do not parse
 or require `PASETO_TOKEN`. They resolve the `SeatEventsTable` logical resource
 through CloudFormation's `describe-stack-resource`, export `EVENTS_TABLE_NAME`,
 and run the host binary. Help also works as
-`create --help` or `read --help`, without AWS commands, credentials, resource
-discovery, or a built binary.
+`create --help`, `read --help` or `check_seats --help`, without AWS commands,
+credentials, resource discovery, or a built binary.
 
 ```sh
 # Use the existing AWS environment; no token is required:
@@ -2438,8 +2479,8 @@ bash tests/events_wrapper_test.sh
 ```
 
 These tests are part of the ordinary `zig build test` graph and contact no AWS
-service. Wrapper tests mock AWS and intake HTTP calls. They do not certify
-deployed permissions, resource resolution or native provisioning.
+service. Wrapper tests mock AWS, intake/query HTTP calls and polling delays. They
+do not certify deployed permissions, resource resolution or native provisioning.
 No Lambda ZIP is required for the host utility.
 
 ### Local seat processor compilation

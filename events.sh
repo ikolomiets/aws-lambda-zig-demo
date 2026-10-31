@@ -7,6 +7,13 @@ stack_name="${STACK_NAME:-aws-lambda-zig-demo}"
 explicit_profile=false
 
 fail() { printf 'events: %s\n' "$1" >&2; exit 2; }
+new_uuid() {
+    local hex variant
+    hex="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    [ "${#hex}" -eq 32 ] || fail 'could not generate Operation UUID'
+    variant="$(printf '%x' "$(( (16#${hex:16:1} & 3) | 8 ))")"
+    printf '%s\n' "${hex:0:8}-${hex:8:4}-4${hex:13:3}-$variant${hex:17:3}-${hex:20:12}"
+}
 usage() {
     cat <<'USAGE'
 Usage:
@@ -14,6 +21,7 @@ Usage:
   events.sh create --class TAG=COUNT [--class TAG=COUNT ...]
                    [--timeout-seconds SECONDS] [--event-id UUID]
   events.sh read --tenant TENANT --event-id UUID
+  events.sh check_seats --event-id UUID
 
 Create requires explicit seat classes and counts and PASETO_TOKEN; no stdin JSON.
 It submits an authenticated SeatReservation create_event Operation to the stack's
@@ -23,11 +31,18 @@ Use --event-id to retry the same creation; otherwise a fresh UUID is generated.
 Reservation timeout defaults to 300 seconds. Counts and timeout are positive u32.
 Read returns persisted Event metadata using the prebuilt zig-out/bin/events utility.
 Read requires explicit --tenant and --event-id; AWS credentials authorize metadata reads.
+The check_seats command requires --event-id and PASETO_TOKEN, which supplies the tenant.
+Any --tenant value supplied to check_seats is ignored.
+It submits a fresh Operation, then queries every second until COMPLETED.
+Each query prints its Operation; the final one includes its SUCCESS or FAILURE result.
+HTTP/configuration errors exit 2 and report the Operation UUID when available.
 
 Options override the environment. Profile: AWS_PROFILE, AWS_DEFAULT_PROFILE,
 PROFILE, or the AWS CLI default credential chain. Region: AWS_REGION,
 AWS_DEFAULT_REGION, REGION, or ca-central-1. STACK_NAME defaults to aws-lambda-zig-demo.
 An inherited profile preserves environment credentials; --profile explicitly selects it.
+Failed credential export for an SSO profile triggers one SSO login and export retry.
+Complete browser sign-in if prompted; login instructions go to stderr.
 USAGE
 }
 
@@ -41,7 +56,7 @@ while [ "$#" -gt 0 ]; do
             value="$2"; shift 2 ;;
         --profile=*|--region=*|--stack-name=*)
             value="${option#*=}"; option="${option%%=*}"; shift ;;
-        create|read) break ;;
+        create|read|check_seats) break ;;
         *) fail 'invalid invocation; use --help' ;;
     esac
     [ -n "$value" ] || fail 'wrapper option values must be nonempty'
@@ -81,6 +96,7 @@ while [ "$#" -gt 0 ]; do
                 fail 'event ID must be a canonical UUID'
             event_id="$value" ;;
         --tenant)
+            if [ "$command_name" = check_seats ]; then continue; fi
             [ "$command_name" = read ] && [ -z "$tenant" ] ||
                 fail '--tenant is accepted once for read only; create uses PASETO_TOKEN'
             tenant="$value"
@@ -115,21 +131,28 @@ if [ "$command_name" = create ]; then
     [[ "$timeout_seconds" =~ ^[0-9]+$ ]] &&
         jq -en --arg n "$timeout_seconds" '$n|tonumber|. >= 1 and . <= 4294967295' \
             >/dev/null 2>&1 || fail 'timeout must be a positive u32 integer'
-    [[ "$owner_token" =~ ^v4\.public\.[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)?$ &&
-        "${#owner_token}" -le 16384 ]] || fail 'PASETO_TOKEN must be a v4.public token'
-    command -v curl >/dev/null 2>&1 || fail 'missing required command: curl'
     if [ -z "$event_id" ]; then
-        hex="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
-        [ "${#hex}" -eq 32 ] || fail 'could not generate Operation UUID'
-        variant="$(printf '%x' "$(( (16#${hex:16:1} & 3) | 8 ))")"
-        event_id="${hex:0:8}-${hex:8:4}-4${hex:13:3}-$variant${hex:17:3}-${hex:20:12}"
+        event_id="$(new_uuid)"
     fi
+    operation_id="$event_id"
     request="$(jq -cn --arg id "$event_id" --argjson classes "$classes" \
         --arg timeout "$timeout_seconds" '{id:$id,name:"SeatReservation",body:{
             command:"create_event",classes:$classes,timeout_seconds:($timeout|tonumber)}}')"
 else
-    [ -n "$tenant" ] && [ -n "$event_id" ] || fail 'read requires --tenant and --event-id'
-    [ -x "$root/zig-out/bin/events" ] || fail 'missing executable: run zig build build-events first'
+    if [ "$command_name" = read ]; then
+        [ -n "$tenant" ] && [ -n "$event_id" ] || fail 'read requires --tenant and --event-id'
+        [ -x "$root/zig-out/bin/events" ] || fail 'missing executable: run zig build build-events first'
+    else
+        [ -n "$event_id" ] || fail 'check_seats requires --event-id'
+        operation_id="$(new_uuid)"
+        request="$(jq -cn --arg id "$operation_id" --arg event "$event_id" \
+            '{id:$id,name:"SeatReservation",body:{command:"check_seats",event_id:$event}}')"
+    fi
+fi
+if [ "$command_name" != read ]; then
+    [[ "$owner_token" =~ ^v4\.public\.[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)?$ &&
+        "${#owner_token}" -le 16384 ]] || fail 'PASETO_TOKEN must be a v4.public token'
+    command -v curl >/dev/null 2>&1 || fail 'missing required command: curl'
 fi
 command -v aws >/dev/null 2>&1 || fail 'missing required command: aws'
 aws_run() {
@@ -144,8 +167,19 @@ aws_run() {
 [ -z "$profile" ] || export AWS_PROFILE="$profile"
 unset AWS_DEFAULT_PROFILE
 export AWS_REGION="$region" AWS_DEFAULT_REGION="$region" AWS_EC2_METADATA_DISABLED=true
-credentials="$(aws_run configure export-credentials --format process 2>/dev/null)" ||
-    fail 'AWS credential export failed; authenticate the selected identity'
+if ! credentials="$(aws_run configure export-credentials --format process 2>/dev/null)"; then
+    sso_configuration="$(aws_run configure get sso_session 2>/dev/null || true)"
+    if [ -z "$sso_configuration" ]; then
+        sso_configuration="$(aws_run configure get sso_start_url 2>/dev/null || true)"
+    fi
+    [ -n "$sso_configuration" ] ||
+        fail 'AWS credential export failed; authenticate the selected identity'
+    printf 'events: AWS credentials unavailable; signing in with AWS SSO\n' >&2
+    aws_run sso login >&2 || fail 'AWS SSO login failed; authenticate the selected identity'
+    credentials="$(aws_run configure export-credentials --format process 2>/dev/null)" ||
+        fail 'AWS credential export failed after SSO login; authenticate the selected identity'
+    unset sso_configuration
+fi
 printf '%s' "$credentials" | jq -e 'type == "object" and
     all(.AccessKeyId,.SecretAccessKey; type == "string" and length > 0) and
     (.SessionToken == null or (.SessionToken|type == "string"))' >/dev/null 2>&1 ||
@@ -168,31 +202,80 @@ if [ "$command_name" = read ]; then
     exec "$root/zig-out/bin/events" read --tenant "$tenant" --event-id "$event_id"
 fi
 
-intake_url="$(aws_run cloudformation describe-stacks --stack-name "$stack_name" \
-    --query "Stacks[0].Outputs[?OutputKey=='IntakeFunctionUrl'].OutputValue | [0]" \
-    --output text --region "$region" 2>/dev/null)" ||
-    fail 'failed to resolve IntakeFunctionUrl from the selected stack'
-printf '%s' "$intake_url" | jq -Rse \
-    'test("^https://(\\[[0-9a-fA-F:.]+\\]|[^/?#@:[:space:]]+)(:[0-9]+)?/?$")' \
-    >/dev/null || fail 'selected stack has no valid IntakeFunctionUrl output'
-# Keep the bearer token out of process arguments and temporary files.
-response="$(
-    {
-        printf 'url = %s\n' "$(printf '%s' "$intake_url" | jq -Rs .)"
-        printf 'request = "POST"\nsilent\nshow-error\nconnect-timeout = 5\nmax-time = 30\n'
-        printf 'max-filesize = 65536\nproto = "=https"\nwrite-out = "\\n%%{http_code}"\n'
-        printf 'header = %s\n' "$(printf 'Authorization: Bearer %s' "$owner_token" | jq -Rs .)"
-        printf 'header = "Content-Type: application/json"\ndata = %s\n' \
-            "$(printf '%s' "$request" | jq -Rs .)"
-    } | curl --disable --config - 2>/dev/null
-)" || fail "creation request failed; retry with --event-id $event_id and the same classes and timeout"
-[[ "$response" == *$'\n'* ]] || fail "invalid intake response for Operation $event_id"
-status="${response##*$'\n'}"
-[[ "$status" =~ ^[0-9]{3}$ ]] || fail "invalid intake HTTP status for Operation $event_id"
-[ "$status" = 200 ] || fail "intake returned HTTP $status for Operation $event_id; retry with the same ID and configuration"
-printf '%s' "${response%$'\n'*}" | jq -ce --arg id "$event_id" '
-    if type == "object" and .id == $id and .name == "SeatReservation" and
-        (.state == "SUBMITTED" or .state == "COMPLETED") and
-        (.tenant|type == "string" and utf8bytelength >= 1 and utf8bytelength <= 64)
-    then . else error("invalid Operation") end
-' 2>/dev/null || fail "invalid intake Operation response for $event_id"
+stack_url() {
+    local key="$1" url
+    url="$(aws_run cloudformation describe-stacks --stack-name "$stack_name" \
+        --query "Stacks[0].Outputs[?OutputKey=='$key'].OutputValue | [0]" \
+        --output text --region "$region" 2>/dev/null)" ||
+        fail "failed to resolve $key from the selected stack"
+    printf '%s' "$url" | jq -Rse \
+        'test("^https://(\\[[0-9a-fA-F:.]+\\]|[^/?#@:[:space:]]+)(:[0-9]+)?/?$")' \
+        >/dev/null || fail "selected stack has no valid $key output"
+    printf '%s\n' "$url"
+}
+
+expected_tenant=null
+http_operation() {
+    local method="$1" url="$2" body="${3:-}" response status
+    # Keep the bearer token out of process arguments and temporary files.
+    response="$(
+        {
+            printf 'url = %s\n' "$(printf '%s' "$url" | jq -Rs .)"
+            printf 'request = "%s"\nsilent\nshow-error\nconnect-timeout = 5\nmax-time = 30\n' "$method"
+            printf 'max-filesize = 65536\nproto = "=https"\nwrite-out = "\\n%%{http_code}"\n'
+            printf 'header = %s\n' "$(printf 'Authorization: Bearer %s' "$owner_token" | jq -Rs .)"
+            if [ -n "$body" ]; then
+                printf 'header = "Content-Type: application/json"\ndata = %s\n' \
+                    "$(printf '%s' "$body" | jq -Rs .)"
+            fi
+        } | curl --disable --config - 2>/dev/null
+    )" || {
+        if [ "$command_name" = create ]; then
+            fail "creation request failed; retry with --event-id $event_id and the same classes and timeout"
+        fi
+        fail "$method request failed for Operation $operation_id"
+    }
+    [[ "$response" == *$'\n'* ]] || fail "invalid $method response for Operation $operation_id"
+    status="${response##*$'\n'}"
+    [[ "$status" =~ ^[0-9]{3}$ ]] || fail "invalid $method HTTP status for Operation $operation_id"
+    if [ "$status" != 200 ]; then
+        if [ "$command_name" = create ]; then
+            fail "intake returned HTTP $status for Operation $operation_id; retry with the same ID and configuration"
+        fi
+        fail "$method returned HTTP $status for Operation $operation_id"
+    fi
+    printf '%s' "${response%$'\n'*}" | jq -cse --arg id "$operation_id" \
+        --argjson tenant "$expected_tenant" --arg command "$command_name" '
+        (if length == 1 then .[0] else error("expected one Operation") end) |
+        if type == "object" and .id == $id and .name == "SeatReservation" and
+            (.state == "SUBMITTED" or .state == "COMPLETED") and
+            (.tenant|type == "string" and utf8bytelength >= 1 and utf8bytelength <= 64) and
+            ($tenant == null or .tenant == $tenant) and
+            ($command != "check_seats" or
+                (if .state == "COMPLETED" then
+                    (.result|type == "object" and
+                        (.type == "SUCCESS" or .type == "FAILURE") and .payload != null)
+                 else true end))
+        then . else error("invalid Operation") end
+    ' 2>/dev/null || fail "invalid $method Operation response for $operation_id"
+}
+
+intake_url="$(stack_url IntakeFunctionUrl)"
+if [ "$command_name" = create ]; then
+    http_operation POST "$intake_url" "$request"
+    exit 0
+fi
+
+# Resolve both endpoints before submitting work, so discovery failures create no Operation.
+query_url="$(stack_url QueryFunctionUrl)"
+operation="$(http_operation POST "$intake_url" "$request")"
+# The authenticated handler supplies the tenant; preserve its exact JSON string.
+expected_tenant="$(printf '%s' "$operation" | jq -c .tenant)"
+while :; do
+    operation="$(http_operation GET "${query_url%/}/$operation_id")"
+    printf '%s\n' "$operation"
+    if [ "$(printf '%s' "$operation" | jq -r .state)" = COMPLETED ]; then
+        exit 0
+    fi
+    sleep 1
+done
