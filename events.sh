@@ -22,6 +22,7 @@ Usage:
                    [--timeout-seconds SECONDS] [--event-id UUID]
   events.sh read --tenant TENANT --event-id UUID
   events.sh check_seats --event-id UUID
+  events.sh reserve_seat --event-id UUID --class TAG --quantity COUNT
 
 Create requires explicit seat classes and counts and PASETO_TOKEN; no stdin JSON.
 It submits an authenticated SeatReservation create_event Operation to the stack's
@@ -33,8 +34,13 @@ Read returns persisted Event metadata using the prebuilt zig-out/bin/events util
 Read requires explicit --tenant and --event-id; AWS credentials authorize metadata reads.
 The check_seats command requires --event-id and PASETO_TOKEN, which supplies the tenant.
 Any --tenant value supplied to check_seats is ignored.
-It submits a fresh Operation, then queries every second until COMPLETED.
+The reserve_seat command requires --event-id, one --class tag, a positive u32 --quantity,
+and PASETO_TOKEN. It submits reserve_seats and creates a timed hold without confirmation.
+Tenant overrides are rejected for reserve_seat; the verified token supplies the tenant.
+Both commands submit a fresh Operation, then query every second until COMPLETED,
+with no overall polling limit and no host binary required.
 Each query prints its Operation; the final one includes its SUCCESS or FAILURE result.
+Either terminal result exits 0. Uncertain requests are not automatically resubmitted.
 HTTP/configuration errors exit 2 and report the Operation UUID when available.
 
 Options override the environment. Profile: AWS_PROFILE, AWS_DEFAULT_PROFILE,
@@ -56,7 +62,7 @@ while [ "$#" -gt 0 ]; do
             value="$2"; shift 2 ;;
         --profile=*|--region=*|--stack-name=*)
             value="${option#*=}"; option="${option%%=*}"; shift ;;
-        create|read|check_seats) break ;;
+        create|read|check_seats|reserve_seat) break ;;
         *) fail 'invalid invocation; use --help' ;;
     esac
     [ -n "$value" ] || fail 'wrapper option values must be nonempty'
@@ -76,15 +82,15 @@ fi
     fail 'invalid wrapper configuration'
 command -v jq >/dev/null 2>&1 || fail 'missing required command: jq'
 
-event_id= tenant= timeout_seconds=300 classes='{}' class_count=0
+event_id= tenant= timeout_seconds=300 classes='{}' class_count=0 seat_class= quantity=
 while [ "$#" -gt 0 ]; do
     option="$1"
     case "$option" in
-        --event-id|--tenant|--class|--timeout-seconds)
+        --event-id|--tenant|--class|--timeout-seconds|--quantity)
             [ "$#" -ge 2 ] && [[ "$2" != --* && "$2" != -h ]] ||
                 fail 'missing command option value'
             value="$2"; shift 2 ;;
-        --event-id=*|--tenant=*|--class=*|--timeout-seconds=*)
+        --event-id=*|--tenant=*|--class=*|--timeout-seconds=*|--quantity=*)
             value="${option#*=}"; option="${option%%=*}"; shift ;;
         *) fail 'invalid command option; use --help' ;;
     esac
@@ -98,15 +104,33 @@ while [ "$#" -gt 0 ]; do
         --tenant)
             if [ "$command_name" = check_seats ]; then continue; fi
             [ "$command_name" = read ] && [ -z "$tenant" ] ||
-                fail '--tenant is accepted once for read only; create uses PASETO_TOKEN'
+                fail '--tenant is accepted once for read only; create and reserve_seat use PASETO_TOKEN'
             tenant="$value"
             printf '%s' "$tenant" | jq -Rse 'utf8bytelength >= 1 and utf8bytelength <= 64' \
                 >/dev/null || fail 'tenant must contain 1-64 UTF-8 bytes' ;;
         --timeout-seconds)
             [ "$command_name" = create ] || fail '--timeout-seconds requires create'
             timeout_seconds="$value" ;;
+        --quantity)
+            [ "$command_name" = reserve_seat ] && [ -z "$quantity" ] ||
+                fail '--quantity is accepted once for reserve_seat only'
+            [[ "$value" =~ ^[0-9]+$ ]] &&
+                jq -en --arg n "$value" '$n|tonumber|. >= 1 and . <= 4294967295' \
+                    >/dev/null 2>&1 || fail 'quantity must be a positive u32 integer'
+            quantity="$value" ;;
         --class)
-            [ "$command_name" = create ] || fail '--class requires create'
+            if [ "$command_name" = reserve_seat ]; then
+                [ -z "$seat_class" ] || fail 'reserve_seat accepts exactly one --class tag'
+                seat_class="$(jq -ern --arg tag "$value" '
+                    $tag | select(utf8bytelength >= 1 and utf8bytelength <= 54 and
+                        (explode|all(. > 31 and (. < 127 or . > 159))) and
+                        . != "capacity" and . != "allocation")
+                ' 2>/dev/null)" || fail 'invalid seat class tag'
+                # Reject invalid UTF-8 rather than accepting jq replacement characters.
+                [ "$seat_class" = "$value" ] || fail 'invalid seat class tag'
+                continue
+            fi
+            [ "$command_name" = create ] || fail '--class requires create or reserve_seat'
             [[ "$value" == *=* ]] || fail 'class must be TAG=COUNT'
             tag="${value%=*}" count="${value##*=}"
             [[ "$count" =~ ^[0-9]+$ ]] || fail 'seat counts must be positive u32 integers'
@@ -143,10 +167,21 @@ else
         [ -n "$tenant" ] && [ -n "$event_id" ] || fail 'read requires --tenant and --event-id'
         [ -x "$root/zig-out/bin/events" ] || fail 'missing executable: run zig build build-events first'
     else
-        [ -n "$event_id" ] || fail 'check_seats requires --event-id'
+        [ -n "$event_id" ] || fail "$command_name requires --event-id"
+        if [ "$command_name" = reserve_seat ]; then
+            [ -n "$seat_class" ] && [ -n "$quantity" ] ||
+                fail 'reserve_seat requires --class and --quantity'
+        fi
         operation_id="$(new_uuid)"
-        request="$(jq -cn --arg id "$operation_id" --arg event "$event_id" \
-            '{id:$id,name:"SeatReservation",body:{command:"check_seats",event_id:$event}}')"
+        if [ "$command_name" = reserve_seat ]; then
+            request="$(jq -cn --arg id "$operation_id" --arg event "$event_id" \
+                --arg class "$seat_class" --arg n "$quantity" \
+                '{id:$id,name:"SeatReservation",body:{command:"reserve_seats",event_id:$event,
+                    class:$class,quantity:($n|tonumber)}}')"
+        else
+            request="$(jq -cn --arg id "$operation_id" --arg event "$event_id" \
+                '{id:$id,name:"SeatReservation",body:{command:"check_seats",event_id:$event}}')"
+        fi
     fi
 fi
 if [ "$command_name" != read ]; then
@@ -251,7 +286,7 @@ http_operation() {
             (.state == "SUBMITTED" or .state == "COMPLETED") and
             (.tenant|type == "string" and utf8bytelength >= 1 and utf8bytelength <= 64) and
             ($tenant == null or .tenant == $tenant) and
-            ($command != "check_seats" or
+            ($command == "create" or
                 (if .state == "COMPLETED" then
                     (.result|type == "object" and
                         (.type == "SUCCESS" or .type == "FAILURE") and .payload != null)

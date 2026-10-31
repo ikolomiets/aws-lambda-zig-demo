@@ -21,7 +21,8 @@ run_events() { bash "$TEST_DIR/repo/events.sh" "$@"; }
 reject() {
     : >"$AWS_CALLS"
     : >"$HTTP_CALLS"
-    if run_events "$@" >"$TEST_DIR/output" 2>&1; then fail_test 'accepted invalid arguments'; fi
+    if run_events "$@" >"$TEST_DIR/output" 2>&1; then fail_test 'accepted invalid arguments'
+    else [ "$?" -eq 2 ] || fail_test 'invalid arguments returned the wrong exit code'; fi
     [ ! -s "$AWS_CALLS" ] || fail_test 'invalid arguments contacted AWS'
     [ ! -s "$HTTP_CALLS" ] || fail_test 'invalid arguments contacted HTTP endpoints'
 }
@@ -104,11 +105,14 @@ case "$method" in
     *) exit 96 ;;
 esac
 jq -c --arg state "$state" --arg tenant "$tenant" --arg type "${RESULT_TYPE:-SUCCESS}" \
+    --arg code "${RESULT_CODE:-event_unavailable}" \
     --arg id "${QUERY_OPERATION_ID:-}" --arg name "${QUERY_OPERATION_NAME:-SeatReservation}" \
     --argjson missing "${MISSING_RESULT:-false}" '
     {id:.id,name:.name,tenant:$tenant,state:$state} +
     (if $state == "COMPLETED" and ($missing|not) then
-        {result:{type:$type,payload:(if $type == "FAILURE" then {code:"event_unavailable"}
+        {result:{type:$type,payload:(if $type == "FAILURE" then {code:$code}
+            elif .body.command == "reserve_seats" then
+                {event_id:.body.event_id,class:.body.class,quantity:.body.quantity,reservation_id:"123"}
             else {event_id:.body.event_id,classes:{general:{total:100,available:97}}} end)}}
      else {} end)
     | if $state == "COMPLETED" then
@@ -126,7 +130,7 @@ MOCK
 chmod +x "$TEST_DIR/bin/aws" "$TEST_DIR/bin/curl" "$TEST_DIR/bin/sleep"
 
 # Help and bad invocations require no credentials, binary, or cloud discovery.
-for args in help create read check_seats; do
+for args in help create read check_seats reserve_seat; do
     if [ "$args" = help ]; then run_events --help >/dev/null
     else run_events "$args" --help >/dev/null; fi
 done
@@ -152,6 +156,33 @@ reject check_seats --event-id "$EVENT_ID" --class general=1
 reject check_seats --event-id "$EVENT_ID" --timeout-seconds 30
 PASETO_TOKEN= reject check_seats --event-id "$EVENT_ID"
 PASETO_TOKEN=malformed reject check_seats --event-id "$EVENT_ID"
+reject reserve_seat
+reject reserve_seat --event-id "$EVENT_ID"
+reject reserve_seat --event-id "$EVENT_ID" --class general
+reject reserve_seat --event-id "$EVENT_ID" --quantity 2
+reject reserve_seat --class general --quantity 2
+reject reserve_seat --event-id bad --class general --quantity 2
+reject reserve_seat --event-id "$EVENT_ID" --event-id "$EVENT_ID" --class general --quantity 2
+reject reserve_seat --event-id "$EVENT_ID" --class general --class premium --quantity 2
+reject reserve_seat --event-id "$EVENT_ID" --class general --quantity 2 --quantity 3
+reject reserve_seat --event-id "$EVENT_ID" --class general --quantity 2 --tenant override
+reject reserve_seat --event-id "$EVENT_ID" --class general --quantity 2 --timeout-seconds 30
+reject reserve_seat --event-id "$EVENT_ID" --class general --quantity
+reject reserve_seat --event-id "$EVENT_ID" --class --quantity 2
+reject reserve_seat --event-id "$EVENT_ID" --class= --quantity 2
+for quantity in '' 0 -1 1.5 1e2 4294967296 invalid; do
+    reject reserve_seat --event-id "$EVENT_ID" --class general --quantity="$quantity"
+done
+for tag in capacity allocation $'bad\nclass' $'bad\177class' $'bad\302\200class' \
+    $'bad\377class' $'bad\300\257class' \
+    "$(printf '%055d' 0)" "$(printf 'é%.0s' {1..28})"; do
+    reject reserve_seat --event-id "$EVENT_ID" --class "$tag" --quantity 2
+done
+PASETO_TOKEN= reject reserve_seat --event-id "$EVENT_ID" --class general --quantity 2
+PASETO_TOKEN=malformed reject reserve_seat --event-id "$EVENT_ID" --class general --quantity 2
+reject create --class general=3 --quantity 2
+reject read --tenant fixture-owner --event-id "$EVENT_ID" --quantity 2
+reject check_seats --event-id "$EVENT_ID" --quantity 2
 
 # Creation has no host-binary prerequisite and uses explicit classes, with no stdin.
 output="$(run_events create --class general=100 --class premium=25 --event-id "$EVENT_ID" </dev/null)"
@@ -204,6 +235,53 @@ printf '%s' "$output" | jq -e --arg previous "$previous_id" '.id != $previous an
     .tenant == "fixture-owner" and .state == "COMPLETED" and
     .result == {type:"FAILURE",payload:{code:"event_unavailable"}}' >/dev/null
 [ ! -s "$SLEEP_CALLS" ] || fail_test 'check slept after completion'
+
+# Reservations use the public intake and query path without a host binary.
+: >"$AWS_CALLS"
+: >"$HTTP_CALLS"
+: >"$SLEEP_CALLS"
+output="$(run_events --profile reserve-profile --region ca-central-1 --stack-name reserve-stack \
+    reserve_seat --event-id "$EVENT_ID" --class general --quantity 2 </dev/null)"
+jq -e --arg event "$EVENT_ID" '.body == {command:"reserve_seats",event_id:$event,class:"general",quantity:2} and
+    .name == "SeatReservation" and .id != $event and
+    (.id|test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")) and
+    (keys == ["body","id","name"])' "$REQUEST_FILE" >/dev/null
+operation_id="$(jq -r .id "$REQUEST_FILE")"
+printf '%s' "$output" | jq -se --arg id "$operation_id" --arg event "$EVENT_ID" 'length == 3 and
+    all(.[]; .id == $id and .tenant == "fixture-owner") and
+    map(.state) == ["SUBMITTED","SUBMITTED","COMPLETED"] and
+    .[-1].result == {type:"SUCCESS",payload:{event_id:$event,class:"general",quantity:2,reservation_id:"123"}}' >/dev/null
+[ "$(cat "$QUERY_COUNT")" = 3 ] || fail_test 'reserve did not poll until completion'
+[ "$(wc -l <"$SLEEP_CALLS" | tr -d ' ')" = 2 ] || fail_test 'reserve did not wait between submitted reads'
+[ "$(cat "$HTTP_CALLS")" = "$(printf 'POST https://intake.invalid/\nGET https://query.invalid/%s\nGET https://query.invalid/%s\nGET https://query.invalid/%s' \
+    "$operation_id" "$operation_id" "$operation_id")" ] || fail_test 'unexpected reserve HTTP calls'
+calls="$(cat "$AWS_CALLS")"
+contains "$calls" IntakeFunctionUrl
+contains "$calls" QueryFunctionUrl
+contains "$calls" '--profile reserve-profile'
+contains "$calls" '--region ca-central-1'
+contains "$calls" '--stack-name reserve-stack'
+case "$calls" in *describe-stack-resource*) fail_test 'reserve read Event metadata' ;; esac
+
+# Each invocation creates a new reservation Operation; a completed failure exits 0.
+previous_id="$operation_id"
+: >"$SLEEP_CALLS"
+output="$(SUBMITTED_READS=0 RESULT_TYPE=FAILURE RESULT_CODE=insufficient_seats run_events \
+    reserve_seat --event-id="$EVENT_ID" --class=general --quantity=2)"
+printf '%s' "$output" | jq -e --arg previous "$previous_id" '.id != $previous and
+    .tenant == "fixture-owner" and .state == "COMPLETED" and
+    .result == {type:"FAILURE",payload:{code:"insufficient_seats"}}' >/dev/null
+[ ! -s "$SLEEP_CALLS" ] || fail_test 'reserve slept after completion'
+
+# Scalar tags retain their exact UTF-8 bytes and punctuation; quantity spans positive u32.
+for tag in 'A=B' ' é "premium" \' "$(printf 'é%.0s' {1..27})"; do
+    output="$(SUBMITTED_READS=0 run_events reserve_seat --event-id "$EVENT_ID" --class "$tag" --quantity 1)"
+    jq -e --arg tag "$tag" '.body.class == $tag and .body.quantity == 1' "$REQUEST_FILE" >/dev/null
+    printf '%s' "$output" | jq -e --arg tag "$tag" '.result.payload.class == $tag' >/dev/null
+done
+output="$(SUBMITTED_READS=0 run_events reserve_seat --event-id="$EVENT_ID" --class=general --quantity=4294967295)"
+jq -e '.body.quantity == 4294967295' "$REQUEST_FILE" >/dev/null
+printf '%s' "$output" | jq -e '.result.payload.quantity == 4294967295' >/dev/null
 
 # Expired modern and legacy SSO sessions refresh using the selected identity.
 for source in cli aws default legacy chain; do
@@ -264,29 +342,37 @@ done
 
 # The authenticated intake supplies the tenant; the wrapper does not decode token claims.
 for tenant in another-owner 'é-tenant' $' tenant\n'; do
-    output="$(SUBMITTED_READS=0 RESPONSE_TENANT="$tenant" run_events check_seats --event-id "$EVENT_ID")"
-    printf '%s' "$output" | jq -e --arg tenant "$tenant" '.tenant == $tenant' >/dev/null
+    for command_name in check_seats reserve_seat; do
+        command_args=("$command_name" --event-id "$EVENT_ID")
+        if [ "$command_name" = reserve_seat ]; then command_args+=(--class general --quantity 2); fi
+        output="$(SUBMITTED_READS=0 RESPONSE_TENANT="$tenant" run_events "${command_args[@]}")"
+        printf '%s' "$output" | jq -e --arg tenant "$tenant" '.tenant == $tenant' >/dev/null
+    done
 done
 
 # Invalid endpoint discovery fails before intake; transport and identity errors stop polling.
-for endpoint in INTAKE_URL QUERY_URL; do
-    : >"$HTTP_CALLS"
-    if output="$(env "$endpoint=http://invalid/" bash "$TEST_DIR/repo/events.sh" check_seats \
-        --event-id "$EVENT_ID" 2>&1)"; then fail_test 'accepted invalid endpoint'; fi
-    [ ! -s "$HTTP_CALLS" ] || fail_test 'invalid endpoint submitted work'
-done
-for fault in 'CURL_FAILURE=true' 'BAD_RESPONSE=true' 'HTTP_STATUS=401' 'RESPONSE_TENANT=' \
-    "RESPONSE_TENANT=$(printf '%065d' 0)" \
-    'QUERY_CURL_FAILURE=true' 'BAD_QUERY_RESPONSE=true' 'QUERY_HTTP_STATUS=401' 'QUERY_TENANT=foreign' \
-    'EXTRA_QUERY_RESPONSE=true' 'MISSING_RESULT=true' 'RESULT_TYPE=INVALID' \
-    'QUERY_OPERATION_ID=foreign' 'QUERY_OPERATION_NAME=foreign'; do
-    : >"$SLEEP_CALLS"
-    if output="$(env "$fault" SUBMITTED_READS=0 bash "$TEST_DIR/repo/events.sh" check_seats \
-        --event-id "$EVENT_ID" 2>&1)"; then fail_test "accepted $fault"
-    else [ "$?" -eq 2 ] || fail_test "wrong exit code for $fault"; fi
-    contains "$output" "$(jq -r .id "$REQUEST_FILE")"
-    [ ! -s "$SLEEP_CALLS" ] || fail_test 'check retried a failed request'
-    case "$output" in *v4.public.fixture*|*fixture-secret*) fail_test 'failure disclosed credentials' ;; esac
+for command_name in check_seats reserve_seat; do
+    command_args=("$command_name" --event-id "$EVENT_ID")
+    if [ "$command_name" = reserve_seat ]; then command_args+=(--class general --quantity 2); fi
+    for endpoint in INTAKE_URL QUERY_URL; do
+        : >"$HTTP_CALLS"
+        if output="$(env "$endpoint=http://invalid/" bash "$TEST_DIR/repo/events.sh" \
+            "${command_args[@]}" 2>&1)"; then fail_test 'accepted invalid endpoint'; fi
+        [ ! -s "$HTTP_CALLS" ] || fail_test 'invalid endpoint submitted work'
+    done
+    for fault in 'CURL_FAILURE=true' 'BAD_RESPONSE=true' 'HTTP_STATUS=401' 'RESPONSE_TENANT=' \
+        "RESPONSE_TENANT=$(printf '%065d' 0)" \
+        'QUERY_CURL_FAILURE=true' 'BAD_QUERY_RESPONSE=true' 'QUERY_HTTP_STATUS=401' 'QUERY_TENANT=foreign' \
+        'EXTRA_QUERY_RESPONSE=true' 'MISSING_RESULT=true' 'RESULT_TYPE=INVALID' \
+        'QUERY_OPERATION_ID=foreign' 'QUERY_OPERATION_NAME=foreign'; do
+        : >"$SLEEP_CALLS"
+        if output="$(env "$fault" SUBMITTED_READS=0 bash "$TEST_DIR/repo/events.sh" \
+            "${command_args[@]}" 2>&1)"; then fail_test "accepted $fault"
+        else [ "$?" -eq 2 ] || fail_test "wrong exit code for $fault"; fi
+        contains "$output" "$(jq -r .id "$REQUEST_FILE")"
+        [ ! -s "$SLEEP_CALLS" ] || fail_test "$command_name retried a failed request"
+        case "$output" in *v4.public.fixture*|*fixture-secret*) fail_test 'failure disclosed credentials' ;; esac
+    done
 done
 
 cat >"$TEST_DIR/repo/zig-out/bin/events" <<'MOCK'
