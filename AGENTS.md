@@ -84,8 +84,10 @@ cloud-side validation. Leave changes uncommitted unless a commit is requested.
 
 ## Commit Messages
 
-Leave agent-made changes uncommitted for code review. Do not create a commit at
-the end of a session unless the user explicitly requests one.
+For commit-only requests, confirm files and exclusions, reuse session reviews and
+passing checks for unchanged content, stage explicit paths, run the AWS privacy
+check, commit, and verify status. Review only unreviewed changes or privacy flags;
+report the hash and exclusions.
 
 Write commit messages that are sufficiently detailed for a future maintainer to
 understand the change without reconstructing it from the diff. Use a concise
@@ -95,8 +97,9 @@ safety or migration decisions.
 
 ## Security and Private AWS Details
 
-Before committing or publishing changes, check tracked and newly added files for
-AWS details that should remain private. Do not check in:
+Before committing or publishing, check added lines in modified files and full
+contents of new files for private AWS details. Reuse prior checks of unchanged
+content. Do not check in:
 
 - AWS access keys, secret access keys, session tokens, SSO cache data, or CLI
   credential/config files.
