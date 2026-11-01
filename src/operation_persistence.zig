@@ -2,6 +2,7 @@ const std = @import("std");
 const aws = @import("aws");
 const dynamodb = @import("dynamodb");
 const operation = @import("operation");
+const logging = @import("outcome_log");
 
 const Allocator = std.mem.Allocator;
 const AttributeValue = dynamodb.types.AttributeValue;
@@ -13,6 +14,83 @@ const hash_size = 64;
 const attribute_count_min = 7;
 const attribute_count_max = 8;
 const create_condition = "attribute_not_exists(id)";
+
+pub const SeatIdentity = struct { id: u128, tenant: []const u8 };
+
+/// Request backing storage belongs to arena through the SDK call.
+pub fn create_request(
+    arena: Allocator,
+    table: []const u8,
+    source: *const operation.Operation,
+) !dynamodb.PutItemInput {
+    const persisted = persistentCopy(source);
+    try validateCreation(&persisted);
+    const request = try arena.create(CreateRequest);
+    try createRequestInit(request, &persisted);
+    return .{
+        .table_name = try arena.dupe(u8, table),
+        .item = request.items[0..request.item_count],
+        .condition_expression = create_condition,
+    };
+}
+
+pub fn decode_item(arena: Allocator, item: []const Attribute) !operation.Operation {
+    return decodeItem(arena, item);
+}
+
+pub fn read_request(arena: Allocator, table: []const u8, id: u128) !dynamodb.GetItemInput {
+    const request = try arena.create(ReadRequest);
+    readRequestInit(request, id);
+    return .{
+        .table_name = try arena.dupe(u8, table),
+        .key = &request.key,
+        .consistent_read = true,
+    };
+}
+
+/// Seat finalization binds trusted identity without comparing the original input hash.
+/// This Update is also composable with Event finalization in TransactWriteItems.
+pub fn seat_completion_update(
+    arena: Allocator,
+    table: []const u8,
+    identity: *const SeatIdentity,
+    completion: *const operation.Completion,
+    now: operation.UnixSeconds,
+) !dynamodb.types.Update {
+    try operation.validateTenant(identity.tenant);
+    const expires_at = try operation.expires_at_from_last_updated(now);
+    const result_buffer = try arena.create([operation.result_size_max]u8);
+    const result = try operation.writeCompletionJSON(result_buffer, completion);
+    const id_buffer = try arena.create([id_size]u8);
+    const id = operation.uuidToString(identity.id, id_buffer);
+    const key = try arena.dupe(Attribute, &.{stringAttribute("id", id)});
+    const names = try arena.dupe(AttributeName, &.{
+        .{ .key = "#tenant", .value = "tenant" },
+        .{ .key = "#name", .value = "name" },
+        .{ .key = "#state", .value = "state" },
+        .{ .key = "#result", .value = "result" },
+    });
+    const values = try arena.dupe(Attribute, &.{
+        stringAttribute(":id", id),
+        stringAttribute(":tenant", try arena.dupe(u8, identity.tenant)),
+        stringAttribute(":name", "SeatReservation"),
+        stringAttribute(":submitted", "SUBMITTED"),
+        stringAttribute(":completed", "COMPLETED"),
+        stringAttribute(":result", result),
+        numberAttribute(":now", try std.fmt.allocPrint(arena, "{d}", .{now})),
+        numberAttribute(":expires_at", try std.fmt.allocPrint(arena, "{d}", .{expires_at})),
+    });
+    return .{
+        .table_name = try arena.dupe(u8, table),
+        .key = key,
+        .expression_attribute_names = names,
+        .expression_attribute_values = values,
+        .condition_expression = "id = :id AND #tenant = :tenant AND #name = :name AND " ++
+            "#state = :submitted AND attribute_not_exists(#result)",
+        .update_expression = completion_update,
+        .return_values_on_condition_check_failure = .all_old,
+    };
+}
 
 comptime {
     std.debug.assert(id_size == 36);
@@ -56,6 +134,15 @@ pub const Persistence = struct {
         arena: Allocator,
         source: *const operation.Operation,
     ) !operation.Operation {
+        return self.create_observed(arena, source, null);
+    }
+
+    pub fn create_observed(
+        self: *Self,
+        arena: Allocator,
+        source: *const operation.Operation,
+        trace: ?*const logging.Context,
+    ) !operation.Operation {
         var persisted = persistentCopy(source);
         try validateCreation(&persisted);
 
@@ -69,6 +156,7 @@ pub const Persistence = struct {
             .return_values_on_condition_check_failure = .all_old,
             .table_name = self.table_name,
         }, .{ .diagnostic = &diagnostic }) catch |err| {
+            if (trace) |observer| observer.aws_error(err, &diagnostic);
             return createError(arena, err, &diagnostic, &persisted);
         };
         return persisted;
@@ -155,6 +243,17 @@ pub const Persistence = struct {
         completion: *const operation.Completion,
         now: operation.UnixSeconds,
     ) !void {
+        return self.complete_by_id_observed(arena, id, completion, now, null);
+    }
+
+    pub fn complete_by_id_observed(
+        self: *Self,
+        arena: Allocator,
+        id: u128,
+        completion: *const operation.Completion,
+        now: operation.UnixSeconds,
+        trace: ?*const logging.Context,
+    ) !void {
         const request = try arena.create(CompletionByIdRequest);
         defer arena.destroy(request);
         try completionByIdRequestInit(request, id, completion, now);
@@ -167,6 +266,7 @@ pub const Persistence = struct {
             .table_name = self.table_name,
             .update_expression = completion_update,
         }, .{ .diagnostic = &diagnostic }) catch |err| {
+            if (trace) |observer| observer.aws_error(err, &diagnostic);
             return writeError(err, &diagnostic, error.OperationConflict);
         };
     }
@@ -1676,6 +1776,30 @@ pub const test_support = if (@import("builtin").is_test) struct {
             var store: Store = .{};
             store.entries[0] = persistentCopy(queued);
             return store;
+        }
+
+        pub fn create(
+            self: *Store,
+            arena: Allocator,
+            source: *const operation.Operation,
+        ) !operation.Operation {
+            const request = try arena.create(CreateRequest);
+            defer arena.destroy(request);
+            try createRequestInit(request, source);
+            const candidate = try decodeItem(arena, request.items[0..request.item_count]);
+            for (self.entries) |slot| {
+                if (slot) |entry| {
+                    if (entry.id != candidate.id) continue;
+                    if (!std.mem.eql(u8, &entry.hash.?, &candidate.hash.?)) return error.OperationConflict;
+                    return entry;
+                }
+            }
+            for (&self.entries) |*slot| {
+                if (slot.* != null) continue;
+                slot.* = candidate;
+                return candidate;
+            }
+            return error.TestStoreFull;
         }
 
         pub fn completeById(self: *Store, arena: Allocator, id: u128, completion: *const operation.Completion, now: operation.UnixSeconds) !void {

@@ -56,6 +56,13 @@ Options:
                          TigerBeetle processor name. Defaults to tiger-beetle-processor.
   --tiger-beetle-completion-processor-name NAME
                          Completion processor name. Defaults to tiger-beetle-completion-processor.
+  --seat-reservation-processor-name NAME
+                         Seat submission Lambda name.
+  --seat-reservation-completion-processor-name NAME
+                         Seat completion Lambda name.
+  --existing-ledger-counter-table-name NAME
+                         Reference an existing counter table in this account and Region.
+  --ledger-counter-id ID  Select the counter record. Defaults to global.
   --tigerbeetle-cluster-id ID
                          Unsigned decimal cluster ID. Defaults to 0.
   --tigerbeetle-addresses ADDRESSES
@@ -1795,6 +1802,10 @@ deploy_wireguard_cleanup_phase() {
     local VPC_ID="$WIREGUARD_CLEANUP_VPC_ID"
     local LAMBDA_ROUTE_TABLE_ID="$WIREGUARD_CLEANUP_ROUTE_TABLE_ID"
 
+    if [ "$CLEANUP" -eq 1 ]; then
+        update_wireguard_cleanup_state "$retain_cleanup_resources"
+        return
+    fi
     deploy_wireguard_stack_phase "$retain_cleanup_resources" "$phase_description"
 }
 
@@ -1828,6 +1839,8 @@ build_wireguard_parameter_reset_overrides() {
 }
 
 clear_saved_wireguard_parameters() {
+    # Owned-resource teardown deletes the stack next, including saved inputs.
+    [ "$CLEANUP" -eq 0 ] || return 0
     build_wireguard_parameter_reset_overrides
     deploy_stack_phase "Clearing saved WireGuard inputs"
 }
@@ -2108,6 +2121,8 @@ parse_wireguard_options() {
                     --profile | --region | --stack-name | \
                         --intake-function-name | --query-function-name | \
                         --tiger-beetle-processor-name | --tiger-beetle-completion-processor-name | \
+                        --seat-reservation-processor-name | --seat-reservation-completion-processor-name | \
+                        --existing-ledger-counter-table-name | --ledger-counter-id | \
                         --tigerbeetle-cluster-id | \
                         --tigerbeetle-addresses | --lambda-principal)
                         need_value "$1" "${2:-}"

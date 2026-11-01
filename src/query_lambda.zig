@@ -1220,6 +1220,27 @@ test "authenticated query preserves full 96 KiB Result inside HTTP metadata fram
 
 /// Runs the authenticated query handler with a local persistence response and an empty cache.
 pub const test_support = if (@import("builtin").is_test) struct {
+    pub fn query_with_backend(
+        allocator: Allocator,
+        id: u128,
+        subject: []const u8,
+        backend: anytype,
+    ) ![]const u8 {
+        const token = try testTokenForSubject(0x72, subject);
+        defer std.testing.allocator.free(token);
+        var environment = try testEnvironment(0x72);
+        defer environment.deinit();
+        var uuid: [operation.uuid_string_size]u8 = undefined;
+        const path = try std.fmt.allocPrint(allocator, "/{s}", .{operation.uuidToString(id, &uuid)});
+        defer allocator.free(path);
+        const event = try testRequestEvent(.{ .method = .GET, .token = token, .raw_path = path });
+        defer std.testing.allocator.free(event);
+        var cache: OperationCache = undefined;
+        OperationCache.init(&cache, allocator);
+        defer cache.deinit();
+        return handleInvocation(allocator, event, &environment, QueryAdapter.init(backend, &cache), 1000, 0);
+    }
+
     pub fn query(allocator: Allocator, stored: *const operation.Operation) ![]const u8 {
         const token = try testTokenForSubject(0x72, stored.tenant);
         defer std.testing.allocator.free(token);

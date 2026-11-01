@@ -7,7 +7,7 @@ account lookups, or any combination. Whole-Operation preflight prevents invalid 
 native effects; independent native creation chains and conditional Completion persistence support
 redelivery under the operating assumptions below.
 
-This document owns processor behavior and its rationale. [CONTEXT.md](../CONTEXT.md) owns domain
+This document owns processor behavior and its rationale. [GLOSSARY.md](../GLOSSARY.md) owns domain
 vocabulary; the [hash ADR](adr/0001-operation-json-hash-contract.md) and
 [lifecycle ADR](adr/0002-two-state-operation-state.md) own cross-cutting decisions. The
 [native wrapper reference](ZIG_WRAPPER_FOR_TIGERBEETLE.md) owns the C ABI, packaging and client
@@ -27,16 +27,26 @@ shared [`processor_message.zig`](../src/processor_message.zig) codec. See
 - Operation Tenant is server-owned. Intake authentication and tenant-authorized query reads apply.
   The processor has no tenant-scoped native resource ownership or access policy.
 - Intake and persistence use BLAKE3-256 over the compact normalized fixed-order tenant/name/Body
-  envelope. Processors receive no tenant, name, hash, state or timestamps and do not recompute
-  that hash. The internal queue-producer boundary is trusted.
+  envelope. Processor Messages carry trusted tenant and opaque Context, but no name, hash, state
+  or timestamps. Processors do not recompute that hash. The internal queue-producer boundary is
+  trusted; tenant and Context are not a cryptographic binding to the original Operation input.
 - Public intake Bodies are capped at 4,096 bytes. Internal Processor Message Bodies are
   capped at 98,304 compact JSON bytes (96 KiB), independently of intake admission. Persisted
-  Results have a 96 KiB complete-envelope limit.
+  Results have a 96 KiB complete-envelope limit. Compact Context is capped at 4,096 bytes and
+  the complete compact Processor Message at 115,328 bytes. Raw message input has the same
+  envelope cap before JSON parsing; SQS request and Lambda event escaping are separate layers.
 - Intake routes Operation name `TigerBeetle` through `TigerBeetleQueue`. Every internal SQS
-  record contains exactly `{operation_id, body, result_queue?}`. UUIDs are canonical lowercase
-  hyphenated strings; `body` may be any JSON value. Unknown fields and duplicate decoded keys
+  record contains exactly `{operation_id, tenant, body, context, result_queue?}`. UUIDs are canonical
+  lowercase hyphenated strings. Tenant contains 1–64 decoded UTF-8 bytes, preserving its spelling
+  without trimming or normalization. `body` and `context` may be any JSON values; explicit null
+  means no Context, while omission is invalid. Unknown fields and duplicate decoded keys
   are rejected. A supplied route must be a nonempty UTF-8 string, at most 2,048 bytes, without
   control characters; omission, rather than null, selects default behavior.
+- Intake derives tenant only from the verified PASETO subject and supplies null Context. Public
+  callers cannot supply tenant, Context or routing. The native processor preserves tenant and
+  Context on every outgoing Processor Message, including admission and native diagnostics,
+  without interpreting either as a native resource policy. Public Results contain only the
+  final interpretation of Body and acquire no Processor Message metadata.
 - Incoming `result_queue` selects the destination of this processor's output, falling back to
   `COMPLETION_QUEUE_URL`. The processor independently chooses its outgoing route; TigerBeetle
   omits it. Public intake accepts no routing field. There is no chain orchestration here.
@@ -239,6 +249,47 @@ retry its source and every later unpublished source, together with unfinished wo
 sends stay acknowledged. The final consumer receives one message per invocation and performs one
 conditional completion write; a transient failure retries that message independently.
 
+## Structured outcome logs
+
+The executor and completion processor use the shared, synchronous 8 KiB JSON
+emitter described in the [seat reference](SEAT_RESERVATION.md#structured-outcome-logs).
+Their component names are `tigerbeetle_executor` and `tigerbeetle_completion`.
+Every record carries schema version, level, failed or completed stage, Lambda
+request ID, available Operation UUID, SQS message ID, recognized seat command,
+reason, failure code and Result type; unavailable metadata is null. The executor
+logs metadata instead of the full incoming Body. Logging failure never changes
+execution, persistence or acknowledgements.
+
+Before entering native execution, every admitted source emits a correlated INFO
+`started` record. A timeout can leave this record without a final summary. Bounded
+`native_status_counts` details record family, numeric status and count independently
+of publication. Native chain rejections are WARN. Admission diagnostics use safe
+`diagnostic_code` values without logging caller fields, aliases or resource IDs.
+The executor does not interpret terminal Results for logging.
+
+The final executor summary is `published` only after a successful SQS send, and
+its `result_type` is always null. Publication establishes delivery to the next
+processor, not terminal Operation success. Unfinished work logs `retry` with a
+native-stage reason; allocation failure logs the admission or scratch stage. A
+failed publication logs its error and stage, while later unpublished sources log
+`BlockedByEarlierPublication`. Successfully published sources remain acknowledged.
+Invalid envelopes log `acknowledged_invalid` at ERROR without native execution or
+a Result; allocation failures retry.
+
+Completion logs INFO `finalized` with `SUCCESS` or `FAILURE` only after persistence
+succeeds. A malformed native Body in a valid envelope follows the same failure
+persistence path and records the interpretation reason. `OperationConflict` logs
+INFO `acknowledged_conflict` with null Result type: no readback is performed and
+no saved winner is claimed. Other persistence failures log ERROR `retry`.
+Malformed envelopes acknowledge as ERROR `acknowledged_invalid` without a Result.
+Invocation failures without identifiable records log ERROR with the failed stage.
+AWS detail records capture safe code, status and request ID before diagnostic
+release and distinguish transport errors and expected conditional conflicts.
+
+Operational [rollout and acceptance](DEPLOY_AWS_LAMBDA_WITH_SAM.md#outcome-log-rollout-and-manual-acceptance)
+and [correlation queries](DEPLOY_AWS_LAMBDA_WITH_SAM.md#investigate-structured-outcomes)
+remain manual.
+
 ## Recovery and operating assumptions
 
 Retain trustworthy outcomes only within the live invocation. Redelivery repeats validation and normal
@@ -313,6 +364,48 @@ Use assertions for programmer invariants, capacities, chain/range coverage, phas
 serializer proofs. Handle malformed external replies, allocation/native/publication failures as errors.
 Retain the repository's scoped dynamic invocation-allocation allowance and follow Tiger Style
 without unrelated refactors.
+
+## Test navigation
+
+Deterministic tests are embedded beside the implementation in `src/`. The composed
+test `authenticated pipeline retains Results through diagnostics duplicates and failed sends`
+in [the processor source](../src/tiger_beetle_processor.zig) exercises authenticated
+intake → native execution adapter → Completion → authenticated query, including
+diagnostics, duplicate delivery, and failed or uncertain sends. `FakeExecution`
+supplies native replies and `SerialPublisher` captures sends; this test uses no
+live TigerBeetle or AWS service.
+
+Its `test_pipeline_submit`, `test_pipeline_query`, and `test_pipeline_redelivery`
+helpers call `test_support.submit` in [intake](../src/intake_lambda.zig),
+`test_support.invoke` in [Completion](../src/tiger_beetle_completion_processor.zig),
+and `test_support.query` in [query](../src/query_lambda.zig).
+`test_support.Store` in [persistence](../src/operation_persistence.zig) uses the
+real item/request encoders for deterministic storage behavior. In
+[build.zig](../build.zig), `tiger_beetle_processor_test_mod` wires those host
+imports, including `lambda_test_mod`, `query_test_mod`,
+`tiger_beetle_completion_processor_test_mod`, and `host_operation_persistence`.
+The existing `zig build test-tigerbeetle-processor` target selects these tests;
+`zig build test` also includes them.
+
+Locate the test, helper callers, and host wiring by symbols before reading their
+surrounding declarations:
+
+```sh
+rg -n 'authenticated pipeline|test_pipeline_|test_support\.(submit|invoke|query)|test_support.Store' src/tiger_beetle_processor.zig
+rg -n 'pub const test_support' src/intake_lambda.zig src/query_lambda.zig src/tiger_beetle_completion_processor.zig src/operation_persistence.zig
+rg -n 'tiger_beetle_processor_test_mod|test-tigerbeetle-processor' build.zig
+```
+
+Separate harnesses in `tests/` cover live integration
+([tigerbeetle_integration.zig](../tests/tigerbeetle_integration.zig)), native ABI
+([tigerbeetle_c_abi.zig](../tests/tigerbeetle_c_abi.zig)), and shell behavior
+([deployment lifecycle](../tests/deploy_cleanup_lifecycle_test.sh),
+[processor interface](../tests/processor_interface_test.sh), and
+[isolated replica](../tests/tigerbeetle_isolated_test.sh)). Deployment/interface
+shell tests mock external commands; the isolated-replica harness starts a local
+TigerBeetle process. Live and ABI checks are separate from the aggregate local
+suite. The [repository validation table](../AGENTS.md#build-and-validation)
+owns target selection and prerequisites.
 
 ## Rationale and precise boundaries
 
@@ -482,10 +575,10 @@ For a non-array lookup family:
 {"create_accounts":[],"create_transfers":[],"lookup_accounts":[],"error":{"message":"Expected an array of commands.","field":"lookup_accounts"}}
 ```
 
-Processor Message framing carries the operation UUID outside its body:
+Processor Message framing carries the Operation UUID, trusted tenant and opaque Context outside Body:
 
 ```json
-{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","body":{"create_accounts":[{"error_code":"created"}],"create_transfers":[],"lookup_accounts":[]}}
+{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","tenant":"demo-tenant","context":null,"body":{"create_accounts":[{"error_code":"created"}],"create_transfers":[],"lookup_accounts":[]}}
 ```
 
 ## Scope exclusions

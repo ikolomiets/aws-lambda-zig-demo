@@ -1,6 +1,9 @@
 const std = @import("std");
 const tigerbeetle = @import("tigerbeetle");
 const c = @import("tigerbeetle_c");
+const seat = @import("seat_reservation");
+const messages = @import("processor_message");
+const native = @import("tiger_beetle_processor");
 
 const assert = std.debug.assert;
 
@@ -1232,10 +1235,593 @@ test "native account flags void balances and complete linked replay" {
     try std.testing.expectEqualDeep(committed, try lookup_account_balances(client, debit_id, credit_id));
 }
 
+test "Seat Event initialization funds class totals replays intact and enforces bounds" {
+    const ns = try TestNamespace.init();
+    const client = try local_client();
+    defer client.destroy();
+    var accounts = [_]tigerbeetle.Account{
+        make_account(ns.id(8101)), make_account(ns.id(8102)),
+        make_account(ns.id(8103)), make_account(ns.id(8104)),
+    };
+    accounts[0].code = 3;
+    accounts[0].flags = @intCast(c.TB_ACCOUNT_CREDITS_MUST_NOT_EXCEED_DEBITS);
+    accounts[1].code = 2;
+    accounts[1].flags = @intCast(c.TB_ACCOUNT_DEBITS_MUST_NOT_EXCEED_CREDITS);
+    for (accounts[2..]) |*account| {
+        account.code = 1;
+        account.flags = @intCast(c.TB_ACCOUNT_DEBITS_MUST_NOT_EXCEED_CREDITS);
+    }
+    for (accounts[0..3]) |*account| account.flags |= account_linked_flag;
+    try expect_accounts(
+        client,
+        &accounts,
+        &.{ account_created, account_created, account_created, account_created },
+    );
+    // Account and transfer IDs intentionally share values in separate namespaces.
+    var funding = [_]tigerbeetle.Transfer{
+        make_transfer(accounts[2].id, accounts[0].id, accounts[2].id),
+        make_transfer(accounts[3].id, accounts[0].id, accounts[3].id),
+    };
+    for (&funding) |*transfer| transfer.amount = std.math.maxInt(u32);
+    funding[0].flags = transfer_linked_flag;
+    try expect_transfers(client, &funding, &.{ transfer_created, transfer_created });
+    const before = try observe(client, accounts[0].id);
+    try std.testing.expectEqual(@as(u128, 8_589_934_590), before.debits_posted);
+    try std.testing.expectEqual(
+        @as(u128, 4_294_967_295),
+        (try observe(client, accounts[2].id)).credits_posted,
+    );
+    try expect_accounts(
+        client,
+        &accounts,
+        &.{
+            account_exists,              account_linked_event_failed,
+            account_linked_event_failed, account_linked_event_failed,
+        },
+    );
+    try expect_transfers(client, &funding, &.{ transfer_exists, transfer_linked_event_failed });
+    try std.testing.expectEqualDeep(before, try observe(client, accounts[0].id));
+    var overdraw = make_transfer(ns.id(8110), accounts[2].id, accounts[1].id);
+    overdraw.amount = 4_294_967_296;
+    try expect_transfers(client, &.{overdraw}, &.{c.TB_CREATE_TRANSFER_EXCEEDS_CREDITS});
+    var allocation_debit = make_transfer(ns.id(8111), accounts[1].id, accounts[2].id);
+    allocation_debit.amount = 1;
+    try expect_transfers(client, &.{allocation_debit}, &.{c.TB_CREATE_TRANSFER_EXCEEDS_CREDITS});
+    const source = make_account(ns.id(8112));
+    try expect_accounts(client, &.{source}, &.{account_created});
+    var capacity_credit = make_transfer(ns.id(8113), source.id, accounts[0].id);
+    capacity_credit.amount = 8_589_934_591;
+    try expect_transfers(client, &.{capacity_credit}, &.{c.TB_CREATE_TRANSFER_EXCEEDS_DEBITS});
+    try std.testing.expectEqualDeep(before, try observe(client, accounts[0].id));
+    try std.testing.expectEqual(@as(u128, 0), (try observe(client, accounts[1].id)).credits_posted);
+}
+
+const SeatObservation = struct {
+    client: *tigerbeetle.Client,
+    output: ?[]const u8 = null,
+
+    pub fn createAccounts(
+        self: *SeatObservation,
+        input: []const tigerbeetle.Account,
+        output: []tigerbeetle.CreateAccountResult,
+    ) !usize {
+        return self.client.createAccounts(input, output);
+    }
+
+    pub fn createTransfers(
+        self: *SeatObservation,
+        input: []const tigerbeetle.Transfer,
+        output: []tigerbeetle.CreateTransferResult,
+    ) !usize {
+        return self.client.createTransfers(input, output);
+    }
+
+    pub fn lookupAccounts(
+        self: *SeatObservation,
+        input: []const u128,
+        output: []tigerbeetle.Account,
+    ) !usize {
+        return self.client.lookupAccounts(input, output);
+    }
+
+    pub fn sendCompletion(
+        self: *SeatObservation,
+        arena: std.mem.Allocator,
+        _: ?[]const u8,
+        body: []const u8,
+    ) !void {
+        self.output = try arena.dupe(u8, body);
+    }
+};
+
+fn observe_seats(
+    arena: std.mem.Allocator,
+    client: *tigerbeetle.Client,
+    event: *const seat.Event,
+) !seat.Availability {
+    const command: seat.Command = .{ .check_seats = event.event_id };
+    const message = try native_seat_result(arena, client, event, &command, 0);
+    const result = try seat.availability_result(arena, &message.body, event);
+    return result.success.check_seats.classes[0];
+}
+
+fn native_seat_result(
+    arena: std.mem.Allocator,
+    client: *tigerbeetle.Client,
+    event: *const seat.Event,
+    command: *const seat.Command,
+    attempt_id: u128,
+) !messages.Message {
+    const body = try seat.encode_native_body(arena, &.{
+        .command = command,
+        .event = event,
+        .attempt_id = attempt_id,
+    });
+    const input = try messages.encode(arena, &.{
+        .operation_id = 1,
+        .tenant = event.tenant,
+        .body = try seat.parse_value(arena, body, messages.body_size_max),
+        .context = try seat.parse_value(
+            arena,
+            try seat.encode_context(
+                arena,
+                command,
+                if (command.* == .reserve_seats) attempt_id else null,
+            ),
+            messages.context_size_max,
+        ),
+    });
+    var effects: SeatObservation = .{ .client = client };
+    const event_json = try std.json.Stringify.valueAlloc(arena, .{
+        .Records = &.{.{
+            .messageId = "native-seat-observation",
+            .receiptHandle = "receipt",
+            .body = input,
+            .attributes = std.json.Value{ .object = .empty },
+            .messageAttributes = std.json.Value{ .object = .empty },
+            .md5OfBody = "md5",
+            .eventSource = "aws:sqs",
+            .eventSourceARN = "arn",
+            .awsRegion = "ca-central-1",
+        }},
+    }, .{});
+    const response = try native.test_support.invoke(arena, event_json, &effects);
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+    const output = effects.output orelse return error.MissingObservation;
+    return messages.decode(arena, output);
+}
+
+test "Seat availability observes native funding holds posting and eventual expiry cleanup" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const ns = try TestNamespace.init();
+    const client = try local_client();
+    defer client.destroy();
+    var accounts = [_]tigerbeetle.Account{
+        make_account(ns.id(8201)), make_account(ns.id(8202)), make_account(ns.id(8203)),
+    };
+    accounts[0].code = 3;
+    accounts[0].flags = c.TB_ACCOUNT_CREDITS_MUST_NOT_EXCEED_DEBITS | account_linked_flag;
+    accounts[1].code = 2;
+    accounts[1].flags = c.TB_ACCOUNT_DEBITS_MUST_NOT_EXCEED_CREDITS | account_linked_flag;
+    accounts[2].flags = c.TB_ACCOUNT_DEBITS_MUST_NOT_EXCEED_CREDITS;
+    try expect_accounts(client, &accounts, &.{ account_created, account_created, account_created });
+    const event: seat.Event = .{
+        .tenant = "native-theatre",
+        .event_id = 2,
+        .ledger = ledger,
+        .capacity_account_id = accounts[0].id,
+        .allocation_account_id = accounts[1].id,
+        .timeout_seconds = 1,
+        .classes = &.{.{
+            .tag = try seat.Tag.init("general"),
+            .total = 10,
+            .tb_account_id = accounts[2].id,
+        }},
+        .state = .ready,
+    };
+    const funding = make_transfer(accounts[2].id, accounts[0].id, accounts[2].id);
+    try expect_transfers(client, &.{funding}, &.{transfer_created});
+    try std.testing.expectEqual(@as(u32, 10), (try observe_seats(arena, client, &event)).available);
+    var hold = make_transfer(ns.id(8210), accounts[2].id, accounts[1].id);
+    hold.amount = 4;
+    hold.code = 2;
+    hold.flags = tigerbeetle.transfer_pending;
+    hold.timeout = 60;
+    try expect_transfers(client, &.{hold}, &.{transfer_created});
+    try std.testing.expectEqual(@as(u32, 6), (try observe_seats(arena, client, &event)).available);
+    const post = post_transfer(ns.id(8211), hold.id, std.math.maxInt(u128));
+    try expect_transfers(client, &.{post}, &.{transfer_created});
+    try std.testing.expectEqual(@as(u32, 6), (try observe_seats(arena, client, &event)).available);
+    hold.id = ns.id(8212);
+    hold.amount = 2;
+    hold.timeout = 1;
+    try expect_transfers(client, &.{hold}, &.{transfer_created});
+    try std.testing.expectEqual(@as(u32, 4), (try observe_seats(arena, client, &event)).available);
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(1500), .awake);
+    const delayed = try observe_seats(arena, client, &event);
+    // The deadline does not promise that lookup has already reclaimed the supply.
+    try std.testing.expect(delayed.available == 4 or delayed.available == 6);
+    try std.testing.expectEqual(@as(u32, 10), delayed.total);
+    try wait_pending_cleanup(client, accounts[2].id);
+    try std.testing.expectEqual(@as(u32, 6), (try observe_seats(arena, client, &event)).available);
+}
+
 fn void_transfer(id: u128, pending_id: u128) tigerbeetle.Transfer {
     var transfer = std.mem.zeroes(tigerbeetle.Transfer);
     transfer.id = id;
     transfer.pending_id = pending_id;
     transfer.flags = tigerbeetle.transfer_void_pending_transfer;
     return transfer;
+}
+
+fn reservation_event(
+    arena: std.mem.Allocator,
+    client: *tigerbeetle.Client,
+    ns: *const TestNamespace,
+    timeout_seconds: u32,
+) !seat.Event {
+    const classes = try arena.dupe(seat.EventClass, &.{
+        .{ .tag = try seat.Tag.init("general"), .total = 10, .tb_account_id = ns.id(8303) },
+        .{ .tag = try seat.Tag.init("premium"), .total = 3, .tb_account_id = ns.id(8304) },
+    });
+    var event: seat.Event = .{
+        .tenant = "native-theatre",
+        .event_id = 2,
+        .ledger = ledger,
+        .capacity_account_id = ns.id(8301),
+        .allocation_account_id = ns.id(8302),
+        .timeout_seconds = timeout_seconds,
+        .classes = classes,
+        .state = .creating,
+    };
+    const command: seat.Command = .{ .create_event = .{
+        .classes = &.{
+            .{ .tag = classes[0].tag, .total = 10 },
+            .{ .tag = classes[1].tag, .total = 3 },
+        },
+        .timeout_seconds = timeout_seconds,
+    } };
+    const message = try native_seat_result(arena, client, &event, &command, 0);
+    try std.testing.expect(try seat.creation_result(arena, &message.body, &event) == .success);
+    event.state = .ready;
+    return event;
+}
+
+fn confirm_native(
+    arena: std.mem.Allocator,
+    client: *tigerbeetle.Client,
+    event: *const seat.Event,
+    options: struct { pending_id: u128, posting_id: u128, status: []const u8 },
+) !seat.Result {
+    const command: seat.Command = .{ .confirm_seats = .{
+        .event_id = event.event_id,
+        .pending_id = options.pending_id,
+    } };
+    const message = try native_seat_result(arena, client, event, &command, options.posting_id);
+    const transfers = message.body.object.get("create_transfers").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), transfers.len);
+    try std.testing.expectEqualStrings(
+        options.status,
+        transfers[0].object.get("error_code").?.string,
+    );
+    return seat.confirmation_result(&message.body, event, &.{
+        .command = command,
+        .reservation_id = null,
+    });
+}
+
+fn confirmation_hold(event: *const seat.Event, id: u128) tigerbeetle.Transfer {
+    var hold = make_transfer(id, event.classes[0].tb_account_id, event.allocation_account_id);
+    hold.ledger = event.ledger;
+    hold.code = 2;
+    hold.amount = 1;
+    hold.flags = tigerbeetle.transfer_pending;
+    hold.timeout = event.timeout_seconds;
+    return hold;
+}
+
+test "Seat confirmation inherits each class posts fully and accepts replay or already posted" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const ns = try TestNamespace.init();
+    const client = try local_client();
+    defer client.destroy();
+    const event = try reservation_event(arena, client, &ns, 60);
+    const statuses = [_][]const u8{ "created", "exists", "pending_transfer_already_posted" };
+    var posted_total: u128 = 0;
+    for (event.classes, 0..) |class, class_index| {
+        const offset: u16 = @intCast(class_index * 10);
+        var hold = confirmation_hold(&event, ns.id(8400 + offset));
+        hold.debit_account_id = class.tb_account_id;
+        hold.amount = if (class_index == 0) 4 else 2;
+        try expect_transfers(client, &.{hold}, &.{transfer_created});
+        for (statuses, [_]u16{ 8401, 8401, 8402 }) |status, posting_offset| {
+            const result = try confirm_native(arena, client, &event, .{
+                .pending_id = hold.id,
+                .posting_id = ns.id(posting_offset + offset),
+                .status = status,
+            });
+            try std.testing.expectEqual(hold.id, result.success.confirm_seats.pending_id);
+            const debit = try observe(client, hold.debit_account_id);
+            const credit = try observe(client, hold.credit_account_id);
+            try std.testing.expectEqual(@as(u128, 0), debit.debits_pending);
+            try std.testing.expectEqual(hold.amount, debit.debits_posted);
+            try std.testing.expectEqual(@as(u128, 0), credit.credits_pending);
+            try std.testing.expectEqual(posted_total + hold.amount, credit.credits_posted);
+        }
+        posted_total += hold.amount;
+    }
+}
+
+test "Seat confirmation checks tenant event credit ledger and code before and after posting" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const ns = try TestNamespace.init();
+    const foreign_ns = try TestNamespace.init();
+    const sibling_ns = try TestNamespace.init();
+    const client = try local_client();
+    defer client.destroy();
+    const event = try reservation_event(arena, client, &ns, 60);
+    var foreign = try reservation_event(arena, client, &foreign_ns, 60);
+    foreign.tenant = "other-theatre";
+    var sibling = try reservation_event(arena, client, &sibling_ns, 60);
+    sibling.event_id = 3;
+    var wrong_ledger = event;
+    wrong_ledger.ledger += 1;
+    var holds = [_]tigerbeetle.Transfer{
+        confirmation_hold(&foreign, ns.id(8410)),
+        confirmation_hold(&sibling, ns.id(8411)),
+        confirmation_hold(&event, ns.id(8413)),
+        confirmation_hold(&event, ns.id(8414)),
+        confirmation_hold(&event, ns.id(8415)),
+    };
+    holds[2].credit_account_id = foreign.allocation_account_id;
+    holds[3].code = 3;
+    try expect_transfers(client, &holds, &([_]u32{transfer_created} ** 5));
+    const statuses = [_][]const u8{
+        "pending_transfer_has_different_credit_account_id",
+        "pending_transfer_has_different_credit_account_id",
+        "pending_transfer_has_different_credit_account_id",
+        "pending_transfer_has_different_code",
+        "pending_transfer_has_different_ledger",
+    };
+    for (holds, statuses, 0..) |hold, status, index| {
+        const selected = if (index == 4) &wrong_ledger else &event;
+        for ([_]bool{ false, true }) |posted| {
+            if (posted) {
+                var post = post_transfer(ns.id(8430) + index, hold.id, std.math.maxInt(u128));
+                post.debit_account_id = hold.debit_account_id;
+                post.credit_account_id = hold.credit_account_id;
+                post.ledger = hold.ledger;
+                post.code = hold.code;
+                try expect_transfers(client, &.{post}, &.{transfer_created});
+            }
+            const before = try observe(client, hold.debit_account_id);
+            const result = try confirm_native(arena, client, selected, .{
+                .pending_id = hold.id,
+                .posting_id = ns.id(8450) + index * 2 + @intFromBool(posted),
+                .status = status,
+            });
+            try std.testing.expectEqual(seat.FailureCode.invalid_reservation, result.failure);
+            try std.testing.expectEqualDeep(before, try observe(client, hold.debit_account_id));
+        }
+    }
+}
+
+test "Seat confirmation maps native expired missing nonpending and voided references" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const ns = try TestNamespace.init();
+    const client = try local_client();
+    defer client.destroy();
+    const event = try reservation_event(arena, client, &ns, 1);
+    const hold = confirmation_hold(&event, ns.id(8470));
+    try expect_transfers(client, &.{hold}, &.{transfer_created});
+    try wait_pending_cleanup(client, hold.debit_account_id);
+    const expired = try confirm_native(arena, client, &event, .{
+        .pending_id = hold.id,
+        .posting_id = ns.id(8471),
+        .status = "pending_transfer_expired",
+    });
+    try std.testing.expectEqual(seat.FailureCode.reservation_expired, expired.failure);
+    const missing = try confirm_native(arena, client, &event, .{
+        .pending_id = ns.id(8472),
+        .posting_id = ns.id(8473),
+        .status = "pending_transfer_not_found",
+    });
+    try std.testing.expectEqual(seat.FailureCode.invalid_reservation, missing.failure);
+    const nonpending = try confirm_native(arena, client, &event, .{
+        .pending_id = event.classes[0].tb_account_id,
+        .posting_id = ns.id(8474),
+        .status = "pending_transfer_not_pending",
+    });
+    try std.testing.expectEqual(seat.FailureCode.invalid_reservation, nonpending.failure);
+    var voided_hold = hold;
+    voided_hold.id = ns.id(8475);
+    voided_hold.timeout = 60;
+    try expect_transfers(client, &.{voided_hold}, &.{transfer_created});
+    try expect_transfers(
+        client,
+        &.{void_transfer(ns.id(8476), voided_hold.id)},
+        &.{transfer_created},
+    );
+    const voided = try confirm_native(arena, client, &event, .{
+        .pending_id = voided_hold.id,
+        .posting_id = ns.id(8477),
+        .status = "pending_transfer_already_voided",
+    });
+    try std.testing.expectEqual(seat.FailureCode.operation_rejected, voided.failure);
+}
+
+const ConcurrentReservation = struct {
+    client: *tigerbeetle.Client,
+    hold: tigerbeetle.Transfer,
+    ready: *std.atomic.Value(u32),
+    start: *std.Io.Event,
+    status: u32 = 0,
+    failure: ?anyerror = null,
+
+    fn run(self: *ConcurrentReservation) void {
+        _ = self.ready.fetchAdd(1, .release);
+        self.start.waitUncancelable(std.testing.io);
+        var output: [1]tigerbeetle.CreateTransferResult = undefined;
+        const count = logged_create_transfers(self.client, &.{self.hold}, &output) catch |err| {
+            self.failure = err;
+            return;
+        };
+        if (count != 1) {
+            self.failure = error.InvalidCount;
+            return;
+        }
+        self.status = output[0].status;
+    }
+};
+
+fn compete_reservations(first: *ConcurrentReservation, second: *ConcurrentReservation) !void {
+    assert(first.start == second.start);
+    assert(first.ready == second.ready);
+    const thread_a = try std.Thread.spawn(.{}, ConcurrentReservation.run, .{first});
+    var joined = false;
+    defer if (!joined) thread_a.join();
+    const thread_b = std.Thread.spawn(.{}, ConcurrentReservation.run, .{second}) catch |err| {
+        first.start.set(std.testing.io);
+        return err;
+    };
+    defer if (!joined) thread_b.join();
+    defer first.start.set(std.testing.io);
+    for (0..200) |_| {
+        if (first.ready.load(.acquire) == 2) break;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    try std.testing.expectEqual(@as(u32, 2), first.ready.load(.acquire));
+    first.start.set(std.testing.io);
+    thread_a.join();
+    thread_b.join();
+    joined = true;
+    if (first.failure) |err| return err;
+    if (second.failure) |err| return err;
+}
+
+test "Seat reservations concurrently enforce all or nothing bounds independently per class" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const ns = try TestNamespace.init();
+    const first = try local_client();
+    defer first.destroy();
+    const second = try local_client();
+    defer second.destroy();
+    const event = try reservation_event(arena, first, &ns, 60);
+    var hold = make_transfer(
+        ns.id(8310),
+        event.classes[0].tb_account_id,
+        event.allocation_account_id,
+    );
+    hold.code = 2;
+    hold.amount = 7;
+    hold.flags = tigerbeetle.transfer_pending;
+    hold.timeout = event.timeout_seconds;
+    var ready: std.atomic.Value(u32) = .init(0);
+    var start: std.Io.Event = .unset;
+    var a: ConcurrentReservation = .{
+        .client = first,
+        .hold = hold,
+        .ready = &ready,
+        .start = &start,
+    };
+    hold.id = ns.id(8311);
+    var b: ConcurrentReservation = .{
+        .client = second,
+        .hold = hold,
+        .ready = &ready,
+        .start = &start,
+    };
+    try compete_reservations(&a, &b);
+    const winner = if (a.status == transfer_created) &a else &b;
+    const loser = if (a.status == transfer_created) &b else &a;
+    try std.testing.expectEqual(transfer_created, winner.status);
+    try std.testing.expectEqual(@as(u32, c.TB_CREATE_TRANSFER_EXCEEDS_CREDITS), loser.status);
+    try std.testing.expectEqual(@as(u32, 3), (try observe_seats(arena, first, &event)).available);
+    try std.testing.expectEqual(
+        @as(u128, 7),
+        (try observe(first, event.allocation_account_id)).credits_pending,
+    );
+    const premium: seat.Command = .{ .reserve_seats = .{
+        .event_id = event.event_id,
+        .class = event.classes[1].tag,
+        .quantity = 3,
+    } };
+    const message = try native_seat_result(arena, first, &event, &premium, ns.id(8312));
+    const context: seat.Context = .{ .command = premium, .reservation_id = ns.id(8312) };
+    const projected = try seat.reservation_result(&message.body, &event, &context);
+    try std.testing.expect(projected == .success);
+    try std.testing.expectEqual(
+        @as(u128, 3),
+        (try observe(first, event.classes[1].tb_account_id)).debits_pending,
+    );
+    try std.testing.expectEqual(@as(u32, 3), (try observe_seats(arena, first, &event)).available);
+    try expect_transfers(first, &.{winner.hold}, &.{transfer_exists});
+    try std.testing.expectEqual(
+        @as(u128, 7),
+        (try observe(first, event.classes[0].tb_account_id)).debits_pending,
+    );
+    const release_general = void_transfer(ns.id(8313), winner.hold.id);
+    try expect_transfers(first, &.{release_general}, &.{transfer_created});
+    try expect_transfers(first, &.{void_transfer(ns.id(8314), ns.id(8312))}, &.{transfer_created});
+}
+
+test "Seat reservation deadline starts at creation and replay permits delayed expired success" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const ns = try TestNamespace.init();
+    const client = try local_client();
+    defer client.destroy();
+    const event = try reservation_event(arena, client, &ns, 2);
+    const command: seat.Command = .{ .reserve_seats = .{
+        .event_id = event.event_id,
+        .class = event.classes[0].tag,
+        .quantity = 2,
+    } };
+    const context: seat.Context = .{ .command = command, .reservation_id = ns.id(8320) };
+    // Waiting longer than the timeout before dispatch cannot age an uncreated hold.
+    _ = try seat.encode_native_body(arena, &.{
+        .command = &command,
+        .event = &event,
+        .attempt_id = ns.id(8320),
+    });
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(2500), .awake);
+    const delayed = try native_seat_result(arena, client, &event, &command, ns.id(8320));
+    try std.testing.expectEqual(
+        @as(u128, 2),
+        (try observe(client, event.classes[0].tb_account_id)).debits_pending,
+    );
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(1200), .awake);
+    const replay = try native_seat_result(arena, client, &event, &command, ns.id(8320));
+    try std.testing.expectEqualStrings(
+        "exists",
+        replay.body.object.get("create_transfers").?.array.items[0]
+            .object.get("error_code").?.string,
+    );
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(1100), .awake);
+    // Logical expiry rejects posting even if asynchronous balance cleanup lags.
+    const late_post = post_transfer(ns.id(8321), ns.id(8320), std.math.maxInt(u128));
+    try expect_transfers(client, &.{late_post}, &.{
+        c.TB_CREATE_TRANSFER_PENDING_TRANSFER_EXPIRED,
+    });
+    try wait_pending_cleanup(client, event.classes[0].tb_account_id);
+    const result = try seat.reservation_result(&delayed.body, &event, &context);
+    try std.testing.expectEqual(ns.id(8320), result.success.reserve_seats.reservation_id);
+    const expired_replay = try native_seat_result(arena, client, &event, &command, ns.id(8320));
+    const replay_result = try seat.reservation_result(&expired_replay.body, &event, &context);
+    try std.testing.expect(replay_result == .success);
+    try std.testing.expectEqual(
+        @as(u128, 0),
+        (try observe(client, event.classes[0].tb_account_id)).debits_pending,
+    );
 }

@@ -4,7 +4,7 @@ A 100% Zig implementation of AWS Lambda functions and runtime, integrated with
 DynamoDB and SQS to create an asynchronous operation-processing framework backed
 by TigerBeetle over a WireGuard VPN.
 
-The project builds custom `provided.al2023` intake, query, TigerBeetle processor, and Completion processor
+The project builds custom `provided.al2023` intake, query, TigerBeetle processor, Completion processor, seat submission, and seat completion
 bootstraps and a host-native PASETO v4.public utility named `paseto`. The
 stack-aware `persistence.sh` and `queue.sh` commands manage Operations in
 DynamoDB and SQS, while `lambda_logs.sh` downloads any function's CloudWatch
@@ -39,11 +39,29 @@ The maintained [TigerBeetle processor design](docs/TIGER_BEETLE_PROCESSOR.md) de
 Body schema, replay obligations, complete Results and retry behavior; use it for the current
 processor contract.
 
+The [Seat Reservation contracts](docs/SEAT_RESERVATION.md) provide pure command
+and metadata validation. The host `events` binary inserts validated creating
+Event metadata and reads tenant-scoped records. The `events.sh` wrapper uses
+`PASETO_TOKEN` to submit public creation Operations with explicit `--class TAG=COUNT`
+arguments and `check_seats --event-id UUID` to query current
+availability. `reserve_seat --event-id UUID --class TAG --quantity COUNT` creates
+a timed reservation. `confirm_seats --event-id UUID --reservation-id ID`
+confirms its full held quantity using the returned `reservation_id`.
+Checks, reservations and confirmations each submit a fresh Operation and poll
+every second until completion, printing the Result.
+It uses the host binary to read Event metadata. See the
+[Event utility guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-event-metadata-utility).
+The host `ledger-counter` binary and `ledger-counter.sh` wrapper provide explicit
+first-time initialization, inspection and allocation through explicitly selected
+Ledger Counters. SAM exposes the actual counter table and selected ID, defaulting
+to `global`; consumers requiring one sequence share both binding components. See the [counter utility guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#global-ledger-counter-utility).
+
 ## Requirements for Zig on AWS Lambda
 
 - Zig 0.16.0 or newer within the supported 0.16.x line.
 - AWS CLI v2 and AWS SAM CLI for the SAM deployment flow and stack queries.
-- `jq` for the Lambda log helper and shell regression tests.
+- `jq` for the Lambda log helper, deployed scenario runner, and shell regression tests.
+- Bash 3.2 or newer and curl for the deployed scenario runner.
 - An AWS profile with permission to create Lambda, IAM, and CloudFormation
   resources.
 
@@ -67,7 +85,9 @@ zig build --release -Darch=arm
 ```
 
 This also installs the host-native `zig-out/bin/paseto` utility and the local
-implementations invoked by `persistence.sh` and `queue.sh`. The intake and query
+implementations invoked by `persistence.sh`, `queue.sh`, `events.sh`, and
+`ledger-counter.sh`. Build the Events utility with `zig build build-events` or
+the counter utility with `zig build build-ledger-counter`. The intake and query
 bootstraps and the PASETO utility use the shared PASETO implementation in
 `src/paseto.zig`; the persistence and queue commands use the shared model in
 `src/operation.zig`. The Lambda and local commands reach AWS through
@@ -79,12 +99,14 @@ Verify the ARM64 Linux executables:
 file zig-out/bin/intake/bootstrap \
   zig-out/bin/query/bootstrap \
   zig-out/bin/tiger_beetle_processor/bootstrap \
-  zig-out/bin/tiger_beetle_completion_processor/bootstrap
+  zig-out/bin/tiger_beetle_completion_processor/bootstrap \
+  zig-out/bin/seat_reservation_processor/bootstrap \
+  zig-out/bin/seat_reservation_completion_processor/bootstrap
 ```
 
-Intake, query, and the Completion processor are statically linked and single-threaded. TigerBeetle processor is
+Intake, query, native completion and both seat processors are statically linked and single-threaded. TigerBeetle processor is
 multithread-capable for the TigerBeetle callback thread and is a dynamically
-linked glibc executable. All four are stripped.
+linked glibc executable. All six are stripped.
 
 ```text
 intake/query/tiger-beetle-completion-processor: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
@@ -95,13 +117,18 @@ Package the executables for Lambda when preparing artifacts manually (`deploy.sh
 automatically):
 
 ```sh
+rm -f intake-lambda.zip query-lambda.zip tiger-beetle-processor.zip \
+  tiger-beetle-completion-processor.zip seat-reservation-processor.zip \
+  seat-reservation-completion-processor.zip
 zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
 zip -qj query-lambda.zip zig-out/bin/query/bootstrap
 zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
 zip -qj tiger-beetle-completion-processor.zip zig-out/bin/tiger_beetle_completion_processor/bootstrap
+zip -qj seat-reservation-processor.zip zig-out/bin/seat_reservation_processor/bootstrap
+zip -qj seat-reservation-completion-processor.zip zig-out/bin/seat_reservation_completion_processor/bootstrap
 ```
 
-All four zip archives are intentionally ignored by Git because they are generated
+All six zip archives are intentionally ignored by Git because they are generated
 deployment artifacts.
 
 ## PASETO Authentication
@@ -267,23 +294,25 @@ remain readable until DynamoDB removes it asynchronously.
 
 ## SQS Workflows
 
-`queue.sh` sends canonical Operations, destructively consumes queued messages,
+`queue.sh` sends canonical Processor Messages, destructively consumes queued messages,
 and checks a named SQS queue in the SAM stack. Its first argument must be the
 queue's SAM logical resource ID, such as `TigerBeetleQueue` or
 `CompletionQueue`. It uses `PROFILE`, `REGION`, and `STACK_NAME`, defaulting to
 `dev`, `ca-central-1`, and `aws-lambda-zig-demo`. It exports temporary profile
 credentials, resolves the selected physical queue URL, and exports that URL
-under the logical resource ID expected by the CLI. Send a lookup-only `TigerBeetle` Operation
+under the logical resource ID expected by the CLI. Send a lookup-only `TigerBeetle` Processor Message
 with a concrete account Resource ID like this:
 
 ```sh
 message_json='{"operation_id":"11223344-5566-7788-99aa-bbccddeeff00",'\
-'"body":{"lookup_accounts":[{"id":"101"}]}}'
+'"tenant":"demo-tenant","context":null,"body":{"lookup_accounts":[{"id":"101"}]}}'
 printf '%s\n' "$message_json" | ./queue.sh TigerBeetleQueue send
 ```
 
 `send` validates a minimal Processor Message with `src/processor_message.zig`, including its
-96 KiB Body bound and optional internal `result_queue`. It sends compact JSON and prints the same
+98,304-byte compact Body bound, required 1–64-byte UTF-8 tenant, required Context (null or up to
+4,096 compact JSON bytes), optional internal `result_queue` (up to 2,048 decoded bytes), and
+115,328-byte envelope bound. It sends compact JSON and prints the same
 bytes followed by a newline after success. It neither accepts `--tenant` nor reads or updates
 DynamoDB. The matching Operation must already exist as `SUBMITTED` for final completion to persist.
 Use authenticated intake for the complete persistence-and-enqueue flow. CompletionQueue accepts
@@ -391,21 +420,28 @@ receives `COMPLETION_QUEUE_URL`, `TIGERBEETLE_CLUSTER_ID`, and
 invocations. Lambda polls `TigerBeetleQueue` in batches of at most 10 records with no batching
 delay.
 
-For every record, the handler decodes `{operation_id, body, result_queue?}`. Its Body contains
+For every record, the handler decodes `{operation_id, tenant, body, context, result_queue?}`.
+Tenant is trusted metadata derived by intake from the verified PASETO subject. Context is an opaque
+JSON value; explicit null means no Context, while omission is invalid. Its Body contains
 `create_accounts`, `create_transfers`, and `lookup_accounts` command lists, with at most 64
-commands combined. Public intake accepts at most 4 KiB; internal Bodies permit 96 KiB.
+commands combined. Public intake accepts at most 4,096 bytes; internal Bodies permit 98,304 compact
+JSON bytes. Context permits 4,096 compact JSON bytes, tenant permits 1–64 decoded UTF-8 bytes,
+routes permit 2,048 decoded bytes, and compact envelopes and pre-parse raw messages permit
+115,328 bytes. SQS request and Lambda event escaping are separate layers.
 See the maintained [Body schema](docs/TIGER_BEETLE_PROCESSOR.md#body-schema) and
 [output contract](docs/TIGER_BEETLE_PROCESSOR.md#result-and-completion-publication).
 
 Output places native details directly in `body`, without `type` or `payload`:
 
 ```json
-{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","body":{"create_accounts":[{"error_code":"exists"},{"error_code":"linked_event_failed"}],"create_transfers":[],"lookup_accounts":[]}}
+{"operation_id":"00112233-4455-6677-8899-aabbccddeeff","tenant":"demo-tenant","context":null,"body":{"create_accounts":[{"error_code":"exists"},{"error_code":"linked_event_failed"}],"create_transfers":[],"lookup_accounts":[]}}
 ```
 
-Each SQS message carries one Operation UUID and Body. Incoming `result_queue` overrides the
+Each SQS message carries one Operation UUID, trusted tenant, Body and Context. Native outputs and
+diagnostics preserve tenant and Context without interpreting them; public Results contain only
+the final interpretation of Body. Incoming `result_queue` overrides the
 default `COMPLETION_QUEUE_URL`. TigerBeetle omits the outgoing route; another processor may choose
-its own. The public caller cannot set this internal field. The template grants sends only to
+its own. Public callers cannot set tenant, Context or routing. The template grants sends only to
 CompletionQueue; any additional internal destination needs an explicit IAM grant.
 
 The processor executes all admitted account chains, then eligible transfer chains, then requested
@@ -510,7 +546,7 @@ different value when the function should see a narrower principal string.
 configuration. It is public key material; keep the corresponding private key
 only in the signing environment.
 
-`deploy.sh` builds and packages all four bootstraps, preserves any existing WireGuard state,
+`deploy.sh` builds and packages all six bootstraps, preserves any existing WireGuard state,
 and defaults the TigerBeetle processor and Completion processor names to `tiger-beetle-processor` and `tiger-beetle-completion-processor`.
 Override them with `TIGER_BEETLE_PROCESSOR_NAME`, `TIGER_BEETLE_COMPLETION_PROCESSOR_NAME`, or the matching
 `--tiger-beetle-processor-name` and `--tiger-beetle-completion-processor-name` options. Both deployment helpers accept these options.
@@ -659,7 +695,8 @@ do not. The ID comes only from the single `rawPath` segment: query strings and
 GET bodies neither provide nor alter it. A different token subject receives the
 same `404 Not Found` response as a missing Operation.
 
-For `SUBMITTED`, intake sends compact `{operation_id,body}` JSON to SQS without a
+For `SUBMITTED`, intake sends compact `{operation_id,tenant,context,body}` JSON to SQS, using
+the verified PASETO subject as tenant and null Context, without a
 trailing newline or routing field. It returns the unchanged bodyless Operation snapshot. A matching retry whose item is still `SUBMITTED` sends it again; matching
 `COMPLETED` items are returned immediately without another SQS
 send.
@@ -705,24 +742,28 @@ or CloudFront.
 - `src/paseto_cli.zig`: host PASETO v4.public CLI and its tests.
 - `persistence.sh`: stack-aware persistence command and credential setup.
 - `queue.sh`: stack-aware queue command and credential setup.
-- `lambda_logs.sh`: explicit four-handler CloudWatch log download helper.
-- `build.zig`: Zig build graph for all four bootstraps, local commands, and tests.
+- `lambda_logs.sh`: explicit six-handler CloudWatch log download helper.
+- `build.zig`: Zig build graph for all six bootstraps, local commands, and tests.
 - `build.zig.zon`: package metadata and pinned dependencies.
-- `template.yaml`: SAM template for all four Lambdas, two Function URLs, two queue mappings, permissions, and the optional EC2 WireGuard gateway.
+- `template.yaml`: SAM template for all six Lambdas, two Function URLs, four queue mappings, permissions, and the optional EC2 WireGuard gateway.
 - `docs/EC2-WireGuard-Gateway.md`: implemented gateway architecture, lifecycle, security, and ownership reference.
 - `docs/`: the SAM deployment guide, ADRs, and the Zig style reference.
 - `AGENTS.md`: repository guidance for coding agents.
 
 ## Development and Validation
 
-Run formatting checks before committing Zig changes:
+Run checks directly during development. See [local checks](docs/agents/local-checks.md)
+for the complete offline sequence, supported hosts, prerequisites, and pinned-package
+provisioning.
+
+Review documentation links, anchors, command names, and prerequisites using the
+[documentation review guide](docs/agents/documentation-checks.md).
+
+Run the complete formatting check for build files, Zig sources, and tests before
+committing Zig changes:
 
 ```sh
-zig fmt --check build.zig src/processor_message.zig src/tiger_beetle_completion_processor.zig \
-  src/tiger_beetle_processor.zig src/intake_lambda.zig src/lambda_auth.zig \
-  src/query_lambda.zig \
-  src/operation.zig src/operation_persistence.zig src/sqs_queue.zig \
-  src/persistence_cli.zig src/queue_cli.zig src/paseto.zig src/paseto_cli.zig
+zig build fmt-check
 ```
 
 Run only the local deployment-helper regression tests with:
@@ -750,6 +791,40 @@ Use the same local checkout in the deployment helper with:
 ```sh
 ./deploy.sh --dry-run --use-local-libs
 ```
+
+### Dependency Source Discovery
+
+When inspecting SDK or client internals, discover the direct package sources
+selected by the active build graph:
+
+```sh
+zig build dependency-paths
+```
+
+The step prints one tab-separated package name and existing source root per direct
+dependency. It uses the names declared in `build.zig.zon` and follows Zig's cache
+and fork resolution. Pins remain in the manifest. It compiles no application
+artifacts and makes no cloud calls; Zig may compile its build runner and write
+build-cache metadata.
+
+Pass the same cache and fork options as the build being investigated. For example,
+with alternate build caches or the existing sibling runtime checkout:
+
+```sh
+zig build dependency-paths --cache-dir .zig-cache-dev --global-cache-dir .zig-global-cache-dev
+zig build dependency-paths --fork=../aws-lambda-zig
+```
+
+The Zig toolchain, `printf`, and resolved package sources must be available.
+Provision unavailable packages separately: `zig build --fetch` fetches the
+manifest's pinned dependencies and requires network access. Normal Zig resolution
+can fetch missing packages before the step runs. To disable fetching, append
+`--system zig-pkg` to the discovery command, pointing `--system` at an already
+provisioned package directory.
+
+Build-cache selection need not change package roots when Zig reuses available
+sources. Use the printed roots for focused file and symbol searches; pins remain
+owned by the manifest, and absolute cache paths belong only in local evidence.
 
 Zig code in this repository should follow
 [docs/TIGER_STYLE.md](docs/TIGER_STYLE.md).

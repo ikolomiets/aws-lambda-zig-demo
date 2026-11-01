@@ -8,12 +8,18 @@ INTAKE_FUNCTION_NAME="${INTAKE_FUNCTION_NAME:-intake-lambda}"
 QUERY_FUNCTION_NAME="${QUERY_FUNCTION_NAME:-query-lambda}"
 TIGER_BEETLE_PROCESSOR_NAME="${TIGER_BEETLE_PROCESSOR_NAME:-tiger-beetle-processor}"
 TIGER_BEETLE_COMPLETION_PROCESSOR_NAME="${TIGER_BEETLE_COMPLETION_PROCESSOR_NAME:-tiger-beetle-completion-processor}"
+SEAT_RESERVATION_PROCESSOR_NAME="${SEAT_RESERVATION_PROCESSOR_NAME-seat-reservation-processor}"
+SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME="${SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME-seat-reservation-completion-processor}"
+EXISTING_LEDGER_COUNTER_TABLE_NAME="${EXISTING_LEDGER_COUNTER_TABLE_NAME-}"
+LEDGER_COUNTER_ID="${LEDGER_COUNTER_ID-global}"
 TIGERBEETLE_CLUSTER_ID="${TIGERBEETLE_CLUSTER_ID:-0}"
 TIGERBEETLE_ADDRESSES="${TIGERBEETLE_ADDRESSES:-10.200.0.2:3000}"
 LAMBDA_PRINCIPAL="${LAMBDA_PRINCIPAL:-*}"
 PASETO_PUBLIC_KEY="${PASETO_PUBLIC_KEY:-}"
 LOCAL_AWS_LAMBDA_ROOT="${LOCAL_AWS_LAMBDA_ROOT:-../aws-lambda-zig}"
 DRY_RUN=0
+DEV=0
+CLEANUP=0
 CHECK_URL=1
 USE_LOCAL_LIBS=0
 DEPLOYMENT_STARTED=0
@@ -29,6 +35,9 @@ Usage: ./deploy.sh [options]
 Build, package, validate, and deploy the Zig Lambdas with AWS SAM. Existing
 WireGuard gateway parameters are preserved. Use wireguard-gateway-setup.sh to
 enable, reconfigure, or disable the gateway.
+Full deployments inspect the exact change set before execution, preserve table
+and allocator identities, and verify selected counter setup without repairing it.
+First-time setup is explicit: ledger-counter.sh --counter-id ID init.
 
 Options:
   --profile NAME         AWS CLI profile. Defaults to $PROFILE or dev.
@@ -44,12 +53,27 @@ Options:
                          Completion processor name. Defaults to tiger-beetle-completion-processor.
   --tigerbeetle-cluster-id ID
                          Unsigned decimal cluster ID. Defaults to 0.
+  --seat-reservation-processor-name NAME
+                         Seat submission name. Defaults to seat-reservation-processor.
+  --seat-reservation-completion-processor-name NAME
+                         Seat completion name. Defaults to seat-reservation-completion-processor.
+  --existing-ledger-counter-table-name NAME
+                         Reference a counter table in this account and Region.
+                         Omit to create a stack-owned table.
+  --ledger-counter-id ID  Counter record ID, 1–128 ASCII bytes. Defaults to global.
   --tigerbeetle-addresses ADDRESSES
                          Comma-separated replica addresses. Defaults to 10.200.0.2:3000.
   --lambda-principal VALUE
                          LAMBDA_PRINCIPAL environment value. Defaults to *.
   --use-local-libs       Use local dependency checkouts with zig build --fork.
                          aws_lambda defaults to ../aws-lambda-zig.
+  --dev                  Build/package with persistent caches and sync only code
+                         to an existing development stack. Skips tests and SAM
+                         validation. Configuration changes require full deployment.
+                         Automatically accepts SAM's development-stack confirmation.
+  --cleanup              Tear down the selected stack only. Permanently deletes
+                         owned tables (all counters) and queued messages. Completes
+                         guarded WireGuard disable first; preserves external resources.
   --dry-run              Run local checks, build, package, and validation only.
   --no-url-check         Skip the post-deploy Function URL HTTP status check.
   -h, --help             Show this help.
@@ -58,10 +82,12 @@ Environment overrides:
   PROFILE, REGION, STACK_NAME, INTAKE_FUNCTION_NAME, QUERY_FUNCTION_NAME,
   TIGER_BEETLE_PROCESSOR_NAME, TIGER_BEETLE_COMPLETION_PROCESSOR_NAME, TIGERBEETLE_CLUSTER_ID,
   TIGERBEETLE_ADDRESSES, LAMBDA_PRINCIPAL, PASETO_PRIVATE_KEY,
+  SEAT_RESERVATION_PROCESSOR_NAME, SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME,
+  EXISTING_LEDGER_COUNTER_TABLE_NAME, LEDGER_COUNTER_ID,
   PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT
 
 Authentication:
-  Non-dry-run deployments require an SSO-backed AWS CLI profile. The script
+  Non-dry-run deployments and cleanup require an SSO-backed AWS CLI profile. The script
   clears inherited static credentials, selects the configured profile, and
   always runs aws sso login to obtain a fresh token before AWS inspection or
   local build work. Dry runs make no AWS authentication calls.
@@ -138,6 +164,35 @@ validate_tigerbeetle_configuration() {
         fail "TIGERBEETLE_ADDRESSES must not contain whitespace"
 }
 
+validate_seat_configuration() {
+    local name
+    for name in "$SEAT_RESERVATION_PROCESSOR_NAME" "$SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME"; do
+        [ -n "$name" ] && [ "${#name}" -le 64 ] &&
+            [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] ||
+            fail "seat Lambda names must contain 1–64 letters, digits, hyphens, or underscores"
+    done
+    [ "${#LEDGER_COUNTER_ID}" -ge 1 ] && [ "${#LEDGER_COUNTER_ID}" -le 128 ] &&
+        [[ "$LEDGER_COUNTER_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+        fail "LEDGER_COUNTER_ID must contain 1–128 ASCII bytes: alphanumeric first, then letters, digits, '.', '_' or '-'"
+    if [ -n "$EXISTING_LEDGER_COUNTER_TABLE_NAME" ]; then
+        [ "${#EXISTING_LEDGER_COUNTER_TABLE_NAME}" -ge 3 ] &&
+            [ "${#EXISTING_LEDGER_COUNTER_TABLE_NAME}" -le 255 ] &&
+            [[ "$EXISTING_LEDGER_COUNTER_TABLE_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] ||
+            fail "EXISTING_LEDGER_COUNTER_TABLE_NAME must be a 3–255 character physical table name"
+    fi
+}
+
+require_seat_development_baseline() {
+    local seat_output_count
+    seat_output_count="$(aws cloudformation describe-stacks \
+        --stack-name "$STACK_NAME" \
+        --query "length(Stacks[0].Outputs[?OutputKey=='SeatReservationProcessorName' || OutputKey=='SeatReservationCompletionProcessorName'])" \
+        --output text --profile "$PROFILE" --region "$REGION")" ||
+        fail "could not verify the six-function baseline; use full deployment before seat development sync"
+    [ "$seat_output_count" = 2 ] ||
+        fail "seat development sync requires a full deployment of the six-function baseline first"
+}
+
 clear_aws_credentials() {
     unset AWS_ACCESS_KEY_ID
     unset AWS_SECRET_ACCESS_KEY
@@ -171,7 +226,11 @@ ensure_stack_not_in_progress() {
         2>&1)"
     then
         case "$stack_status" in
-            *"does not exist"*) return 0 ;;
+            *"does not exist"*)
+                [ "$DEV" -eq 0 ] ||
+                    fail "development code sync requires an existing stack; run a full deployment first"
+                return 0
+                ;;
             *) fail "could not inspect CloudFormation stack $STACK_NAME before deployment" ;;
         esac
     fi
@@ -320,6 +379,7 @@ preserve_wireguard_state() {
             fi
             ;;
         deploy) deploy_stack_phase "Deploying stack" ;;
+        teardown) teardown_preserved_wireguard ;;
         outputs | cleanup) ;;
         *) fail "unknown deployment-controller phase: $phase" ;;
     esac
@@ -339,33 +399,245 @@ build_sam_parameter_overrides() {
         "QueryFunctionName=$QUERY_FUNCTION_NAME"
         "TigerBeetleProcessorName=$TIGER_BEETLE_PROCESSOR_NAME"
         "TigerBeetleCompletionProcessorName=$TIGER_BEETLE_COMPLETION_PROCESSOR_NAME"
+        "SeatReservationProcessorName=$SEAT_RESERVATION_PROCESSOR_NAME"
+        "SeatReservationCompletionProcessorName=$SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME"
         "TigerBeetleClusterId=$TIGERBEETLE_CLUSTER_ID"
         "TigerBeetleAddresses=$TIGERBEETLE_ADDRESSES"
         "LambdaPrincipal=$LAMBDA_PRINCIPAL"
         "PasetoPublicKey=$PASETO_PUBLIC_KEY"
     )
-    SAM_PARAMETER_OVERRIDES+=("${DEPLOYMENT_PARAMETER_OVERRIDES[@]}")
+    if [ -n "$EXISTING_LEDGER_COUNTER_TABLE_NAME" ]; then
+        SAM_PARAMETER_OVERRIDES+=("ExistingLedgerCounterTableName=$EXISTING_LEDGER_COUNTER_TABLE_NAME")
+    fi
+    SAM_PARAMETER_OVERRIDES+=("LedgerCounterId=$LEDGER_COUNTER_ID")
+    # Bash 3.2 treats an empty array expansion as unset under nounset.
+    if [ "${#DEPLOYMENT_PARAMETER_OVERRIDES[@]}" -gt 0 ]; then
+        SAM_PARAMETER_OVERRIDES+=("${DEPLOYMENT_PARAMETER_OVERRIDES[@]}")
+    fi
+}
+
+load_preserved_allocator_binding() {
+    local stack_json binding owned_table
+    PRESERVED_COUNTER_TABLE=''
+    PRESERVED_COUNTER_ID=''
+    PRESERVED_COUNTER_REFERENCE=''
+    DEPLOYMENT_WAITER=stack-update-complete
+    stack_json="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+        --output json --profile "$PROFILE" --region "$REGION" 2>&1)" || {
+        case "$stack_json" in
+            *"(ValidationError)"*"Stack with id $STACK_NAME does not exist"*)
+                DEPLOYMENT_WAITER=stack-create-complete
+                return 0
+                ;;
+            *) fail "could not inspect the established allocator binding" ;;
+        esac
+    }
+    jq -e '(.Stacks | type == "array" and length == 1) and
+        (.Stacks[0].Outputs | type == "array") and
+        (.Stacks[0].Parameters | type == "array")' <<<"$stack_json" >/dev/null ||
+        fail "ambiguous stack inspection; nothing executed"
+    case "$(jq -r '.Stacks[0].StackStatus' <<<"$stack_json")" in
+        REVIEW_IN_PROGRESS) DEPLOYMENT_WAITER=stack-create-complete ;;
+        *_IN_PROGRESS) fail "stack $STACK_NAME has an active lifecycle operation; wait before retrying" ;;
+        CREATE_COMPLETE | UPDATE_COMPLETE | UPDATE_ROLLBACK_COMPLETE | IMPORT_COMPLETE | IMPORT_ROLLBACK_COMPLETE) ;;
+        *) fail "stack $STACK_NAME is not ready for deployment" ;;
+    esac
+    binding="$(jq -ce '
+        .Stacks[0] |
+        def output($key): [.Outputs[]? | select(.OutputKey == $key) | .OutputValue];
+        def parameter($key): [.Parameters[]? | select(.ParameterKey == $key) | .ParameterValue];
+        output("LedgerCounterTableName") as $tables |
+        output("LedgerCounterId") as $ids |
+        parameter("LedgerCounterId") as $configured |
+        parameter("ExistingLedgerCounterTableName") as $references |
+        if ($tables | length) == 0 and ($ids | length) == 0 and
+           ($configured | length) == 0 and ($references | length) == 0 and
+           (output("SeatReservationProcessorName") | length) == 0 then
+            {table: "", id: "", reference: ""}
+        elif ($tables | length) == 1 and ($ids | length) <= 1 and
+             ($configured | length) <= 1 and ($references | length) <= 1 then
+            {table: $tables[0],
+             id: (if ($ids | length) == 0 then "global" else $ids[0] end),
+             reference: (if ($references | length) == 0 then "" else $references[0] end)} |
+            select(.id == (if ($configured | length) == 0 then "global" else $configured[0] end)) |
+            select(.table | type == "string" and test("^[A-Za-z0-9_.-]{3,255}$")) |
+            select(.id | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")) |
+            select(.reference == "" or .reference == .table)
+        else empty end
+    ' <<<"$stack_json")" || fail "invalid or incomplete established allocator binding"
+    PRESERVED_COUNTER_TABLE="$(jq -r '.table' <<<"$binding")"
+    PRESERVED_COUNTER_ID="$(jq -r '.id' <<<"$binding")"
+    PRESERVED_COUNTER_REFERENCE="$(jq -r '.reference' <<<"$binding")"
+    [ -n "$PRESERVED_COUNTER_TABLE" ] || return 0
+    [ "$LEDGER_COUNTER_ID" = "$PRESERVED_COUNTER_ID" ] ||
+        fail "refusing to change the established counter ID; another initialized ID is a different allocator"
+    [ -z "$EXISTING_LEDGER_COUNTER_TABLE_NAME" ] ||
+        [ "$EXISTING_LEDGER_COUNTER_TABLE_NAME" = "$PRESERVED_COUNTER_REFERENCE" ] ||
+        fail "refusing to change the established counter table ownership or physical binding"
+    if [ -z "$PRESERVED_COUNTER_REFERENCE" ]; then
+        owned_table="$(aws cloudformation describe-stack-resource --stack-name "$STACK_NAME" \
+            --logical-resource-id LedgerCounterTable \
+            --query StackResourceDetail.PhysicalResourceId --output text \
+            --profile "$PROFILE" --region "$REGION")" ||
+            fail "could not verify the owned counter table identity"
+        [ "$owned_table" = "$PRESERVED_COUNTER_TABLE" ] ||
+            fail "owned counter table does not match the established allocator"
+    fi
+}
+
+verify_deployment_counter() {
+    # The shared CLI owns consistent reads, record validation and absent-only init.
+    # Always select explicitly so inherited utility settings cannot redirect a read.
+    ./ledger-counter.sh --profile "$PROFILE" --region "$REGION" \
+        --stack-name "$STACK_NAME" --counter-id "$LEDGER_COUNTER_ID" read ||
+        fail "selected allocator setup is missing, corrupt, or unavailable; deployment never initializes or repairs it; see the deployment guide for explicit first-time setup of a new binding"
+}
+
+inspect_deployment_template() {
+    local changeset_id="$1" proposed_template
+    proposed_template="$(aws cloudformation get-template --stack-name "$STACK_NAME" \
+        --change-set-name "$changeset_id" --template-stage Processed --output json \
+        --profile "$PROFILE" --region "$REGION")" ||
+        fail "could not inspect the processed change-set template; nothing executed"
+    jq -e '
+        .TemplateBody | if type == "string" then fromjson else . end |
+        def binding: {"Fn::If": ["OwnLedgerCounterTable",
+            {"Ref": "LedgerCounterTable"}, {"Ref": "ExistingLedgerCounterTableName"}]};
+        def table($name; $attributes; $keys):
+            .Resources[$name] | .Type == "AWS::DynamoDB::Table" and
+            .Properties.AttributeDefinitions == $attributes and
+            .Properties.KeySchema == $keys and .Properties.TableName == null;
+        table("OperationsTable"; [{AttributeName:"id",AttributeType:"S"}];
+            [{AttributeName:"id",KeyType:"HASH"}]) and
+        table("SeatEventsTable";
+            [{AttributeName:"tenant",AttributeType:"S"},{AttributeName:"event_id",AttributeType:"S"}];
+            [{AttributeName:"tenant",KeyType:"HASH"},{AttributeName:"event_id",KeyType:"RANGE"}]) and
+        table("LedgerCounterTable"; [{AttributeName:"counter_id",AttributeType:"S"}];
+            [{AttributeName:"counter_id",KeyType:"HASH"}]) and
+        .Resources.OperationsTable.Properties.TimeToLiveSpecification == {AttributeName:"expires_at",Enabled:true} and
+        .Resources.SeatEventsTable.Properties.TimeToLiveSpecification == null and
+        .Resources.LedgerCounterTable.Properties.TimeToLiveSpecification == null and
+        .Resources.SeatEventsTable.Condition == null and
+        .Resources.OperationsTable.Condition == null and
+        .Resources.LedgerCounterTable.Condition == "OwnLedgerCounterTable" and
+        .Conditions.OwnLedgerCounterTable == {"Fn::Equals":[{"Ref":"ExistingLedgerCounterTableName"},""]} and
+        .Outputs.LedgerCounterTableName.Value == binding and
+        .Outputs.LedgerCounterId.Value == {"Ref":"LedgerCounterId"} and
+        .Resources.SeatReservationProcessor.Properties.Environment.Variables.LEDGER_COUNTER_TABLE_NAME == binding and
+        .Resources.SeatReservationProcessor.Properties.Environment.Variables.LEDGER_COUNTER_ID == {"Ref":"LedgerCounterId"} and
+        .Resources.SeatReservationProcessor.Properties.Environment.Variables.EVENTS_TABLE_NAME == {"Ref":"SeatEventsTable"} and
+        .Resources.SeatReservationCompletionProcessor.Properties.Environment.Variables.EVENTS_TABLE_NAME == {"Ref":"SeatEventsTable"} and
+        .Resources.SeatReservationCompletionProcessor.Properties.Environment.Variables.OPERATIONS_TABLE_NAME == {"Ref":"OperationsTable"}
+    ' <<<"$proposed_template" >/dev/null ||
+        fail "refusing changed table schemas or allocator wiring in the proposed template; nothing executed"
+}
+
+inspect_deployment_changeset() {
+    local changeset_id="$1" page next_token='' seen_tokens=$'\n'
+    local expected_reference="$EXISTING_LEDGER_COUNTER_TABLE_NAME"
+    local pagination=(--no-paginate)
+    if [ -n "$PRESERVED_COUNTER_TABLE" ]; then
+        expected_reference="$PRESERVED_COUNTER_REFERENCE"
+    fi
+
+    while :; do
+        page="$(aws cloudformation describe-change-set \
+            --change-set-name "$changeset_id" --stack-name "$STACK_NAME" \
+            "${pagination[@]}" --output json \
+            --profile "$PROFILE" --region "$REGION")" ||
+            fail "could not inspect the proposed change set; nothing executed"
+        jq -e --arg id "$changeset_id" --arg stack "$STACK_NAME" \
+            --arg counter_id "$LEDGER_COUNTER_ID" \
+            --arg reference "$expected_reference" '
+            .ChangeSetId == $id and .StackName == $stack and
+            .Status == "CREATE_COMPLETE" and .ExecutionStatus == "AVAILABLE" and
+            ([.Parameters[] | select(.ParameterKey == "LedgerCounterId") | .ParameterValue] == [$counter_id]) and
+            ([.Parameters[] | select(.ParameterKey == "ExistingLedgerCounterTableName") | .ParameterValue] == [$reference]) and
+            (.Changes | type == "array") and
+            all(.Changes[];
+                .Type == "Resource" and (.ResourceChange | type == "object") and
+                (.ResourceChange | if .ResourceType == "AWS::DynamoDB::Table" then
+                    .Action == "Add" or
+                    (.Action == "Modify" and .Replacement == "False" and
+                     (.Details | type == "array" and length > 0) and
+                     all(.Details[];
+                         .Target.RequiresRecreation == "Never" and
+                         (.Target.Attribute == "Tags" or
+                          (.Target.Attribute == "Properties" and
+                           (.Target.Name | IN("BillingMode", "ProvisionedThroughput",
+                             "PointInTimeRecoverySpecification", "SSESpecification",
+                             "TableClass", "DeletionProtectionEnabled", "Tags"))))))
+                else
+                    (.ResourceType | type == "string") and
+                    (.Action | IN("Add", "Modify", "Remove"))
+                end)) and
+            (.NextToken == null or (.NextToken | type == "string" and length > 0))
+        ' <<<"$page" >/dev/null ||
+            fail "refusing unsafe or ambiguous change set: table removal, replacement, or schema change; nothing executed"
+        next_token="$(jq -r '.NextToken // empty' <<<"$page")" ||
+            fail "could not read change-set pagination"
+        [ -n "$next_token" ] || break
+        case "$seen_tokens" in
+            *$'\n'"$next_token"$'\n'*) fail "repeated change-set pagination token; nothing executed" ;;
+        esac
+        seen_tokens+="$next_token"$'\n'
+        pagination=(--no-paginate --next-token "$next_token")
+    done
 }
 
 deploy_stack_phase() {
-    local phase_description="$1"
+    local phase_description="$1" sam_output changeset_id
 
+    need_command jq
     build_sam_parameter_overrides
+    load_preserved_allocator_binding
+    if [ -n "$PRESERVED_COUNTER_TABLE" ]; then
+        verify_deployment_counter
+    fi
     DEPLOYMENT_ERROR_PHASE="$phase_description"
     printf '==> %s for stack %s in %s\n' \
         "$phase_description" "$STACK_NAME" "$REGION"
-    sam deploy \
+    sam_output="$(sam deploy \
         --template-file template.yaml \
         --stack-name "$STACK_NAME" \
         --region "$REGION" \
         --profile "$PROFILE" \
         --capabilities CAPABILITY_IAM \
         --resolve-s3 \
+        --use-json \
         --no-confirm-changeset \
+        --no-execute-changeset \
         --no-fail-on-empty-changeset \
         --no-progressbar \
         --parameter-overrides \
-        "${SAM_PARAMETER_OVERRIDES[@]}"
+        "${SAM_PARAMETER_OVERRIDES[@]}" 2>&1)" ||
+        fail "SAM could not prepare a change set: $sam_output"
+    printf '%s\n' "$sam_output"
+    # Use SAM's returned ARN, never a name/latest-change-set lookup that can race.
+    changeset_id="$(sed -n 's/^Changeset created successfully\. \(arn:[^[:space:]]*:changeSet\/[^[:space:]]*\)$/\1/p' <<<"$sam_output")"
+    if [ -z "$changeset_id" ]; then
+        case $'\n'"$sam_output"$'\n' in
+            *$'\n'"No changes to deploy. Stack $STACK_NAME is up to date"$'\n'*)
+                [ -n "$PRESERVED_COUNTER_TABLE" ] || fail "stack exposes no allocator binding"
+                printf '==> Empty infrastructure change set; this does not establish Lambda code equality.\n'
+                return 0
+                ;;
+            *) fail "SAM returned no unambiguous change-set ID; nothing executed" ;;
+        esac
+    fi
+    [[ "$changeset_id" != *[[:space:]]* ]] ||
+        fail "SAM returned multiple change-set IDs; nothing executed"
+    inspect_deployment_changeset "$changeset_id"
+    inspect_deployment_template "$changeset_id"
+    aws cloudformation execute-change-set --change-set-name "$changeset_id" \
+        --stack-name "$STACK_NAME" --profile "$PROFILE" --region "$REGION" ||
+        fail "could not execute the inspected change set"
+    aws cloudformation wait "$DEPLOYMENT_WAITER" --stack-name "$STACK_NAME" \
+        --profile "$PROFILE" --region "$REGION" ||
+        fail "the inspected change set did not reach a successful terminal state"
+    load_preserved_allocator_binding
+    [ -n "$PRESERVED_COUNTER_TABLE" ] || fail "deployed stack exposes no allocator binding"
+    verify_deployment_counter
 }
 
 report_cloudformation_outcome() {
@@ -414,7 +686,9 @@ deployment_error_handler() {
 }
 
 deployment_cleanup() {
+    [ "$DEV" -eq 0 ] || return 0
     invoke_deployment_controller cleanup || true
+    [ "$CLEANUP" -eq 0 ] || return 0
     rm -rf -- "${CACHE_DIR:-.zig-cache-deploy}" \
         "${GLOBAL_CACHE_DIR:-.zig-global-cache-deploy}"
 }
@@ -447,10 +721,11 @@ validate_deployed_function_names() {
     local stack_outputs line output_key output_value
     local deployed_intake_name="" deployed_query_name=""
     local deployed_tiger_beetle_processor_name="" deployed_tiger_beetle_completion_processor_name=""
+    local deployed_seat_processor_name="" deployed_seat_completion_processor_name=""
 
     stack_outputs="$(aws cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='IntakeFunctionName' || OutputKey=='QueryFunctionName' || OutputKey=='TigerBeetleProcessorName' || OutputKey=='TigerBeetleCompletionProcessorName'].join('|', [OutputKey,OutputValue])" \
+        --query "Stacks[0].Outputs[?OutputKey=='IntakeFunctionName' || OutputKey=='QueryFunctionName' || OutputKey=='TigerBeetleProcessorName' || OutputKey=='TigerBeetleCompletionProcessorName' || OutputKey=='SeatReservationProcessorName' || OutputKey=='SeatReservationCompletionProcessorName'].join('|', [OutputKey,OutputValue])" \
         --output text \
         --profile "$PROFILE" \
         --region "$REGION")" ||
@@ -465,6 +740,8 @@ validate_deployed_function_names() {
             QueryFunctionName) deployed_query_name="$output_value" ;;
             TigerBeetleProcessorName) deployed_tiger_beetle_processor_name="$output_value" ;;
             TigerBeetleCompletionProcessorName) deployed_tiger_beetle_completion_processor_name="$output_value" ;;
+            SeatReservationProcessorName) deployed_seat_processor_name="$output_value" ;;
+            SeatReservationCompletionProcessorName) deployed_seat_completion_processor_name="$output_value" ;;
             *) fail "stack returned an unexpected Lambda function-name output" ;;
         esac
     done <<<"${stack_outputs//$'\t'/$'\n'}"
@@ -477,12 +754,150 @@ validate_deployed_function_names() {
         fail "stack output TigerBeetleProcessorName does not match the requested name"
     [ "$deployed_tiger_beetle_completion_processor_name" = "$TIGER_BEETLE_COMPLETION_PROCESSOR_NAME" ] ||
         fail "stack output TigerBeetleCompletionProcessorName does not match the requested name"
+    [ "$deployed_seat_processor_name" = "$SEAT_RESERVATION_PROCESSOR_NAME" ] ||
+        fail "stack output SeatReservationProcessorName does not match the requested name"
+    [ "$deployed_seat_completion_processor_name" = "$SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME" ] ||
+        fail "stack output SeatReservationCompletionProcessorName does not match the requested name"
     printf '==> Deployed Lambda function names match requested values\n'
 }
 
+# Read by immutable ID after the initial name lookup. Only an explicit service
+# not-found response means already complete; access/transport errors are unknown.
+inspect_cleanup_stack() {
+    local response
+    if ! response="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+        --output json --profile "$PROFILE" --region "$REGION" 2>&1)"
+    then
+        case "$response" in
+            *"(ValidationError) when calling the DescribeStacks operation: Stack with id $STACK_NAME does not exist")
+                return 1 ;;
+            *) fail "could not inspect stack for cleanup; deletion is unverified: $response" ;;
+        esac
+    fi
+    jq -e '.Stacks | type == "array" and length == 1 and
+        (.[0] | (.StackId | type == "string" and startswith("arn:")) and
+        (.StackStatus | type == "string") and (.Parameters | type == "array"))' \
+        <<<"$response" >/dev/null || fail "malformed cleanup stack inspection; nothing deleted"
+    CLEANUP_STACK_DESCRIPTION="$response"
+}
+
+teardown_preserved_wireguard() (
+    local gateway_state retained_state
+    gateway_state="$(jq -er '.Stacks[0].Parameters | map(select(.ParameterKey == "EnableWireGuardGateway")) |
+        if length == 1 then .[0].ParameterValue else error("missing gateway state") end' \
+        <<<"$CLEANUP_STACK_DESCRIPTION")" || fail "could not resolve cleanup gateway state"
+    retained_state="$(jq -er '.Stacks[0].Parameters | map(select(.ParameterKey == "RetainTigerBeetleProcessorVpcCleanupResources")) |
+        if length == 1 then .[0].ParameterValue else error("missing retained state") end' \
+        <<<"$CLEANUP_STACK_DESCRIPTION")" || fail "could not resolve retained cleanup state"
+    case "$gateway_state:$retained_state" in
+        false:false) return 0 ;;
+        true:false | true:true | false:true) ;;
+        *) fail "unknown WireGuard cleanup state; nothing deleted" ;;
+    esac
+
+    # Reuse the same ownership preflight, detachment, version and ENI guards as
+    # explicit gateway disable. No local artifacts or allocator setup are needed.
+    source ./wireguard-gateway-setup.sh
+    CLEANUP=1
+    ENABLE_WIREGUARD_GATEWAY=0
+    plan_wireguard_deployment
+    TIGER_BEETLE_PROCESSOR_NAME="$(aws cloudformation describe-stack-resource \
+        --stack-name "$STACK_NAME" --logical-resource-id TigerBeetleProcessor \
+        --query StackResourceDetail.PhysicalResourceId --output text \
+        --profile "$PROFILE" --region "$REGION")" || fail "could not resolve deployed TigerBeetle processor"
+    [[ "$TIGER_BEETLE_PROCESSOR_NAME" =~ ^[A-Za-z0-9_-]+$ ]] ||
+        fail "invalid deployed TigerBeetle processor name"
+    preflight_planned_cleanup_ipv6_egress
+    run_wireguard_deployment "$WIREGUARD_DEPLOYMENT_MODE"
+)
+
+update_wireguard_cleanup_state() {
+    local retain_resources="$1" parameters update_output
+    inspect_cleanup_stack || fail "stack disappeared during guarded WireGuard cleanup"
+    parameters="$(jq -c --arg retain "$retain_resources" '.Stacks[0].Parameters | map(
+        if .ParameterKey == "EnableWireGuardGateway" then {ParameterKey:.ParameterKey,ParameterValue:"false"}
+        elif .ParameterKey == "RetainTigerBeetleProcessorVpcCleanupResources" then {ParameterKey:.ParameterKey,ParameterValue:$retain}
+        else {ParameterKey:.ParameterKey,UsePreviousValue:true} end)' \
+        <<<"$CLEANUP_STACK_DESCRIPTION")" || fail "could not preserve deployed parameters for teardown"
+    if ! update_output="$(aws cloudformation update-stack --stack-name "$STACK_NAME" \
+        --use-previous-template --parameters "$parameters" \
+        --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+        --profile "$PROFILE" --region "$REGION" 2>&1)"
+    then
+        case "$update_output" in
+            *"(ValidationError) when calling the UpdateStack operation: No updates are to be performed.") ;;
+            *) fail "guarded WireGuard teardown update failed: $update_output" ;;
+        esac
+    else
+        aws cloudformation wait stack-update-complete --stack-name "$STACK_NAME" \
+            --profile "$PROFILE" --region "$REGION" ||
+            fail "WireGuard teardown update did not complete; rerun --cleanup after the active operation finishes"
+    fi
+    inspect_cleanup_stack || fail "stack disappeared during WireGuard teardown verification"
+    jq -e --arg retain "$retain_resources" '.Stacks[0] |
+        (.StackStatus == "UPDATE_COMPLETE" or .StackStatus == "CREATE_COMPLETE") and
+        ([.Parameters[] | select(.ParameterKey == "EnableWireGuardGateway") | .ParameterValue] == ["false"]) and
+        ([.Parameters[] | select(.ParameterKey == "RetainTigerBeetleProcessorVpcCleanupResources") | .ParameterValue] == [$retain])' \
+        <<<"$CLEANUP_STACK_DESCRIPTION" >/dev/null ||
+        fail "WireGuard teardown state is unverified; dependent resources remain"
+}
+
+run_owned_resource_cleanup() {
+    local stack_status resources
+    need_command aws
+    need_command jq
+    printf '==> Cleanup permanently deletes owned Operations, Events, every counter in an owned table, and queued messages. Native state is unchanged.\n'
+    prepare_aws_sso_session "$PROFILE"
+    if ! inspect_cleanup_stack; then
+        printf '==> Stack %s is already absent; no deletion attempted.\n' "$STACK_NAME"
+        return 0
+    fi
+    STACK_NAME="$(jq -r '.Stacks[0].StackId' <<<"$CLEANUP_STACK_DESCRIPTION")"
+    stack_status="$(jq -r '.Stacks[0].StackStatus' <<<"$CLEANUP_STACK_DESCRIPTION")"
+    printf '==> Cleanup stack ID: %s (use this ID to resume verification after deletion).\n' "$STACK_NAME"
+    case "$stack_status" in
+        DELETE_IN_PROGRESS | DELETE_COMPLETE) ;;
+        *_IN_PROGRESS) fail "stack is $stack_status; wait for the active operation to finish before retrying --cleanup" ;;
+        CREATE_COMPLETE | CREATE_FAILED | ROLLBACK_COMPLETE | ROLLBACK_FAILED | \
+            UPDATE_COMPLETE | UPDATE_FAILED | UPDATE_ROLLBACK_COMPLETE | UPDATE_ROLLBACK_FAILED | \
+            IMPORT_COMPLETE | IMPORT_ROLLBACK_COMPLETE | IMPORT_ROLLBACK_FAILED | DELETE_FAILED)
+            invoke_deployment_controller teardown
+            # Recheck after prerequisites and before the irreversible delete.
+            ensure_stack_not_in_progress
+            aws cloudformation delete-stack --stack-name "$STACK_NAME" \
+                --profile "$PROFILE" --region "$REGION" ||
+                fail "stack deletion request failed; rerun --cleanup to inspect/resume"
+            ;;
+        *) fail "unknown stack status $stack_status; nothing deleted" ;;
+    esac
+    aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" \
+        --profile "$PROFILE" --region "$REGION" ||
+        fail "stack deletion did not complete within the AWS waiter bound; resources may remain; inspect stack events and rerun --cleanup"
+    # JSON output preserves AWS CLI pagination. DELETE_SKIPPED is not completion.
+    resources="$(aws cloudformation list-stack-resources --stack-name "$STACK_NAME" \
+        --output json --profile "$PROFILE" --region "$REGION")" ||
+        fail "could not verify deleted stack resources; cleanup is unverified"
+    jq -e '.StackResourceSummaries | type == "array" and length > 0 and
+        all(.[]; .ResourceStatus == "DELETE_COMPLETE")' <<<"$resources" >/dev/null ||
+        fail "stack contains retained, failed, or unknown resources; cleanup is incomplete"
+    printf '==> Verified deletion of all resources in stack %s. External resources are preserved.\n' "$STACK_NAME"
+}
+
 parse_deployment_options() {
+    local configuration_option=""
+    local build_option=""
+
     reject_retired_processor_overrides
     while [ "$#" -gt 0 ]; do
+        case "${1%%=*}" in
+            --intake-function-name | --query-function-name | \
+                --tiger-beetle-processor-name | --tiger-beetle-completion-processor-name | \
+                --seat-reservation-processor-name | --seat-reservation-completion-processor-name | \
+                --existing-ledger-counter-table-name | --ledger-counter-id | \
+                --tigerbeetle-cluster-id | --tigerbeetle-addresses | --lambda-principal)
+                configuration_option="${1%%=*}"
+                ;;
+        esac
         case "$1" in
             --execution-function-name | --execution-function-name=*)
                 fail "--execution-function-name is retired; use --tiger-beetle-processor-name"
@@ -567,6 +982,27 @@ parse_deployment_options() {
                     fail "empty value for --tiger-beetle-completion-processor-name"
                 shift
                 ;;
+            --seat-reservation-processor-name | --seat-reservation-processor-name=* | \
+                --seat-reservation-completion-processor-name | --seat-reservation-completion-processor-name=* | \
+                --existing-ledger-counter-table-name | --existing-ledger-counter-table-name=* | \
+                --ledger-counter-id | --ledger-counter-id=*)
+                local seat_option="${1%%=*}" seat_value
+                if [[ "$1" = *=* ]]; then
+                    seat_value="${1#*=}"
+                    [ -n "$seat_value" ] || fail "empty value for $seat_option"
+                    shift
+                else
+                    need_value "$1" "${2:-}"
+                    seat_value="$2"
+                    shift 2
+                fi
+                case "$seat_option" in
+                    --seat-reservation-processor-name) SEAT_RESERVATION_PROCESSOR_NAME="$seat_value" ;;
+                    --seat-reservation-completion-processor-name) SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME="$seat_value" ;;
+                    --existing-ledger-counter-table-name) EXISTING_LEDGER_COUNTER_TABLE_NAME="$seat_value" ;;
+                    --ledger-counter-id) LEDGER_COUNTER_ID="$seat_value" ;;
+                esac
+                ;;
             --tigerbeetle-cluster-id)
                 need_value "$1" "${2:-}"
                 TIGERBEETLE_CLUSTER_ID="$2"
@@ -600,6 +1036,7 @@ parse_deployment_options() {
                 shift
                 ;;
             --use-local-libs)
+                build_option=--use-local-libs
                 USE_LOCAL_LIBS=1
                 shift
                 ;;
@@ -607,7 +1044,16 @@ parse_deployment_options() {
                 DRY_RUN=1
                 shift
                 ;;
+            --dev)
+                DEV=1
+                shift
+                ;;
+            --cleanup)
+                CLEANUP=1
+                shift
+                ;;
             --no-url-check)
+                build_option=--no-url-check
                 CHECK_URL=0
                 shift
                 ;;
@@ -634,6 +1080,20 @@ parse_deployment_options() {
             *) fail "unknown option: $1" ;;
         esac
     done
+    if [ "$CLEANUP" -eq 1 ]; then
+        [ "$DEV" -eq 0 ] && [ "$DRY_RUN" -eq 0 ] ||
+            fail "--cleanup is teardown-only and cannot be combined with --dev or --dry-run"
+        [ -z "$configuration_option$build_option" ] ||
+            fail "--cleanup accepts only profile, region, and stack selection; remove deployment/build options"
+        [ "$DEPLOYMENT_CONTROLLER" = preserve_wireguard_state ] ||
+            fail "--cleanup uses deploy.sh's guarded teardown controller; custom or WireGuard deployment controllers are incompatible"
+    fi
+    if [ "$DEV" -eq 1 ]; then
+        [ -z "$configuration_option" ] ||
+            fail "$configuration_option requires a full deployment; --dev syncs code only"
+        [ "$DEPLOYMENT_CONTROLLER" = preserve_wireguard_state ] ||
+            fail "WireGuard lifecycle or custom controllers require a full deployment; --dev syncs code only"
+    fi
 }
 
 validate_lambda_bootstraps() {
@@ -642,7 +1102,9 @@ validate_lambda_bootstraps() {
     for bootstrap in \
         zig-out/bin/intake/bootstrap \
         zig-out/bin/query/bootstrap \
-        zig-out/bin/tiger_beetle_completion_processor/bootstrap
+        zig-out/bin/tiger_beetle_completion_processor/bootstrap \
+        zig-out/bin/seat_reservation_processor/bootstrap \
+        zig-out/bin/seat_reservation_completion_processor/bootstrap
     do
         artifact_type="$(file "$bootstrap")"
         case "$artifact_type" in
@@ -667,17 +1129,23 @@ package_lambda_archives() {
         intake-lambda.zip \
         query-lambda.zip \
         tiger-beetle-processor.zip \
-        tiger-beetle-completion-processor.zip
+        tiger-beetle-completion-processor.zip \
+        seat-reservation-processor.zip \
+        seat-reservation-completion-processor.zip
     zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
     zip -qj query-lambda.zip zig-out/bin/query/bootstrap
     zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
     zip -qj tiger-beetle-completion-processor.zip zig-out/bin/tiger_beetle_completion_processor/bootstrap
+    zip -qj seat-reservation-processor.zip zig-out/bin/seat_reservation_processor/bootstrap
+    zip -qj seat-reservation-completion-processor.zip zig-out/bin/seat_reservation_completion_processor/bootstrap
 
     for archive in \
         intake-lambda.zip \
         query-lambda.zip \
         tiger-beetle-processor.zip \
-        tiger-beetle-completion-processor.zip
+        tiger-beetle-completion-processor.zip \
+        seat-reservation-processor.zip \
+        seat-reservation-completion-processor.zip
     do
         [ -s "$archive" ] || fail "$archive was not created or is empty"
         archive_contents="$(unzip -Z1 "$archive")"
@@ -688,30 +1156,53 @@ package_lambda_archives() {
 
 run_deployment() {
     parse_deployment_options "$@"
-    validate_tiger_beetle_completion_processor_name
+    if [ "$CLEANUP" -eq 1 ]; then
+        cd "$(dirname "${BASH_SOURCE[0]}")"
+        trap deployment_cleanup EXIT
+        run_owned_resource_cleanup
+        return
+    fi
+    if [ "$DEV" -eq 0 ]; then
+        validate_tiger_beetle_completion_processor_name
+        validate_seat_configuration
+    fi
 
     cd "$(dirname "${BASH_SOURCE[0]}")"
     CACHE_DIR=".zig-cache-deploy"
     GLOBAL_CACHE_DIR=".zig-global-cache-deploy"
+    if [ "$DEV" -eq 1 ]; then
+        CACHE_DIR=".zig-cache-dev"
+        GLOBAL_CACHE_DIR=".zig-global-cache-dev"
+    fi
     trap deployment_cleanup EXIT
 
-    validate_tigerbeetle_configuration
+    if [ "$DEV" -eq 0 ]; then
+        validate_tigerbeetle_configuration
+    fi
 
     if [ "$DRY_RUN" -eq 0 ]; then
         need_command aws
         prepare_aws_sso_session "$PROFILE"
         ensure_stack_not_in_progress
-        validate_existing_intake_name "$INTAKE_FUNCTION_NAME"
+        if [ "$DEV" -eq 1 ]; then
+            require_seat_development_baseline
+        fi
+        if [ "$DEV" -eq 0 ]; then
+            validate_existing_intake_name "$INTAKE_FUNCTION_NAME"
+        fi
     fi
 
-    [ -n "$PASETO_PUBLIC_KEY" ] ||
-        fail "PASETO_PUBLIC_KEY is required; generate one with: zig-out/bin/paseto keygen"
+    if [ "$DEV" -eq 0 ]; then
+        [ -n "$PASETO_PUBLIC_KEY" ] ||
+            fail "PASETO_PUBLIC_KEY is required; generate one with: zig-out/bin/paseto keygen"
+    fi
     if [ "$DRY_RUN" -eq 0 ] && [ "$CHECK_URL" -eq 1 ]; then
         [ -n "${PASETO_PRIVATE_KEY:-}" ] ||
             fail "PASETO_PRIVATE_KEY is required for the authenticated Function URL check"
     fi
-
-    invoke_deployment_controller plan
+    if [ "$DEV" -eq 0 ]; then
+        invoke_deployment_controller plan
+    fi
 
     need_command zig
     need_command zip
@@ -721,6 +1212,9 @@ run_deployment() {
     if [ "$DRY_RUN" -eq 0 ] && [ "$CHECK_URL" -eq 1 ]; then
         need_command curl
     fi
+    [ "$(zig version)" = 0.16.0 ] || fail "Lambda builds require Zig 0.16.0"
+    [ -f ../zig/lib/std/Io/net/HostName.zig ] ||
+        fail "required sibling Zig standard library missing: ../zig/lib/std/Io/net/HostName.zig"
 
     LOCAL_FORKS=()
     if [ "$USE_LOCAL_LIBS" -eq 1 ]; then
@@ -732,18 +1226,6 @@ run_deployment() {
             fail "local aws_lambda checkout missing src/root.zig: $LOCAL_AWS_LAMBDA_ROOT"
         LOCAL_FORKS+=("$LOCAL_AWS_LAMBDA_ROOT")
     fi
-
-    printf '==> Checking Zig formatting\n'
-    zig fmt --check \
-        build.zig \
-        src/processor_message.zig \
-        src/tiger_beetle_completion_processor.zig \
-        src/tiger_beetle_processor.zig \
-        src/intake_lambda.zig \
-        src/lambda_auth.zig \
-        src/paseto.zig \
-        src/paseto_cli.zig \
-        src/query_lambda.zig
 
     ZIG_BUILD_ARGS=(
         --cache-dir "$CACHE_DIR"
@@ -757,8 +1239,13 @@ run_deployment() {
         done
     fi
 
-    printf '==> Running Zig tests\n'
-    zig build test "${ZIG_BUILD_ARGS[@]}"
+    printf '==> Checking Zig formatting\n'
+    zig build fmt-check "${ZIG_BUILD_ARGS[@]}"
+
+    if [ "$DEV" -eq 0 ]; then
+        printf '==> Running Zig tests\n'
+        zig build test "${ZIG_BUILD_ARGS[@]}"
+    fi
 
     printf '==> Removing obsolete root Lambda bootstrap\n'
     rm -f zig-out/bin/bootstrap
@@ -772,16 +1259,42 @@ run_deployment() {
     printf '==> Refreshing Lambda zip archives\n'
     package_lambda_archives
 
-    printf '==> Validating SAM template\n'
-    sam validate --template-file template.yaml --region "$REGION"
-    sam validate --lint --template-file template.yaml --region "$REGION"
+    if [ "$DEV" -eq 0 ]; then
+        printf '==> Validating SAM template\n'
+        sam validate --template-file template.yaml --region "$REGION"
+        sam validate --lint --template-file template.yaml --region "$REGION"
+    fi
 
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '==> Dry run complete. Skipped SAM deploy.\n'
+        if [ "$DEV" -eq 1 ]; then
+            printf '==> Development dry run complete. Skipped SAM sync.\n'
+        else
+            printf '==> Dry run complete. Skipped SAM deploy.\n'
+        fi
         return 0
     fi
 
-    deploy_stack_and_resolve_controller_outputs
+    if [ "$DEV" -eq 1 ]; then
+        printf '==> Syncing Lambda code to existing development stack %s in %s\n' \
+            "$STACK_NAME" "$REGION"
+        sam sync \
+            --template-file template.yaml \
+            --stack-name "$STACK_NAME" \
+            --region "$REGION" \
+            --profile "$PROFILE" \
+            --code \
+            --no-watch \
+            --no-dependency-layer \
+            --resource-id IntakeFunction \
+            --resource-id QueryFunction \
+            --resource-id TigerBeetleProcessor \
+            --resource-id TigerBeetleCompletionProcessor \
+            --resource-id SeatReservationProcessor \
+            --resource-id SeatReservationCompletionProcessor <<< 'Y' ||
+            fail "development code sync failed; some functions may already have updated"
+    else
+        deploy_stack_and_resolve_controller_outputs
+    fi
 
     OPERATIONS_TABLE_NAME="$(aws cloudformation describe-stack-resource \
         --stack-name "$STACK_NAME" \

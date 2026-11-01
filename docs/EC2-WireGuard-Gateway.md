@@ -395,7 +395,7 @@ non-SSO profiles are unsupported. Dry runs make no AWS authentication calls.
 The helper stops before local work when the stack status ends in
 `_IN_PROGRESS`.
 
-The helper then runs Zig formatting and tests, builds all four Linux ARM64
+The helper then runs Zig formatting and tests, builds all six Linux ARM64
 bootstraps, refreshes their zip archives, and runs both SAM validations. First
 enablement preflights a VPC with no EIGW or `::/0` conflict, then uses one SAM
 update. CloudFormation creates `TigerBeetleProcessorEgressOnlyInternetGateway`, adds
@@ -445,6 +445,16 @@ topology changes use this exact old-resource sequence:
    ENI-management policy.
 4. Only after cleanup succeeds, clear the saved optional gateway inputs. A
    topology reconfiguration then preflights and deploys the target values.
+
+For complete owned-resource teardown, use
+[`./deploy.sh --cleanup`](DEPLOY_AWS_LAMBDA_WITH_SAM.md#13-delete-the-sam-stack).
+It completes or resumes the same ownership preflight, detach, published-version,
+and ENI guards using the deployed template and previous non-lifecycle parameters.
+It then deletes the stack, including owned tables and every counter in an owned
+table, and verifies resource deletion. Saved gateway inputs disappear with the
+stack instead of requiring a separate reset update. It performs no build, code
+deployment, counter setup, or native reset. Referenced counter tables, external
+networking/SSM keys, and externally hosted TigerBeetle state remain untouched.
 
 If the bounded wait or an AWS inspection fails, cleanup and parameter reset are
 not attempted. The EIGW, IPv6 route, TigerBeetle processor security group, required
@@ -639,7 +649,8 @@ SAM-owned IPv6 route, EIGW, TigerBeetle processor security group, and conditiona
 ENI-management IAM. The sequence never deletes or disassociates the external
 VPC/subnet IPv6 allocations.
 
-Run guarded disablement before deleting an enabled stack. Neither disablement
+`deploy.sh --cleanup` runs guarded disablement before deleting an enabled stack;
+complete the same guarded disablement before any manual stack deletion. Neither disablement
 nor later stack deletion changes operator-owned IPv6 associations, DNS or
 network-ACL configuration, NAT/default routes, external SSM parameters,
 supporting network, workstation keys, or TigerBeetle data. Remove external

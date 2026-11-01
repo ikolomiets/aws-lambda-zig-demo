@@ -84,6 +84,22 @@ fn resolve_tiger_beetle_processor_target(
 }
 
 pub fn build(b: *std.Build) void {
+    const optimize = b.standardOptimizeOption(.{
+        .preferred_optimize_mode = .ReleaseSafe,
+    });
+    // Set this before any dependency resolves, including source-path discovery.
+    if (b.release_mode == .any) {
+        std.debug.assert(optimize == .ReleaseSafe);
+        b.release_mode = .safe;
+    }
+    const dependency_paths = b.addSystemCommand(&.{ "printf", "%s\t%s\n" });
+    for (b.available_deps) |dependency| {
+        dependency_paths.addArg(dependency[0]);
+        dependency_paths.addDirectoryArg(b.dependency(dependency[0], .{}).path(""));
+    }
+    b.step("dependency-paths", "Print named source roots for resolved direct dependencies")
+        .dependOn(&dependency_paths.step);
+
     const fmt_check = b.addFmt(.{
         .paths = &.{ "build.zig", "build.zig.zon", "src", "tests" },
         .check = true,
@@ -91,14 +107,6 @@ pub fn build(b: *std.Build) void {
     b.step("fmt-check", "Check formatting of project Zig sources and tests")
         .dependOn(&fmt_check.step);
 
-    const optimize = b.standardOptimizeOption(.{
-        .preferred_optimize_mode = .ReleaseSafe,
-    });
-    // Propagate the project's preferred mode to dependencies for bare `--release` builds.
-    if (b.release_mode == .any) {
-        std.debug.assert(optimize == .ReleaseSafe);
-        b.release_mode = .safe;
-    }
     const tigerbeetle_c_artifacts = b.dependency("tigerbeetle_c_artifacts", .{});
     const lambda_arch = b.option(
         lambda.Arch,
@@ -288,6 +296,91 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&install_tiger_beetle_completion_processor.step);
 
+    const lambda_seat = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/seat_reservation.zig"),
+        .imports = &.{
+            .{ .name = "operation", .module = lambda_operation },
+            .{ .name = "processor_message", .module = lambda_processor_message },
+        },
+    });
+    const lambda_seat_persistence = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/seat_reservation_persistence.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
+            .{ .name = "dynamodb", .module = lambda_dynamodb },
+            .{ .name = "operation", .module = lambda_operation },
+            .{ .name = "operation_persistence", .module = lambda_operation_persistence },
+            .{ .name = "seat_reservation", .module = lambda_seat },
+        },
+    });
+    const lambda_ledger_counter = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/ledger_counter.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
+            .{ .name = "dynamodb", .module = lambda_dynamodb },
+        },
+    });
+    const lambda_seat_submission = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .strip = true,
+        .single_threaded = true,
+        .root_source_file = b.path("src/seat_reservation_processor.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
+            .{ .name = "dynamodb", .module = lambda_dynamodb },
+            .{ .name = "aws-lambda", .module = lambda_runtime },
+            .{ .name = "operation", .module = lambda_operation },
+            .{ .name = "processor_message", .module = lambda_processor_message },
+            .{ .name = "seat_reservation", .module = lambda_seat },
+            .{ .name = "seat_reservation_persistence", .module = lambda_seat_persistence },
+            .{ .name = "ledger_counter", .module = lambda_ledger_counter },
+            .{ .name = "sqs_queue", .module = lambda_sqs_queue },
+        },
+    });
+    const lambda_seat_completion = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .strip = true,
+        .single_threaded = true,
+        .root_source_file = b.path("src/seat_reservation_completion_processor.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
+            .{ .name = "dynamodb", .module = lambda_dynamodb },
+            .{ .name = "aws-lambda", .module = lambda_runtime },
+            .{ .name = "operation", .module = lambda_operation },
+            .{ .name = "operation_persistence", .module = lambda_operation_persistence },
+            .{ .name = "processor_message", .module = lambda_processor_message },
+            .{ .name = "seat_reservation", .module = lambda_seat },
+            .{ .name = "seat_reservation_persistence", .module = lambda_seat_persistence },
+            .{ .name = "seat_reservation_processor", .module = lambda_seat_submission },
+        },
+    });
+    const seat_submission_lambda = b.addExecutable(.{
+        .name = "seat-reservation-processor-bootstrap",
+        .root_module = lambda_seat_submission,
+    });
+    const seat_completion_lambda = b.addExecutable(.{
+        .name = "seat-reservation-completion-processor-bootstrap",
+        .root_module = lambda_seat_completion,
+    });
+    const install_seat_submission = b.addInstallArtifact(seat_submission_lambda, .{
+        .dest_dir = .{ .override = .{ .custom = "bin/seat_reservation_processor" } },
+        .dest_sub_path = "bootstrap",
+    });
+    const install_seat_completion = b.addInstallArtifact(seat_completion_lambda, .{
+        .dest_dir = .{ .override = .{ .custom = "bin/seat_reservation_completion_processor" } },
+        .dest_sub_path = "bootstrap",
+    });
+    b.getInstallStep().dependOn(&install_seat_submission.step);
+    b.getInstallStep().dependOn(&install_seat_completion.step);
+
     const tiger_beetle_processor_mod = b.createModule(.{
         .target = tiger_beetle_processor_target,
         .optimize = optimize,
@@ -348,6 +441,84 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation", .module = host_operation },
         },
     });
+    const host_seat_reservation = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/seat_reservation.zig"),
+        .imports = &.{
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "processor_message", .module = host_processor_message },
+        },
+    });
+    const seat_reservation_tests = b.addTest(.{ .root_module = host_seat_reservation });
+    const run_seat_reservation_tests = b.addRunArtifact(seat_reservation_tests);
+    b.step("test-seat-reservation", "Run pure Seat Reservation contract tests")
+        .dependOn(&run_seat_reservation_tests.step);
+    const host_seat_persistence = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/seat_reservation_persistence.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "dynamodb", .module = host_dynamodb },
+            .{ .name = "seat_reservation", .module = host_seat_reservation },
+        },
+    });
+    const seat_persistence_tests = b.addTest(.{ .root_module = host_seat_persistence });
+    const run_seat_persistence_tests = b.addRunArtifact(seat_persistence_tests);
+    b.step("test-seat-persistence", "Run Seat Event persistence tests")
+        .dependOn(&run_seat_persistence_tests.step);
+    const events_cli_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/seat_events_cli.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "seat_reservation", .module = host_seat_reservation },
+            .{ .name = "seat_reservation_persistence", .module = host_seat_persistence },
+        },
+    });
+    const events_exe = b.addExecutable(.{ .name = "events", .root_module = events_cli_mod });
+    const install_events = b.addInstallArtifact(events_exe, .{});
+    b.getInstallStep().dependOn(&install_events.step);
+    b.step("build-events", "Build the host Events utility").dependOn(&install_events.step);
+    const events_cli_tests = b.addTest(.{ .root_module = events_cli_mod });
+    const run_events_cli_tests = b.addRunArtifact(events_cli_tests);
+    b.step("test-events-cli", "Run Events utility tests").dependOn(&run_events_cli_tests.step);
+    const host_ledger_counter = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/ledger_counter.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "dynamodb", .module = host_dynamodb },
+        },
+    });
+    const ledger_counter_tests = b.addTest(.{ .root_module = host_ledger_counter });
+    const run_ledger_counter_tests = b.addRunArtifact(ledger_counter_tests);
+    b.step("test-ledger-counter", "Run global ledger counter tests")
+        .dependOn(&run_ledger_counter_tests.step);
+    const ledger_counter_cli_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/ledger_counter_cli.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "ledger_counter", .module = host_ledger_counter },
+        },
+    });
+    const ledger_counter_exe = b.addExecutable(.{
+        .name = "ledger-counter",
+        .root_module = ledger_counter_cli_mod,
+    });
+    const install_ledger_counter = b.addInstallArtifact(ledger_counter_exe, .{});
+    b.getInstallStep().dependOn(&install_ledger_counter.step);
+    b.step("build-ledger-counter", "Build the host global ledger counter utility")
+        .dependOn(&install_ledger_counter.step);
+    const ledger_counter_cli_tests = b.addTest(.{ .root_module = ledger_counter_cli_mod });
+    const run_ledger_counter_cli_tests = b.addRunArtifact(ledger_counter_cli_tests);
+    b.step("test-ledger-counter-cli", "Run ledger counter utility tests")
+        .dependOn(&run_ledger_counter_cli_tests.step);
     const host_operation_persistence = b.createModule(.{
         .target = b.graph.host,
         .optimize = optimize,
@@ -358,6 +529,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation", .module = host_operation },
         },
     });
+    host_seat_persistence.addImport("operation", host_operation);
+    host_seat_persistence.addImport("operation_persistence", host_operation_persistence);
     const host_sqs_queue = b.createModule(.{
         .target = b.graph.host,
         .optimize = optimize,
@@ -477,26 +650,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_query_tests = b.addRunArtifact(query_tests);
 
-    const tiger_beetle_processor_test_mod = b.createModule(.{
-        .target = b.graph.host,
-        .optimize = .ReleaseSafe,
-        .root_source_file = b.path("src/tiger_beetle_processor.zig"),
-        .single_threaded = false,
-        .imports = &.{
-            .{ .name = "aws", .module = host_aws },
-            .{ .name = "aws-lambda", .module = test_runtime },
-            .{ .name = "processor_message", .module = host_processor_message },
-            .{ .name = "operation", .module = host_operation },
-            .{ .name = "sqs_queue", .module = host_sqs_queue },
-            .{ .name = tigerbeetle_import_name, .module = tigerbeetle_host },
-        },
-    });
-    const tiger_beetle_processor_tests = b.addTest(.{
-        .root_module = tiger_beetle_processor_test_mod,
-    });
-    const run_tiger_beetle_processor_tests = b.addRunArtifact(tiger_beetle_processor_tests);
-    b.step("test-tigerbeetle-processor", "Run processor parsing and invocation tests").dependOn(&run_tiger_beetle_processor_tests.step);
-
     const tiger_beetle_completion_processor_test_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
@@ -510,15 +663,86 @@ pub fn build(b: *std.Build) void {
             .{ .name = "operation_persistence", .module = host_operation_persistence },
         },
     });
-    // Existing application modules are connected only for the local full-path tests.
-    tiger_beetle_processor_test_mod.addImport("tiger_beetle_completion_processor", tiger_beetle_completion_processor_test_mod);
-    tiger_beetle_processor_test_mod.addImport("operation_persistence", host_operation_persistence);
-    tiger_beetle_processor_test_mod.addImport("query_lambda", query_test_mod);
     const tiger_beetle_completion_processor_tests = b.addTest(.{
         .root_module = tiger_beetle_completion_processor_test_mod,
     });
     const run_tiger_beetle_completion_processor_tests = b.addRunArtifact(tiger_beetle_completion_processor_tests);
     b.step("test-tigerbeetle-completion-processor", "Run tigerbeetle-completion-processor tests").dependOn(&run_tiger_beetle_completion_processor_tests.step);
+
+    const tiger_beetle_processor_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+        .root_source_file = b.path("src/tiger_beetle_processor.zig"),
+        .single_threaded = false,
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "processor_message", .module = host_processor_message },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "sqs_queue", .module = host_sqs_queue },
+            .{ .name = tigerbeetle_import_name, .module = tigerbeetle_host },
+            .{ .name = "tiger_beetle_completion_processor", .module = tiger_beetle_completion_processor_test_mod },
+            .{ .name = "operation_persistence", .module = host_operation_persistence },
+            .{ .name = "query_lambda", .module = query_test_mod },
+            .{ .name = "intake_lambda", .module = lambda_test_mod },
+            .{ .name = "sqs", .module = host_sqs },
+        },
+    });
+    const tiger_beetle_processor_tests = b.addTest(.{
+        .root_module = tiger_beetle_processor_test_mod,
+    });
+    const run_tiger_beetle_processor_tests = b.addRunArtifact(tiger_beetle_processor_tests);
+    b.step("test-tigerbeetle-processor", "Run processor parsing and invocation tests").dependOn(&run_tiger_beetle_processor_tests.step);
+
+    const seat_submission_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .single_threaded = true,
+        .root_source_file = b.path("src/seat_reservation_processor.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "dynamodb", .module = host_dynamodb },
+            .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "processor_message", .module = host_processor_message },
+            .{ .name = "seat_reservation", .module = host_seat_reservation },
+            .{ .name = "seat_reservation_persistence", .module = host_seat_persistence },
+            .{ .name = "ledger_counter", .module = host_ledger_counter },
+            .{ .name = "sqs_queue", .module = host_sqs_queue },
+        },
+    });
+    const seat_completion_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .single_threaded = true,
+        .root_source_file = b.path("src/seat_reservation_completion_processor.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "dynamodb", .module = host_dynamodb },
+            .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "operation_persistence", .module = host_operation_persistence },
+            .{ .name = "processor_message", .module = host_processor_message },
+            .{ .name = "seat_reservation", .module = host_seat_reservation },
+            .{ .name = "seat_reservation_persistence", .module = host_seat_persistence },
+            .{ .name = "seat_reservation_processor", .module = seat_submission_mod },
+        },
+    });
+    const seat_submission_exe = b.addExecutable(.{
+        .name = "seat-reservation-processor",
+        .root_module = seat_submission_mod,
+    });
+    const seat_completion_exe = b.addExecutable(.{
+        .name = "seat-reservation-completion-processor",
+        .root_module = seat_completion_mod,
+    });
+    const seat_processors_build = b.step("build-seat-processors", "Compile host seat invocation adapters");
+    seat_processors_build.dependOn(&seat_submission_exe.step);
+    seat_processors_build.dependOn(&seat_completion_exe.step);
+    const seat_processor_tests = b.addTest(.{ .root_module = seat_completion_mod });
+    const run_seat_processor_tests = b.addRunArtifact(seat_processor_tests);
+    b.step("test-seat-processors", "Run composed seat submission and completion tests")
+        .dependOn(&run_seat_processor_tests.step);
 
     const lambda_auth_tests = b.addTest(.{
         .root_module = host_lambda_auth,
@@ -621,6 +845,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = tigerbeetle_import_name, .module = tigerbeetle_host },
             .{ .name = tigerbeetle_c_import_name, .module = tigerbeetle_c_host },
+            .{ .name = "seat_reservation", .module = host_seat_reservation },
+            .{ .name = "processor_message", .module = host_processor_message },
+            .{ .name = "tiger_beetle_processor", .module = tiger_beetle_processor_test_mod },
         },
     });
     const tigerbeetle_integration_tests = b.addTest(.{
@@ -704,7 +931,6 @@ pub fn build(b: *std.Build) void {
     cleanup_lifecycle_test.addFileArg(
         b.path("tests/deploy_cleanup_lifecycle_test.sh"),
     );
-
     const gateway_interface_test = b.addSystemCommand(&.{"bash"});
     gateway_interface_test.addFileArg(
         b.path("tests/deploy_gateway_interface_test.sh"),
@@ -712,6 +938,12 @@ pub fn build(b: *std.Build) void {
 
     const processor_interface_test = b.addSystemCommand(&.{"bash"});
     processor_interface_test.addFileArg(b.path("tests/processor_interface_test.sh"));
+
+    const seat_scenarios_test = b.addSystemCommand(&.{"bash"});
+    seat_scenarios_test.addFileArg(b.path("tests/seat_scenarios_test.sh"));
+
+    const events_wrapper_test = b.addSystemCommand(&.{"bash"});
+    events_wrapper_test.addFileArg(b.path("tests/events_wrapper_test.sh"));
 
     const deploy_test_step = b.step(
         "test-deploy",
@@ -721,8 +953,63 @@ pub fn build(b: *std.Build) void {
     deploy_test_step.dependOn(&cleanup_lifecycle_test.step);
     deploy_test_step.dependOn(&gateway_interface_test.step);
     deploy_test_step.dependOn(&processor_interface_test.step);
+    deploy_test_step.dependOn(&seat_scenarios_test.step);
+    deploy_test_step.dependOn(&events_wrapper_test.step);
 
+    const lambda_outcome_log = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/outcome_log.zig"),
+    });
+    for ([_]*std.Build.Module{
+        lambda_ledger_counter,
+        lambda_operation_persistence,
+        lambda_sqs_queue,
+        intake_lambda_mod,
+        tiger_beetle_completion_processor_mod,
+        lambda_seat_submission,
+        lambda_seat_completion,
+    }) |module| {
+        module.addImport("outcome_log", lambda_outcome_log);
+    }
+    const native_outcome_log = b.createModule(.{
+        .target = tiger_beetle_processor_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/outcome_log.zig"),
+    });
+    for ([_]*std.Build.Module{
+        tiger_beetle_processor_sqs_queue,
+        tiger_beetle_processor_mod,
+    }) |module| {
+        module.addImport("outcome_log", native_outcome_log);
+    }
+    const host_outcome_log = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/outcome_log.zig"),
+    });
+    for ([_]*std.Build.Module{
+        host_ledger_counter,
+        host_operation_persistence,
+        host_sqs_queue,
+        lambda_test_mod,
+        tiger_beetle_completion_processor_test_mod,
+        tiger_beetle_processor_test_mod,
+        seat_submission_mod,
+        seat_completion_mod,
+    }) |module| {
+        module.addImport("outcome_log", host_outcome_log);
+    }
+    const log_tests = b.addTest(.{ .root_module = host_outcome_log });
+    const run_log_tests = b.addRunArtifact(log_tests);
     const test_step = b.step("test", "Run unit and integration tests");
+    test_step.dependOn(&run_log_tests.step);
+    test_step.dependOn(&run_seat_reservation_tests.step);
+    test_step.dependOn(&run_seat_processor_tests.step);
+    test_step.dependOn(&run_seat_persistence_tests.step);
+    test_step.dependOn(&run_events_cli_tests.step);
+    test_step.dependOn(&run_ledger_counter_tests.step);
+    test_step.dependOn(&run_ledger_counter_cli_tests.step);
     test_step.dependOn(&run_lambda_auth_tests.step);
     test_step.dependOn(&run_query_tests.step);
     test_step.dependOn(&run_tiger_beetle_processor_tests.step);

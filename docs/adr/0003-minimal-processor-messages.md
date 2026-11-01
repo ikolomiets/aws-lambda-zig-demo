@@ -1,9 +1,17 @@
 # Separate processor messages from persisted Operations
 
-Processors exchange one `{operation_id, body, result_queue?}` envelope per SQS message. The
-Operation's tenant, name, lifecycle, timestamps and original-input hash remain at intake and
-persistence. Carrying them through execution coupled processors to an input snapshot that cannot
-represent another processor's output.
+Processors exchange one `{operation_id, tenant, body, context, result_queue?}` envelope per SQS
+message. The Operation UUID correlates the work; trusted tenant identifies the authenticated
+requester. Context is an opaque JSON value owned by participating domain processors. Explicit
+null means no Context; omission is invalid. Same-type outputs preserve tenant and Context even
+when Body changes, including diagnostics. Native execution interprets neither as resource
+authorization. Name, lifecycle, timestamps and original-input hash remain at intake and persistence,
+so execution is independent of an Operation snapshot and supports another processor's output.
+
+Intake derives tenant only from the verified PASETO subject and emits null Context. Tenant retains
+its 1–64-byte UTF-8 contract. Unknown fields, duplicate decoded keys and invalid metadata are
+rejected. Public callers cannot supply tenant, Context or routing. Public Results acquire no
+Processor Message fields.
 
 Incoming `result_queue` overrides the processor's default result destination. Each processor
 chooses its outgoing route independently; TigerBeetle currently omits it. Public intake exposes
@@ -15,17 +23,18 @@ interprets those details and creates the existing tagged persisted Result. The e
 native chain classification needed for execution control, including transfer eligibility, but
 no longer emits a terminal success/failure discriminator.
 
-Intake input remains limited to 4 KiB. Internal Bodies permit 96 KiB so results can become inputs.
-TigerBeetle still admits at most 64 commands. The persisted Result envelope keeps its 96 KiB bound;
-executor admission reserves room for the wrapper the final processor adds.
+Intake Body remains limited to 4,096 bytes. Internal Bodies permit 98,304 compact JSON bytes so
+results can become inputs; Context permits 4,096 compact JSON bytes. Decoded routes permit 2,048
+bytes. The compact shared envelope is bounded at 115,328 bytes, with the same pre-parse raw-input
+cap. Serializer checks include escaping; SQS request and Lambda event wrapping have separate
+transport costs. TigerBeetle admits at most 64 commands. The complete persisted Result keeps its
+98,304-byte bound; executor admission reserves room for the wrapper the final processor adds.
 
-One message per operation replaces aggregation. This increases SQS sends to at most ten per
-executor invocation and completion invocations to one per operation, while reducing each final
-invocation to one conditional write. Serial publication preserves successful acknowledgements
-when a later send fails, including when destinations differ.
+Each Operation output occupies one message, with at most ten serial SQS sends per executor
+invocation and one conditional write per final invocation. Publication follows source order,
+skips unfinished work, and stops at the first failed or uncertain send. Only successfully published
+sources acknowledge, including when destinations differ. This preserves retry eligibility without
+a durable execution journal or publication outbox.
 
-This is a coordinated wire cutover with no dual parser. Drain old messages, including delayed or
-in-flight retries and replayable dead-letter messages, before replacing producers and consumers.
-Stored Operations and hashes require no migration. Rename the completion function, role, mapping,
-parameters, outputs, executable and package to TigerBeetle-specific names; existing stacks require
-a reviewed CloudFormation change set for those replacements. No cloud deployment is part of this change.
+The codec accepts only the current envelope. Operational rollout instructions belong in the
+[deployment guide](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#processor-message-rollout).

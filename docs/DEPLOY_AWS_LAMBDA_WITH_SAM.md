@@ -1,17 +1,23 @@
-# Deploy intake, query, and the TigerBeetle and Completion processors with SAM
+# Deploy the six operation and Seat Reservation Lambdas with SAM
 
-This guide documents how to deploy the four Zig Lambda packages in this repository
+This guide documents how to deploy the six Zig Lambda packages in this repository
 using AWS SAM and `template.yaml`.
 
-SAM deploys all four Lambda functions as one CloudFormation-managed stack. It creates
+SAM deploys all six Lambda functions as one CloudFormation-managed stack. It creates
 their execution roles, public Function URLs for intake and query, the DynamoDB
 operations table, the TigerBeetle queue sent by intake and consumed by the TigerBeetle processor,
-and the Completion queue sent by the TigerBeetle processor and consumed by the Completion processor. The complete
-data flow is:
+and the Completion queue sent by the TigerBeetle processor and consumed by the Completion processor.
+It also creates seat submission/completion queues, durable Events and an owned or
+referenced Ledger Counter table. The data flows are:
 
 ```text
 intake -> TigerBeetleQueue -> tiger-beetle-processor -> CompletionQueue -> tiger-beetle-completion-processor -> DynamoDB
+intake -> SeatReservationQueue -> seat-reservation-processor -> TigerBeetleQueue
+  -> tiger-beetle-processor -> SeatReservationCompletionQueue -> seat-reservation-completion-processor -> DynamoDB
 ```
+
+Seat submission sends local rejections directly to seat completion. Events and
+Ledger Counters are retained independently of the Operations TTL.
 
 The template can also provision an optional EC2 WireGuard gateway that routes
 TigerBeetle processor traffic to TigerBeetle on a development workstation. While
@@ -19,11 +25,24 @@ the TigerBeetle processor is VPC-attached, SAM supplies outbound IPv6 access to 
 dual-stack endpoint through a stack-owned egress-only internet gateway (EIGW).
 The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 
+## Contents
+
+- [Assumptions](#assumptions) · [SSO authentication](#1-authenticate-with-aws-sso)
+- [Build and package](#2-build-and-package-the-zig-lambdas) · [Template validation](#3-validate-the-sam-template)
+- [Stack resources](#4-understand-what-the-template-creates) · [Deployment values](#5-preserve-the-intake-function-name-and-choose-deployment-values)
+- [Full deployment](#6-deploy-with-sam-guided-mode) · [Development code updates](#development-code-updates) · [Rebuild and redeploy](#12-update-the-deployed-lambda-code)
+- [Gateway operation](#7-configure-and-operate-the-wireguard-gateway) · [Gateway diagnostics](#diagnose-failures) · [Key rotation](#rotate-wireguard-keys)
+- [API checks](#8-test-query-get-and-intake-post) · [Lambda logs](#9-download-lambda-logs)
+- [Operation persistence utility](#10-create-read-update-and-delete-persisted-operations) · [Seat Event utility](#seat-event-metadata-utility) · [Ledger counter utility](#global-ledger-counter-utility) · [Queue utility](#11-send-receive-and-check-queued-operations)
+- [Persistence configuration diagnostics](#troubleshoot-persistence-command-configuration) · [Lambda initialization diagnostics](#troubleshoot-lambda-initialization)
+- [Stack deletion](#13-delete-the-sam-stack) · [Security note](#security-note)
+
 ## Assumptions
 
 - AWS CLI v2 and SAM CLI are installed.
 - `zip`, `unzip`, and `file` are installed for package validation.
-- `jq` is installed for `lambda_logs.sh` and shell regression tests.
+- `jq` 1.6 or newer is installed for deployment guards, `lambda_logs.sh`, deployed seat scenarios, and shell regression tests.
+- Bash 3.2 or newer and curl are installed when running deployed seat scenarios.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
@@ -123,7 +142,7 @@ done
 ```
 
 Run the full local test graph before packaging. This includes the Zig tests and
-the local deployment-helper regression tests:
+mocked deployment-helper tests:
 
 ```sh
 zig build test
@@ -135,9 +154,9 @@ To run only the deployment-helper regression tests, use:
 zig build test-deploy
 ```
 
-The deployment-helper tests replace AWS commands with shell mocks, so they
-require Bash and `jq`, with no AWS credentials or network access. `deploy.sh` invokes only
-`zig build test`, which includes these tests exactly once.
+The deployment-helper tests mock AWS commands, so they require Bash and `jq`,
+with no AWS credentials or network access. `deploy.sh` invokes only `zig build test`,
+which includes these tests exactly once.
 
 Build the stripped ReleaseSafe Lambda executables for AWS Lambda ARM64. ARM64
 is also the project build default; `-Darch=arm` keeps the deployment command
@@ -148,16 +167,21 @@ zig build --release -Darch=arm
 ```
 
 The build also installs the host-native `paseto` utility and the local command
-implementations invoked by `persistence.sh` and `queue.sh`. Each Lambda zip
+implementations invoked by `persistence.sh`, `queue.sh`, `events.sh`, and
+`ledger-counter.sh`. The utilities can also be built separately with
+`zig build build-events` and `zig build build-ledger-counter`.
+Each Lambda zip
 contains only its handler's root-level `bootstrap`.
 
-Verify that all four built artifacts are Linux ARM64 executables.
+Verify that all six built artifacts are Linux ARM64 executables.
 
 ```sh
 file zig-out/bin/intake/bootstrap \
   zig-out/bin/query/bootstrap \
   zig-out/bin/tiger_beetle_processor/bootstrap \
-  zig-out/bin/tiger_beetle_completion_processor/bootstrap
+  zig-out/bin/tiger_beetle_completion_processor/bootstrap \
+  zig-out/bin/seat_reservation_processor/bootstrap \
+  zig-out/bin/seat_reservation_completion_processor/bootstrap
 ```
 
 Inspect the TigerBeetle processor bootstrap before creating or updating any AWS resource. It must be the
@@ -186,7 +210,7 @@ The package-level check is independent of the Lambda executable: `strings` on
 `lib/aarch64-linux-gnu.2.27/libtb_client.a` must show epoll, eventfd, and timerfd markers and no
 `io_uring` marker. The macOS archive remains the Darwin/kqueue build.
 
-Intake, query, and the Completion processor remain single-threaded, statically linked
+Intake, query, native completion, and both seat processors are single-threaded, statically linked
 executables:
 
 ```text
@@ -199,14 +223,21 @@ and `file` reports it as dynamically linked. Amazon Linux 2023 supplies the
 glibc loader and libraries; do not expect the TigerBeetle processor bootstrap to be
 static.
 
-Create or refresh all four packages.
+Create or refresh all six packages. Remove old archives first so stale entries cannot survive.
 
 ```sh
+rm -f intake-lambda.zip query-lambda.zip tiger-beetle-processor.zip \
+  tiger-beetle-completion-processor.zip seat-reservation-processor.zip \
+  seat-reservation-completion-processor.zip
 zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
 zip -qj query-lambda.zip zig-out/bin/query/bootstrap
 zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
 zip -qj tiger-beetle-completion-processor.zip zig-out/bin/tiger_beetle_completion_processor/bootstrap
+zip -qj seat-reservation-processor.zip zig-out/bin/seat_reservation_processor/bootstrap
+zip -qj seat-reservation-completion-processor.zip zig-out/bin/seat_reservation_completion_processor/bootstrap
 ```
+
+For each archive, `unzip -Z1 <archive>` must print exactly `bootstrap`.
 
 SAM reads the packages from the matching `CodeUri` properties in `template.yaml`.
 
@@ -250,6 +281,11 @@ Both commands should report that `template.yaml` is valid.
 `template.yaml` defines these resources:
 
 - `OperationsTable`: `AWS::DynamoDB::Table`
+- `SeatEventsTable`: on-demand table, String partition key `tenant` and sort key `event_id`, without TTL
+- `LedgerCounterTable`: conditional owned on-demand table, String partition key `counter_id`, without sort key or TTL
+- `SeatReservationQueue` and `SeatReservationCompletionQueue`: standard SQS queues
+- `SeatReservationProcessor` and `SeatReservationCompletionProcessor`: Lambda functions with generated execution roles
+- `SeatReservationProcessorQueueMapping` and `SeatReservationCompletionProcessorQueueMapping`: SQS event-source mappings
 - `TigerBeetleQueue`: `AWS::SQS::Queue`
 - `CompletionQueue`: `AWS::SQS::Queue`
 - `IntakeFunction`: `AWS::Serverless::Function`
@@ -322,7 +358,7 @@ Environment:
 ```
 
 The intake function additionally receives the queue URL under the exact
-operation-routing key `TigerBeetleQueue` and the following table-write and
+operation-routing keys `TigerBeetleQueue` and `SeatReservationQueue` and the following table-write and
 queue-send permissions:
 
 ```yaml
@@ -336,10 +372,13 @@ Policies:
       - Effect: Allow
         Action:
           - sqs:SendMessage
-        Resource: !GetAtt TigerBeetleQueue.Arn
+        Resource:
+          - !GetAtt TigerBeetleQueue.Arn
+          - !GetAtt SeatReservationQueue.Arn
 Environment:
   Variables:
     TigerBeetleQueue: !Ref TigerBeetleQueue
+    SeatReservationQueue: !Ref SeatReservationQueue
 ```
 
 The query function receives its own inline policy containing only
@@ -350,7 +389,7 @@ The TigerBeetle processor function uses the same `provided.al2023` ARM64 runtime
 memory, a 15-second timeout, and basic logging policy. It has no Function URL
 or authentication configuration. Its explicit role grants queue-scoped
 polling permissions for `TigerBeetleQueue` and `sqs:SendMessage` only for
-`CompletionQueue`. It has no DynamoDB permission. When the gateway is enabled,
+`CompletionQueue` and `SeatReservationCompletionQueue`. It has no DynamoDB permission. When the gateway is enabled,
 the role also receives the six EC2 network-interface actions required by a
 VPC-attached Lambda. The function receives `COMPLETION_QUEUE_URL` plus the
 TigerBeetle settings.
@@ -370,12 +409,59 @@ attachment. Its explicit role can poll only `CompletionQueue` and can call
 only `dynamodb:UpdateItem` on `OperationsTable`. Its only application
 environment value is `OPERATIONS_TABLE_NAME`.
 
+Both seat processors use `provided.al2023`, ARM64, 128 MiB and a 15-second
+timeout, with basic CloudWatch logging, no Function URL and no VPC attachment.
+Their mappings use batch size 1, zero batching delay and
+`ReportBatchItemFailures`, without `ScalingConfig` or a reserved concurrency cap.
+Each standard seat queue has 90-second visibility, default retention and no
+redrive policy. Existing native mappings retain batch sizes 10 and 1.
+
+| Function | Table permissions | Queue permissions |
+| --- | --- | --- |
+| Seat submission | `GetItem`/`PutItem` on Events; `GetItem`/`UpdateItem` on the selected counter table | Poll seat submissions; send native work and seat completions |
+| Seat completion | `GetItem`/`UpdateItem` on Events and Operations | Poll seat completions |
+
+Polling grants `sqs:ReceiveMessage`, `sqs:DeleteMessage` and
+`sqs:GetQueueAttributes` on the source queue. Seat completion has no counter
+access, and native processing has no DynamoDB access. Atomic creation
+finalization and coherent readback use underlying item permissions, as described in
+[DynamoDB transaction authorization](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html).
+Events and Operations share this stack's account and Region.
+
+Submission receives `EVENTS_TABLE_NAME`, `LEDGER_COUNTER_TABLE_NAME`,
+`LEDGER_COUNTER_ID`, `TigerBeetleQueue` and `SeatReservationCompletionQueue`.
+Completion receives `EVENTS_TABLE_NAME` and `OPERATIONS_TABLE_NAME`. Neither
+seat function receives a native cluster ID or links the native client.
+
+`ExistingLedgerCounterTableName` defaults to empty, creating the owned
+`LedgerCounterTable`; a physical name references an existing table in this
+account and Region. The referenced table retains its data and owner lifecycle;
+SAM creates no resource for it. `LedgerCounterId` defaults to
+`global`, accepts 1–128 ASCII bytes (alphanumeric first, then alphanumeric,
+`.`, `_`, `-`), and is exported as `LEDGER_COUNTER_ID`. Runtime validates Number
+`high_water` as bounded u32; DynamoDB schema does not enforce non-key numeric
+bounds. Operations retains its existing `id` key and 24-hour TTL; Events and
+counter tables have no TTL. There is no implicit counter initialization.
+
+Outputs expose both seat function names/ARNs, both seat queue URLs,
+`SeatEventsTableName`, actual owned or referenced `LedgerCounterTableName`,
+and configured `LedgerCounterId`. Share the physical table and ID across every
+deployment and native cluster requiring one sequence. Public SeatReservation
+Bodies, Context and Events carry no counter selector.
+
+Deployment credentials need CloudFormation, Lambda, SQS, IAM role/pass-role and
+owned-table management permissions separately from runtime roles. Explicit
+counter setup needs `PutItem`/`GetItem` on the intended counter table; submission
+cannot initialize it. Utility discovery needs the CloudFormation reads described
+below. Template validation and mocks establish neither live IAM nor connectivity
+and do not authorize deployment.
+
 The least-privilege boundary is deliberate: intake creates an Operation and
 routes `"name":"TigerBeetle"` to `TigerBeetleQueue`; query reads the table;
-TigerBeetle processor polls `TigerBeetleQueue` and publishes terminal results to
-`CompletionQueue`; and
+TigerBeetle processor polls `TigerBeetleQueue` and publishes results to
+`CompletionQueue` or seat completion; and
 the Completion processor polls `CompletionQueue` and updates the table. Lambda's managed
-event-source pollers consume both source queues outside the function TigerBeetle processor
+event-source pollers consume all four source queues outside the function
 environment. Therefore only TigerBeetle processor's AWS SDK `SendMessage` call needs the
 VPC SQS egress path. Completion remains outside the VPC and reaches DynamoDB
 normally.
@@ -403,9 +489,13 @@ TigerBeetle processor with SQS events. The mapping remains enabled when the
 managed WireGuard gateway is disabled; operators must provide another trusted
 route to the configured TigerBeetle address or accept timeout-driven
 partial-batch retries. Each record is a minimal Processor Message with canonical `operation_id`,
-JSON `body`, and optional internal `result_queue`. Invalid envelopes acknowledge without native
+trusted `tenant`, JSON `body`, explicit JSON `context`, and optional internal `result_queue`. Invalid envelopes acknowledge without native
 work. Intake omits the route and exposes no route field to external callers. Internal Bodies may
-contain up to 96 KiB of compact JSON; public intake stays at 4 KiB.
+contain up to 98,304 bytes of compact JSON; public intake stays at 4,096 bytes. Context permits
+4,096 compact JSON bytes, tenant permits 1–64 decoded UTF-8 bytes, and routes permit 2,048
+decoded bytes. Compact envelopes and pre-parse raw messages are capped at 115,328 bytes.
+SQS request and Lambda event wrapping add escaping outside that envelope. The native processor
+carries tenant and Context unchanged on every output, including diagnostics, without interpreting them.
 
 The executor validates and admits complete command lists, then submits account creations,
 eligible transfer creations, and lookups. It retains native statuses and observations directly in
@@ -435,29 +525,19 @@ transient DynamoDB failures retry the individual message.
 The final function retains its 15-second timeout, 128 MiB memory, non-VPC configuration and
 90-second queue visibility timeout. Each invocation now makes at most one completion write.
 
-### Processor message cutover
+### Processor message rollout
 
-Creation-command `flags` now require arrays of canonical names, and newly produced found-account
-Results contain named flag arrays. Before rolling out this processor, stop producers and drain old
-queued and in-flight Operations that contain integer flags; those messages will fail validation after
-the cutover. Previously persisted Results remain unchanged. Update Result consumers to accept named
-flag arrays before restarting production.
+The current internal envelope requires trusted tenant and explicit Context; messages missing
+either field are invalid and acknowledge without native work or completion writes. Intake derives
+tenant from the verified PASETO subject and supplies null Context. Public callers cannot supply
+these fields or Result Queue routing; stored Operations, public Results and the input hash contract
+retain their existing shape and bounds.
 
-This is a breaking internal wire change with no dual parser. Stop intake and internal producers,
-then drain old queued and in-flight work before replacing producers and consumers together. Account
-for delayed messages and retained dead-letter messages before allowing later replay. Old full
-Operation inputs and aggregate Completion messages will be rejected by the new consumers. Stored
-Operations, public HTTP requests/responses, and the tenant/name/Body hash contract do not change.
-
-Completion resources are renamed to `TigerBeetleCompletionProcessor`, its Role and QueueMapping;
-parameter/output names use `TigerBeetleCompletionProcessorName` and `TigerBeetleCompletionProcessorArn`.
-The default function and zip are `tiger-beetle-completion-processor` and
-`tiger-beetle-completion-processor.zip`; the executable is
-`zig-out/bin/tiger_beetle_completion_processor/bootstrap`. Deployment helpers now accept
-`TIGER_BEETLE_COMPLETION_PROCESSOR_NAME` and `--tiger-beetle-completion-processor-name`.
-The former `COMPLETION_PROCESSOR_NAME` and `--completion-processor-name` are rejected before AWS calls.
-Review the CloudFormation change set for renamed-resource replacements before an existing-stack
-upgrade. No old packages are refreshed automatically by build validation.
+Deploy compatible producers and consumers together through full deployment before using code-only
+`--dev` sync. The codec has no dual parser. Stop producers and drain incompatible queued, delayed
+and in-flight messages, including retained dead-letter messages eligible for later replay, before
+replacing the pipeline. Re-submit work through authenticated intake as needed; do not invent trusted
+metadata for historical messages. Build validation does not refresh zip packages automatically.
 
 Per-message routing does not expand IAM: the template still permits the executor to send only to
 CompletionQueue. Adding an internal processor destination requires an explicit send grant and
@@ -495,9 +575,9 @@ or another DynamoDB service failure while processing an entry and retries the
 single Completion message.
 
 The second intake inline-policy statement grants that function only
-`SendMessage` access to this stack's TigerBeetle queue. The handler sends full
-compact `SUBMITTED` Operation JSON, but has no receive, delete, purge, or
-queue-management permissions. TigerBeetle processor receives its separate TigerBeetle queue
+`SendMessage` access to this stack's TigerBeetle queue. The handler sends a
+compact Processor Message containing the trusted tenant, null Context and original
+Body, and has no receive, delete, purge, or queue-management permissions. TigerBeetle processor receives its separate TigerBeetle queue
 queue-scoped poller policy and Completion queue-scoped `SendMessage` policy.
 Completion receives its separate Completion queue-scoped poller policy and
 table-scoped `UpdateItem`; neither role grants queue-management access. The
@@ -621,10 +701,13 @@ intake-lambda
 query-lambda
 tiger-beetle-processor
 tiger-beetle-completion-processor
+seat-reservation-processor
+seat-reservation-completion-processor
 ```
 
 They are controlled by `IntakeFunctionName`, `QueryFunctionName`,
-`TigerBeetleProcessorName`, and `TigerBeetleCompletionProcessorName`. Before
+`TigerBeetleProcessorName`, `TigerBeetleCompletionProcessorName`,
+`SeatReservationProcessorName`, and `SeatReservationCompletionProcessorName`. Before
 updating an existing stack, resolve the current intake physical name and reuse
 it exactly:
 
@@ -983,6 +1066,10 @@ remove the local gateway files after the direct deployment is configured.
 
 ## 6. Deploy with SAM guided mode
 
+Use `./deploy.sh` for guarded full deployments and ordinary redeployments. The
+direct SAM commands below describe manual setup; they bypass the helper's
+[durable-data guards](#durable-data-guards-and-first-time-counter-setup).
+
 Run:
 
 ```sh
@@ -996,6 +1083,9 @@ sam deploy --guided \
     QueryFunctionName=query-lambda \
     TigerBeetleProcessorName=tiger-beetle-processor \
     TigerBeetleCompletionProcessorName=tiger-beetle-completion-processor \
+    SeatReservationProcessorName=seat-reservation-processor \
+    SeatReservationCompletionProcessorName=seat-reservation-completion-processor \
+    LedgerCounterId=global \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -1049,6 +1139,9 @@ sam deploy \
     QueryFunctionName=query-lambda \
     TigerBeetleProcessorName=tiger-beetle-processor \
     TigerBeetleCompletionProcessorName=tiger-beetle-completion-processor \
+    SeatReservationProcessorName=seat-reservation-processor \
+    SeatReservationCompletionProcessorName=seat-reservation-completion-processor \
+    LedgerCounterId=global \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY"
 ```
@@ -1079,6 +1172,9 @@ sam deploy --guided \
     QueryFunctionName=query-lambda \
     TigerBeetleProcessorName=tiger-beetle-processor \
     TigerBeetleCompletionProcessorName=tiger-beetle-completion-processor \
+    SeatReservationProcessorName=seat-reservation-processor \
+    SeatReservationCompletionProcessorName=seat-reservation-completion-processor \
+    LedgerCounterId=global \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY" \
     EnableWireGuardGateway=true \
@@ -1111,6 +1207,9 @@ sam deploy \
     QueryFunctionName=query-lambda \
     TigerBeetleProcessorName=tiger-beetle-processor \
     TigerBeetleCompletionProcessorName=tiger-beetle-completion-processor \
+    SeatReservationProcessorName=seat-reservation-processor \
+    SeatReservationCompletionProcessorName=seat-reservation-completion-processor \
+    LedgerCounterId=global \
     LambdaPrincipal='*' \
     PasetoPublicKey="$PASETO_PUBLIC_KEY" \
     EnableWireGuardGateway=true \
@@ -1140,7 +1239,9 @@ Routine `deploy.sh` runs preserve all existing WireGuard-related CloudFormation
 parameters, whether the gateway is enabled or disabled. A new stack uses the
 template defaults and remains disabled. Gateway flags are rejected by
 `deploy.sh`, while gateway-specific environment variables are not read; use
-`wireguard-gateway-setup.sh` for any gateway lifecycle change. A routine
+`wireguard-gateway-setup.sh` for gateway configuration changes. The explicit
+[`deploy.sh --cleanup` teardown](#13-delete-the-sam-stack) also completes guarded
+disablement before deleting owned resources. A routine
 deployment also rejects the internal retained-cleanup state until explicit
 teardown finishes.
 
@@ -1165,7 +1266,31 @@ TIGER_BEETLE_COMPLETION_PROCESSOR_NAME='<tiger-beetle-completion-processor-name>
 ./deploy.sh --tiger-beetle-completion-processor-name '<tiger-beetle-completion-processor-name>'
 ```
 
-Both deployment helpers accept both processor name flags, in separate or
+Both deployment helpers also accept `--seat-reservation-processor-name` and
+`--seat-reservation-completion-processor-name`, with matching
+`SEAT_RESERVATION_PROCESSOR_NAME` and `SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME`
+environment overrides. `--existing-ledger-counter-table-name` (or
+`EXISTING_LEDGER_COUNTER_TABLE_NAME`) selects a referenced physical table;
+`--ledger-counter-id` (or `LEDGER_COUNTER_ID`) selects its record. CLI values
+override environment values. Omitted ID defaults to `global`; explicitly empty
+or invalid IDs fail before AWS access. No counter selection derives from native
+cluster configuration. Keep both components of every established binding on
+deploy, WireGuard enable/reconfigure and disable runs. An omitted existing-table
+override preserves SAM's prior parameter on update; it creates an owned table
+on a new stack. Omitted counter ID always selects the documented `global`
+default, so supply a non-default ID on every full deployment.
+
+For an initial deployment referencing an existing shared binding:
+
+```sh
+./deploy.sh --existing-ledger-counter-table-name '<counter-table-name>' --ledger-counter-id '<counter-id>'
+```
+
+Full deployment does not verify selected counter setup or guard rebinding yet.
+Retain the binding explicitly; changing a cluster does not authorize changing
+the table/ID or initializing missing established state.
+
+Both deployment helpers accept all processor name flags, in separate or
 `--option=value` form. When using custom names, pass them or export
 `TIGER_BEETLE_PROCESSOR_NAME` and `TIGER_BEETLE_COMPLETION_PROCESSOR_NAME` on every deploy,
 WireGuard enable, reconfigure, and disable run.
@@ -1272,7 +1397,7 @@ tenant-safe 404, authenticated wrong methods return 405, and an authenticated
 bodyless intake POST returns 400. The private key and test token are not printed
 or passed to the Lambda environment. Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run` to run the
-local checks, rebuild all four Lambda zip archives, and validate `template.yaml` without
+local checks, rebuild all six Lambda zip archives, and validate `template.yaml` without
 deploying to AWS.
 
 For non-dry-run deployments, the helper clears inherited static AWS credential
@@ -1332,6 +1457,136 @@ Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run --use-local-libs`
 to build with local dependency checkouts. The `aws_lambda` checkout defaults
 to `../aws-lambda-zig`; override it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
+
+Both deployment modes run `zig build fmt-check` with their selected local and
+global caches and any `--use-local-libs` package forks. This target checks build
+files, Zig sources, and tests before the remaining test/build steps.
+
+### Durable-data guards and first-time counter setup
+
+Full deployment creates a JSON proposal with
+`sam deploy --use-json --no-execute-changeset`.
+The helper takes the exact ARN returned by SAM, explicitly reads every page
+with `DescribeChangeSet`, and reads that change set's processed template with
+`GetTemplate`. It refuses table removal, definite or conditional replacement,
+missing/unknown replacement information, key/attribute/TTL changes, ambiguous
+table changes, and changes to the table references used by the seat processors.
+The processed template must retain the documented schemas and allocator wiring.
+Unknown or malformed responses, failed inspection, repeated pagination tokens,
+and an unrecognized SAM response stop execution. The helper executes only the
+inspected ARN and waits for stack creation or update to finish. An empty SAM
+change set succeeds, but does not establish that deployed Lambda code equals
+local code after development sync.
+
+An established allocator is the physical table together with its selected
+case-sensitive counter ID. Both remain stable through full deployment and
+WireGuard controller phases. The helper verifies the owned logical table's
+physical identity or the explicit referenced table, the stack's selected ID,
+and the proposed parameters and runtime wiring. Switching to another table or
+another ID is refused even if the replacement record already exists. Omitting
+the referenced-table option preserves a stack's existing reference. A selected
+non-default ID must still be supplied with `--ledger-counter-id` or
+`LEDGER_COUNTER_ID`; omission defaults to `global`. Native cluster selection is
+independent and never initializes, resets, or selects a counter.
+
+Before updating an established binding, normal deployment invokes the shared
+counter utility's strongly consistent `read` with an explicit selected ID. It
+also verifies setup after successful infrastructure execution. It never invokes
+`init` or `allocate`, repairs missing state, or cleans up data before deploying.
+A missing, corrupt, or unavailable selected record fails the run while leaving
+other counters untouched. Inspect an established allocator failure and recover
+its original state; initialization is only for a deliberately new binding.
+
+A first deployment can create the owned table before failing its setup check.
+The deployed infrastructure remains available for explicit first-time setup.
+For a newly selected binding only, initialize it and repeat the same deployment:
+
+```sh
+./ledger-counter.sh --profile dev --region ca-central-1 \
+  --stack-name aws-lambda-zig-demo --counter-id global init
+./deploy.sh --profile dev --region ca-central-1 --stack-name aws-lambda-zig-demo
+```
+
+For an explicitly selected ID, pass that same ID to `init` and to deployment's
+`--ledger-counter-id`. Setup uses the shared absent-only insertion at 1000 and
+validates existing state without replacing it; the first allocation is 1001.
+For a referenced table, its owner can perform first-time setup with the direct
+binary before deployment, or use the wrapper after stack outputs exist. All
+participants requiring one sequence use the same table/ID across native clusters.
+
+The deployment identity needs `cloudformation:DescribeStacks`,
+`cloudformation:DescribeStackResource`, `cloudformation:DescribeChangeSet`,
+`cloudformation:GetTemplate`, and `cloudformation:ExecuteChangeSet`, in addition
+to its existing packaging/change-set/resource permissions. Counter verification
+also needs AWS CLI credential export and `dynamodb:GetItem` on the selected
+table. Explicit setup separately needs `dynamodb:PutItem` and `GetItem` on that
+table. These operator permissions do not change runtime IAM: seat submission
+retains `GetItem`/`UpdateItem` counter access and cannot initialize a counter.
+The guards have mocked offline coverage; they do not establish live AWS IAM,
+connectivity, or delivery evidence.
+
+### Development code updates
+
+Use `./deploy.sh --dev` for compatible code changes on an existing development
+stack. Establish the six-function baseline with a full deployment first; a
+four-function stack cannot use seat development sync. The helper requires both
+seat function-name outputs before building or syncing. Plain `./deploy.sh`
+retains the full test suite, both SAM validation passes, controller/WireGuard
+flow, outputs, smoke checks, and deletion of `.zig-cache-deploy` and
+`.zig-global-cache-deploy` on exit.
+
+```sh
+# With the private key matching the deployed public key exported for smoke checks:
+./deploy.sh --dev --profile dev --region ca-central-1 --stack-name aws-lambda-zig-demo
+
+# Local build/package checks only; no keys, login, AWS inspection, or sync:
+./deploy.sh --dev --dry-run
+```
+
+Development mode retains `.zig-cache-dev` and `.zig-global-cache-dev` across
+successful and failed runs; ordinary deployment does not delete these caches.
+It checks Zig 0.16.0 and the required sibling standard library, runs the existing
+complete `fmt-check` target, and incrementally builds the same ARM64 ReleaseSafe
+targets and host tools. The sibling file check does not verify the hostname workaround;
+see the [hostname-connect note](ZIG_0_16_HOSTNAME_CONNECT_STALL.md). It refreshes
+all six prebuilt ZIPs and verifies stripped ARM64 bootstraps and root-level
+archive contents. It skips the full suite and both SAM validation passes. Build,
+package, and sync failures fail the run.
+
+After SSO login and the active-stack guard, the helper runs one-shot
+`sam sync --code --no-watch --no-dependency-layer` against `template.yaml`, using
+the selected stack/profile/Region and exactly `IntakeFunction`, `QueryFunction`,
+`TigerBeetleProcessor`, `TigerBeetleCompletionProcessor`,
+`SeatReservationProcessor`, and `SeatReservationCompletionProcessor`. SAM handles the
+prebuilt ZIPs, unchanged-code detection, upload, and update waiting. SAM may ask
+for its development-stack opt-in on first use; selecting `--dev` automatically
+answers that confirmation with a single `Y`. The warning remains visible, and
+any further prompt receives EOF. The helper then retains the
+existing read-only table/queue summaries, Function URL outputs, and HTTP probes;
+`--no-url-check` skips those HTTP probes and the private-key requirement.
+The public key is not required in development mode because the deployed
+configuration supplies it. Run `zig build test` separately for the full local
+release gates. The mode has no measured speed guarantee.
+
+Development sync never invokes the separately authorized
+[deployed seat scenarios](#seat-workflow-evidence-and-deployed-scenarios).
+
+Development mode invokes no deployment controller, WireGuard lifecycle action,
+or counter setup. It rejects explicit function-name, TigerBeetle configuration,
+counter-table/counter-ID, and Lambda-principal flags, lifecycle options including `--cleanup`, and custom
+deployment controllers. Environment configuration overrides such as
+`PASETO_PUBLIC_KEY`, function names, and TigerBeetle settings are not applied by
+code sync. Use full deployment for new resources, IAM, environment/runtime/network
+settings, and coordinated incompatible message-envelope changes; those require
+a new compatible baseline before further code-only iterations.
+
+Multi-function code sync is not atomic: a failed run may leave some functions
+updated. Synchronized code can differ from the artifact recorded by
+CloudFormation. An empty deployment change set or CloudFormation drift status
+does not establish code equality. Return to the full deployment path for
+infrastructure changes and release checks. See the
+[SAM code-sync reference](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-cli-command-reference-sam-sync.html)
+for the AWS CLI behavior.
 
 ## 7. Configure and operate the WireGuard gateway
 
@@ -1770,8 +2025,9 @@ return static HTTP 503; malformed items and other unexpected failures remain
 sanitized HTTP 500 responses. DynamoDB TTL remains asynchronous, so an item is
 readable while it is still stored even after `expires_at`.
 
-The SQS message is compact `{operation_id,body}` JSON with no trailing newline.
-Intake supplies the submitted Body and omits internal routing metadata. The DynamoDB item and successful HTTP response omit `body`.
+The SQS message is compact `{operation_id,tenant,context,body}` JSON with no trailing newline.
+Intake supplies the verified PASETO subject as tenant, null Context, and the submitted Body, and
+omits internal routing metadata. The DynamoDB item and successful HTTP response omit `body`.
 A matching retry whose stored item is still `SUBMITTED` sends the queued copy again.
 Matching `COMPLETED` retries return the stored Operation without
 another send.
@@ -1792,6 +2048,189 @@ TigerBeetleCompletionProcessor receives one Processor Message per invocation. It
 native Body and conditionally completes the Operation selected by its UUID. Conflicts acknowledge;
 transient failures retry that single message. Earlier completed Operations are unaffected.
 
+### Seat workflow evidence and deployed scenarios
+
+Keep these evidence levels separate when recording validation:
+
+| Level | Command and what it establishes |
+| --- | --- |
+| Authorized local native | `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` exercises the local replica's funding, reservation bounds, replay, confirmation and expiry. It requires the separately authorized local replica and establishes no cloud delivery or IAM behavior. |
+| Deployed | The separately invoked [runner](../seat_scenarios.sh) exercises the selected development stack through its public intake/query and host read utilities. Only an executed, passing run establishes deployed behavior for its covered paths. |
+
+The deployed runner requires an existing compatible **six-function full-deployment
+baseline**: `IntakeFunction`, `QueryFunction`, `SeatReservationProcessor`,
+`TigerBeetleProcessor`, `SeatReservationCompletionProcessor`, and
+`TigerBeetleCompletionProcessor`, with their current queues, mappings, IAM and
+runtime configuration. The selected counter binding must already be initialized;
+native connectivity and gateway configuration must already work. Build the host
+utilities beforehand using the [ordinary build](#2-build-and-package-the-zig-lambdas).
+The runner requires Bash 3.2+, jq 1.6+, AWS CLI, curl, and executable
+`zig-out/bin/dynamodb`, `events`, and `ledger-counter`. It never builds,
+packages, deploys, synchronizes, logs in, or initializes a counter.
+
+Help is credential-free and performs no AWS calls, utility execution, or discovery:
+
+```sh
+./seat_scenarios.sh --help
+```
+
+Authenticate AWS using your existing environment or profile and export a valid
+`PASETO_TOKEN` signed for the deployed public key. Invoking the runner exercises
+the selected **development** stack, including creating a Seat Event and reserving
+and confirming seats. With the default stack and Region, run:
+
+```sh
+./seat_scenarios.sh
+```
+
+Command-line options override the environment. Profile selection uses
+`AWS_PROFILE`, then `AWS_DEFAULT_PROFILE`, then `PROFILE`, otherwise the AWS CLI's
+default credential chain. Region selection uses `AWS_REGION`, then
+`AWS_DEFAULT_REGION`, then `REGION`, otherwise `ca-central-1`. `STACK_NAME` defaults
+to `aws-lambda-zig-demo`. An inherited profile does not override environment
+credentials; explicit `--profile` uses the AWS CLI's explicit profile selection.
+The runner exports the resolved credentials through
+`aws configure export-credentials --format process`, retaining support for both
+session credentials and credentials without a session token.
+
+By default, each invocation creates a private, unique
+`.scratch/seat-scenarios.XXXXXX` directory under the current working directory and
+prints its path. `OUTPUT_DIR` or `--output-dir` selects an explicit directory,
+which must be new and have an existing parent. All selectors remain available:
+
+```sh
+./seat_scenarios.sh --profile '<development-profile>' --region ca-central-1 \
+  --stack-name '<development-stack>' --output-dir './seat-scenario-run-unique'
+```
+
+`--authorize-cloud` is accepted for compatibility and is optional. The runner has
+no cloud-inspection dry run. Invalid arguments print the error and usage to stderr
+and exit with status 2 before contacting AWS.
+Operator access requires `cloudformation:DescribeStacks`,
+`cloudformation:DescribeStackResource`, and `dynamodb:GetItem` on the Operations,
+Events, and actual counter tables. `PASETO_TOKEN` supplies public handler
+authentication; no private key or token-issuance utility is required. Tokens must
+remain valid throughout the run. These operator reads do not certify the Lambda
+roles' permissions.
+Environment endpoint overrides are rejected, and AWS CLI configured endpoint
+overrides are disabled for discovery. Read utilities receive empty shared config
+and credentials files (`/dev/null`) with the exported credentials and explicit
+Region; a profile-level SDK endpoint override cannot redirect inspection.
+
+The runner discovers `IntakeFunctionUrl`, `QueryFunctionUrl`, `SeatEventsTableName`,
+`LedgerCounterTableName`, and `LedgerCounterId` from the selected stack's outputs.
+It discovers `OperationsTable` through its physical resource, since there is no
+Operations table-name output. The counter table output works for owned and
+referenced tables; the ID output is required even for the default `global`.
+Every counter read passes `--counter-id` explicitly to the direct utility, so an
+inherited `LEDGER_COUNTER_ID` cannot redirect inspection. No native cluster-ID
+discovery participates. Utilities receive the discovered table names, resolved
+credentials and selected Region through their environment.
+
+Each invocation generates six unique Operation UUIDs for the owner workflow.
+Creation's UUID is the new Event ID. The owner subject comes from the authenticated
+intake response. The owner creates general/premium capacities
+3/2 with a 300-second reservation timeout, checks initial availability, reserves two
+general seats, checks the hold, confirms it, and checks remaining availability 1/2.
+Every terminal public Result is compared against its exact allowed projection,
+then read back with `dynamodb read`. `events read` verifies ready metadata and
+the allocated ledger; counter reads bracket creation without assuming a gapless
+sequence or exclusive allocator use. Missing authentication must produce 401.
+
+Optionally export `PASETO_FOREIGN_TOKEN`, signed for a different subject, to enable
+cross-tenant checks and three additional Operations. Otherwise, these checks are
+skipped and the manifest records `tenant_isolation: "skipped"`. With the second
+token, the other tenant sees the owner's Operation as the same static 404 as a missing
+Operation, cannot reuse its UUID at intake (409), and receives exact
+`event_unavailable` Results for foreign check/reserve/confirm requests. The manifest
+records `tenant_isolation: "pending"` until all these checks pass, then `"passed"`.
+
+The entire invocation has a 300-second deadline, including subprocesses; commands
+are individually limited to 30 seconds and HTTP requests to 10 seconds without
+redirects or automatic retries. Each Operation polls at most 30 times, waiting two
+seconds between reads. `--poll-attempts` accepts 1–60, `--poll-seconds` accepts 0–5,
+and `--timeout-seconds` accepts 1–300. A stalled command, timeout, unexpected HTTP
+status, malformed output, wrong Result or failed utility stops the run nonzero.
+There is no automatic resubmission or recovery. These bounds may expose a slow
+stack as a failed scenario; inspect it before deciding whether to run again.
+
+The private output directory contains `manifest.json`, validated terminal public
+Operations, ready Event metadata, and before/after counter observations. The
+manifest records authenticated tenants, generated Operation IDs, tenant-isolation
+coverage and `running`, `failed`, or `passed`; failures include stage, Operation
+UUID where applicable, and a sanitized
+reason. A stopped invocation may retain `running`. Raw service errors, stack outputs,
+table names, Function URLs, credentials, signing keys and bearer tokens are not
+captured. Do not redirect AWS discovery/debug output into fixtures or publish local
+deployment output. An unrun runner, mocked pass, or incomplete/failed manifest is
+**not a passing cloud result**. Record executed revision, time and covered paths
+alongside local evidence; this scenario does not prove all IAM permissions,
+failure/redelivery paths or deployed recovery.
+
+Each run retains a permanent Event, native accounts/funding and confirmed seat
+transfers, consumes at least one ledger value (gaps are allowed), and leaves six
+disposable Operations, or nine with the optional cross-tenant checks. These
+Operations retain their existing 24-hour TTL. Interrupted runs may retain creating
+Events or unconfirmed holds. The runner never resets/decrements
+counters, deletes metadata or Operations, or cleans up native state. Unique
+identities provide repeatability; cleanup is a separate authorized lifecycle action.
+Deleting or expiring an Operation removes the completion/recovery anchor; permanent
+Event metadata cannot reconstruct it or authorize repair. Keep local evidence as
+needed, without treating it as a durable execution journal.
+
+### Outcome log rollout and manual acceptance
+
+Build, run the complete offline checks, and refresh all six packages using
+[the packaging procedure](#2-build-and-package-the-zig-lambdas). Deploy the same
+revision across intake, both seat processors and both TigerBeetle processors.
+Follow the [coordinated processor procedure](#processor-message-rollout) before
+resuming producers; development sync is appropriate only after establishing a
+compatible six-function baseline. The deployment helper is unchanged and does
+not automate these acceptance checks. Run cloud updates and scenarios only after
+explicit deployment authorization.
+
+Confirmation requests and Context have exactly `command`, `event_id` and
+`pending_id`. Successful confirmation payloads have exactly `event_id` and
+`reservation_id`. Missing, unknown or malformed fields receive ordinary schema
+validation. Winner readback validates only current Result shapes; invalid stored
+shapes are diagnosed and acknowledged without rewriting Operations. No Event
+migration or native connectivity change accompanies this rollout.
+
+After the update, perform these checks manually:
+
+1. With the private key matching the deployed public key already exported, issue
+   a fresh token and run the complete seat workflow twice:
+
+   ```sh
+   export PASETO_TOKEN="$(zig-out/bin/paseto issue --subject gosha --ttl-seconds 900)"
+   ./seat_scenarios.sh --profile '<development-profile>' --region ca-central-1
+   ./seat_scenarios.sh --profile '<development-profile>' --region ca-central-1
+   ```
+
+   Require both manifests to report `passed`, including final general availability
+   **1** and premium availability **2**. Keep each generated evidence directory;
+   refresh the token if it cannot remain valid for both runs.
+2. Read the created ready Event using `events read` from either run's evidence.
+   Use one of its saved account IDs for a fresh `TigerBeetle` Operation containing
+   only `lookup_accounts`. Submit another fresh Operation with a new unused
+   native account ID. Use authenticated [POST and query GET](#8-test-query-get-and-intake-post),
+   fresh Operation UUIDs and the same `gosha` token. Require terminal `SUCCESS`
+   for the known account and `FAILURE` for the absent account. For both UUIDs,
+   require executor `published` and completion `finalized` records with the
+   corresponding terminal Result type only on the completion record.
+3. Submit a fresh `SeatReservation` Operation containing a malformed confirmation,
+   for example `{"command":"confirm_seats","event_id":"<event-uuid>"}` (missing
+   `pending_id`). Require terminal `FAILURE` with `code: invalid_request`, a
+   submission `rejected` record with its safe schema reason and rejection-publication
+   stage, and a completion `finalized` record with `FAILURE`.
+4. [Download all six Lambda logs](#9-download-lambda-logs), including query. Use the
+   new records to correlate the five instrumented functions by Operation UUID,
+   then SQS message ID and Lambda request ID per attempt. Query retains its
+   existing logs. Confirm the seat flow traverses intake, seat submission, native
+   executor and seat completion, and the lookup-only flow traverses intake,
+   native executor and native completion. Investigate any ERROR, retry, or
+   `started` record without a final summary before accepting the rollout.
+
 ## 9. Download Lambda logs
 
 Run the stack-aware log helper with an explicit Lambda selection:
@@ -1801,11 +2240,14 @@ Run the stack-aware log helper with an explicit Lambda selection:
 ./lambda_logs.sh query
 ./lambda_logs.sh tiger-beetle-processor
 ./lambda_logs.sh tiger-beetle-completion-processor
+./lambda_logs.sh seat-reservation-processor
+./lambda_logs.sh seat-reservation-completion-processor
 ```
 
 The stack name is fixed as `aws-lambda-zig-demo`. The helper resolves
 `IntakeFunctionName`, `QueryFunctionName`, `TigerBeetleProcessorName`, or
-`TigerBeetleCompletionProcessorName` and writes a root-level file named after that
+`TigerBeetleCompletionProcessorName`, `SeatReservationProcessorName`, or
+`SeatReservationCompletionProcessorName` and writes a root-level file named after that
 function, such as `intake-lambda.log`. It uses only the standard
 `AWS_PROFILE` and `AWS_REGION` environment variables, defaulting to `dev` and
 `ca-central-1`:
@@ -1838,6 +2280,42 @@ private operational data, so do not publish or commit copied log files. Logs
 created by earlier versions of the helper with `[event-id=...]` headers are
 unsupported; remove or rename the existing log before running the updated
 helper.
+
+### Investigate structured outcomes
+
+Select the log groups for the five instrumented functions and the relevant time
+window in CloudWatch Logs Insights. The new JSON lines have `schema_version: 1`;
+legacy seat ERROR previews and runtime START/END/REPORT lines have separate shapes.
+Inspect one Operation across all attempts:
+
+```text
+fields @timestamp, component, stage, outcome, level, lambda_request_id,
+       sqs_message_id, command, reason, failure_code, result_type, http_status
+| filter schema_version = 1 and operation_id = "<operation-uuid>"
+| sort @timestamp asc
+```
+
+Inspect failures and uncertain delivery separately from expected conditional
+conflicts:
+
+```text
+fields @timestamp, component, operation_id, sqs_message_id, lambda_request_id,
+       stage, outcome, reason, service_code, service_http_status,
+       service_request_id, transport_error, diagnostic_code
+| filter schema_version = 1 and (level = "ERROR" or outcome = "retry")
+| sort @timestamp asc
+```
+
+To investigate a hard timeout, filter the first query by the `lambda_request_id`
+from a `started` record and inspect the runtime REPORT line in that same log
+stream. No final summary is guaranteed after a process timeout or crash. A
+`published` record proves SQS publication only; use the final processor and
+an authenticated Operation query to establish the terminal Result. Native
+completion's `acknowledged_conflict` leaves the saved Result unknown; seat
+completion's `winner_observed` describes a validated durable winner. Service
+records preserve safe code/status/request ID without including AWS error text.
+These are manual investigation queries, with no metrics, alarms or deployment
+verification automation.
 
 ## 10. Create, read, update, and delete persisted Operations
 
@@ -1915,6 +2393,416 @@ command additionally needs `dynamodb:Scan` and `dynamodb:DeleteItem`. The
 Lambda roles do not grant these permissions to the local AWS identity;
 TigerBeetle processor itself has no DynamoDB permissions.
 
+### Seat Event metadata utility
+
+The host `events` utility reads and inserts Event metadata in `SeatEventsTable`.
+The `events.sh` wrapper submits public creation, reservation, confirmation and
+availability Operations and reads metadata from the selected stack. SAM provisions
+the table without TTL independently of Operations.
+
+The table requires separate String keys `tenant` (partition) and `event_id`
+(sort), without TTL. The direct binary uses the pinned SDK's standard AWS
+credentials, profile, Region and endpoint configuration. Authenticate the
+selected identity before table commands; it needs table-scoped `dynamodb:PutItem`
+and `dynamodb:GetItem`. Wrapper execution needs AWS CLI credential export;
+creation, reservations, confirmations and availability checks additionally need
+`cloudformation:DescribeStacks` to discover the Function URLs and a valid
+`PASETO_TOKEN`. Wrapper reads need
+`cloudformation:DescribeStackResource` and `dynamodb:GetItem`. These are operator
+permissions; this utility adds no Lambda IAM or SAM resources.
+
+Build the host binary independently and inspect credential-free help:
+
+```sh
+zig build build-events
+zig-out/bin/events --help
+./events.sh --help
+```
+
+The direct binary's `events create` inserts validated `creating` metadata
+absent-only; `events read` uses a strongly consistent tenant/Event key.
+Both commands require `--tenant` and `--event-id`. Creation accepts one complete
+logical Event document on stdin,
+whose tenant and event ID must match those arguments. See the
+[Seat Reservation reference](SEAT_RESERVATION.md) for exact fields and validation.
+The utility stores supplied ledger/account IDs. It does not allocate a ledger,
+create or fund native resources, implement a public creation Operation, or
+finalize readiness. It has no replace, update, reset, or delete-all command.
+
+For direct execution, select the intended existing table and authenticated
+profile explicitly. These example IDs describe metadata only; operators supply
+identities appropriate to their cluster.
+
+```sh
+export EVENTS_TABLE_NAME='<events-table-name>' AWS_PROFILE=dev AWS_REGION=ca-central-1
+
+cat <<'JSON' | zig-out/bin/events create \
+  --tenant tenant-a --event-id 00000000-0000-0000-0000-000000000001
+{"tenant":"tenant-a","event_id":"00000000-0000-0000-0000-000000000001","ledger":1001,"timeout_seconds":300,"capacity_account_id":"1","allocation_account_id":"2","state":"creating","classes":{"general":{"total":100,"tb_account_id":"3"}}}
+JSON
+
+zig-out/bin/events read \
+  --tenant tenant-a --event-id 00000000-0000-0000-0000-000000000001
+```
+
+A racing or uncertain insertion returns the validated saved winner, including
+its IDs, ledger and current state. Different classes or timeout
+report a conflict. If readback cannot establish a saved winner, creation fails
+and the caller retries with the same tenant/Event identity.
+
+The wrapper uses the same AWS selection as `seat_scenarios.sh`. Command-line
+`--profile`, `--region`, and `--stack-name` options before the command override
+the environment. Profile selection uses `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`,
+then `PROFILE`, otherwise the AWS CLI default credential chain. Region selection
+uses `AWS_REGION`, `AWS_DEFAULT_REGION`, then `REGION`, otherwise `ca-central-1`.
+`STACK_NAME` defaults to `aws-lambda-zig-demo`. An inherited profile preserves
+environment credentials; explicit `--profile` selects that profile through the
+AWS CLI. The wrapper exports resolved credentials using
+`aws configure export-credentials --format process`, supports credentials with
+or without a session token, and disables EC2 metadata discovery.
+
+If credential export fails for a profile configured with `sso_session` or legacy
+`sso_start_url`, the wrapper runs
+[`aws sso login`](https://docs.aws.amazon.com/cli/latest/reference/sso/login.html)
+once using the same profile selection, then retries export once. Login can open
+the browser and require you to complete sign-in. Login instructions and progress
+go to stderr; stdout retains the command's JSON output. This recovery applies to
+`create`, `read`, `check_seats`, `reserve_seat` and `confirm_seats`. Non-SSO export
+failures, failed login and a failed retry exit `2` before resource discovery or
+Operation submission.
+
+Wrapper creation takes required, repeatable `--class TAG=COUNT` arguments instead
+of stdin JSON. There are no default seat classes or counts. It accepts 1–31
+distinct classes with positive u32 counts; tags follow the
+[public command contract](SEAT_RESERVATION.md#commands). `--timeout-seconds`
+defaults to 300 and accepts a positive u32 reservation timeout. `PASETO_TOKEN`
+authenticates a `SeatReservation` Operation containing `create_event` at the
+stack's `IntakeFunctionUrl`; the handler verifies the tenant, and processors
+allocate the ledger and native IDs. No host binary is required for creation.
+
+With AWS credentials and `PASETO_TOKEN` already exported:
+
+```sh
+./events.sh create --class general=100 --class premium=25 --timeout-seconds 600
+
+# Select an Operation/Event UUID explicitly, including when retrying an uncertain POST.
+./events.sh create --class general=100 --class premium=25 --timeout-seconds 600 \
+  --event-id 00000000-0000-0000-0000-000000000001
+```
+
+Creation generates a fresh Operation/Event UUID unless `--event-id` is supplied.
+It prints the intake Operation JSON and does not wait for initialization.
+`SUBMITTED` does not establish readiness; use the authenticated
+[query GET](#8-test-query-get-and-intake-post) with the returned ID to observe
+completion. Retry uncertain requests with the same UUID, classes, and timeout.
+For administrative metadata insertion with supplied ledger/account IDs, invoke
+`zig-out/bin/events create` directly with the JSON document shown above.
+
+Wrapper availability checks require `--event-id` and accept the shared profile,
+Region and stack selectors. `PASETO_TOKEN` supplies the tenant; `--tenant` is
+ignored if supplied. With AWS credentials and `PASETO_TOKEN` already exported:
+
+```sh
+./events.sh check_seats --event-id 00000000-0000-0000-0000-000000000001
+
+./events.sh --profile dev --region ca-central-1 --stack-name '<stack-name>' check_seats \
+  --event-id 00000000-0000-0000-0000-000000000001
+```
+
+Availability checks submit a `SeatReservation` Operation whose Body contains
+exactly `command: "check_seats"` and `event_id`.
+
+Wrapper reservations require `--event-id`, one scalar `--class TAG` and
+`--quantity COUNT`. The Event ID is a canonical UUID, the class follows the
+[public tag rules](SEAT_RESERVATION.md#commands), and quantity is a positive u32
+integer (1–4,294,967,295). Missing, duplicate or incompatible options are rejected
+before AWS or HTTP calls. The shared profile, Region and stack selectors apply.
+With AWS credentials and `PASETO_TOKEN` already exported:
+
+```sh
+./events.sh reserve_seat --event-id 00000000-0000-0000-0000-000000000001 \
+  --class general --quantity 2
+
+./events.sh --profile dev --region ca-central-1 --stack-name '<stack-name>' reserve_seat \
+  --event-id=00000000-0000-0000-0000-000000000001 --class=general --quantity=2
+```
+
+The reservation Body contains exactly `command: "reserve_seats"`, `event_id`,
+`class` and numeric `quantity`. `PASETO_TOKEN` supplies the tenant; `--tenant`
+overrides are rejected. This command creates a timed hold without confirmation.
+The Event must be ready and owned by the authenticated tenant. A successful
+Result contains `event_id`, `class`, `quantity` and decimal-string `reservation_id`;
+a failure contains `code`, such as `insufficient_seats`. The
+[reservation workflow](SEAT_RESERVATION.md#reservation-workflow) defines hold
+lifetime and retry semantics; success does not promise remaining hold lifetime.
+
+Wrapper confirmations require `--event-id` and `--reservation-id ID`, using the
+`reservation_id` from a successful reservation Result. The Event ID is a canonical
+UUID. The pending transfer identifies its Seat Class. The reservation ID is a
+canonical ASCII decimal string from 1 through 2^128−2
+(340282366920938463463374607431768211454), without leading zeros, signs or
+whitespace. Missing, duplicate or incompatible options are rejected before AWS
+or HTTP calls. The shared profile, Region and stack selectors apply.
+With AWS credentials and `PASETO_TOKEN` already exported:
+
+```sh
+./events.sh confirm_seats --event-id 00000000-0000-0000-0000-000000000001 \
+  --reservation-id '<reservation_id>'
+
+./events.sh --profile dev --region ca-central-1 --stack-name '<stack-name>' confirm_seats \
+  --event-id=00000000-0000-0000-0000-000000000001 --reservation-id='<reservation_id>'
+```
+
+The confirmation Body contains exactly `command: "confirm_seats"`, `event_id`
+and string `pending_id`, populated from `--reservation-id` without numeric
+conversion. `PASETO_TOKEN` supplies the tenant; `--tenant` overrides are rejected.
+Confirmation posts the full held quantity for any Seat Class of the owned, ready Event.
+A successful Result contains exactly `event_id` and `reservation_id`;
+a failure contains `code`, such as `reservation_expired` or `invalid_reservation`.
+The [confirmation workflow](SEAT_RESERVATION.md#confirmation-workflow) defines
+repeat-confirmation and failure semantics.
+
+When upgrading from class-bearing confirmation requests, stop producers and drain
+the old requests and native completions from queued, delayed and in-flight messages,
+including retained dead-letter messages eligible for replay. Upgrade both seat
+processors together and update callers before resuming submissions. The new request
+and Context decoders reject `class`; they do not accept both schemas. Existing Event
+metadata and pending reservations need no migration, and previously completed
+Operations keep their original Results, including any saved `class` field.
+
+Each check, reservation or confirmation generates a fresh Operation UUID,
+independently of the Event UUID. The handler derives the tenant from the verified
+token. The wrapper takes that tenant from the authenticated intake response and
+verifies it on subsequent query responses, without decoding token
+claims or sending a tenant override in the public Body. No host binary is
+required. Both `IntakeFunctionUrl` and `QueryFunctionUrl` are resolved before
+submission.
+
+After submission, the wrapper immediately queries the new Operation and waits
+one second between subsequent reads while its state is `SUBMITTED`. It has no
+overall polling limit. Each query prints its Operation JSON on one line, including
+`SUBMITTED` observations. The final line contains the completed Operation and its
+`result`; the command exits `0` for either a `SUCCESS` or `FAILURE` Result. Successful
+availability Results contain `total` and `available` for every Seat Class; see the
+[availability workflow](SEAT_RESERVATION.md#availability-workflow) for observation
+semantics. HTTP, transport and malformed or mismatched Operation responses stop
+the command with exit `2`; diagnostics include the Operation UUID after an HTTP
+attempt so callers can use the [query GET](#8-test-query-get-and-intake-post) to
+inspect an uncertain request. The wrapper does not automatically resubmit uncertain
+requests. Running `reserve_seat` again creates a new Operation and may reserve
+additional seats; inspect the reported Operation UUID before deciding to repeat it.
+
+Wrapper reads require explicit `--tenant` and `--event-id` arguments. The tenant
+contains 1–64 UTF-8 bytes. Reads use AWS IAM for metadata access and do not parse
+or require `PASETO_TOKEN`. They resolve the `SeatEventsTable` logical resource
+through CloudFormation's `describe-stack-resource`, export `EVENTS_TABLE_NAME`,
+and run the host binary. Help also works as
+`create --help`, `read --help`, `check_seats --help`, `reserve_seat --help` or
+`confirm_seats --help`, without AWS commands, credentials, resource discovery, or
+a built binary.
+
+```sh
+# Use the existing AWS environment; no token is required:
+./events.sh read --tenant tenant-a --event-id 00000000-0000-0000-0000-000000000001
+
+# Select the AWS profile, Region, and stack explicitly:
+./events.sh --profile dev --region ca-central-1 --stack-name '<stack-name>' read \
+  --tenant tenant-a --event-id 00000000-0000-0000-0000-000000000001
+```
+
+Direct-binary creation stdin is bounded at 16 KiB; commands accept at most six
+arguments, each at most 4,096 bytes, with tenant limited to 64 bytes. Logical
+metadata must fit 16 KiB and the SDK's typed-item encoding must fit 32 KiB.
+Success prints one complete JSON Event plus a newline. Direct-binary exit `1`
+means an unavailable Event or a configuration conflict; exit `2` means invalid
+input/configuration, malformed storage, service failure, unresolved insertion,
+or output failure. Binary and
+wrapper diagnostics omit credentials and service response bodies. Wrapper
+errors exit `2`; creation failures include the Operation UUID so an uncertain
+request can be retried with the same identity.
+
+Run local deterministic utility checks with:
+
+```sh
+zig build test-seat-reservation test-seat-persistence test-events-cli
+bash tests/events_wrapper_test.sh
+```
+
+These tests are part of the ordinary `zig build test` graph and contact no AWS
+service. Wrapper tests mock AWS, intake/query HTTP calls and polling delays. They
+do not certify deployed permissions, resource resolution or native provisioning.
+No Lambda ZIP is required for the host utility.
+
+### Local seat processor compilation
+
+Compile the seat handlers for the host without cloud resources:
+
+```sh
+zig build build-seat-processors
+zig build test-seat-processors
+```
+
+The [seat reference](SEAT_RESERVATION.md#rejection-workflow) describes runtime
+configuration and current behavior. These host builds create no Lambda ZIPs;
+the full ARM64 build separately installs both seat Lambda bootstraps, and SAM
+provisions their queues and mappings. Host compilation does not establish live IAM,
+trigger delivery or connectivity. The composed processor tests exercise confirmation
+submission and completion with mocked DynamoDB and queue effects, including
+class-free Results, native failure mapping and retired-request rejection. They are
+also part of `zig build test`.
+
+### Global ledger counter utility
+
+The host `ledger-counter` utility discovers the selected stack's actual owned
+or referenced table through `LedgerCounterTableName`, and its configured record
+through `LedgerCounterId`. The direct binary also accepts explicit table
+configuration. Full `deploy.sh` verifies selected setup through the shared read
+contract; it never initializes or allocates counter state. Run
+[explicit first-time setup](#durable-data-guards-and-first-time-counter-setup)
+for the intended new binding before seat creation. Development sync performs
+no counter setup or inspection.
+
+The shared [global allocator contract](SEAT_RESERVATION.md#global-ledger-allocator)
+supports independent records with String partition key `counter_id` and Number
+u32 `high_water`. The table has no sort key or TTL. The actual physical table and
+selected ID define the binding. Participating deployments and tenants requiring
+one sequence use the same binding independently of native cluster selection;
+different bindings may allocate equal numeric values. ID selection does not
+change the key schema or rewrite existing `"global"` records. A deployment may own this table or explicitly reference an
+existing one; only the owner may clean it up. These utilities create no table
+and expose no deletion, reset, decrement, recycling or repair command. Deleting
+an owned table removes all its counters; referenced tables and their counters
+remain the owner's responsibility.
+
+The direct binary uses the pinned SDK's standard credentials, profile, Region
+and endpoint configuration. Authenticate the selected identity before table
+commands. Operator permissions are table-scoped `dynamodb:GetItem` for read,
+plus `dynamodb:PutItem` for init and `dynamodb:UpdateItem` for allocate. Wrapper
+execution also needs AWS CLI credential export and
+`cloudformation:DescribeStacks`. These utilities add no Lambda IAM permissions
+or SAM resources, and generate no Lambda ZIP packages.
+
+Build the host binary and inspect credential-free help:
+
+```sh
+zig build build-ledger-counter
+zig-out/bin/ledger-counter --help
+./ledger-counter.sh --help
+```
+
+The binary selects `--counter-id <id>` before the command, then
+`LEDGER_COUNTER_ID`, then `"global"`. IDs contain 1–128 ASCII bytes: letter or
+digit first, then letters, digits, `.`, `_`, or `-`. Equality is case-sensitive
+without trimming or normalization. Empty/invalid selections, missing option
+values, duplicate selectors and unexpected arguments fail before effects.
+
+For direct execution against the intended existing allocator, configure the
+table and authenticated profile explicitly. Omitted ID selection retains the
+existing default invocation:
+
+```sh
+export LEDGER_COUNTER_TABLE_NAME='<counter-table-name>' AWS_PROFILE=dev AWS_REGION=ca-central-1
+zig-out/bin/ledger-counter read
+```
+
+Run `init` only for explicit first-time setup of a new selected counter. It
+inserts 1000 absent-only, preserves that ID's existing record and prints its
+validated current value. It leaves other IDs untouched. An interrupted setup may be rerun explicitly. A missing established
+counter requires investigation; it is not authorization to initialize a new sequence. Native
+cluster changes never justify setup, reset or rebinding to another table or ID.
+Retain both components of an established binding; another initialized ID does
+not establish sequence continuity.
+
+```sh
+# Explicit first-time setup only, after selecting the intended new global binding.
+zig-out/bin/ledger-counter init
+zig-out/bin/ledger-counter read
+zig-out/bin/ledger-counter allocate
+```
+
+Select an independent new counter explicitly in the same existing table:
+
+```sh
+zig-out/bin/ledger-counter --counter-id demo-blue init
+zig-out/bin/ledger-counter --counter-id demo-blue allocate
+export LEDGER_COUNTER_ID=demo-blue
+zig-out/bin/ledger-counter read
+# Explicit selection overrides the environment and reads the original record.
+zig-out/bin/ledger-counter --counter-id global read
+unset LEDGER_COUNTER_ID
+```
+
+This setup does not alter the original `"global"` high-water value. Each new ID
+starts at 1000 and allocates 1001 first; identical numbers across IDs are expected.
+The configured shared client owns its table and ID text; request builders copy
+both through SDK serialization/calls. Seat-runtime and SAM ID wiring remain
+separate work and add no public SeatReservation fields.
+
+`allocate` performs the same bounded conditional atomic increment exposed to
+runtime callers. First allocation returns 1001; 4,294,967,295 is the last value.
+Manual allocation consumes a value even if no Event uses it. Lost responses and
+losing Event-creation races can leave permanent gaps. Never infer an uncertain
+allocation from a later `read`: it cannot identify which caller consumed a value.
+A fresh allocation may consume another value; no value is reclaimed.
+
+Only use stack-wrapper execution when the selected stack exposes a valid
+`LedgerCounterTableName` output. The wrapper defaults to `PROFILE=dev`,
+`REGION=ca-central-1`, and `STACK_NAME=aws-lambda-zig-demo`, with `--profile`,
+`--region`, and `--stack-name`
+overrides before the command. It exports the selected profile's temporary
+credentials, disables EC2 metadata discovery and resolves the selected stack's
+`LedgerCounterTableName` output through `cloudformation describe-stacks`. This
+output names the actual owned or referenced physical allocator table; the wrapper
+never assumes a stack-owned logical resource and never discovers or requires a
+native cluster ID. It exports `LEDGER_COUNTER_TABLE_NAME`, replacing any stale
+environment table binding. ID precedence is explicit `--counter-id`, caller
+`LEDGER_COUNTER_ID`, optional selected-stack `LedgerCounterId` output, then
+`"global"`. Caller selections are validated before AWS commands. If no caller
+selection exists, the wrapper queries the optional output and its presence:
+a missing output defaults to `"global"`; an empty or invalid supplied output
+fails. The literal ID `None` remains a valid selection. Existing stacks need
+only `LedgerCounterTableName`. The wrapper
+exports the effective `LEDGER_COUNTER_ID` and forwards explicit selection to
+the prebuilt binary. It creates no counter state during discovery. Help
+also works as `init --help`, `read --help`, and `allocate --help` without AWS
+commands, credentials, discovery or a built binary.
+
+Missing or invalid discovery fails with a fixed diagnostic naming the required
+`LedgerCounterTableName` output; upstream data is omitted. Wrapper discovery is
+mock-tested; template validation and mocks do not establish live IAM or connectivity.
+
+```sh
+./ledger-counter.sh --profile dev --region ca-central-1 --stack-name '<stack-name>' read
+./ledger-counter.sh --stack-name '<stack-name>' --counter-id demo-blue read
+```
+
+Commands consume no stdin and accept at most five binary arguments (including
+the executable name), each at most 256 bytes. SDK response bodies are capped at
+8 KiB, with one HTTP attempt
+per call. Allocation retries at most four definite concurrent conditional
+rejections; it never retries a possibly successful mutation internally.
+Success prints one bounded JSON object and newline, for example
+`{"counter_id":"global","high_water":1001}`. For successful `allocate`, that
+returned high-water value is the allocated ledger. Help prints usage text.
+Exit `1` means missing state or exhaustion; exit `2` means invalid invocation or
+configuration, corruption, contention, service failure, uncertain setup/allocation
+or output failure. Fixed stderr messages omit arguments, credentials, table names
+and upstream service details. Output failure after mutation may also consume a gap.
+
+Run the credential-free deterministic checks:
+
+```sh
+zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli
+bash -n ledger-counter.sh
+```
+
+These suites also run in `zig build test`. They exercise real typed request
+builders/serialization with controlled external effects, interleaved global
+and independent selected-ID allocation, bounds, corrupt/missing state, wrong
+returned keys, response uncertainty, table/ID ownership and explicit/configured
+selection. They do not establish live DynamoDB, AWS IAM,
+seat processor integration or cloud deployment behavior.
+
 ### Troubleshoot persistence command configuration
 
 `dynamodb: missing or invalid configuration` is emitted before Operation JSON
@@ -1981,16 +2869,18 @@ URL under the same logical ID used by the CLI, and runs the requested operation.
 Use `TigerBeetleQueue` or `CompletionQueue` for this template. Override the
 environment defaults with `PROFILE`, `REGION`, or `STACK_NAME`.
 
-Send an internal Processor Message (no tenant or lifecycle metadata):
+Send an internal Processor Message with explicit trusted tenant and Context (no lifecycle metadata):
 
 ```sh
 message_json='{"operation_id":"00112233-4455-6677-8899-aabbccddeeff",'\
-'"body":{"lookup_accounts":[{"id":"101"}]}}'
+'"tenant":"demo-tenant","context":null,"body":{"lookup_accounts":[{"id":"101"}]}}'
 printf '%s\n' "$message_json" | ./queue.sh TigerBeetleQueue send
 ```
 
 `send` validates and compactly serializes `src/processor_message.zig`'s envelope. `body` may be
-up to 96 KiB; an optional `result_queue` is available to this internal producer. The command
+up to 98,304 compact JSON bytes; `context` is required and permits up to 4,096 compact JSON
+bytes, with null meaning no Context. `tenant` is required and permits 1–64 decoded UTF-8 bytes.
+An optional nonempty `result_queue` permits 2,048 decoded bytes. The envelope permits 115,328 bytes. The command
 rejects `--tenant` and full Operation snapshots. After a successful send, stdout contains the
 exact message plus a newline. It never reads or updates DynamoDB. Use authenticated intake to
 create the Operation and enqueue it together. To target CompletionQueue, supply a native result
@@ -2055,10 +2945,15 @@ After changing Zig source code, rebuild and repackage:
 
 ```sh
 zig build --release -Darch=arm
+rm -f intake-lambda.zip query-lambda.zip tiger-beetle-processor.zip \
+  tiger-beetle-completion-processor.zip seat-reservation-processor.zip \
+  seat-reservation-completion-processor.zip
 zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
 zip -qj query-lambda.zip zig-out/bin/query/bootstrap
 zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
 zip -qj tiger-beetle-completion-processor.zip zig-out/bin/tiger_beetle_completion_processor/bootstrap
+zip -qj seat-reservation-processor.zip zig-out/bin/seat_reservation_processor/bootstrap
+zip -qj seat-reservation-completion-processor.zip zig-out/bin/seat_reservation_completion_processor/bootstrap
 ```
 
 Then redeploy the stack:
@@ -2067,41 +2962,91 @@ Then redeploy the stack:
 sam deploy --profile dev --region ca-central-1
 ```
 
-SAM uploads all four packages and updates their CloudFormation-managed Lambda functions.
+SAM uploads all six packages and updates their CloudFormation-managed Lambda functions.
 
 ## 13. Delete the SAM stack
 
-If the WireGuard gateway is enabled or retained cleanup is in progress, first
-run the guarded disable flow:
+Explicit owned-resource teardown is a separate mode:
 
 ```sh
-./wireguard-gateway-setup.sh --disable
-```
-
-This detaches TigerBeetle processor, waits for every published version and Lambda-created
-ENI to release the retained security group, then removes the stack-owned EIGW,
-IPv6 route, security group, and ENI-management IAM before clearing saved
-gateway inputs. A timed-out run leaves those resources retained; rerun the
-same command to resume. Do not replace this sequence with direct deletion of
-an enabled stack.
-
-Then remove all four SAM-managed functions and roles, the operations table,
-both queues, Function URLs, permissions, and any remaining stack resources:
-
-```sh
-sam delete \
+./deploy.sh --cleanup \
   --stack-name aws-lambda-zig-demo \
   --profile dev \
   --region ca-central-1
 ```
 
+**This permanently deletes owned data.** Cleanup removes all six SAM-managed
+functions and roles, Operations and Events, every counter in an owned counter
+table, all four queues and queued messages, Function URLs, permissions, and the
+remaining stack resources. It preserves a referenced counter table and every
+counter in that table, regardless of the selected counter ID.
+
+Cleanup accepts only stack/profile/Region selection. It rejects `--dev`,
+`--dry-run`, build and configuration flags, URL-check flags, custom deployment
+controllers, and invocation through `wireguard-gateway-setup.sh`. It requires
+AWS CLI, `jq`, Bash, and a fresh SSO login using the selected profile. It does
+not require Zig, SAM, Lambda archives, PASETO keys, counter initialization, or a
+working counter record. Ordinary full deployment never invokes this mode.
+
+When the gateway is enabled or retained cleanup is in progress, cleanup first
+reuses the guarded disable sequence: verify ownership of the old EIGW and IPv6
+route, detach the deployed TigerBeetle processor while retaining network cleanup
+resources and ENI-management IAM, wait for the current function and every
+published version to detach and for zero Lambda ENIs on the retained security
+group, then remove retained resources. The VPC wait retains its approximately
+20-minute bound and `VPC_CLEANUP_MAX_ATTEMPTS`/`VPC_CLEANUP_POLL_SECONDS` controls.
+Any failed inspection, unresolved version/ENI, or failed update stops teardown
+before deleting dependent resources or tables. Rerun `--cleanup` to resume.
+Saved optional gateway parameters disappear with the stack, so cleanup omits
+the separate parameter-reset update used by gateway-only disablement.
+
+These prerequisite updates use the deployed template with
+[`UpdateStack --use-previous-template`](https://docs.aws.amazon.com/cli/latest/reference/cloudformation/update-stack.html).
+Only `EnableWireGuardGateway` and `RetainTigerBeetleProcessorVpcCleanupResources`
+change; all other parameters use `UsePreviousValue=true`, preserving deployed
+function names, code, allocator binding, and authentication settings. The
+controller receives teardown and exit-cleanup phases without deployment planning,
+code deployment, or output/smoke phases. Gateway-only disablement remains
+available through `./wireguard-gateway-setup.sh --disable`.
+
+The helper prints and pins the inspected immutable stack ID before mutation.
+It issues a normal `DeleteStack`, waits with the
+[bounded AWS deletion waiter](https://docs.aws.amazon.com/cli/latest/reference/cloudformation/wait/stack-delete-complete.html)
+(30-second polls, up to 120 failed checks), then verifies every automatically
+paginated `ListStackResources` result is `DELETE_COMPLETE`. Retained/skipped,
+failed, unknown, empty, or unreadable results fail verification. It never uses
+force deletion or deletes resources outside CloudFormation ownership. The
+operator needs `cloudformation:DescribeStacks`, `ListStackResources`, `DeleteStack`,
+and, when WireGuard is active/retained, `UpdateStack`, existing Lambda/EC2
+inspection permissions and permissions for the stack's resource lifecycle.
+Runtime IAM is unchanged.
+
+An active non-deletion stack update stops cleanup. `DELETE_IN_PROGRESS` resumes
+the waiter without reissuing deletion; `DELETE_FAILED` retries normal deletion.
+After interruption, repeat the command. To verify a stack already deleted, pass
+the printed immutable ID as `--stack-name`; CloudFormation retains its
+[resource history for up to 90 days](https://docs.aws.amazon.com/cli/latest/reference/cloudformation/list-stack-resources.html).
+An explicit stack-not-found response reports already absent without claiming
+resource-level verification or searching for orphan resources. Access, transport,
+and malformed-response failures remain errors. A failed verification requires
+inspection of that stack ID and its events; cleanup offers no orphan-removal or
+force-delete path.
+
 This deletes only resources owned by the SAM stack. The operations table has
 `DeletionPolicy: Delete` and `UpdateReplacePolicy: Delete`, so deleting the
 stack or replacing the table permanently deletes its data. Point-in-time
 recovery is disabled; this demo configuration provides no recovery capability.
-Both queues use the same deletion policies, so deleting or replacing either
-one permanently deletes its queued messages. Neither has a dead-letter queue
+Events and the owned counter table also use `Delete` policies. Stack deletion
+permanently removes Events and every counter in an owned table; referenced
+counter tables remain with their owner. All four queues are deleted with their
+queued messages. None has a dead-letter queue
 or another retention/replay resource.
+
+Recreating AWS tables does not reset the externally hosted TigerBeetle state or
+repair lost allocator history. Native accounts and transfers can still contain
+previous ledger values after Events or counters disappear. This helper provides
+no native reset, counter recycling, allocator repair, or automatic reconciliation;
+creating or initializing a new table/ID is not recovery of an established allocator.
 
 The guarded disable terminates the EC2 gateway, releases its Elastic IP,
 removes both stack-owned routes and security groups, and deletes the

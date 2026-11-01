@@ -70,12 +70,41 @@ parse_wireguard_options --tiger-beetle-processor-name=equal-tb --tiger-beetle-co
 parse_deployment_options "${COMMON_DEPLOYMENT_ARGS[@]}"
 [ "$TIGER_BEETLE_PROCESSOR_NAME" = equal-tb ] && [ "$TIGER_BEETLE_COMPLETION_PROCESSOR_NAME" = equal-completion ] ||
     fail_test "WireGuard did not forward equals processor arguments"
+parse_wireguard_options --seat-reservation-processor-name chosen-seat \
+    --seat-reservation-completion-processor-name chosen-seat-completion \
+    --existing-ledger-counter-table-name shared-ledgers --ledger-counter-id sequence.B
+parse_deployment_options "${COMMON_DEPLOYMENT_ARGS[@]}"
+[ "$SEAT_RESERVATION_PROCESSOR_NAME" = chosen-seat ] &&
+    [ "$SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME" = chosen-seat-completion ] &&
+    [ "$EXISTING_LEDGER_COUNTER_TABLE_NAME" = shared-ledgers ] &&
+    [ "$LEDGER_COUNTER_ID" = sequence.B ] ||
+    fail_test "WireGuard did not forward seat configuration"
 
-output="$(env TIGER_BEETLE_PROCESSOR_NAME=env-tb TIGER_BEETLE_COMPLETION_PROCESSOR_NAME=env-completion \
-    bash -c 'source "$1/deploy.sh"; build_sam_parameter_overrides; printf "%s\n" "${SAM_PARAMETER_OVERRIDES[@]}"' \
-    bash "$REPOSITORY_ROOT")"
-contains "$output" 'TigerBeetleProcessorName=env-tb'
-contains "$output" 'TigerBeetleCompletionProcessorName=env-completion'
+# Keep override argument boundaries intact, including synthetic values with spaces.
+for overrides in empty populated; do
+    output="$(env TIGER_BEETLE_PROCESSOR_NAME=env-tb TIGER_BEETLE_COMPLETION_PROCESSOR_NAME=env-completion \
+        bash -c '
+            source "$1/deploy.sh"
+            if [ "$2" = populated ]; then
+                DEPLOYMENT_PARAMETER_OVERRIDES=(
+                    "EnableWireGuardGateway=true"
+                    "WireGuardPrivateKeyParameterName=/fixture path/with spaces"
+                    "WireGuardGatewayPublicKey=fixture+key="
+                )
+            fi
+            build_sam_parameter_overrides
+            printf "ArgumentCount=%s\n" "${#SAM_PARAMETER_OVERRIDES[@]}"
+            printf "%s\n" "${SAM_PARAMETER_OVERRIDES[@]}"
+        ' bash "$REPOSITORY_ROOT" "$overrides")"
+    contains "$output" 'TigerBeetleProcessorName=env-tb'
+    contains "$output" 'TigerBeetleCompletionProcessorName=env-completion'
+    if [ "$overrides" = empty ]; then
+        contains "$output" 'ArgumentCount=11'
+    else
+        contains "$output" 'ArgumentCount=14'
+        contains "$output" $'EnableWireGuardGateway=true\nWireGuardPrivateKeyParameterName=/fixture path/with spaces\nWireGuardGatewayPublicKey=fixture+key='
+    fi
+done
 
 # A deliberately failing lookup checks the selected output key without writing
 # any downloaded logs or issuing a CloudWatch request.

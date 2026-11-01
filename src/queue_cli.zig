@@ -50,6 +50,10 @@ const usage =
     \\  receive  Long-poll, print, and delete messages until interrupted
     \\  check    Print all queue attributes as JSON
     \\
+    \\Processor Message fields:
+    \\  operation_id, tenant, body, context are required; result_queue is optional
+    \\  tenant is trusted UTF-8 metadata; explicit null means no Context
+    \\
     \\Environment:
     \\  <queue-name>  URL of the selected SQS queue
     \\  AWS_*         Standard AWS credentials, region, profile, and endpoint
@@ -437,6 +441,7 @@ fn classifyError(err: anyerror) Failure {
         error.InvalidName,
         error.InvalidState,
         error.BodyTooLarge,
+        error.ContextTooLarge,
         error.ResultTooLarge,
         error.MissingState,
         error.MissingLastUpdated,
@@ -548,7 +553,10 @@ fn executeCheck(
 }
 
 const test_input =
-    "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":{\"message\":\"hello\",\"count\":2}}";
+    "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+    "\"tenant\":\"tenant-a\",\"context\":{\"trace\":[\"é\",true,null]}," ++
+    "\"body\":{\"message\":\"hello\",\"count\":2}," ++
+    "\"result_queue\":\"https://sqs.example.invalid/next\"}";
 const test_tigerbeetle_queue_name = "TigerBeetleQueue";
 const test_completion_queue_name = "CompletionQueue";
 
@@ -791,9 +799,31 @@ test "send rejects oversized message input" {
     try std.testing.expectEqual(@as(u8, 0), fake.send_count);
 }
 
+test "send rejects oversized Context as invalid input before contacting SQS" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input = try std.json.Stringify.valueAlloc(arena.allocator(), .{
+        .operation_id = "00112233-4455-6677-8899-aabbccddeeff",
+        .tenant = "tenant-a",
+        .context = "x" ** 4095,
+        .body = true,
+    }, .{});
+    var fake: FakeQueue = .{};
+    const result = runForTest(&.{ "sqs", test_tigerbeetle_queue_name, "send" }, input, 0, &fake);
+    try std.testing.expectEqual(@as(u8, 2), result.exit_code);
+    try std.testing.expectEqualStrings("sqs: invalid operation input\n", result.stderr());
+    try std.testing.expectEqual(@as(u8, 0), fake.send_count);
+}
+
 test "send queues and prints the same canonical Processor Message" {
     const expected = test_input;
-    const inputs = [_][]const u8{ test_input, " {\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\", \"body\": {\"message\":\"hello\",\"count\":2}} " };
+    const inputs = [_][]const u8{
+        test_input,
+        " {\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\", " ++
+            "\"tenant\":\"tenant-a\",\"context\": {\"trace\":[\"é\",true,null]}," ++
+            "\"body\": {\"message\":\"hello\",\"count\":2}," ++
+            "\"result_queue\":\"https://sqs.example.invalid/next\"} ",
+    };
     var expected_message: ?[]u8 = null;
     defer if (expected_message) |message| std.testing.allocator.free(message);
     for (inputs) |input| {

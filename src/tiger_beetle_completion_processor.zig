@@ -3,6 +3,7 @@ const aws = @import("aws");
 const lambda = @import("aws-lambda");
 const processor_message = @import("processor_message");
 const operation = @import("operation");
+const logging = @import("outcome_log");
 const operation_persistence = @import("operation_persistence");
 
 pub const std_options: std.Options = .{
@@ -20,7 +21,6 @@ pub const std_options: std.Options = .{
 
 const Allocator = std.mem.Allocator;
 const record_count_max = 1;
-const log = std.log.scoped(.tiger_beetle_completion_processor);
 
 comptime {
     std.debug.assert(record_count_max == 1);
@@ -32,7 +32,9 @@ var runtime_completion_persistence: ?CompletionPersistence = null;
 pub fn main(init: std.process.Init) void {
     var resources: RuntimeResources = undefined;
     resources.init(init) catch |err| {
-        std.log.err("Lambda initialization failed: {s}", .{@errorName(err)});
+        var trace = logging.Context.init(.{}, .tigerbeetle_completion);
+        trace.finish(.ERROR, "initialization", "retry", @errorName(err));
+        trace.emit();
         return;
     };
     defer resources.deinit();
@@ -47,11 +49,12 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
         return error.PersistenceNotInitialized;
     };
     var clock: RuntimeClock = .{ .io = ctx.io };
-    return handleInvocation(
+    return handle_invocation_observed(
         ctx.arena,
         event,
         persistence,
         Clock.init(&clock),
+        .{ .request_id = ctx.request.id },
     );
 }
 
@@ -82,18 +85,20 @@ const RuntimeResources = struct {
         resources.* = undefined;
     }
 
-    fn completeById(
+    fn complete_by_id_observed(
         resources: *RuntimeResources,
         arena: Allocator,
         operation_id: u128,
         completion: *const operation.Completion,
         now: operation.UnixSeconds,
+        trace: *const logging.Context,
     ) !void {
-        return resources.persistence.completeById(
+        return resources.persistence.complete_by_id_observed(
             arena,
             operation_id,
             completion,
             now,
+            trace,
         );
     }
 };
@@ -106,6 +111,7 @@ const CompletionPersistence = struct {
         u128,
         *const operation.Completion,
         operation.UnixSeconds,
+        *const logging.Context,
     ) anyerror!void,
 
     fn init(pointer: anytype) CompletionPersistence {
@@ -121,8 +127,12 @@ const CompletionPersistence = struct {
                 operation_id: u128,
                 completion: *const operation.Completion,
                 now: operation.UnixSeconds,
+                trace: *const logging.Context,
             ) anyerror!void {
                 const self: Pointer = @ptrCast(@alignCast(context));
+                if (@hasDecl(pointer_info.pointer.child, "complete_by_id_observed")) {
+                    return self.complete_by_id_observed(arena, operation_id, completion, now, trace);
+                }
                 return self.completeById(arena, operation_id, completion, now);
             }
         };
@@ -138,6 +148,7 @@ const CompletionPersistence = struct {
         operation_id: u128,
         completion: *const operation.Completion,
         now: operation.UnixSeconds,
+        trace: *const logging.Context,
     ) !void {
         return persistence.complete_by_id_fn(
             persistence.context,
@@ -145,6 +156,7 @@ const CompletionPersistence = struct {
             operation_id,
             completion,
             now,
+            trace,
         );
     }
 };
@@ -204,30 +216,43 @@ fn handleInvocation(
     persistence: CompletionPersistence,
     clock: Clock,
 ) ![]const u8 {
+    return handle_invocation_observed(allocator, event, persistence, clock, .{});
+}
+
+fn handle_invocation_observed(
+    allocator: Allocator,
+    event: []const u8,
+    persistence: CompletionPersistence,
+    clock: Clock,
+    logger: logging.Logger,
+) ![]const u8 {
+    var trace = logging.Context.init(logger, .tigerbeetle_completion);
+    trace.record.stage = "event_parse";
     const sqs_event = lambda.sqs.parseEvent(allocator, event) catch |err| {
-        log.debug("stage=event_parse outcome=rejected error={s}", .{@errorName(err)});
+        trace.finish(.ERROR, "event_parse", "retry", @errorName(err));
+        trace.emit();
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return error.MalformedSQSEvent;
     };
     defer sqs_event.deinit(allocator);
-    if (sqs_event.records.len == 0) return error.EmptySQSEvent;
-    if (sqs_event.records.len > record_count_max) return error.TooManyRecords;
+    defer trace.emit();
+    if (sqs_event.records.len == 0) {
+        trace.record.reason = "EmptySQSEvent";
+        return error.EmptySQSEvent;
+    }
+    if (sqs_event.records.len > record_count_max) {
+        trace.record.reason = "TooManyRecords";
+        return error.TooManyRecords;
+    }
     std.debug.assert(sqs_event.records.len == 1);
-
     const record = &sqs_event.records[0];
-    log.debug("message_id={s} body_size={d}", .{ record.message_id, record.body.len });
-    const outcome = processRecord(
-        allocator,
-        record.message_id,
-        record.body,
-        persistence,
-        clock,
-    );
-    return encodeFailureResponse(
-        allocator,
-        record.message_id,
-        outcome == .retry,
-    );
+    trace.record.sqs_message_id = record.message_id;
+    const outcome = process_record_observed(allocator, record.body, persistence, clock, &trace);
+    const response = encodeFailureResponse(allocator, record.message_id, outcome == .retry) catch |err| {
+        trace.finish(.ERROR, "response_encode", "retry", @errorName(err));
+        return err;
+    };
+    return response;
 }
 
 fn processRecord(
@@ -237,20 +262,40 @@ fn processRecord(
     persistence: CompletionPersistence,
     clock: Clock,
 ) RecordOutcome {
+    var trace = logging.Context.init(.{}, .tigerbeetle_completion);
+    trace.record.sqs_message_id = message_id;
+    defer trace.emit();
+    return process_record_observed(arena, body, persistence, clock, &trace);
+}
+
+fn process_record_observed(
+    arena: Allocator,
+    body: []const u8,
+    persistence: CompletionPersistence,
+    clock: Clock,
+    trace: *logging.Context,
+) RecordOutcome {
+    trace.record.stage = "envelope_decode";
     const message = processor_message.decode(arena, body) catch |err| {
-        log.debug("message_id={s} stage=decode error={s}", .{ message_id, @errorName(err) });
+        trace.finish(.ERROR, "envelope_decode", if (err == error.OutOfMemory) "retry" else "acknowledged_invalid", @errorName(err));
         return if (err == error.OutOfMemory) .retry else .acknowledged;
     };
+    trace.identify(message.operation_id);
+    trace.record.command = logging.recognized_command(&message.context);
     const result = interpret_result(&message.body) catch |err| {
-        if (err == error.OutOfMemory) return .retry;
+        if (err == error.OutOfMemory) {
+            trace.finish(.ERROR, "result_interpret", "retry", @errorName(err));
+            return .retry;
+        }
+        trace.record.reason = @errorName(err);
         const invalid: Entry = .{
             .operation_id = message.operation_id,
             .result = .{ .failure = .{ .string = @errorName(err) } },
         };
-        return persistCompletion(arena, message_id, &invalid, persistence, clock);
+        return persistCompletion(arena, &invalid, persistence, clock, trace);
     };
     const entry: Entry = .{ .operation_id = message.operation_id, .result = result };
-    return persistCompletion(arena, message_id, &entry, persistence, clock);
+    return persistCompletion(arena, &entry, persistence, clock, trace);
 }
 
 const Entry = struct {
@@ -336,32 +381,23 @@ fn creation_success(entries: []const std.json.Value) !bool {
 
 fn persistCompletion(
     arena: Allocator,
-    message_id: []const u8,
     entry: *const Entry,
     persistence: CompletionPersistence,
     clock: Clock,
+    trace: *logging.Context,
 ) RecordOutcome {
+    trace.record.stage = "persist";
     const now = clock.now();
-    persistence.completeById(
-        arena,
-        entry.operation_id,
-        &entry.result,
-        now,
-    ) catch |err| {
+    persistence.completeById(arena, entry.operation_id, &entry.result, now, trace) catch |err| {
         if (err == error.OperationConflict) {
-            log.debug("message_id={s} stage=persist outcome=acknowledged_conflict error={s}", .{
-                message_id,
-                @errorName(err),
-            });
+            trace.finish(.INFO, "persist", "acknowledged_conflict", @errorName(err));
             return .acknowledged;
         }
-        log.debug("message_id={s} stage=persist outcome=retry error={s}", .{
-            message_id,
-            @errorName(err),
-        });
+        trace.finish(.ERROR, "persist", "retry", @errorName(err));
         return .retry;
     };
-    log.debug("message_id={s} stage=persist outcome=succeeded", .{message_id});
+    trace.record.result_type = logging.result_type(&entry.result);
+    trace.finish(.INFO, "persist", "finalized", trace.record.reason);
     return .acknowledged;
 }
 
@@ -479,7 +515,7 @@ test "completion derives success and failure from native bodies and preserves de
     for (cases) |case| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        const input = try std.fmt.allocPrint(arena.allocator(), "{{\"operation_id\":\"" ++ test_uuid ++ "\",\"body\":{s}}}", .{case.body});
+        const input = try std.fmt.allocPrint(arena.allocator(), "{{\"operation_id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"context\":null,\"body\":{s}}}", .{case.body});
         var store: FakePersistence = .{};
         const response = try test_support.invoke(arena.allocator(), input, &store);
         try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
@@ -503,7 +539,7 @@ pub const test_support = if (@import("builtin").is_test) struct {
 } else struct {};
 
 test "completion retries transient writes acknowledges conflicts and never writes malformed envelopes" {
-    const input = "{\"operation_id\":\"" ++ test_uuid ++ "\",\"body\":{\"create_accounts\":[{\"error_code\":\"created\"}],\"create_transfers\":[],\"lookup_accounts\":[]}}";
+    const input = "{\"operation_id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"context\":null,\"body\":{\"create_accounts\":[{\"error_code\":\"created\"}],\"create_transfers\":[],\"lookup_accounts\":[]}}";
     for ([_]?anyerror{ null, error.OperationConflict, error.AWSFailure, error.OutOfMemory }) |failure| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -519,7 +555,7 @@ test "completion retries transient writes acknowledges conflicts and never write
         try std.testing.expectEqual(try operation.uuidFromString(test_uuid), store.operation_ids[0]);
         try std.testing.expectEqual(@as(i64, 1_800_000_000), store.times[0]);
     }
-    for ([_][]const u8{ "{}", "{\"operation_id\":\"bad\",\"body\":true}", "{\"results\":[]}" }) |invalid| {
+    for ([_][]const u8{ "{}", "{\"operation_id\":\"bad\",\"tenant\":\"tenant-a\",\"context\":null,\"body\":true}", "{\"results\":[]}" }) |invalid| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         var store: FakePersistence = .{};
@@ -531,7 +567,7 @@ test "completion retries transient writes acknowledges conflicts and never write
 test "valid identity with invalid native body persists diagnostic and decode allocation failure retries" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const input = "{\"operation_id\":\"" ++ test_uuid ++ "\",\"body\":true}";
+    const input = "{\"operation_id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"context\":null,\"body\":true}";
     var store: FakePersistence = .{};
     _ = try test_support.invoke(arena.allocator(), input, &store);
     try std.testing.expectEqualStrings("InvalidTigerBeetleResult", store.completions[0].failure.string);
@@ -551,4 +587,52 @@ test "completion requires exactly one SQS record" {
     try std.testing.expectError(error.EmptySQSEvent, handleInvocation(arena.allocator(), try testEvent(arena.allocator(), &.{}), persistence, Clock.init(&clock)));
     try std.testing.expectError(error.TooManyRecords, handleInvocation(arena.allocator(), try testEvent(arena.allocator(), &.{ "{}", "{}" }), persistence, Clock.init(&clock)));
     try std.testing.expectError(error.MalformedSQSEvent, handleInvocation(arena.allocator(), "{}", persistence, Clock.init(&clock)));
+}
+
+test "completion summary reports durable Results, unknown conflicts and retries" {
+    const cases = [_]struct { body: []const u8, failure: ?anyerror = null, outcome: []const u8, result_type: ?[]const u8 }{
+        .{ .body = "{\"create_accounts\":[{\"error_code\":\"created\"}],\"create_transfers\":[],\"lookup_accounts\":[]}", .outcome = "finalized", .result_type = "SUCCESS" },
+        .{ .body = "{\"create_accounts\":[],\"create_transfers\":[],\"lookup_accounts\":[null]}", .outcome = "finalized", .result_type = "FAILURE" },
+        .{ .body = "true", .outcome = "finalized", .result_type = "FAILURE" },
+        .{ .body = "true", .failure = error.OperationConflict, .outcome = "acknowledged_conflict", .result_type = null },
+        .{ .body = "true", .failure = error.AWSFailure, .outcome = "retry", .result_type = null },
+    };
+    for (cases) |case| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        var observer = logging.TestObserver.init(arena);
+        observer.fail = true;
+        var store: FakePersistence = .{};
+        store.errors[0] = case.failure;
+        var clock = FakeClock.init(&.{1});
+        const payload = try std.json.parseFromSlice(std.json.Value, arena, case.body, .{});
+        const input = try processor_message.encode(arena, &.{ .operation_id = 1, .tenant = "tenant-a", .body = payload.value, .context = .null });
+        const response = try handle_invocation_observed(arena, try testEvent(arena, &.{input}), CompletionPersistence.init(&store), Clock.init(&clock), observer.logger());
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, response, .{});
+        try std.testing.expectEqual(@as(usize, @intFromBool(if (case.failure) |err| err == error.AWSFailure else false)), parsed.value.object.get("batchItemFailures").?.array.items.len);
+        try std.testing.expectEqual(@as(usize, 1), observer.records.items.len);
+        const record = observer.records.items[0];
+        try std.testing.expectEqualStrings(case.outcome, record.outcome);
+        try std.testing.expectEqualDeep(case.result_type, record.result_type);
+        try std.testing.expectEqual(@as(u8, 1), store.call_count);
+    }
+}
+
+test "invalid completion envelopes log an error without claiming or persisting a Result" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    var observer = logging.TestObserver.init(arena);
+    var store: FakePersistence = .{};
+    var clock = FakeClock.init(&.{1});
+    const response = try handle_invocation_observed(arena, try testEvent(arena, &.{"invalid"}), CompletionPersistence.init(&store), Clock.init(&clock), observer.logger());
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+    try std.testing.expectEqual(@as(u8, 0), store.call_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.records.items.len);
+    const record = observer.records.items[0];
+    try std.testing.expectEqualStrings("acknowledged_invalid", record.outcome);
+    try std.testing.expectEqualStrings("envelope_decode", record.stage);
+    try std.testing.expectEqual(logging.Level.ERROR, record.level);
+    try std.testing.expect(record.result_type == null);
 }

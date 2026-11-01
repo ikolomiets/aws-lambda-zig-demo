@@ -1,4 +1,5 @@
 .zig-*/
+.aws-sam/
 zig-out/
 zig-pkg/
 *.zip

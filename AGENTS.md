@@ -2,8 +2,8 @@
 
 ## Repository and Sources of Truth
 
-This is a Zig 0.16.0 AWS Lambda example with four handlers and host-native
-`paseto`, `dynamodb`, and `sqs` CLI tools. `build.zig` and `build.zig.zon` own
+This is a Zig 0.16.0 AWS Lambda example with six handlers and host-native
+`paseto`, `dynamodb`, `sqs`, `events`, and `ledger-counter` CLI tools. `build.zig` and `build.zig.zon` own
 supported targets, optimization, executables, and pinned dependencies, including
 `aws_lambda`.
 
@@ -13,21 +13,37 @@ Read sources relevant to the task:
 | --- | --- |
 | HTTP intake or operation query | `src/intake_lambda.zig`, `src/query_lambda.zig`, `src/lambda_auth.zig` |
 | Operation data and persistence | `src/operation.zig`, `src/operation_persistence.zig` |
-| Queue transport and Completion messages | `src/sqs_queue.zig`, `src/processor_message.zig` |
+| Seat contracts, Event metadata, and host tooling | `src/seat_reservation.zig`, `src/seat_reservation_persistence.zig`, `src/seat_events_cli.zig`, `events.sh`, [seat reference](docs/SEAT_RESERVATION.md), [Event utility setup and discovery](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-event-metadata-utility) |
+| Global ledger allocation and counter tooling | `src/ledger_counter.zig`, `src/ledger_counter_cli.zig`, `ledger-counter.sh`, [seat reference](docs/SEAT_RESERVATION.md#global-ledger-allocator), [counter setup and discovery](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#global-ledger-counter-utility) |
+| Queue transport and Completion messages | `src/sqs_queue.zig`, `src/processor_message.zig`, [minimal Processor Messages ADR](docs/adr/0003-minimal-processor-messages.md) |
+| Seat SQS processors | `src/seat_reservation_processor.zig`, `src/seat_reservation_completion_processor.zig`, [seat reference](docs/SEAT_RESERVATION.md) |
 | SQS processors | `src/tiger_beetle_processor.zig`, `src/tiger_beetle_completion_processor.zig`, [processor contract](docs/TIGER_BEETLE_PROCESSOR.md) |
 | TigerBeetle client wrapper | `src/tigerbeetle.zig`, [wrapper design](docs/ZIG_WRAPPER_FOR_TIGERBEETLE.md) |
-| PASETO and local CLI tools | `src/paseto.zig`, `src/paseto_cli.zig`, `src/persistence_cli.zig`, `src/queue_cli.zig` |
-| Vocabulary or cross-cutting decisions | `CONTEXT.md`, relevant files in `docs/adr/` |
-| SAM resources, permissions, or function settings | `template.yaml`, relevant sections of [deployment guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md) |
-| Generic deployment flow | `deploy.sh`, relevant sections of the deployment guide |
-| WireGuard lifecycle | `wireguard-gateway-setup.sh`, relevant sections of the deployment guide |
+| SDK/client dependency internals | `build.zig.zon`, `zig build dependency-paths` with the active cache/fork options; [dependency source discovery](README.md#dependency-source-discovery) |
+| PASETO and local CLI tools | `src/paseto.zig`, `src/paseto_cli.zig`, `src/persistence_cli.zig`, `src/queue_cli.zig`, `persistence.sh`, `queue.sh`, [persistence utility](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#10-create-read-update-and-delete-persisted-operations), [queue utility](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#11-send-receive-and-check-queued-operations) |
+| Vocabulary or cross-cutting decisions | `GLOSSARY.md`, relevant files in `docs/adr/` |
+| SAM resources, permissions, or function settings | `template.yaml`, [resource contract](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#4-understand-what-the-template-creates), [deployment values](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#5-preserve-the-intake-function-name-and-choose-deployment-values) |
+| Generic deployment flow or development code updates | `deploy.sh`, [full deployment](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#6-deploy-with-sam-guided-mode), [development code updates](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#development-code-updates) |
+| Deployment lifecycle | `deploy.sh`, [stack deletion](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#13-delete-the-sam-stack), [gateway deployment and disablement](docs/EC2-WireGuard-Gateway.md#10-deployment-and-disablement-lifecycle) |
+| WireGuard setup and keys | `wireguard-gateway-setup.sh`, [gateway operation](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#7-configure-and-operate-the-wireguard-gateway), [key rotation](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#rotate-wireguard-keys) |
+| Deployment or runtime diagnostics | `lambda_logs.sh`, [Lambda logs](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#9-download-lambda-logs), [gateway failures](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#diagnose-failures), [persistence configuration](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#troubleshoot-persistence-command-configuration), [Lambda initialization](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#troubleshoot-lambda-initialization) |
 
 Consult related implementation files when behavior crosses these boundaries.
 Keep processor contract changes in the processor reference, vocabulary in
-`CONTEXT.md`, and cross-cutting decisions in ADRs.
+`GLOSSARY.md`, and cross-cutting decisions in ADRs.
 Write reference documentation in the present tense and describe only the current
 contract. Keep change history and cutover instructions in the deployment guide;
 record lasting cross-cutting decisions in ADRs.
+
+## Agent skills
+
+- **Issue tracker:** local Markdown issues under `.scratch/<effort>/`. Before reading
+  or updating tickets, specs, or decision maps, read the
+  [tracker conventions](docs/agents/issue-tracker.md).
+- **Triage labels:** use the default role names. Before triaging incoming issues
+  or changing triage labels, read the [label mapping](docs/agents/triage-labels.md).
+- **Domain docs:** one root `GLOSSARY.md` and `docs/adr/`. Before engineering
+  exploration, read the [domain documentation rules](docs/agents/domain.md).
 
 ## Coding Style and Scope
 
@@ -68,8 +84,10 @@ cloud-side validation. Leave changes uncommitted unless a commit is requested.
 
 ## Commit Messages
 
-Leave agent-made changes uncommitted for code review. Do not create a commit at
-the end of a session unless the user explicitly requests one.
+For commit-only requests, confirm files and exclusions, reuse session reviews and
+passing checks for unchanged content, stage explicit paths, run the AWS privacy
+check, commit, and verify status. Review only unreviewed changes or privacy flags;
+report the hash and exclusions.
 
 Write commit messages that are sufficiently detailed for a future maintainer to
 understand the change without reconstructing it from the diff. Use a concise
@@ -79,8 +97,9 @@ safety or migration decisions.
 
 ## Security and Private AWS Details
 
-Before committing or publishing changes, check tracked and newly added files for
-AWS details that should remain private. Do not check in:
+Before committing or publishing, check added lines in modified files and full
+contents of new files for private AWS details. Reuse prior checks of unchanged
+content. Do not check in:
 
 - AWS access keys, secret access keys, session tokens, SSO cache data, or CLI
   credential/config files.
@@ -99,6 +118,11 @@ the AWS CLI query that retrieves it instead of recording the value itself.
 
 ## Build and Validation
 
+Before selecting targeted checks, running final validation or diagnosing
+check-environment failures, read the [local-check guide](docs/agents/local-checks.md).
+Use its targeted checks during implementation and its complete offline checks
+after final fixes.
+
 The TigerBeetle processor build currently requires the sibling Zig standard
 library at `../zig/lib`. Before a Lambda build, check `zig version` (0.16.0) and
 `test -f ../zig/lib/std/Io/net/HostName.zig`. A missing checkout is an environment
@@ -106,33 +130,8 @@ prerequisite failure. File presence does not verify the patch; consult the
 [hostname-connect workaround note](docs/ZIG_0_16_HOSTNAME_CONNECT_STALL.md) when
 setting up or diagnosing this build.
 
-Select checks by the affected behavior:
-
-| Check | Scope |
-| --- | --- |
-| `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
-| `zig build test` | Full local Zig and mocked deployment-helper suite; excludes the live replica and separate ABI checks |
-| `zig build test-deploy` | Mocked deployment regression tests; requires Bash and `jq` |
-| `zig build test-tigerbeetle-processor` | Processor parsing and invocation tests |
-| `zig build test-tigerbeetle-wrapper` | Offline wrapper tests |
-| `zig build test-tigerbeetle-c-abi` | Native C ABI smoke test on Apple Silicon macOS |
-| `zig build test-tigerbeetle-c-abi-linux test-tigerbeetle-wrapper-linux` | Compile ARM64 Linux ABI and wrapper tests; does not execute them |
-| `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` | Live integration tests against the local development replica |
-| `zig build --release -Darch=arm` | Stripped ReleaseSafe ARM64 Lambda bootstraps and host CLI tools |
-| `sam validate --template-file template.yaml --region ca-central-1` | SAM template validation when the template changes |
-| `sam validate --lint --template-file template.yaml --region ca-central-1` | Stricter SAM template validation |
-
-For shell changes, run `bash -n` on each affected script. To check the deployment
-helpers and shell tests together, use:
-
-```sh
-for script in deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh; do
-  bash -n "$script" || exit
-done
-```
-
 For Zig code or build changes, check formatting and build the affected targets,
 then select tests for the changed behavior. Documentation-only changes need link
 and command consistency checks rather than an application rebuild. The
 TigerBeetle processor must remain multithread-capable for its native callback
-thread; the other three Lambda bootstraps are single-threaded.
+thread; the other five Lambda bootstraps are single-threaded.

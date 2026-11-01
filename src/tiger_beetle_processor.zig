@@ -3,6 +3,7 @@ const aws = @import("aws");
 const lambda = @import("aws-lambda");
 const processor_message = @import("processor_message");
 const operation = @import("operation");
+const logging = @import("outcome_log");
 const sqs_queue = @import("sqs_queue");
 const tigerbeetle = @import("tigerbeetle");
 
@@ -41,7 +42,9 @@ var runtime_completion_publisher: ?CompletionPublisher = null;
 pub fn main(init: std.process.Init) void {
     var resources: RuntimeResources = undefined;
     resources.init(init) catch |err| {
-        std.log.err("Lambda initialization failed: {s}", .{@errorName(err)});
+        var trace = logging.Context.init(.{}, .tigerbeetle_executor);
+        trace.finish(.ERROR, "initialization", "retry", @errorName(err));
+        trace.emit();
         return;
     };
     defer resources.deinit();
@@ -61,7 +64,7 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
     const publisher = runtime_completion_publisher orelse {
         return error.CompletionPublisherNotInitialized;
     };
-    return handleInvocation(ctx.arena, event, execution, publisher);
+    return handle_invocation_observed(ctx.arena, event, execution, publisher, .{ .request_id = ctx.request.id });
 }
 
 const RuntimeResources = struct {
@@ -130,13 +133,14 @@ const RuntimeResources = struct {
         return resources.tigerbeetle_client.lookupAccounts(ids, output);
     }
 
-    fn sendCompletion(
+    fn send_completion_observed(
         resources: *RuntimeResources,
         arena: Allocator,
         result_queue: ?[]const u8,
         body: []const u8,
+        trace: ?*const logging.Context,
     ) !void {
-        return resources.completion_queue.sender.send(arena, result_queue orelse resources.completion_queue.queue_url, body);
+        return resources.completion_queue.sender.send_observed(arena, result_queue orelse resources.completion_queue.queue_url, body, trace);
     }
 };
 
@@ -257,7 +261,8 @@ const ExecutionAdapter = struct {
 
 const CompletionPublisher = struct {
     context: *anyopaque,
-    send_fn: *const fn (*anyopaque, Allocator, ?[]const u8, []const u8) anyerror!void,
+    trace: ?*const logging.Context = null,
+    send_fn: *const fn (*anyopaque, Allocator, ?[]const u8, []const u8, ?*const logging.Context) anyerror!void,
 
     fn init(pointer: anytype) CompletionPublisher {
         const Pointer = @TypeOf(pointer);
@@ -271,8 +276,12 @@ const CompletionPublisher = struct {
                 arena: Allocator,
                 result_queue: ?[]const u8,
                 body: []const u8,
+                trace: ?*const logging.Context,
             ) anyerror!void {
                 const self: Pointer = @ptrCast(@alignCast(context));
+                if (@hasDecl(pointer_info.pointer.child, "send_completion_observed")) {
+                    return self.send_completion_observed(arena, result_queue, body, trace);
+                }
                 return self.sendCompletion(arena, result_queue, body);
             }
         };
@@ -283,7 +292,7 @@ const CompletionPublisher = struct {
     }
 
     fn send(publisher: CompletionPublisher, arena: Allocator, result_queue: ?[]const u8, body: []const u8) !void {
-        return publisher.send_fn(publisher.context, arena, result_queue, body);
+        return publisher.send_fn(publisher.context, arena, result_queue, body, publisher.trace);
     }
 };
 
@@ -314,16 +323,52 @@ const RecordParseOutcome = union(enum) {
     valid: processor_message.Message,
 };
 
+pub const test_support = if (@import("builtin").is_test) struct {
+    pub fn invoke(arena: Allocator, event: []const u8, effects: anytype) ![]const u8 {
+        return handleInvocation(
+            arena,
+            event,
+            ExecutionAdapter.init(effects),
+            CompletionPublisher.init(effects),
+        );
+    }
+} else struct {};
+
 fn handleInvocation(
     allocator: Allocator,
     event: []const u8,
     execution: ExecutionAdapter,
     publisher: CompletionPublisher,
 ) ![]const u8 {
-    const sqs_event = try lambda.sqs.parseEvent(allocator, event);
-    defer sqs_event.deinit(allocator);
-    if (sqs_event.records.len > record_count_max) return error.TooManyRecords;
+    return handle_invocation_observed(allocator, event, execution, publisher, .{});
+}
 
+fn handle_invocation_observed(
+    allocator: Allocator,
+    event: []const u8,
+    execution: ExecutionAdapter,
+    publisher: CompletionPublisher,
+    logger: logging.Logger,
+) ![]const u8 {
+    var invocation = logging.Context.init(logger, .tigerbeetle_executor);
+    const sqs_event = lambda.sqs.parseEvent(allocator, event) catch |err| {
+        invocation.finish(.ERROR, "event_parse", "retry", @errorName(err));
+        invocation.emit();
+        return err;
+    };
+    defer sqs_event.deinit(allocator);
+    if (sqs_event.records.len > record_count_max) {
+        invocation.finish(.ERROR, "event_parse", "retry", "TooManyRecords");
+        invocation.emit();
+        return error.TooManyRecords;
+    }
+    var traces: [record_count_max]logging.Context = undefined;
+    for (sqs_event.records, traces[0..sqs_event.records.len]) |record, *trace| {
+        trace.* = logging.Context.init(logger, .tigerbeetle_executor);
+        trace.record.sqs_message_id = record.message_id;
+        trace.finish(.ERROR, "scratch_allocate", "retry", "OutOfMemory");
+    }
+    defer for (traces[0..sqs_event.records.len]) |*trace| trace.emit();
     var queued_operations: [record_count_max]processor_message.Message = undefined;
     var queued_record_indexes: [record_count_max]usize = undefined;
     const result_buffer = try allocator.create([operation.result_size_max]u8);
@@ -333,8 +378,8 @@ fn handleInvocation(
     var retry_records = [_]bool{false} ** record_count_max;
     var queued_count: usize = 0;
     for (sqs_event.records, 0..) |record, record_index| {
-        log.debug("message_id={s} body={s}", .{ record.message_id, record.body });
-        switch (parseRecord(allocator, record.message_id, record.body)) {
+        const trace = &traces[record_index];
+        switch (parse_record_observed(allocator, record.body, trace)) {
             .acknowledged => {},
             .retry => retry_records[record_index] = true,
             .valid => |queued| {
@@ -345,22 +390,84 @@ fn handleInvocation(
             },
         }
     }
+    execute_and_publish(allocator, queued_operations[0..queued_count], queued_record_indexes[0..queued_count], &retry_records, result_buffer, completion_buffer, execution, publisher, &traces);
+    return encodeFailureResponse(allocator, sqs_event.records, &retry_records) catch |err| {
+        for (traces[0..sqs_event.records.len]) |*trace| trace.finish(.ERROR, "response_encode", "retry", @errorName(err));
+        return err;
+    };
+}
+
+fn execute_and_publish(
+    allocator: Allocator,
+    queued: []const processor_message.Message,
+    record_indexes: []const usize,
+    retry_records: []bool,
+    result_buffer: *[operation.result_size_max]u8,
+    completion_buffer: []u8,
+    execution: ExecutionAdapter,
+    publisher: CompletionPublisher,
+    traces: *[record_count_max]logging.Context,
+) void {
     var plans = [_]?Planning{null} ** record_count_max;
-    defer for (plans[0..queued_count]) |planning| {
+    defer for (plans[0..queued.len]) |planning| {
         if (planning) |value| if (value == .admitted) {
             allocator.free(value.admitted.commands);
             allocator.free(value.admitted.outcomes);
         };
     };
-    for (queued_operations[0..queued_count], 0..) |*queued, index| {
-        plans[index] = plan_body(allocator, &queued.body) catch null;
+    for (queued, 0..) |*entry, index| {
+        const trace = &traces[record_indexes[index]];
+        trace.finish(.ERROR, "admission", "retry", "OutOfMemory");
+        plans[index] = plan_body(allocator, &entry.body) catch null;
+        if (plans[index]) |*plan| {
+            if (plan.* == .admitted) {
+                trace.finish(.INFO, "native", "started", null);
+                trace.emit();
+                trace.finish(.ERROR, "native", "retry", "UnfinishedWork");
+            } else {
+                trace.record.diagnostic_code = @tagName(plan.rejected.log_code);
+            }
+        }
     }
-    execute_phases(allocator, plans[0..queued_count], execution) catch |err| {
-        log.debug("stage=native outcome=stopped error={s}", .{@errorName(err)});
+    execute_phases(allocator, plans[0..queued.len], execution) catch |err| {
+        for (record_indexes) |record_index| {
+            const trace = &traces[record_index];
+            if (std.mem.eql(u8, trace.record.stage, "native")) trace.record.reason = @errorName(err);
+        }
     };
-    publish_results(allocator, queued_operations[0..queued_count], plans[0..queued_count], queued_record_indexes[0..queued_count], retry_records[0..sqs_event.records.len], result_buffer, completion_buffer, publisher);
+    for (plans[0..queued.len], record_indexes) |planning, index| {
+        if (planning) |*plan| {
+            if (plan.* == .admitted) emit_native_counts(&traces[index], &plan.admitted);
+        }
+    }
+    publish_results_observed(allocator, queued, plans[0..queued.len], record_indexes, retry_records, result_buffer, completion_buffer, publisher, traces);
+}
 
-    return encodeFailureResponse(allocator, sqs_event.records, &retry_records);
+fn emit_native_counts(trace: *const logging.Context, plan: *const Plan) void {
+    var counts: [command_count_max]logging.NativeCount = undefined;
+    var used: usize = 0;
+    for (plan.commands, plan.outcomes) |command, outcome| {
+        if (outcome != .created) continue;
+        const family: []const u8 = if (command.native == .account) "create_accounts" else "create_transfers";
+        var found = false;
+        for (counts[0..used]) |*count| {
+            if (count.code == outcome.created and std.mem.eql(u8, count.family, family)) {
+                count.count += 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.debug.assert(used < counts.len);
+            counts[used] = .{ .family = family, .code = outcome.created, .count = 1 };
+            used += 1;
+        }
+    }
+    if (used == 0) return;
+    var detail = trace.*;
+    detail.record.native_status_counts = counts[0..used];
+    detail.finish(if (plan.chains[0] == .rejected or plan.chains[1] == .rejected) .WARN else .INFO, "native", "native_status", null);
+    detail.emit();
 }
 
 // Transport count is independent of invocation delivery and native packet capacity.
@@ -376,24 +483,62 @@ fn publish_results(
     completion_buffer: []u8,
     publisher: CompletionPublisher,
 ) void {
+    publish_results_observed(allocator, queued, plans, record_indexes, retry_records, result_buffer, completion_buffer, publisher, null);
+}
+
+fn publish_results_observed(
+    allocator: Allocator,
+    queued: []const processor_message.Message,
+    plans: []const ?Planning,
+    record_indexes: []const usize,
+    retry_records: []bool,
+    result_buffer: *[operation.result_size_max]u8,
+    completion_buffer: []u8,
+    publisher: CompletionPublisher,
+    traces: ?*[record_count_max]logging.Context,
+) void {
     std.debug.assert(queued.len == plans.len);
     std.debug.assert(queued.len == record_indexes.len);
     // A successful serial send acknowledges exactly its source, never an unsent suffix.
     for (record_indexes) |index| retry_records[index] = true;
+    var blocked = false;
     for (queued, plans, record_indexes) |*entry, planning, record_index| {
+        const trace: ?*logging.Context = if (traces) |all| &all[record_index] else null;
+        if (blocked) {
+            if (trace) |context| context.finish(.ERROR, "publish", "retry", "BlockedByEarlierPublication");
+            continue;
+        }
         const plan = &(planning orelse continue);
         const body = switch (plan.*) {
             .rejected => |*diagnostic| write_diagnostic(result_buffer, diagnostic),
             .admitted => |*admitted| write_result(result_buffer, admitted) catch |err| switch (err) {
-                error.UnsupportedTigerBeetleAccountFlags => write_diagnostic(result_buffer, &.{
-                    .message = "UnsupportedTigerBeetleAccountFlags",
-                }),
+                error.UnsupportedTigerBeetleAccountFlags => diagnostic: {
+                    if (trace) |context| context.record.diagnostic_code = "UnsupportedTigerBeetleAccountFlags";
+                    break :diagnostic write_diagnostic(result_buffer, &.{ .message = "UnsupportedTigerBeetleAccountFlags" });
+                },
                 else => continue,
             },
         };
-        const message = processor_message.frame(completion_buffer, entry.operation_id, body, null) catch return;
-        publisher.send(allocator, entry.result_queue, message) catch return;
+        if (trace) |context| context.record.stage = "publication_encode";
+        const message = processor_message.frame(completion_buffer, body, &.{
+            .operation_id = entry.operation_id,
+            .tenant = entry.tenant,
+            .context = entry.context,
+        }) catch |err| {
+            if (trace) |context| context.finish(.ERROR, "publication_encode", "retry", @errorName(err));
+            blocked = true;
+            continue;
+        };
+        if (trace) |context| context.record.stage = "publish";
+        var observed_publisher = publisher;
+        observed_publisher.trace = trace;
+        observed_publisher.send(allocator, entry.result_queue, message) catch |err| {
+            if (trace) |context| context.finish(.ERROR, "publish", "retry", @errorName(err));
+            blocked = true;
+            continue;
+        };
         retry_records[record_index] = false;
+        if (trace) |context| context.finish(.INFO, "publish", "published", null);
     }
 }
 
@@ -422,20 +567,18 @@ fn parseRecord(
     message_id: []const u8,
     body: []const u8,
 ) RecordParseOutcome {
+    var trace = logging.Context.init(.{}, .tigerbeetle_executor);
+    trace.record.sqs_message_id = message_id;
+    return parse_record_observed(arena, body, &trace);
+}
+
+fn parse_record_observed(arena: Allocator, body: []const u8, trace: *logging.Context) RecordParseOutcome {
     const queued = processor_message.decode(arena, body) catch |err| {
-        if (err == error.OutOfMemory) {
-            log.debug("message_id={s} stage=parse outcome=retry error={s}", .{
-                message_id,
-                @errorName(err),
-            });
-            return .retry;
-        }
-        log.debug("message_id={s} outcome=acknowledged_invalid error={s}", .{
-            message_id,
-            @errorName(err),
-        });
-        return .acknowledged;
+        trace.finish(.ERROR, "envelope_decode", if (err == error.OutOfMemory) "retry" else "acknowledged_invalid", @errorName(err));
+        return if (err == error.OutOfMemory) .retry else .acknowledged;
     };
+    trace.identify(queued.operation_id);
+    trace.record.command = logging.recognized_command(&queued.context);
     return .{ .valid = queued };
 }
 
@@ -1101,6 +1244,7 @@ const Plan = struct {
     chains: [2]ChainState = .{ .unfinished, .unfinished },
 };
 const Diagnostic = struct {
+    log_code: enum { invalid_body, invalid_command, invalid_field, unknown_field, duplicate_id, empty_commands, command_limit } = .invalid_command,
     family: ?Family = null,
     command_index: usize = 0,
     id: ?u128 = null,
@@ -1164,7 +1308,7 @@ fn unknown_member(object: *const std.json.ObjectMap, family: ?Family) ?u32 {
 }
 
 fn field_error(field: []const u8, message: []const u8) Diagnostic {
-    return .{ .field = field, .message = message };
+    return .{ .log_code = .invalid_field, .field = field, .message = message };
 }
 
 const WireField = enum {
@@ -1212,7 +1356,7 @@ fn validate_command(family: Family, value: *const std.json.Value, command: *Comm
     if (value.* != .object) return .{ .message = "Expected a command object." };
     const object = &value.object;
     if (unknown_member(object, family)) |index| {
-        return .{ .member_index = index, .message = "Unknown field." };
+        return .{ .log_code = .unknown_field, .member_index = index, .message = "Unknown field." };
     }
     var fields: ParsedFields = .{};
     if (family != .lookup_accounts) {
@@ -1399,8 +1543,8 @@ fn first_duplicate_id(ids: []ValidationId) ?usize {
 
 fn validate_body(body: *const std.json.Value, counts: *[3]usize) ?Diagnostic {
     counts.* = .{ 0, 0, 0 };
-    if (body.* != .object) return .{ .message = "Expected a Body object." };
-    if (unknown_member(&body.object, null)) |index| return .{ .member_index = index, .message = "Unknown field." };
+    if (body.* != .object) return .{ .log_code = .invalid_body, .message = "Expected a Body object." };
+    if (unknown_member(&body.object, null)) |index| return .{ .log_code = .unknown_field, .member_index = index, .message = "Unknown field." };
     var ids: [validation_id_count_max]ValidationId = undefined;
     for (families, 0..) |family, family_index| {
         const list = body.object.get(@tagName(family)) orelse continue;
@@ -1427,15 +1571,16 @@ fn validate_body(body: *const std.json.Value, counts: *[3]usize) ?Diagnostic {
         // Only the validated prefix is sorted; the Body and execution order remain untouched.
         if (first_duplicate_id(ids[0..id_count])) |index| {
             std.debug.assert(index < list.array.items.len);
-            const problem = field_error("id", "This ID repeats an earlier command's ID in the same list.");
+            var problem = field_error("id", "This ID repeats an earlier command's ID in the same list.");
+            problem.log_code = .duplicate_id;
             return locate_diagnostic(problem, family, index, &list.array.items[index]);
         }
         if (first_problem) |problem| return problem;
     }
     const count = std.math.add(usize, counts[0], counts[1]) catch unreachable;
     const total = std.math.add(usize, count, counts[2]) catch unreachable;
-    if (total == 0) return .{ .message = "At least one command is required." };
-    if (total > command_count_max) return .{ .message = "The Body exceeds the 64-command complete Result capacity." };
+    if (total == 0) return .{ .log_code = .empty_commands, .message = "At least one command is required." };
+    if (total > command_count_max) return .{ .log_code = .command_limit, .message = "The Body exceeds the 64-command complete Result capacity." };
     return null;
 }
 
@@ -1493,7 +1638,7 @@ test "valid message invalid Body publishes diagnostics and admits neighbors with
 
 fn test_body_message(allocator: Allocator, id: u128, body_json: []const u8) ![]const u8 {
     const body = try std.json.parseFromSliceLeaky(std.json.Value, allocator, body_json, .{ .duplicate_field_behavior = .@"error" });
-    return processor_message.encode(allocator, &.{ .operation_id = id, .body = body });
+    return processor_message.encode(allocator, &.{ .operation_id = id, .tenant = "tenant-a", .body = body, .context = .null });
 }
 
 fn test_plan(allocator: Allocator, json: []const u8) !Planning {
@@ -2590,7 +2735,7 @@ test "realizable lookup Body carries found data larger than 4 KiB through Comple
     const result = try write_result(buffer, &plan);
     try std.testing.expect(result.len > 4096);
     const transport = try allocator.alloc(u8, completion_buffer_size);
-    const message = try processor_message.frame(transport, 1, result, null);
+    const message = try processor_message.frame(transport, result, &.{ .operation_id = 1, .tenant = "tenant-a", .context = .null });
     const decoded = try test_results(allocator, &.{message});
     const entry = decoded.results[0].valid;
     try std.testing.expectEqual(@as(u128, 1), entry.operation_id);
@@ -3121,17 +3266,18 @@ test "executable invocation allocation faults include post effect publication an
 
 const SerialPublisher = struct {
     messages: [4][]const u8 = undefined,
+    routes: [4]?[]const u8 = undefined,
     calls: usize = 0,
     fail_at: ?usize = null,
     ambiguous: bool = false,
 
     fn sendCompletion(self: *SerialPublisher, allocator: Allocator, result_queue: ?[]const u8, body: []const u8) !void {
-        _ = result_queue;
         std.debug.assert(self.calls < self.messages.len);
         const index = self.calls;
         self.calls += 1;
         if (self.fail_at == index and !self.ambiguous) return error.SendFailed;
         self.messages[index] = try allocator.dupe(u8, body);
+        self.routes[index] = result_queue;
         if (self.fail_at == index) return error.SendFailed;
     }
 };
@@ -3151,6 +3297,9 @@ test "serial publication skips unfinished records and preserves successful prefi
             for (queued, plans, &indexes, 0..) |*entry, *plan, *index, i| {
                 const message = try test_body_message(allocator, i + 1, "true");
                 entry.* = (parseRecord(allocator, "source", message)).valid;
+                entry.tenant = if (i % 2 == 0) "tenant-a" else "tenant-b";
+                entry.context = .{ .integer = @intCast(i) };
+                entry.result_queue = if (i % 2 == 0) null else "https://sqs.example.invalid/next";
                 plan.* = try plan_body(allocator, &entry.body);
                 index.* = i;
             }
@@ -3173,6 +3322,12 @@ test "serial publication skips unfinished records and preserves successful prefi
             var next_id: u128 = 1;
             const captured = if (fail_at) |n| n + @intFromBool(ambiguous) else 3;
             for (publisher.messages[0..captured], 0..) |message, send_index| {
+                const decoded = try processor_message.decode(allocator, message);
+                const source = &queued[@intCast(decoded.operation_id - 1)];
+                try std.testing.expectEqualStrings(source.tenant, decoded.tenant);
+                try std.testing.expectEqual(source.context.integer, decoded.context.integer);
+                try std.testing.expect(decoded.result_queue == null);
+                try std.testing.expectEqual(source.result_queue, publisher.routes[send_index]);
                 const batch = try test_results(allocator, &.{message});
                 try std.testing.expectEqual(@as(usize, if (send_index == 2) 1 else completion_count_max), batch.results.len);
                 for (batch.results) |entry| {
@@ -3411,7 +3566,7 @@ test "bounded individual publication preserves successful prefix after ambiguous
     }
     const result = try allocator.create([operation.result_size_max]u8);
     const buffer = try allocator.alloc(u8, completion_buffer_size);
-    const single_size = (try processor_message.frame(buffer, 1, write_diagnostic(result, &plans[0].?.rejected), null)).len;
+    const single_size = (try processor_message.frame(buffer, write_diagnostic(result, &plans[0].?.rejected), &.{ .operation_id = 1, .tenant = "tenant-a", .context = .null })).len;
     var retries = [_]bool{false} ** 3;
     var publisher: SerialPublisher = .{ .fail_at = 1, .ambiguous = true };
     publish_results(allocator, &queued, &plans, &.{ 0, 1, 2 }, &retries, result, buffer[0..single_size], CompletionPublisher.init(&publisher));
@@ -3545,7 +3700,7 @@ test "internal route overrides publication destination while outgoing route is a
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const input = "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":true,\"result_queue\":\"https://sqs.example.invalid/next\"}";
+    const input = "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"tenant-a\",\"context\":null,\"body\":true,\"result_queue\":\"https://sqs.example.invalid/next\"}";
     var execution: FakeExecution = .{};
     var publisher: FakePublisher = .{};
     const response = try handleInvocation(allocator, try testEvent(allocator, &.{input}), ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
@@ -3597,7 +3752,7 @@ test "internal Body above public intake cap reaches admission and missing route 
     const allocator = arena.allocator();
     const text = try allocator.alloc(u8, processor_message.body_size_max - 2);
     @memset(text, 'x');
-    const input = try processor_message.encode(allocator, &.{ .operation_id = 1, .body = .{ .string = text } });
+    const input = try processor_message.encode(allocator, &.{ .operation_id = 1, .tenant = "tenant-a", .body = .{ .string = text }, .context = .null });
     var execution: FakeExecution = .{};
     var publisher: FakePublisher = .{};
     const response = try handleInvocation(allocator, try testEvent(allocator, &.{input}), ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
@@ -3636,4 +3791,301 @@ test "large internal command diagnostic preserves its prefix within the output b
     const result = try @import("tiger_beetle_completion_processor").test_support.interpret(&message.body);
     try std.testing.expect(result == .failure);
     try std.testing.expect((try operation.completionEncodedSize(&result)) <= operation.result_size_max);
+}
+
+test "normal native outputs and diagnostics preserve opaque trusted metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const context = try std.json.parseFromSliceLeaky(std.json.Value, allocator,
+        \\{"unrecognized-domain":[null,true,"é\n\""],"reservation_id":"123"}
+    , .{});
+    for ([_][]const u8{ "{\"create_accounts\":[{\"id\":\"1\",\"flags\":[],\"ledger\":1,\"code\":1}]}", "true" }) |body| {
+        var source = try processor_message.decode(
+            allocator,
+            try test_body_message(allocator, 7, body),
+        );
+        source.tenant = "tenant-é\"\\\n";
+        source.context = context;
+        source.result_queue = "https://sqs.example.invalid/domain-completion";
+        const message = try processor_message.encode(allocator, &source);
+        var execution: FakeExecution = .{};
+        var publisher: FakePublisher = .{};
+        const response = try handleInvocation(
+            allocator,
+            try testEvent(allocator, &.{message}),
+            ExecutionAdapter.init(&execution),
+            CompletionPublisher.init(&publisher),
+        );
+        try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
+        const output = try processor_message.decode(allocator, publisher.message);
+        try std.testing.expectEqual(source.operation_id, output.operation_id);
+        try std.testing.expectEqualStrings(source.tenant, output.tenant);
+        try std.testing.expectEqualStrings(
+            try std.json.Stringify.valueAlloc(allocator, source.context, .{}),
+            try std.json.Stringify.valueAlloc(allocator, output.context, .{}),
+        );
+        try std.testing.expectEqualStrings(source.result_queue.?, publisher.routes[0].?);
+        try std.testing.expect(output.result_queue == null);
+        try std.testing.expectEqual(body[0] != '{', output.body.object.contains("error"));
+    }
+}
+
+const PipelineIntake = struct {
+    allocator: Allocator,
+    store: *@import("operation_persistence").test_support.Store,
+    messages: [3][]const u8 = undefined,
+    sends: usize = 0,
+
+    pub fn create(
+        self: *PipelineIntake,
+        _: Allocator,
+        source: *const operation.Operation,
+    ) !operation.Operation {
+        return self.store.create(self.allocator, source);
+    }
+
+    pub fn send(
+        self: *PipelineIntake,
+        _: Allocator,
+        queue_url: []const u8,
+        message: []const u8,
+    ) !void {
+        try std.testing.expectEqualStrings("https://sqs.example.invalid/tigerbeetle", queue_url);
+        std.debug.assert(self.sends < self.messages.len);
+        self.messages[self.sends] = try self.allocator.dupe(u8, message);
+        self.sends += 1;
+    }
+};
+
+fn test_pipeline_submit(allocator: Allocator, backend: *PipelineIntake) !void {
+    const intake = @import("intake_lambda");
+    for ([_][]const u8{
+        "{\"create_accounts\":[{\"id\":\"1\",\"flags\":[],\"ledger\":1,\"code\":1}]}",
+        "true",
+        "{\"create_accounts\":[{\"id\":\"2\",\"flags\":[],\"ledger\":1,\"code\":1}]}",
+    }, 0..) |body, i| {
+        var uuid: [operation.uuid_string_size]u8 = undefined;
+        const input = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":\"{s}\",\"name\":\"TigerBeetle\",\"body\":{s}}}",
+            .{ operation.uuidToString(i + 1, &uuid), body },
+        );
+        const response = try intake.test_support.submit(allocator, &.{
+            .input = input,
+            .subject = "tenant-é",
+        }, backend);
+        const http = try std.json.parseFromSliceLeaky(std.json.Value, allocator, response, .{});
+        try std.testing.expectEqual(@as(i64, 200), http.object.get("statusCode").?.integer);
+        const queued = try processor_message.decode(allocator, backend.messages[i]);
+        try std.testing.expectEqualStrings("tenant-é", queued.tenant);
+        try std.testing.expect(queued.context == .null);
+        try std.testing.expect(queued.result_queue == null);
+        const stored = try backend.store.read(allocator, queued.operation_id);
+        try std.testing.expectEqualStrings(queued.tenant, stored.tenant);
+        try std.testing.expect(stored.state == .submitted);
+    }
+}
+
+fn test_pipeline_query(
+    allocator: Allocator,
+    store: *@import("operation_persistence").test_support.Store,
+    id: u128,
+) !operation.Operation {
+    const stored = try store.read(allocator, id);
+    const response = try @import("query_lambda").test_support.query(allocator, &stored);
+    const http = try std.json.parseFromSliceLeaky(std.json.Value, allocator, response, .{});
+    try std.testing.expectEqual(@as(i64, 200), http.object.get("statusCode").?.integer);
+    return operation.parseOutputJSON(allocator, http.object.get("body").?.string);
+}
+
+fn test_pipeline_redelivery(allocator: Allocator, intake: *PipelineIntake) !void {
+    const completion = @import("tiger_beetle_completion_processor");
+    // Restart with only queue bytes and durable state. Successful sends may
+    // also be redelivered; the real completion request keeps the first Result.
+    var replay_execution: FakeExecution = .{};
+    var replay_publisher: SerialPublisher = .{};
+    const replay = try handleInvocation(
+        allocator,
+        try testEvent(allocator, &intake.messages),
+        ExecutionAdapter.init(&replay_execution),
+        CompletionPublisher.init(&replay_publisher),
+    );
+    try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", replay);
+    for (replay_publisher.messages[0..3]) |message| {
+        _ = try completion.test_support.invoke(allocator, message, intake.store);
+        _ = try completion.test_support.invoke(allocator, message, intake.store);
+    }
+    try std.testing.expectEqual(@as(usize, 3), intake.store.writes);
+    for (0..3) |i| {
+        const queried = try test_pipeline_query(allocator, intake.store, i + 1);
+        const result = queried.state.completed;
+        try std.testing.expectEqual(i == 1, result == .failure);
+        const payload = if (result == .success)
+            result.success.object
+        else
+            result.failure.object;
+        for ([_][]const u8{ "operation_id", "tenant", "context", "result_queue" }) |key| {
+            try std.testing.expect(!payload.contains(key));
+        }
+    }
+}
+
+test "authenticated pipeline retains Results through diagnostics duplicates and failed sends" {
+    const completion = @import("tiger_beetle_completion_processor");
+    for ([_]?usize{ null, 1 }) |fail_at| {
+        for ([_]bool{ false, true }) |ambiguous| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            var store: @import("operation_persistence").test_support.Store = .{};
+            var intake: PipelineIntake = .{ .allocator = allocator, .store = &store };
+            try test_pipeline_submit(allocator, &intake);
+            var execution: FakeExecution = .{};
+            var publisher: SerialPublisher = .{ .fail_at = fail_at, .ambiguous = ambiguous };
+            const response = try handleInvocation(
+                allocator,
+                try testEvent(allocator, &intake.messages),
+                ExecutionAdapter.init(&execution),
+                CompletionPublisher.init(&publisher),
+            );
+            try std.testing.expectEqualStrings(if (fail_at == null)
+                "{\"batchItemFailures\":[]}"
+            else
+                "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-1\"},{\"itemIdentifier\":\"message-2\"}]}", response);
+            const delivered: usize = if (fail_at == null) 3 else if (ambiguous) 2 else 1;
+            for (publisher.messages[0..delivered], 0..) |message, i| {
+                const decoded = try processor_message.decode(allocator, message);
+                try std.testing.expectEqualStrings("tenant-é", decoded.tenant);
+                try std.testing.expect(decoded.context == .null);
+                try std.testing.expectEqualStrings(
+                    "{\"batchItemFailures\":[]}",
+                    try completion.test_support.invoke(allocator, message, &store),
+                );
+                const queried = try test_pipeline_query(allocator, &store, i + 1);
+                try std.testing.expect(queried.state == .completed);
+            }
+            for (delivered..3) |i| {
+                const queried = try test_pipeline_query(allocator, &store, i + 1);
+                try std.testing.expect(queried.state == .submitted);
+            }
+            try test_pipeline_redelivery(allocator, &intake);
+        }
+    }
+}
+
+test "escaped maximum Processor Message survives SQS request and ten-record Lambda wrapping" {
+    const sqs = @import("sqs");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const text = try allocator.alloc(u8, (98304 - 2) / 6 + (98304 - 2) % 6);
+    @memset(text[0 .. (98304 - 2) / 6], 0);
+    @memset(text[(98304 - 2) / 6 ..], 'x');
+    const message = try processor_message.encode(allocator, &.{
+        .operation_id = std.math.maxInt(u128),
+        .tenant = "\x00" ** 64,
+        .body = .{ .string = text },
+        .context = .{ .string = "\"" ** 2047 },
+        .result_queue = "\\" ** 2048,
+    });
+    const request: sqs.SendMessageInput = .{
+        .queue_url = "https://sqs.example.invalid/next",
+        .message_body = message,
+    };
+    const request_json = try aws.json.jsonStringify(request, allocator);
+    const request_value = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        request_json,
+        .{},
+    );
+    try std.testing.expectEqualStrings(message, request_value.object.get("MessageBody").?.string);
+    try std.testing.expect(request_json.len > message.len);
+    try std.testing.expect(request_json.len < 1024 * 1024);
+    const event = try testEvent(allocator, &([_][]const u8{message} ** 10));
+    try std.testing.expect(event.len > 10 * message.len);
+    try std.testing.expect(event.len < 6 * 1024 * 1024);
+    const parsed = try lambda.sqs.parseEvent(allocator, event);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 10), parsed.records.len);
+    for (parsed.records) |record| {
+        try std.testing.expectEqualStrings(message, record.body);
+        const decoded = try processor_message.decode(allocator, record.body);
+        try std.testing.expectEqualStrings("\x00" ** 64, decoded.tenant);
+        try std.testing.expectEqualStrings("\"" ** 2047, decoded.context.string);
+    }
+}
+
+test "executor summaries distinguish publication, native rejection, admission and blocked retries" {
+    for ([_]bool{ false, true }) |fail_send| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        var observer = logging.TestObserver.init(arena);
+        observer.fail = true;
+        const bodies = [_][]const u8{
+            "{\"create_accounts\":[{\"id\":\"1\",\"flags\":[],\"ledger\":1,\"code\":1}]}",
+            "true",
+            "{\"lookup_accounts\":[{\"id\":\"2\"}]}",
+            "invalid envelope",
+        };
+        var messages: [bodies.len][]const u8 = undefined;
+        for (bodies[0..3], 0..) |body, i| messages[i] = try test_body_message(arena, i + 1, body);
+        messages[3] = bodies[3];
+        var execution: FakeExecution = .{};
+        execution.account_outcomes[0] = .{ .rejected = 9999 };
+        var publisher: SerialPublisher = .{ .fail_at = if (fail_send) 1 else null };
+        const response = try handle_invocation_observed(arena, try testEvent(arena, &messages), ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher), observer.logger());
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, response, .{});
+        try std.testing.expectEqual(@as(usize, if (fail_send) 2 else 0), parsed.value.object.get("batchItemFailures").?.array.items.len);
+        var summaries: usize = 0;
+        var starts: usize = 0;
+        var native_counts: usize = 0;
+        for (observer.records.items) |record| {
+            try std.testing.expect(record.result_type == null);
+            try std.testing.expectEqualStrings("lambda-test", record.lambda_request_id.?);
+            if (std.mem.eql(u8, record.outcome, "started")) {
+                starts += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, record.outcome, "native_status")) {
+                native_counts += 1;
+                try std.testing.expectEqual(@as(u32, 9999), record.native_status_counts.?[0].code);
+                continue;
+            }
+            summaries += 1;
+            if (std.mem.eql(u8, record.sqs_message_id.?, "message-0")) try std.testing.expectEqualStrings("published", record.outcome);
+            if (std.mem.eql(u8, record.sqs_message_id.?, "message-1")) {
+                try std.testing.expectEqualStrings("invalid_body", record.diagnostic_code.?);
+                try std.testing.expectEqualStrings(if (fail_send) "retry" else "published", record.outcome);
+                if (fail_send) try std.testing.expectEqualStrings("SendFailed", record.reason.?);
+            }
+            if (std.mem.eql(u8, record.sqs_message_id.?, "message-2") and fail_send) try std.testing.expectEqualStrings("BlockedByEarlierPublication", record.reason.?);
+            if (std.mem.eql(u8, record.sqs_message_id.?, "message-3")) try std.testing.expectEqualStrings("acknowledged_invalid", record.outcome);
+        }
+        try std.testing.expectEqual(@as(usize, 4), summaries);
+        try std.testing.expectEqual(@as(usize, 2), starts);
+        try std.testing.expectEqual(@as(usize, 1), native_counts);
+    }
+}
+
+test "executor unfinished native work logs a correlated retry while diagnostics publish" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    var observer = logging.TestObserver.init(arena);
+    const native = try test_body_message(arena, 1, "{\"lookup_accounts\":[{\"id\":\"1\"}]}");
+    const diagnostic = try test_body_message(arena, 2, "true");
+    var execution: FakeExecution = .{ .lookup_error = error.NativeDisconnected };
+    var publisher: FakePublisher = .{};
+    const response = try handle_invocation_observed(arena, try testEvent(arena, &.{ native, diagnostic }), ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher), observer.logger());
+    try std.testing.expect(std.mem.indexOf(u8, response, "message-0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "message-1") == null);
+    try std.testing.expectEqual(@as(usize, 3), observer.records.items.len);
+    try std.testing.expectEqualStrings("started", observer.records.items[0].outcome);
+    try std.testing.expectEqualStrings("retry", observer.records.items[1].outcome);
+    try std.testing.expectEqualStrings("native", observer.records.items[1].stage);
+    try std.testing.expectEqualStrings("NativeDisconnected", observer.records.items[1].reason.?);
+    try std.testing.expectEqualStrings("published", observer.records.items[2].outcome);
 }

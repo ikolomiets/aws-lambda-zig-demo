@@ -6,6 +6,7 @@ const operation = @import("operation");
 const processor_message = @import("processor_message");
 const operation_persistence = @import("operation_persistence");
 const sqs_queue = @import("sqs_queue");
+const logging = @import("outcome_log");
 
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{.{
@@ -47,7 +48,9 @@ var runtime_intake_adapter: ?IntakeAdapter = null;
 pub fn main(init: std.process.Init) void {
     var resources: RuntimeResources = undefined;
     resources.init(init) catch |err| {
-        std.log.err("Lambda initialization failed: {s}", .{@errorName(err)});
+        var trace = logging.Context.init(.{}, .intake);
+        trace.finish(.ERROR, "initialization", "failed", @errorName(err));
+        trace.emit();
         return;
     };
     defer resources.deinit();
@@ -62,12 +65,13 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
         return error.PersistenceNotInitialized;
     };
     const now = std.Io.Clock.real.now(ctx.io).toSeconds();
-    return handleInvocation(
+    return handle_invocation_observed(
         ctx.arena,
         event,
         @field(ctx, "_").kv,
         intake,
         now,
+        .{ .request_id = ctx.request.id },
     );
 }
 
@@ -102,23 +106,25 @@ const RuntimeResources = struct {
         resources.* = undefined;
     }
 
-    fn create(
+    fn create_observed(
         resources: *RuntimeResources,
         arena: Allocator,
         source: *const operation.Operation,
+        trace: *const logging.Context,
     ) !operation.Operation {
-        return resources.persistence.create(arena, source);
+        return resources.persistence.create_observed(arena, source, trace);
     }
 
-    fn send(
+    fn send_observed(
         resources: *RuntimeResources,
         arena: Allocator,
         queue_url: []const u8,
         message: []const u8,
+        trace: *const logging.Context,
     ) !void {
         std.debug.assert(queue_url.len > 0);
         std.debug.assert(message.len > 0);
-        return resources.sender.send(arena, queue_url, message);
+        return resources.sender.send_observed(arena, queue_url, message, trace);
     }
 };
 
@@ -128,12 +134,14 @@ const IntakeAdapter = struct {
         *anyopaque,
         Allocator,
         *const operation.Operation,
+        *const logging.Context,
     ) anyerror!operation.Operation,
     send_fn: *const fn (
         *anyopaque,
         Allocator,
         []const u8,
         []const u8,
+        *const logging.Context,
     ) anyerror!void,
 
     fn init(pointer: anytype) IntakeAdapter {
@@ -147,8 +155,12 @@ const IntakeAdapter = struct {
                 context: *anyopaque,
                 allocator: Allocator,
                 source: *const operation.Operation,
+                trace: *const logging.Context,
             ) anyerror!operation.Operation {
                 const self: Pointer = @ptrCast(@alignCast(context));
+                if (@hasDecl(pointer_info.pointer.child, "create_observed")) {
+                    return self.create_observed(allocator, source, trace);
+                }
                 return self.create(allocator, source);
             }
 
@@ -157,8 +169,12 @@ const IntakeAdapter = struct {
                 allocator: Allocator,
                 queue_url: []const u8,
                 message: []const u8,
+                trace: *const logging.Context,
             ) anyerror!void {
                 const self: Pointer = @ptrCast(@alignCast(context));
+                if (@hasDecl(pointer_info.pointer.child, "send_observed")) {
+                    return self.send_observed(allocator, queue_url, message, trace);
+                }
                 return self.send(allocator, queue_url, message);
             }
         };
@@ -173,8 +189,9 @@ const IntakeAdapter = struct {
         intake: IntakeAdapter,
         allocator: Allocator,
         source: *const operation.Operation,
+        trace: *const logging.Context,
     ) !operation.Operation {
-        return intake.create_fn(intake.context, allocator, source);
+        return intake.create_fn(intake.context, allocator, source, trace);
     }
 
     fn send(
@@ -182,8 +199,9 @@ const IntakeAdapter = struct {
         allocator: Allocator,
         queue_url: []const u8,
         message: []const u8,
+        trace: *const logging.Context,
     ) !void {
-        return intake.send_fn(intake.context, allocator, queue_url, message);
+        return intake.send_fn(intake.context, allocator, queue_url, message, trace);
     }
 };
 
@@ -206,8 +224,39 @@ fn handleInvocation(
     intake: IntakeAdapter,
     now: i64,
 ) []const u8 {
-    const outcome = invocationOutcome(allocator, event, env, intake, now);
-    return encodeOutcome(allocator, outcome) catch internal_server_error_response;
+    return handle_invocation_observed(allocator, event, env, intake, now, .{});
+}
+
+fn handle_invocation_observed(
+    allocator: Allocator,
+    event: []const u8,
+    env: *const std.process.Environ.Map,
+    intake: IntakeAdapter,
+    now: i64,
+    logger: logging.Logger,
+) []const u8 {
+    var trace = logging.Context.init(logger, .intake);
+    defer trace.emit();
+    const outcome = invocationOutcome(allocator, event, env, intake, now, &trace);
+    trace.record.http_status = switch (outcome) {
+        .success => 200,
+        .bad_request => 400,
+        .conflict => 409,
+        .method_not_allowed => 405,
+        .service_unavailable => 503,
+        .unauthorized => 401,
+        .internal_server_error => 500,
+    };
+    if (outcome != .success) {
+        const status = trace.record.http_status.?;
+        trace.record.level = if (status >= 500) .ERROR else if (status == 409) .INFO else .WARN;
+        trace.record.outcome = if (status == 409) "conflict" else if (status >= 500) "failed" else "rejected";
+    }
+    return encodeOutcome(allocator, outcome) catch |err| {
+        trace.record.http_status = 500;
+        trace.finish(.ERROR, "response_encode", "failed", @errorName(err));
+        return internal_server_error_response;
+    };
 }
 
 const InvocationOutcome = union(enum) {
@@ -233,12 +282,17 @@ fn invocationOutcome(
     env: *const std.process.Environ.Map,
     intake: IntakeAdapter,
     now: i64,
+    trace: *logging.Context,
 ) InvocationOutcome {
-    const request = lambda.url.parseRequest(allocator, event) catch {
+    trace.record.stage = "event_parse";
+    const request = lambda.url.parseRequest(allocator, event) catch |err| {
+        trace.record.reason = @errorName(err);
         return .internal_server_error;
     };
     defer request.deinit(allocator);
+    trace.record.stage = "authenticate";
     var identity = lambda_auth.authenticate(allocator, &request, env, now) catch |err| {
+        trace.record.reason = @errorName(err);
         return switch (err) {
             error.Unauthorized => .unauthorized,
             error.InternalFailure => .internal_server_error,
@@ -246,11 +300,12 @@ fn invocationOutcome(
     };
     defer identity.deinit();
 
+    trace.record.stage = "method";
     const method = request.request_context.http.method orelse {
         return .method_not_allowed;
     };
     if (method != .POST) return .method_not_allowed;
-    return post_invocation_outcome(allocator, identity.subject, &request, env, intake, now);
+    return post_invocation_outcome(allocator, identity.subject, &request, env, intake, now, trace);
 }
 
 fn post_invocation_outcome(
@@ -260,8 +315,13 @@ fn post_invocation_outcome(
     env: *const std.process.Environ.Map,
     intake: IntakeAdapter,
     now: operation.UnixSeconds,
+    trace: *logging.Context,
 ) InvocationOutcome {
-    const input_json = request.body orelse return .bad_request;
+    trace.record.stage = "request_parse";
+    const input_json = request.body orelse {
+        trace.record.reason = "MissingBody";
+        return .bad_request;
+    };
     var operation_arena = std.heap.ArenaAllocator.init(allocator);
     defer operation_arena.deinit();
     const arena = operation_arena.allocator();
@@ -273,36 +333,53 @@ fn post_invocation_outcome(
             .now = now,
         },
     ) catch |err| {
+        trace.record.reason = @errorName(err);
         return switch (err) {
             error.OutOfMemory => .internal_server_error,
             else => .bad_request,
         };
     };
+    trace.identify(parsed.id);
+    if (parsed.body) |body| trace.record.command = logging.recognized_command(&body);
+    trace.record.stage = "route";
     var queue_key_buffer: [operation_queue_key_size_max]u8 = undefined;
-    const queue_key = operation_queue_key(parsed.name, &queue_key_buffer) catch {
+    const queue_key = operation_queue_key(parsed.name, &queue_key_buffer) catch |err| {
+        trace.record.reason = @errorName(err);
         return .bad_request;
     };
-    const queue_url = sqs_queue.configured_queue_url(env, queue_key) catch {
+    const queue_url = sqs_queue.configured_queue_url(env, queue_key) catch |err| {
+        trace.record.reason = @errorName(err);
         return .bad_request;
     };
-    const created = intake.create(arena, &parsed) catch |err| {
+    trace.record.stage = "persist_create";
+    const created = intake.create(arena, &parsed, trace) catch |err| {
+        trace.record.reason = @errorName(err);
         return switch (err) {
             error.OperationConflict => .conflict,
             else => .internal_server_error,
         };
     };
-    if (created.state != .submitted) return operation_success_outcome(allocator, &created);
+    if (created.state == .completed) {
+        trace.record.result_type = logging.result_type(&created.state.completed);
+        trace.finish(.INFO, "persist_create", "winner_observed", null);
+        return operation_success_outcome(allocator, &created, trace);
+    }
 
     var queued = created;
     queued.body = parsed.body;
-    const message = operation_message_body(arena, &queued) catch {
+    trace.record.stage = "message_encode";
+    const message = operation_message_body(arena, &queued) catch |err| {
+        trace.record.reason = @errorName(err);
         return .internal_server_error;
     };
-    intake.send(arena, queue_url, message) catch {
+    trace.record.stage = "publish";
+    intake.send(arena, queue_url, message, trace) catch |err| {
+        trace.record.reason = @errorName(err);
         return .service_unavailable;
     };
 
-    return operation_success_outcome(allocator, &created);
+    trace.finish(.INFO, "publish", "accepted", null);
+    return operation_success_outcome(allocator, &created, trace);
 }
 
 fn operation_queue_key(
@@ -332,15 +409,19 @@ fn operation_message_body(
 
     return processor_message.encode(allocator, &.{
         .operation_id = queued.id,
+        .tenant = queued.tenant,
         .body = queued.body.?,
+        .context = .null,
     });
 }
 
 fn operation_success_outcome(
     allocator: Allocator,
     persisted: *const operation.Operation,
+    trace: *logging.Context,
 ) InvocationOutcome {
-    const body = operation_output_body(allocator, persisted) catch {
+    const body = operation_output_body(allocator, persisted) catch |err| {
+        trace.finish(.ERROR, "operation_encode", "failed", @errorName(err));
         return .internal_server_error;
     };
     return .{ .success = .{
@@ -525,6 +606,44 @@ fn handleInvocationForTest(
         now,
     );
 }
+
+/// Composed tests authenticate real Function URL requests and replace only external effects.
+pub const test_support = if (@import("builtin").is_test) struct {
+    pub const Submission = struct {
+        logger: logging.Logger = .{},
+        input: []const u8,
+        subject: []const u8,
+        operation_name: []const u8 = "TigerBeetle",
+    };
+
+    pub fn submit(
+        allocator: Allocator,
+        options: *const Submission,
+        backend: anytype,
+    ) ![]const u8 {
+        const token = try lambda_auth.testing.issue_token(allocator, .{
+            .seed_byte = 0x63,
+            .subject = options.subject,
+            .now = 1000,
+            .ttl_seconds = 60,
+        });
+        defer allocator.free(token);
+        var environment = std.process.Environ.Map.init(allocator);
+        defer environment.deinit();
+        try lambda_auth.testing.put_public_key(&environment, 0x63);
+        try put_test_queue_url(&environment, options.operation_name);
+        const event = try test_authorization_request_event(
+            allocator,
+            .POST,
+            "Authorization",
+            "Bearer",
+            token,
+            options.input,
+        );
+        defer allocator.free(event);
+        return handle_invocation_observed(allocator, event, &environment, IntakeAdapter.init(backend), 1000, options.logger);
+    }
+} else struct {};
 
 fn put_test_queue_url(
     environment: *std.process.Environ.Map,
@@ -713,7 +832,7 @@ test "authenticated POST persists and queues SUBMITTED then returns without its 
         "\\\"expires_at\\\":1700086400," ++
         "\\\"hash\\\":\\\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\\\"}\"}";
     const expected_message =
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":{\"message\":\"hello\",\"count\":2}}";
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":{\"message\":\"hello\",\"count\":2}}";
 
     for (inputs) |input| {
         var fake: FakeIntake = .{};
@@ -780,12 +899,12 @@ test "POST queues every JSON body variant as exact minimal Processor Message JSO
 
     const bodies = [_][]const u8{ "null", "false", "42", "\"text\"", "[1]", "{\"a\":1}" };
     const messages = [_][]const u8{
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":null}",
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":false}",
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":42}",
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":\"text\"}",
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":[1]}",
-        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"body\":{\"a\":1}}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":null}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":false}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":42}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":\"text\"}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":[1]}",
+        "{\"operation_id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"lambda-test-user\",\"context\":null,\"body\":{\"a\":1}}",
     };
 
     for (bodies, messages) |body, expected_message| {
@@ -869,6 +988,11 @@ test "POST derives tenant and hash from distinct bounded verified subjects" {
 
         try expectContains(response, subject);
         try std.testing.expectEqualStrings(subject, fake.lastTenant());
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const queued = try processor_message.decode(arena.allocator(), fake.lastMessage());
+        try std.testing.expectEqualStrings(subject, queued.tenant);
+        try std.testing.expect(queued.context == .null);
         hashes[index] = fake.last_hash.?;
     }
     try std.testing.expect(!std.mem.eql(u8, &hashes[0], &hashes[1]));
@@ -1712,12 +1836,29 @@ test "public intake preserves the 4 KiB cap and rejects internal routing metadat
         .{ .input = prefix ++ "\"" ++ "x" ** 4094 ++ "\"}", .accepted = true },
         .{ .input = prefix ++ "\"" ++ "x" ** 4095 ++ "\"}", .accepted = false },
         .{ .input = prefix ++ "{},\"result_queue\":\"https://sqs.example.invalid/internal\"}", .accepted = false },
+        .{ .input = prefix ++ "{},\"tenant\":\"spoofed\"}", .accepted = false },
+        .{ .input = prefix ++ "{},\"context\":null}", .accepted = false },
     };
     for (cases) |case| {
         var fake: FakeIntake = .{};
-        const event = try test_authorization_request_event(allocator, .POST, "Authorization", "Bearer", token, case.input);
+        const event = try test_authorization_request_event(
+            allocator,
+            .POST,
+            "Authorization",
+            "Bearer",
+            token,
+            case.input,
+        );
         defer allocator.free(event);
-        const response = handleInvocationForTest(allocator, event, .{}, .{}, &environment, &fake, 1000);
+        const response = handleInvocationForTest(
+            allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            &fake,
+            1000,
+        );
         defer allocator.free(response);
         if (case.accepted) {
             try expectContains(response, "\"statusCode\":200");
@@ -1728,5 +1869,65 @@ test "public intake preserves the 4 KiB cap and rejects internal routing metadat
             try std.testing.expectEqual(@as(u8, 0), fake.create_count);
             try std.testing.expectEqual(@as(u8, 0), fake.send_count);
         }
+    }
+}
+
+test "structured intake summaries preserve HTTP decisions and ignore observer failures" {
+    const cases = [_]struct { create_error: ?anyerror = null, send_error: ?anyerror = null, status: u16, outcome: []const u8, stage: []const u8 }{
+        .{ .status = 200, .outcome = "accepted", .stage = "publish" },
+        .{ .create_error = error.OperationConflict, .status = 409, .outcome = "conflict", .stage = "persist_create" },
+        .{ .create_error = error.AWSFailure, .status = 500, .outcome = "failed", .stage = "persist_create" },
+        .{ .send_error = error.AWSFailure, .status = 503, .outcome = "failed", .stage = "publish" },
+    };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var observer = logging.TestObserver.init(arena.allocator());
+        observer.fail = true;
+        var backend: FakeIntake = .{ .create_error = case.create_error, .send_error = case.send_error };
+        const response = try test_support.submit(arena.allocator(), &.{
+            .input = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"name\":\"TigerBeetle\",\"body\":null}",
+            .subject = "tenant-a",
+            .logger = observer.logger(),
+        }, &backend);
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), response, .{});
+        try std.testing.expectEqual(@as(i64, case.status), parsed.value.object.get("statusCode").?.integer);
+        try std.testing.expectEqual(@as(usize, 1), observer.records.items.len);
+        const record = observer.records.items[0];
+        try std.testing.expectEqualStrings(case.outcome, record.outcome);
+        try std.testing.expectEqualStrings(case.stage, record.stage);
+        try std.testing.expectEqual(@as(?u16, case.status), record.http_status);
+        try std.testing.expectEqualStrings("00112233-4455-6677-8899-aabbccddeeff", record.operation_id.?);
+        try std.testing.expect(record.result_type == null);
+        try std.testing.expectEqual(@as(u8, if (case.create_error == null) 1 else 0), backend.send_count);
+    }
+}
+
+test "intake matching completed retries log the saved outcome without publication" {
+    for ([_]operation.Completion{ .{ .success = .{ .bool = true } }, .{ .failure = .{ .bool = false } } }) |completion| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        var observer = logging.TestObserver.init(arena);
+        var backend: FakeIntake = .{ .response = .{
+            .id = 1,
+            .tenant = "tenant-a",
+            .name = "TigerBeetle",
+            .state = .{ .completed = completion },
+            .last_updated = 1,
+            .expires_at = 86401,
+            .hash = .{0} ** 32,
+        } };
+        _ = try test_support.submit(arena, &.{
+            .input = "{\"id\":\"00000000-0000-0000-0000-000000000001\",\"name\":\"TigerBeetle\",\"body\":null}",
+            .subject = "tenant-a",
+            .logger = observer.logger(),
+        }, &backend);
+        try std.testing.expectEqual(@as(u8, 0), backend.send_count);
+        try std.testing.expectEqual(@as(usize, 1), observer.records.items.len);
+        const record = observer.records.items[0];
+        try std.testing.expectEqualStrings("winner_observed", record.outcome);
+        try std.testing.expectEqualStrings(logging.result_type(&completion), record.result_type.?);
+        try std.testing.expectEqual(@as(?u16, 200), record.http_status);
     }
 }
