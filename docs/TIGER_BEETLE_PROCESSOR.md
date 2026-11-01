@@ -249,6 +249,47 @@ retry its source and every later unpublished source, together with unfinished wo
 sends stay acknowledged. The final consumer receives one message per invocation and performs one
 conditional completion write; a transient failure retries that message independently.
 
+## Structured outcome logs
+
+The executor and completion processor use the shared, synchronous 8 KiB JSON
+emitter described in the [seat reference](SEAT_RESERVATION.md#structured-outcome-logs).
+Their component names are `tigerbeetle_executor` and `tigerbeetle_completion`.
+Every record carries schema version, level, failed or completed stage, Lambda
+request ID, available Operation UUID, SQS message ID, recognized seat command,
+reason, failure code and Result type; unavailable metadata is null. The executor
+logs metadata instead of the full incoming Body. Logging failure never changes
+execution, persistence or acknowledgements.
+
+Before entering native execution, every admitted source emits a correlated INFO
+`started` record. A timeout can leave this record without a final summary. Bounded
+`native_status_counts` details record family, numeric status and count independently
+of publication. Native chain rejections are WARN. Admission diagnostics use safe
+`diagnostic_code` values without logging caller fields, aliases or resource IDs.
+The executor does not interpret terminal Results for logging.
+
+The final executor summary is `published` only after a successful SQS send, and
+its `result_type` is always null. Publication establishes delivery to the next
+processor, not terminal Operation success. Unfinished work logs `retry` with a
+native-stage reason; allocation failure logs the admission or scratch stage. A
+failed publication logs its error and stage, while later unpublished sources log
+`BlockedByEarlierPublication`. Successfully published sources remain acknowledged.
+Invalid envelopes log `acknowledged_invalid` at ERROR without native execution or
+a Result; allocation failures retry.
+
+Completion logs INFO `finalized` with `SUCCESS` or `FAILURE` only after persistence
+succeeds. A malformed native Body in a valid envelope follows the same failure
+persistence path and records the interpretation reason. `OperationConflict` logs
+INFO `acknowledged_conflict` with null Result type: no readback is performed and
+no saved winner is claimed. Other persistence failures log ERROR `retry`.
+Malformed envelopes acknowledge as ERROR `acknowledged_invalid` without a Result.
+Invocation failures without identifiable records log ERROR with the failed stage.
+AWS detail records capture safe code, status and request ID before diagnostic
+release and distinguish transport errors and expected conditional conflicts.
+
+Operational [rollout and acceptance](DEPLOY_AWS_LAMBDA_WITH_SAM.md#outcome-log-rollout-and-manual-acceptance)
+and [correlation queries](DEPLOY_AWS_LAMBDA_WITH_SAM.md#investigate-structured-outcomes)
+remain manual.
+
 ## Recovery and operating assumptions
 
 Retain trustworthy outcomes only within the live invocation. Redelivery repeats validation and normal

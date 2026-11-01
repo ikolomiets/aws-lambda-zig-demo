@@ -2,6 +2,7 @@ const std = @import("std");
 const aws = @import("aws");
 const dynamodb = @import("dynamodb");
 const operation = @import("operation");
+const logging = @import("outcome_log");
 
 const Allocator = std.mem.Allocator;
 const AttributeValue = dynamodb.types.AttributeValue;
@@ -133,6 +134,15 @@ pub const Persistence = struct {
         arena: Allocator,
         source: *const operation.Operation,
     ) !operation.Operation {
+        return self.create_observed(arena, source, null);
+    }
+
+    pub fn create_observed(
+        self: *Self,
+        arena: Allocator,
+        source: *const operation.Operation,
+        trace: ?*const logging.Context,
+    ) !operation.Operation {
         var persisted = persistentCopy(source);
         try validateCreation(&persisted);
 
@@ -146,6 +156,7 @@ pub const Persistence = struct {
             .return_values_on_condition_check_failure = .all_old,
             .table_name = self.table_name,
         }, .{ .diagnostic = &diagnostic }) catch |err| {
+            if (trace) |observer| observer.aws_error(err, &diagnostic);
             return createError(arena, err, &diagnostic, &persisted);
         };
         return persisted;
@@ -232,6 +243,17 @@ pub const Persistence = struct {
         completion: *const operation.Completion,
         now: operation.UnixSeconds,
     ) !void {
+        return self.complete_by_id_observed(arena, id, completion, now, null);
+    }
+
+    pub fn complete_by_id_observed(
+        self: *Self,
+        arena: Allocator,
+        id: u128,
+        completion: *const operation.Completion,
+        now: operation.UnixSeconds,
+        trace: ?*const logging.Context,
+    ) !void {
         const request = try arena.create(CompletionByIdRequest);
         defer arena.destroy(request);
         try completionByIdRequestInit(request, id, completion, now);
@@ -244,6 +266,7 @@ pub const Persistence = struct {
             .table_name = self.table_name,
             .update_expression = completion_update,
         }, .{ .diagnostic = &diagnostic }) catch |err| {
+            if (trace) |observer| observer.aws_error(err, &diagnostic);
             return writeError(err, &diagnostic, error.OperationConflict);
         };
     }

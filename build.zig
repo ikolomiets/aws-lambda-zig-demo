@@ -956,7 +956,54 @@ pub fn build(b: *std.Build) void {
     deploy_test_step.dependOn(&seat_scenarios_test.step);
     deploy_test_step.dependOn(&events_wrapper_test.step);
 
+    const lambda_outcome_log = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/outcome_log.zig"),
+    });
+    for ([_]*std.Build.Module{
+        lambda_ledger_counter,
+        lambda_operation_persistence,
+        lambda_sqs_queue,
+        intake_lambda_mod,
+        tiger_beetle_completion_processor_mod,
+        lambda_seat_submission,
+        lambda_seat_completion,
+    }) |module| {
+        module.addImport("outcome_log", lambda_outcome_log);
+    }
+    const native_outcome_log = b.createModule(.{
+        .target = tiger_beetle_processor_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/outcome_log.zig"),
+    });
+    for ([_]*std.Build.Module{
+        tiger_beetle_processor_sqs_queue,
+        tiger_beetle_processor_mod,
+    }) |module| {
+        module.addImport("outcome_log", native_outcome_log);
+    }
+    const host_outcome_log = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("src/outcome_log.zig"),
+    });
+    for ([_]*std.Build.Module{
+        host_ledger_counter,
+        host_operation_persistence,
+        host_sqs_queue,
+        lambda_test_mod,
+        tiger_beetle_completion_processor_test_mod,
+        tiger_beetle_processor_test_mod,
+        seat_submission_mod,
+        seat_completion_mod,
+    }) |module| {
+        module.addImport("outcome_log", host_outcome_log);
+    }
+    const log_tests = b.addTest(.{ .root_module = host_outcome_log });
+    const run_log_tests = b.addRunArtifact(log_tests);
     const test_step = b.step("test", "Run unit and integration tests");
+    test_step.dependOn(&run_log_tests.step);
     test_step.dependOn(&run_seat_reservation_tests.step);
     test_step.dependOn(&run_seat_processor_tests.step);
     test_step.dependOn(&run_seat_persistence_tests.step);

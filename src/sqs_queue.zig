@@ -1,6 +1,7 @@
 const std = @import("std");
 const aws = @import("aws");
 const sqs = @import("sqs");
+const logging = @import("outcome_log");
 
 const Allocator = std.mem.Allocator;
 
@@ -58,8 +59,21 @@ pub const Sender = struct {
         queue_url: []const u8,
         body: []const u8,
     ) !void {
+        return self.send_observed(arena, queue_url, body, null);
+    }
+
+    pub fn send_observed(
+        self: *Self,
+        arena: Allocator,
+        queue_url: []const u8,
+        body: []const u8,
+        trace: ?*const logging.Context,
+    ) !void {
         const request = try send_request(queue_url, body);
-        _ = self.client.sendMessage(arena, request, .{}) catch |err| {
+        var diagnostic: sqs.ServiceError = undefined;
+        _ = self.client.sendMessage(arena, request, .{ .diagnostic = &diagnostic }) catch |err| {
+            if (trace) |observer| observer.aws_error(err, &diagnostic);
+            if (err == error.ServiceError) diagnostic.deinit();
             return map_aws_error(err);
         };
     }

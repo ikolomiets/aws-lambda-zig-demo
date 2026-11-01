@@ -3,6 +3,7 @@ const aws = @import("aws");
 const lambda = @import("aws-lambda");
 const processor_message = @import("processor_message");
 const operation = @import("operation");
+const logging = @import("outcome_log");
 const sqs_queue = @import("sqs_queue");
 const tigerbeetle = @import("tigerbeetle");
 
@@ -41,7 +42,9 @@ var runtime_completion_publisher: ?CompletionPublisher = null;
 pub fn main(init: std.process.Init) void {
     var resources: RuntimeResources = undefined;
     resources.init(init) catch |err| {
-        std.log.err("Lambda initialization failed: {s}", .{@errorName(err)});
+        var trace = logging.Context.init(.{}, .tigerbeetle_executor);
+        trace.finish(.ERROR, "initialization", "retry", @errorName(err));
+        trace.emit();
         return;
     };
     defer resources.deinit();
@@ -61,7 +64,7 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
     const publisher = runtime_completion_publisher orelse {
         return error.CompletionPublisherNotInitialized;
     };
-    return handleInvocation(ctx.arena, event, execution, publisher);
+    return handle_invocation_observed(ctx.arena, event, execution, publisher, .{ .request_id = ctx.request.id });
 }
 
 const RuntimeResources = struct {
@@ -130,13 +133,14 @@ const RuntimeResources = struct {
         return resources.tigerbeetle_client.lookupAccounts(ids, output);
     }
 
-    fn sendCompletion(
+    fn send_completion_observed(
         resources: *RuntimeResources,
         arena: Allocator,
         result_queue: ?[]const u8,
         body: []const u8,
+        trace: ?*const logging.Context,
     ) !void {
-        return resources.completion_queue.sender.send(arena, result_queue orelse resources.completion_queue.queue_url, body);
+        return resources.completion_queue.sender.send_observed(arena, result_queue orelse resources.completion_queue.queue_url, body, trace);
     }
 };
 
@@ -257,7 +261,8 @@ const ExecutionAdapter = struct {
 
 const CompletionPublisher = struct {
     context: *anyopaque,
-    send_fn: *const fn (*anyopaque, Allocator, ?[]const u8, []const u8) anyerror!void,
+    trace: ?*const logging.Context = null,
+    send_fn: *const fn (*anyopaque, Allocator, ?[]const u8, []const u8, ?*const logging.Context) anyerror!void,
 
     fn init(pointer: anytype) CompletionPublisher {
         const Pointer = @TypeOf(pointer);
@@ -271,8 +276,12 @@ const CompletionPublisher = struct {
                 arena: Allocator,
                 result_queue: ?[]const u8,
                 body: []const u8,
+                trace: ?*const logging.Context,
             ) anyerror!void {
                 const self: Pointer = @ptrCast(@alignCast(context));
+                if (@hasDecl(pointer_info.pointer.child, "send_completion_observed")) {
+                    return self.send_completion_observed(arena, result_queue, body, trace);
+                }
                 return self.sendCompletion(arena, result_queue, body);
             }
         };
@@ -283,7 +292,7 @@ const CompletionPublisher = struct {
     }
 
     fn send(publisher: CompletionPublisher, arena: Allocator, result_queue: ?[]const u8, body: []const u8) !void {
-        return publisher.send_fn(publisher.context, arena, result_queue, body);
+        return publisher.send_fn(publisher.context, arena, result_queue, body, publisher.trace);
     }
 };
 
@@ -331,10 +340,35 @@ fn handleInvocation(
     execution: ExecutionAdapter,
     publisher: CompletionPublisher,
 ) ![]const u8 {
-    const sqs_event = try lambda.sqs.parseEvent(allocator, event);
-    defer sqs_event.deinit(allocator);
-    if (sqs_event.records.len > record_count_max) return error.TooManyRecords;
+    return handle_invocation_observed(allocator, event, execution, publisher, .{});
+}
 
+fn handle_invocation_observed(
+    allocator: Allocator,
+    event: []const u8,
+    execution: ExecutionAdapter,
+    publisher: CompletionPublisher,
+    logger: logging.Logger,
+) ![]const u8 {
+    var invocation = logging.Context.init(logger, .tigerbeetle_executor);
+    const sqs_event = lambda.sqs.parseEvent(allocator, event) catch |err| {
+        invocation.finish(.ERROR, "event_parse", "retry", @errorName(err));
+        invocation.emit();
+        return err;
+    };
+    defer sqs_event.deinit(allocator);
+    if (sqs_event.records.len > record_count_max) {
+        invocation.finish(.ERROR, "event_parse", "retry", "TooManyRecords");
+        invocation.emit();
+        return error.TooManyRecords;
+    }
+    var traces: [record_count_max]logging.Context = undefined;
+    for (sqs_event.records, traces[0..sqs_event.records.len]) |record, *trace| {
+        trace.* = logging.Context.init(logger, .tigerbeetle_executor);
+        trace.record.sqs_message_id = record.message_id;
+        trace.finish(.ERROR, "scratch_allocate", "retry", "OutOfMemory");
+    }
+    defer for (traces[0..sqs_event.records.len]) |*trace| trace.emit();
     var queued_operations: [record_count_max]processor_message.Message = undefined;
     var queued_record_indexes: [record_count_max]usize = undefined;
     const result_buffer = try allocator.create([operation.result_size_max]u8);
@@ -344,8 +378,8 @@ fn handleInvocation(
     var retry_records = [_]bool{false} ** record_count_max;
     var queued_count: usize = 0;
     for (sqs_event.records, 0..) |record, record_index| {
-        log.debug("message_id={s} body={s}", .{ record.message_id, record.body });
-        switch (parseRecord(allocator, record.message_id, record.body)) {
+        const trace = &traces[record_index];
+        switch (parse_record_observed(allocator, record.body, trace)) {
             .acknowledged => {},
             .retry => retry_records[record_index] = true,
             .valid => |queued| {
@@ -356,22 +390,84 @@ fn handleInvocation(
             },
         }
     }
+    execute_and_publish(allocator, queued_operations[0..queued_count], queued_record_indexes[0..queued_count], &retry_records, result_buffer, completion_buffer, execution, publisher, &traces);
+    return encodeFailureResponse(allocator, sqs_event.records, &retry_records) catch |err| {
+        for (traces[0..sqs_event.records.len]) |*trace| trace.finish(.ERROR, "response_encode", "retry", @errorName(err));
+        return err;
+    };
+}
+
+fn execute_and_publish(
+    allocator: Allocator,
+    queued: []const processor_message.Message,
+    record_indexes: []const usize,
+    retry_records: []bool,
+    result_buffer: *[operation.result_size_max]u8,
+    completion_buffer: []u8,
+    execution: ExecutionAdapter,
+    publisher: CompletionPublisher,
+    traces: *[record_count_max]logging.Context,
+) void {
     var plans = [_]?Planning{null} ** record_count_max;
-    defer for (plans[0..queued_count]) |planning| {
+    defer for (plans[0..queued.len]) |planning| {
         if (planning) |value| if (value == .admitted) {
             allocator.free(value.admitted.commands);
             allocator.free(value.admitted.outcomes);
         };
     };
-    for (queued_operations[0..queued_count], 0..) |*queued, index| {
-        plans[index] = plan_body(allocator, &queued.body) catch null;
+    for (queued, 0..) |*entry, index| {
+        const trace = &traces[record_indexes[index]];
+        trace.finish(.ERROR, "admission", "retry", "OutOfMemory");
+        plans[index] = plan_body(allocator, &entry.body) catch null;
+        if (plans[index]) |*plan| {
+            if (plan.* == .admitted) {
+                trace.finish(.INFO, "native", "started", null);
+                trace.emit();
+                trace.finish(.ERROR, "native", "retry", "UnfinishedWork");
+            } else {
+                trace.record.diagnostic_code = @tagName(plan.rejected.log_code);
+            }
+        }
     }
-    execute_phases(allocator, plans[0..queued_count], execution) catch |err| {
-        log.debug("stage=native outcome=stopped error={s}", .{@errorName(err)});
+    execute_phases(allocator, plans[0..queued.len], execution) catch |err| {
+        for (record_indexes) |record_index| {
+            const trace = &traces[record_index];
+            if (std.mem.eql(u8, trace.record.stage, "native")) trace.record.reason = @errorName(err);
+        }
     };
-    publish_results(allocator, queued_operations[0..queued_count], plans[0..queued_count], queued_record_indexes[0..queued_count], retry_records[0..sqs_event.records.len], result_buffer, completion_buffer, publisher);
+    for (plans[0..queued.len], record_indexes) |planning, index| {
+        if (planning) |*plan| {
+            if (plan.* == .admitted) emit_native_counts(&traces[index], &plan.admitted);
+        }
+    }
+    publish_results_observed(allocator, queued, plans[0..queued.len], record_indexes, retry_records, result_buffer, completion_buffer, publisher, traces);
+}
 
-    return encodeFailureResponse(allocator, sqs_event.records, &retry_records);
+fn emit_native_counts(trace: *const logging.Context, plan: *const Plan) void {
+    var counts: [command_count_max]logging.NativeCount = undefined;
+    var used: usize = 0;
+    for (plan.commands, plan.outcomes) |command, outcome| {
+        if (outcome != .created) continue;
+        const family: []const u8 = if (command.native == .account) "create_accounts" else "create_transfers";
+        var found = false;
+        for (counts[0..used]) |*count| {
+            if (count.code == outcome.created and std.mem.eql(u8, count.family, family)) {
+                count.count += 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.debug.assert(used < counts.len);
+            counts[used] = .{ .family = family, .code = outcome.created, .count = 1 };
+            used += 1;
+        }
+    }
+    if (used == 0) return;
+    var detail = trace.*;
+    detail.record.native_status_counts = counts[0..used];
+    detail.finish(if (plan.chains[0] == .rejected or plan.chains[1] == .rejected) .WARN else .INFO, "native", "native_status", null);
+    detail.emit();
 }
 
 // Transport count is independent of invocation delivery and native packet capacity.
@@ -387,28 +483,62 @@ fn publish_results(
     completion_buffer: []u8,
     publisher: CompletionPublisher,
 ) void {
+    publish_results_observed(allocator, queued, plans, record_indexes, retry_records, result_buffer, completion_buffer, publisher, null);
+}
+
+fn publish_results_observed(
+    allocator: Allocator,
+    queued: []const processor_message.Message,
+    plans: []const ?Planning,
+    record_indexes: []const usize,
+    retry_records: []bool,
+    result_buffer: *[operation.result_size_max]u8,
+    completion_buffer: []u8,
+    publisher: CompletionPublisher,
+    traces: ?*[record_count_max]logging.Context,
+) void {
     std.debug.assert(queued.len == plans.len);
     std.debug.assert(queued.len == record_indexes.len);
     // A successful serial send acknowledges exactly its source, never an unsent suffix.
     for (record_indexes) |index| retry_records[index] = true;
+    var blocked = false;
     for (queued, plans, record_indexes) |*entry, planning, record_index| {
+        const trace: ?*logging.Context = if (traces) |all| &all[record_index] else null;
+        if (blocked) {
+            if (trace) |context| context.finish(.ERROR, "publish", "retry", "BlockedByEarlierPublication");
+            continue;
+        }
         const plan = &(planning orelse continue);
         const body = switch (plan.*) {
             .rejected => |*diagnostic| write_diagnostic(result_buffer, diagnostic),
             .admitted => |*admitted| write_result(result_buffer, admitted) catch |err| switch (err) {
-                error.UnsupportedTigerBeetleAccountFlags => write_diagnostic(result_buffer, &.{
-                    .message = "UnsupportedTigerBeetleAccountFlags",
-                }),
+                error.UnsupportedTigerBeetleAccountFlags => diagnostic: {
+                    if (trace) |context| context.record.diagnostic_code = "UnsupportedTigerBeetleAccountFlags";
+                    break :diagnostic write_diagnostic(result_buffer, &.{ .message = "UnsupportedTigerBeetleAccountFlags" });
+                },
                 else => continue,
             },
         };
+        if (trace) |context| context.record.stage = "publication_encode";
         const message = processor_message.frame(completion_buffer, body, &.{
             .operation_id = entry.operation_id,
             .tenant = entry.tenant,
             .context = entry.context,
-        }) catch return;
-        publisher.send(allocator, entry.result_queue, message) catch return;
+        }) catch |err| {
+            if (trace) |context| context.finish(.ERROR, "publication_encode", "retry", @errorName(err));
+            blocked = true;
+            continue;
+        };
+        if (trace) |context| context.record.stage = "publish";
+        var observed_publisher = publisher;
+        observed_publisher.trace = trace;
+        observed_publisher.send(allocator, entry.result_queue, message) catch |err| {
+            if (trace) |context| context.finish(.ERROR, "publish", "retry", @errorName(err));
+            blocked = true;
+            continue;
+        };
         retry_records[record_index] = false;
+        if (trace) |context| context.finish(.INFO, "publish", "published", null);
     }
 }
 
@@ -437,20 +567,18 @@ fn parseRecord(
     message_id: []const u8,
     body: []const u8,
 ) RecordParseOutcome {
+    var trace = logging.Context.init(.{}, .tigerbeetle_executor);
+    trace.record.sqs_message_id = message_id;
+    return parse_record_observed(arena, body, &trace);
+}
+
+fn parse_record_observed(arena: Allocator, body: []const u8, trace: *logging.Context) RecordParseOutcome {
     const queued = processor_message.decode(arena, body) catch |err| {
-        if (err == error.OutOfMemory) {
-            log.debug("message_id={s} stage=parse outcome=retry error={s}", .{
-                message_id,
-                @errorName(err),
-            });
-            return .retry;
-        }
-        log.debug("message_id={s} outcome=acknowledged_invalid error={s}", .{
-            message_id,
-            @errorName(err),
-        });
-        return .acknowledged;
+        trace.finish(.ERROR, "envelope_decode", if (err == error.OutOfMemory) "retry" else "acknowledged_invalid", @errorName(err));
+        return if (err == error.OutOfMemory) .retry else .acknowledged;
     };
+    trace.identify(queued.operation_id);
+    trace.record.command = logging.recognized_command(&queued.context);
     return .{ .valid = queued };
 }
 
@@ -1116,6 +1244,7 @@ const Plan = struct {
     chains: [2]ChainState = .{ .unfinished, .unfinished },
 };
 const Diagnostic = struct {
+    log_code: enum { invalid_body, invalid_command, invalid_field, unknown_field, duplicate_id, empty_commands, command_limit } = .invalid_command,
     family: ?Family = null,
     command_index: usize = 0,
     id: ?u128 = null,
@@ -1179,7 +1308,7 @@ fn unknown_member(object: *const std.json.ObjectMap, family: ?Family) ?u32 {
 }
 
 fn field_error(field: []const u8, message: []const u8) Diagnostic {
-    return .{ .field = field, .message = message };
+    return .{ .log_code = .invalid_field, .field = field, .message = message };
 }
 
 const WireField = enum {
@@ -1227,7 +1356,7 @@ fn validate_command(family: Family, value: *const std.json.Value, command: *Comm
     if (value.* != .object) return .{ .message = "Expected a command object." };
     const object = &value.object;
     if (unknown_member(object, family)) |index| {
-        return .{ .member_index = index, .message = "Unknown field." };
+        return .{ .log_code = .unknown_field, .member_index = index, .message = "Unknown field." };
     }
     var fields: ParsedFields = .{};
     if (family != .lookup_accounts) {
@@ -1414,8 +1543,8 @@ fn first_duplicate_id(ids: []ValidationId) ?usize {
 
 fn validate_body(body: *const std.json.Value, counts: *[3]usize) ?Diagnostic {
     counts.* = .{ 0, 0, 0 };
-    if (body.* != .object) return .{ .message = "Expected a Body object." };
-    if (unknown_member(&body.object, null)) |index| return .{ .member_index = index, .message = "Unknown field." };
+    if (body.* != .object) return .{ .log_code = .invalid_body, .message = "Expected a Body object." };
+    if (unknown_member(&body.object, null)) |index| return .{ .log_code = .unknown_field, .member_index = index, .message = "Unknown field." };
     var ids: [validation_id_count_max]ValidationId = undefined;
     for (families, 0..) |family, family_index| {
         const list = body.object.get(@tagName(family)) orelse continue;
@@ -1442,15 +1571,16 @@ fn validate_body(body: *const std.json.Value, counts: *[3]usize) ?Diagnostic {
         // Only the validated prefix is sorted; the Body and execution order remain untouched.
         if (first_duplicate_id(ids[0..id_count])) |index| {
             std.debug.assert(index < list.array.items.len);
-            const problem = field_error("id", "This ID repeats an earlier command's ID in the same list.");
+            var problem = field_error("id", "This ID repeats an earlier command's ID in the same list.");
+            problem.log_code = .duplicate_id;
             return locate_diagnostic(problem, family, index, &list.array.items[index]);
         }
         if (first_problem) |problem| return problem;
     }
     const count = std.math.add(usize, counts[0], counts[1]) catch unreachable;
     const total = std.math.add(usize, count, counts[2]) catch unreachable;
-    if (total == 0) return .{ .message = "At least one command is required." };
-    if (total > command_count_max) return .{ .message = "The Body exceeds the 64-command complete Result capacity." };
+    if (total == 0) return .{ .log_code = .empty_commands, .message = "At least one command is required." };
+    if (total > command_count_max) return .{ .log_code = .command_limit, .message = "The Body exceeds the 64-command complete Result capacity." };
     return null;
 }
 
@@ -3885,4 +4015,77 @@ test "escaped maximum Processor Message survives SQS request and ten-record Lamb
         try std.testing.expectEqualStrings("\x00" ** 64, decoded.tenant);
         try std.testing.expectEqualStrings("\"" ** 2047, decoded.context.string);
     }
+}
+
+test "executor summaries distinguish publication, native rejection, admission and blocked retries" {
+    for ([_]bool{ false, true }) |fail_send| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        var observer = logging.TestObserver.init(arena);
+        observer.fail = true;
+        const bodies = [_][]const u8{
+            "{\"create_accounts\":[{\"id\":\"1\",\"flags\":[],\"ledger\":1,\"code\":1}]}",
+            "true",
+            "{\"lookup_accounts\":[{\"id\":\"2\"}]}",
+            "invalid envelope",
+        };
+        var messages: [bodies.len][]const u8 = undefined;
+        for (bodies[0..3], 0..) |body, i| messages[i] = try test_body_message(arena, i + 1, body);
+        messages[3] = bodies[3];
+        var execution: FakeExecution = .{};
+        execution.account_outcomes[0] = .{ .rejected = 9999 };
+        var publisher: SerialPublisher = .{ .fail_at = if (fail_send) 1 else null };
+        const response = try handle_invocation_observed(arena, try testEvent(arena, &messages), ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher), observer.logger());
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, response, .{});
+        try std.testing.expectEqual(@as(usize, if (fail_send) 2 else 0), parsed.value.object.get("batchItemFailures").?.array.items.len);
+        var summaries: usize = 0;
+        var starts: usize = 0;
+        var native_counts: usize = 0;
+        for (observer.records.items) |record| {
+            try std.testing.expect(record.result_type == null);
+            try std.testing.expectEqualStrings("lambda-test", record.lambda_request_id.?);
+            if (std.mem.eql(u8, record.outcome, "started")) {
+                starts += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, record.outcome, "native_status")) {
+                native_counts += 1;
+                try std.testing.expectEqual(@as(u32, 9999), record.native_status_counts.?[0].code);
+                continue;
+            }
+            summaries += 1;
+            if (std.mem.eql(u8, record.sqs_message_id.?, "message-0")) try std.testing.expectEqualStrings("published", record.outcome);
+            if (std.mem.eql(u8, record.sqs_message_id.?, "message-1")) {
+                try std.testing.expectEqualStrings("invalid_body", record.diagnostic_code.?);
+                try std.testing.expectEqualStrings(if (fail_send) "retry" else "published", record.outcome);
+                if (fail_send) try std.testing.expectEqualStrings("SendFailed", record.reason.?);
+            }
+            if (std.mem.eql(u8, record.sqs_message_id.?, "message-2") and fail_send) try std.testing.expectEqualStrings("BlockedByEarlierPublication", record.reason.?);
+            if (std.mem.eql(u8, record.sqs_message_id.?, "message-3")) try std.testing.expectEqualStrings("acknowledged_invalid", record.outcome);
+        }
+        try std.testing.expectEqual(@as(usize, 4), summaries);
+        try std.testing.expectEqual(@as(usize, 2), starts);
+        try std.testing.expectEqual(@as(usize, 1), native_counts);
+    }
+}
+
+test "executor unfinished native work logs a correlated retry while diagnostics publish" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    var observer = logging.TestObserver.init(arena);
+    const native = try test_body_message(arena, 1, "{\"lookup_accounts\":[{\"id\":\"1\"}]}");
+    const diagnostic = try test_body_message(arena, 2, "true");
+    var execution: FakeExecution = .{ .lookup_error = error.NativeDisconnected };
+    var publisher: FakePublisher = .{};
+    const response = try handle_invocation_observed(arena, try testEvent(arena, &.{ native, diagnostic }), ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher), observer.logger());
+    try std.testing.expect(std.mem.indexOf(u8, response, "message-0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "message-1") == null);
+    try std.testing.expectEqual(@as(usize, 3), observer.records.items.len);
+    try std.testing.expectEqualStrings("started", observer.records.items[0].outcome);
+    try std.testing.expectEqualStrings("retry", observer.records.items[1].outcome);
+    try std.testing.expectEqualStrings("native", observer.records.items[1].stage);
+    try std.testing.expectEqualStrings("NativeDisconnected", observer.records.items[1].reason.?);
+    try std.testing.expectEqualStrings("published", observer.records.items[2].outcome);
 }

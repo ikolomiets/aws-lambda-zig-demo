@@ -26,6 +26,8 @@ pub const FinalizationOptions = struct {
     now: operation.UnixSeconds,
 };
 
+pub const Finalization = struct { winner: bool, result: operation.Completion };
+
 /// There is no separate-write fallback. An uncertain transaction requires one coherent pair.
 pub fn finalize_creation(
     arena: Allocator,
@@ -33,7 +35,7 @@ pub fn finalize_creation(
     saved: *const seat.Event,
     result: *const operation.Completion,
     backend: anytype,
-) !void {
+) !Finalization {
     if (saved.state == .creating) {
         const terminal: seat.EventState = if (result.* == .success) .ready else .failed;
         const actions = try arena.alloc(dynamodb.types.TransactWriteItem, 2);
@@ -51,7 +53,7 @@ pub fn finalize_creation(
             options.now,
         ) };
         if (backend.transact_write(arena, .{ .transact_items = actions })) |_| {
-            return;
+            return .{ .winner = false, .result = result.* };
         } else |_| {}
     }
     const event_read = try read_request(arena, options.events_table, &.{
@@ -75,6 +77,7 @@ pub fn finalize_creation(
         records[1].item orelse return error.InconsistentCreation,
     );
     try validate_creation_pair(saved, &event, &winner);
+    return .{ .winner = true, .result = winner.state.completed };
 }
 
 fn validate_creation_pair(

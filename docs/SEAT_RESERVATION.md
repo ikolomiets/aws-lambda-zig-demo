@@ -84,6 +84,39 @@ observations through authenticated intake and query. Native client access and it
 callback thread remain in TigerBeetle Processor. These boundaries use the existing
 small effect adapters and shared SQS sender without a generic workflow framework.
 
+## Structured outcome logs
+
+Intake, Seat Reservation submission/completion and TigerBeetle execution/completion
+emit synchronous JSON records through [the shared emitter](../src/outcome_log.zig).
+Each record has `schema_version: 1`, `level`, `component`, `stage`, `outcome`,
+`lambda_request_id`, `operation_id`, `sqs_message_id`, recognized `command`,
+`reason`, `failure_code` and `result_type`. Unavailable metadata is null. Intake
+also records final `http_status`. The buffer is fixed at 8 KiB; serialization or
+observer failure drops the record without changing processing or acknowledgement.
+Invocation metadata is passed through adapters rather than kept in mutable global
+context. New records contain metadata only: no Body, Context, tenant, tokens,
+queue URLs or account projections. Existing bounded seat ERROR previews remain
+available for inconsistent inputs.
+
+There is one final summary per request or SQS message. Submission emits
+`dispatched` after native publication or `rejected` after local-failure publication.
+An already terminal creation Event uses `dispatched` at stage `event_terminal`
+with reason `EventAlreadyTerminal`, without sending more native work. Otherwise,
+`retry` identifies the failed stage and safe internal error name. Local rejection
+records retain the public `failure_code` separately from that internal `reason`.
+Unusable or inconsistent messages emit `acknowledged_invalid` at ERROR. Completion
+emits `finalized` after a successful write or `winner_observed` after authoritative
+readback. Its Result type and failure code describe the durable winner, even when
+the incoming proposal differs. Operating failures are ERROR, admission rejections
+are WARN, and successful processing and expected conditional conflicts are INFO.
+
+AWS detail records capture safe service code, HTTP status and request ID before
+SDK diagnostic release; transport errors have a separate `transport_error` field.
+Service messages and response bodies are omitted. Expected DynamoDB conditional
+failures are INFO; other AWS failures are ERROR. See the deployment guide for
+[rollout and manual acceptance](DEPLOY_AWS_LAMBDA_WITH_SAM.md#outcome-log-rollout-and-manual-acceptance)
+and [investigation queries](DEPLOY_AWS_LAMBDA_WITH_SAM.md#investigate-structured-outcomes).
+
 ## Rejection workflow
 
 When configured with `SeatReservationQueue`, intake routes the exact name
@@ -131,7 +164,11 @@ Operation-only finalization guards UUID, tenant, exact name `SeatReservation`,
 `SUBMITTED` state and absent Result, with normal timestamps and 24-hour TTL and
 without comparing the input hash. A conflict or uncertain write requires a
 strongly consistent readback. Only a matching identity with a valid terminal seat
-Result proves a winner; that Result remains unchanged even when it differs from
+Result proves a winner. Validation accepts only the exact current creation,
+reservation, confirmation and availability shapes; reservation success includes
+class and quantity, and confirmation success contains only Event and reservation
+IDs. Invalid shapes follow inconsistent-message handling without rewriting the
+stored Operation. A valid Result remains unchanged even when it differs from
 the incoming rejection. Submitted readback and transient write/readback failures
 remain retryable. Identity or stored-state inconsistencies are diagnosed.
 

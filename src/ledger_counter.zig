@@ -1,4 +1,5 @@
 const std = @import("std");
+const logging = @import("outcome_log");
 const aws = @import("aws");
 const dynamodb = @import("dynamodb");
 const Allocator = std.mem.Allocator;
@@ -113,6 +114,11 @@ pub const Counter = struct {
         return self.allocate_selected(arena, self.selected_id);
     }
 
+    pub fn allocate_observed(self: *Counter, arena: Allocator, trace: *const logging.Context) !u32 {
+        var backend: SDKBackend = .{ .client = &self.client, .trace = trace };
+        return allocate_ledger_selected(arena, &.{ .table_name = self.table_name, .id = self.selected_id }, &backend);
+    }
+
     pub fn allocate_selected(self: *Counter, arena: Allocator, id: []const u8) !u32 {
         var backend: SDKBackend = .{ .client = &self.client };
         return allocate_ledger_selected(
@@ -127,6 +133,7 @@ const read_counter_selected = read_selected;
 const allocate_ledger_selected = allocate_selected;
 
 const SDKBackend = struct {
+    trace: ?*const logging.Context = null,
     client: *dynamodb.Client,
 
     fn put(self: *SDKBackend, arena: Allocator, request: dynamodb.PutItemInput) !void {
@@ -166,6 +173,7 @@ const SDKBackend = struct {
             request,
             .{ .diagnostic = &diagnostic },
         ) catch |err| {
+            if (self.trace) |trace| trace.aws_error(err, &diagnostic);
             if (err != error.ServiceError) return error.MutationUncertain;
             defer diagnostic.deinit();
             return mutation_error(diagnostic.kind, error.CounterChanged);

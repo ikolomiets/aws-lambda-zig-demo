@@ -186,13 +186,8 @@ fn validate_success_payload(payload: *const std.json.Value) !void {
     } else if (payload.object.contains("class")) {
         _ = try Tag.init(try string_value(try required(payload, "class")));
         _ = try native_id(try string_value(try required(payload, "reservation_id")));
-        if (payload.object.contains("quantity")) {
-            try exact_fields(payload, &.{ "event_id", "class", "quantity", "reservation_id" });
-            _ = try positive_u32(try required(payload, "quantity"));
-        } else {
-            // Completed Operations retain their original confirmation Result.
-            try exact_fields(payload, &.{ "event_id", "class", "reservation_id" });
-        }
+        try exact_fields(payload, &.{ "event_id", "class", "quantity", "reservation_id" });
+        _ = try positive_u32(try required(payload, "quantity"));
     } else if (payload.object.contains("reservation_id")) {
         try exact_fields(payload, &.{ "event_id", "reservation_id" });
         _ = try native_id(try string_value(try required(payload, "reservation_id")));
@@ -1327,14 +1322,14 @@ test "reserve Context carries its attempt ID and confirmation carries only the p
     ));
 }
 
-test "confirmation Results validate new and historical winners with exact fields and native IDs" {
+test "seat Results validate exact fields and native IDs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const payloads = [_][]const u8{
         \\{"event_id":"00000000-0000-0000-0000-000000000001","reservation_id":"340282366920938463463374607431768211454"}
         ,
-        \\{"event_id":"00000000-0000-0000-0000-000000000001","class":"a","reservation_id":"123"}
+        \\{"event_id":"00000000-0000-0000-0000-000000000001","class":"a","quantity":1,"reservation_id":"123"}
         ,
     };
     for (payloads) |input| {

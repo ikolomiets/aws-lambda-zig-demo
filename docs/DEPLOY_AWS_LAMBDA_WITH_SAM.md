@@ -575,9 +575,9 @@ or another DynamoDB service failure while processing an entry and retries the
 single Completion message.
 
 The second intake inline-policy statement grants that function only
-`SendMessage` access to this stack's TigerBeetle queue. The handler sends full
-compact `SUBMITTED` Operation JSON, but has no receive, delete, purge, or
-queue-management permissions. TigerBeetle processor receives its separate TigerBeetle queue
+`SendMessage` access to this stack's TigerBeetle queue. The handler sends a
+compact Processor Message containing the trusted tenant, null Context and original
+Body, and has no receive, delete, purge, or queue-management permissions. TigerBeetle processor receives its separate TigerBeetle queue
 queue-scoped poller policy and Completion queue-scoped `SendMessage` policy.
 Completion receives its separate Completion queue-scoped poller policy and
 table-scoped `UpdateItem`; neither role grants queue-management access. The
@@ -2057,10 +2057,6 @@ Keep these evidence levels separate when recording validation:
 | Authorized local native | `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` exercises the local replica's funding, reservation bounds, replay, confirmation and expiry. It requires the separately authorized local replica and establishes no cloud delivery or IAM behavior. |
 | Deployed | The separately invoked [runner](../seat_scenarios.sh) exercises the selected development stack through its public intake/query and host read utilities. Only an executed, passing run establishes deployed behavior for its covered paths. |
 
-The [2026-10-16 AWS validation report](SEAT_AWS_VALIDATION_2026_10_16.md)
-records an executed six-function development-stack exercise, transaction contention
-and the observed regional concurrency limit, with its revision and evidence limits.
-
 The deployed runner requires an existing compatible **six-function full-deployment
 baseline**: `IntakeFunction`, `QueryFunction`, `SeatReservationProcessor`,
 `TigerBeetleProcessor`, `SeatReservationCompletionProcessor`, and
@@ -2182,6 +2178,59 @@ Deleting or expiring an Operation removes the completion/recovery anchor; perman
 Event metadata cannot reconstruct it or authorize repair. Keep local evidence as
 needed, without treating it as a durable execution journal.
 
+### Outcome log rollout and manual acceptance
+
+Build, run the complete offline checks, and refresh all six packages using
+[the packaging procedure](#2-build-and-package-the-zig-lambdas). Deploy the same
+revision across intake, both seat processors and both TigerBeetle processors.
+Follow the [coordinated processor procedure](#processor-message-rollout) before
+resuming producers; development sync is appropriate only after establishing a
+compatible six-function baseline. The deployment helper is unchanged and does
+not automate these acceptance checks. Run cloud updates and scenarios only after
+explicit deployment authorization.
+
+Confirmation requests and Context have exactly `command`, `event_id` and
+`pending_id`. Successful confirmation payloads have exactly `event_id` and
+`reservation_id`. Missing, unknown or malformed fields receive ordinary schema
+validation. Winner readback validates only current Result shapes; invalid stored
+shapes are diagnosed and acknowledged without rewriting Operations. No Event
+migration or native connectivity change accompanies this rollout.
+
+After the update, perform these checks manually:
+
+1. With the private key matching the deployed public key already exported, issue
+   a fresh token and run the complete seat workflow twice:
+
+   ```sh
+   export PASETO_TOKEN="$(zig-out/bin/paseto issue --subject gosha --ttl-seconds 900)"
+   ./seat_scenarios.sh --profile '<development-profile>' --region ca-central-1
+   ./seat_scenarios.sh --profile '<development-profile>' --region ca-central-1
+   ```
+
+   Require both manifests to report `passed`, including final general availability
+   **1** and premium availability **2**. Keep each generated evidence directory;
+   refresh the token if it cannot remain valid for both runs.
+2. Read the created ready Event using `events read` from either run's evidence.
+   Use one of its saved account IDs for a fresh `TigerBeetle` Operation containing
+   only `lookup_accounts`. Submit another fresh Operation with a new unused
+   native account ID. Use authenticated [POST and query GET](#8-test-query-get-and-intake-post),
+   fresh Operation UUIDs and the same `gosha` token. Require terminal `SUCCESS`
+   for the known account and `FAILURE` for the absent account. For both UUIDs,
+   require executor `published` and completion `finalized` records with the
+   corresponding terminal Result type only on the completion record.
+3. Submit a fresh `SeatReservation` Operation containing a malformed confirmation,
+   for example `{"command":"confirm_seats","event_id":"<event-uuid>"}` (missing
+   `pending_id`). Require terminal `FAILURE` with `code: invalid_request`, a
+   submission `rejected` record with its safe schema reason and rejection-publication
+   stage, and a completion `finalized` record with `FAILURE`.
+4. [Download all six Lambda logs](#9-download-lambda-logs), including query. Use the
+   new records to correlate the five instrumented functions by Operation UUID,
+   then SQS message ID and Lambda request ID per attempt. Query retains its
+   existing logs. Confirm the seat flow traverses intake, seat submission, native
+   executor and seat completion, and the lookup-only flow traverses intake,
+   native executor and native completion. Investigate any ERROR, retry, or
+   `started` record without a final summary before accepting the rollout.
+
 ## 9. Download Lambda logs
 
 Run the stack-aware log helper with an explicit Lambda selection:
@@ -2231,6 +2280,42 @@ private operational data, so do not publish or commit copied log files. Logs
 created by earlier versions of the helper with `[event-id=...]` headers are
 unsupported; remove or rename the existing log before running the updated
 helper.
+
+### Investigate structured outcomes
+
+Select the log groups for the five instrumented functions and the relevant time
+window in CloudWatch Logs Insights. The new JSON lines have `schema_version: 1`;
+legacy seat ERROR previews and runtime START/END/REPORT lines have separate shapes.
+Inspect one Operation across all attempts:
+
+```text
+fields @timestamp, component, stage, outcome, level, lambda_request_id,
+       sqs_message_id, command, reason, failure_code, result_type, http_status
+| filter schema_version = 1 and operation_id = "<operation-uuid>"
+| sort @timestamp asc
+```
+
+Inspect failures and uncertain delivery separately from expected conditional
+conflicts:
+
+```text
+fields @timestamp, component, operation_id, sqs_message_id, lambda_request_id,
+       stage, outcome, reason, service_code, service_http_status,
+       service_request_id, transport_error, diagnostic_code
+| filter schema_version = 1 and (level = "ERROR" or outcome = "retry")
+| sort @timestamp asc
+```
+
+To investigate a hard timeout, filter the first query by the `lambda_request_id`
+from a `started` record and inspect the runtime REPORT line in that same log
+stream. No final summary is guaranteed after a process timeout or crash. A
+`published` record proves SQS publication only; use the final processor and
+an authenticated Operation query to establish the terminal Result. Native
+completion's `acknowledged_conflict` leaves the saved Result unknown; seat
+completion's `winner_observed` describes a validated durable winner. Service
+records preserve safe code/status/request ID without including AWS error text.
+These are manual investigation queries, with no metrics, alarms or deployment
+verification automation.
 
 ## 10. Create, read, update, and delete persisted Operations
 
