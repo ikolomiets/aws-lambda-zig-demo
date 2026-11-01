@@ -63,6 +63,7 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
 | `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli` | Host counter build and deterministic global allocation/tooling tests |
 | `zig build build-seat-processors` | Compile host seat invocation adapters without live services or Lambda packaging |
+| `zig build test-seat-processors` | Composed seat submission and completion tests with mocked external effects |
 | `zig build test-tigerbeetle-processor` | Processor parsing and invocation tests |
 | `zig build test-tigerbeetle-wrapper` | Offline wrapper tests |
 | `zig build test-tigerbeetle-c-abi` | Native C ABI smoke test on Apple Silicon macOS |

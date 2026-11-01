@@ -96,8 +96,10 @@ JSON
                     payload="$(jq -cn --arg id "$event_id" \
                         '{event_id:$id,class:"general",quantity:2,reservation_id:"5"}')" ;;
                 confirm_seats)
+                    printf '%s' "$request" | jq -e \
+                        '.body | keys == ["command","event_id","pending_id"] and .pending_id == "5"' >/dev/null
                     payload="$(jq -cn --arg id "$event_id" \
-                        '{event_id:$id,class:"general",reservation_id:"5"}')" ;;
+                        '{event_id:$id,reservation_id:"5"}')" ;;
                 *) exit 95 ;;
             esac
         fi

@@ -17,38 +17,68 @@ new_uuid() {
 usage() {
     cat <<'USAGE'
 Usage:
-  events.sh [--profile PROFILE] [--region REGION] [--stack-name STACK] <command>
+  events.sh [--profile PROFILE] [--region REGION] [--stack-name STACK]
+            <command>
   events.sh create --class TAG=COUNT [--class TAG=COUNT ...]
                    [--timeout-seconds SECONDS] [--event-id UUID]
   events.sh read --tenant TENANT --event-id UUID
   events.sh check_seats --event-id UUID
   events.sh reserve_seat --event-id UUID --class TAG --quantity COUNT
+  events.sh confirm_seats --event-id UUID --reservation-id ID
 
-Create requires explicit seat classes and counts and PASETO_TOKEN; no stdin JSON.
-It submits an authenticated SeatReservation create_event Operation to the stack's
-IntakeFunctionUrl. The verified token supplies the tenant; processors allocate
-the ledger and native IDs. Output is the submitted Operation, not readiness evidence.
-Use --event-id to retry the same creation; otherwise a fresh UUID is generated.
-Reservation timeout defaults to 300 seconds. Counts and timeout are positive u32.
-Read returns persisted Event metadata using the prebuilt zig-out/bin/events utility.
-Read requires explicit --tenant and --event-id; AWS credentials authorize metadata reads.
-The check_seats command requires --event-id and PASETO_TOKEN, which supplies the tenant.
-Any --tenant value supplied to check_seats is ignored.
-The reserve_seat command requires --event-id, one --class tag, a positive u32 --quantity,
-and PASETO_TOKEN. It submits reserve_seats and creates a timed hold without confirmation.
-Tenant overrides are rejected for reserve_seat; the verified token supplies the tenant.
-Both commands submit a fresh Operation, then query every second until COMPLETED,
-with no overall polling limit and no host binary required.
-Each query prints its Operation; the final one includes its SUCCESS or FAILURE result.
-Either terminal result exits 0. Uncertain requests are not automatically resubmitted.
-HTTP/configuration errors exit 2 and report the Operation UUID when available.
+Commands:
+  create
+    Requires explicit seat classes and counts and PASETO_TOKEN; no stdin JSON.
+    Submits a SeatReservation create_event Operation to IntakeFunctionUrl.
+    The verified token supplies the tenant; processors allocate the ledger
+    and native IDs. Output is the submitted Operation, not readiness evidence.
 
-Options override the environment. Profile: AWS_PROFILE, AWS_DEFAULT_PROFILE,
-PROFILE, or the AWS CLI default credential chain. Region: AWS_REGION,
-AWS_DEFAULT_REGION, REGION, or ca-central-1. STACK_NAME defaults to aws-lambda-zig-demo.
-An inherited profile preserves environment credentials; --profile explicitly selects it.
-Failed credential export for an SSO profile triggers one SSO login and export retry.
-Complete browser sign-in if prompted; login instructions go to stderr.
+    Use --event-id to retry the same creation; otherwise a fresh UUID is
+    generated. Reservation timeout defaults to 300 seconds. Counts and
+    timeout are positive u32.
+
+  read
+    Returns persisted Event metadata using the prebuilt zig-out/bin/events.
+    Requires explicit --tenant and --event-id.
+    AWS credentials authorize metadata reads.
+
+  check_seats
+    Requires --event-id and PASETO_TOKEN, which supplies the tenant.
+    Any --tenant value supplied to check_seats is ignored.
+
+  reserve_seat
+    Requires --event-id, one --class tag, a positive u32 --quantity, and
+    PASETO_TOKEN. Submits reserve_seats to create a timed hold.
+    Tenant overrides are rejected; the verified token supplies the tenant.
+
+  confirm_seats
+    Requires --event-id, --reservation-id and PASETO_TOKEN.
+    Confirms the full hold returned by reserve_seat.
+    Reservation IDs are decimal strings from 1 through
+    340282366920938463463374607431768211454, without leading zeros.
+    Tenant overrides are rejected; the verified token supplies the tenant.
+
+Operation output:
+  Checks, reservations and confirmations submit a fresh Operation, then query
+  every second until COMPLETED. Polling has no overall limit and requires no
+  host binary.
+
+  Each query prints its Operation; the final one includes its SUCCESS or
+  FAILURE result. Either terminal result exits 0.
+
+  Uncertain requests are not automatically resubmitted. HTTP/configuration
+  errors exit 2 and report the Operation UUID when available.
+
+AWS configuration:
+  Options override the environment. Selection order:
+    Profile: AWS_PROFILE, AWS_DEFAULT_PROFILE, PROFILE, AWS CLI default chain.
+    Region:  AWS_REGION, AWS_DEFAULT_REGION, REGION, ca-central-1.
+    Stack:   STACK_NAME, aws-lambda-zig-demo.
+
+  An inherited profile preserves environment credentials; --profile explicitly
+  selects it. Failed credential export for an SSO profile triggers one SSO
+  login and export retry. Complete browser sign-in if prompted; login
+  instructions go to stderr.
 USAGE
 }
 
@@ -62,7 +92,7 @@ while [ "$#" -gt 0 ]; do
             value="$2"; shift 2 ;;
         --profile=*|--region=*|--stack-name=*)
             value="${option#*=}"; option="${option%%=*}"; shift ;;
-        create|read|check_seats|reserve_seat) break ;;
+        create|read|check_seats|reserve_seat|confirm_seats) break ;;
         *) fail 'invalid invocation; use --help' ;;
     esac
     [ -n "$value" ] || fail 'wrapper option values must be nonempty'
@@ -82,15 +112,17 @@ fi
     fail 'invalid wrapper configuration'
 command -v jq >/dev/null 2>&1 || fail 'missing required command: jq'
 
-event_id= tenant= timeout_seconds=300 classes='{}' class_count=0 seat_class= quantity=
+event_id= tenant= timeout_seconds=300 classes='{}' class_count=0 seat_class= quantity= reservation_id=
 while [ "$#" -gt 0 ]; do
     option="$1"
-    case "$option" in
-        --event-id|--tenant|--class|--timeout-seconds|--quantity)
+    case "$command_name:$option" in
+        *:--event-id|*:--tenant|*:--timeout-seconds|*:--quantity|*:--reservation-id|\
+        create:--class|reserve_seat:--class)
             [ "$#" -ge 2 ] && [[ "$2" != --* && "$2" != -h ]] ||
                 fail 'missing command option value'
             value="$2"; shift 2 ;;
-        --event-id=*|--tenant=*|--class=*|--timeout-seconds=*|--quantity=*)
+        *:--event-id=*|*:--tenant=*|*:--timeout-seconds=*|*:--quantity=*|*:--reservation-id=*|\
+        create:--class=*|reserve_seat:--class=*)
             value="${option#*=}"; option="${option%%=*}"; shift ;;
         *) fail 'invalid command option; use --help' ;;
     esac
@@ -104,7 +136,7 @@ while [ "$#" -gt 0 ]; do
         --tenant)
             if [ "$command_name" = check_seats ]; then continue; fi
             [ "$command_name" = read ] && [ -z "$tenant" ] ||
-                fail '--tenant is accepted once for read only; create and reserve_seat use PASETO_TOKEN'
+                fail '--tenant is accepted once for read only; create, reserve_seat and confirm_seats use PASETO_TOKEN'
             tenant="$value"
             printf '%s' "$tenant" | jq -Rse 'utf8bytelength >= 1 and utf8bytelength <= 64' \
                 >/dev/null || fail 'tenant must contain 1-64 UTF-8 bytes' ;;
@@ -118,9 +150,18 @@ while [ "$#" -gt 0 ]; do
                 jq -en --arg n "$value" '$n|tonumber|. >= 1 and . <= 4294967295' \
                     >/dev/null 2>&1 || fail 'quantity must be a positive u32 integer'
             quantity="$value" ;;
+        --reservation-id)
+            [ "$command_name" = confirm_seats ] && [ -z "$reservation_id" ] ||
+                fail '--reservation-id is accepted once for confirm_seats only'
+            # Compare decimal strings to retain the full u128 range without rounding.
+            [[ "$value" =~ ^[1-9][0-9]*$ ]] &&
+                jq -en --arg id "$value" '$id | length < 39 or
+                    (length == 39 and . <= "340282366920938463463374607431768211454")' \
+                    >/dev/null 2>&1 || fail 'reservation ID must be a canonical decimal string from 1 through 2^128-2'
+            reservation_id="$value" ;;
         --class)
             if [ "$command_name" = reserve_seat ]; then
-                [ -z "$seat_class" ] || fail 'reserve_seat accepts exactly one --class tag'
+                [ -z "$seat_class" ] || fail "$command_name accepts exactly one --class tag"
                 seat_class="$(jq -ern --arg tag "$value" '
                     $tag | select(utf8bytelength >= 1 and utf8bytelength <= 54 and
                         (explode|all(. > 31 and (. < 127 or . > 159))) and
@@ -130,7 +171,6 @@ while [ "$#" -gt 0 ]; do
                 [ "$seat_class" = "$value" ] || fail 'invalid seat class tag'
                 continue
             fi
-            [ "$command_name" = create ] || fail '--class requires create or reserve_seat'
             [[ "$value" == *=* ]] || fail 'class must be TAG=COUNT'
             tag="${value%=*}" count="${value##*=}"
             [[ "$count" =~ ^[0-9]+$ ]] || fail 'seat counts must be positive u32 integers'
@@ -171,6 +211,8 @@ else
         if [ "$command_name" = reserve_seat ]; then
             [ -n "$seat_class" ] && [ -n "$quantity" ] ||
                 fail 'reserve_seat requires --class and --quantity'
+        elif [ "$command_name" = confirm_seats ]; then
+            [ -n "$reservation_id" ] || fail 'confirm_seats requires --reservation-id'
         fi
         operation_id="$(new_uuid)"
         if [ "$command_name" = reserve_seat ]; then
@@ -178,6 +220,11 @@ else
                 --arg class "$seat_class" --arg n "$quantity" \
                 '{id:$id,name:"SeatReservation",body:{command:"reserve_seats",event_id:$event,
                     class:$class,quantity:($n|tonumber)}}')"
+        elif [ "$command_name" = confirm_seats ]; then
+            request="$(jq -cn --arg id "$operation_id" --arg event "$event_id" \
+                --arg pending "$reservation_id" \
+                '{id:$id,name:"SeatReservation",body:{command:"confirm_seats",event_id:$event,
+                    pending_id:$pending}}')"
         else
             request="$(jq -cn --arg id "$operation_id" --arg event "$event_id" \
                 '{id:$id,name:"SeatReservation",body:{command:"check_seats",event_id:$event}}')"

@@ -2311,16 +2311,16 @@ TigerBeetle processor itself has no DynamoDB permissions.
 ### Seat Event metadata utility
 
 The host `events` utility reads and inserts Event metadata in `SeatEventsTable`.
-The `events.sh` wrapper submits public creation, reservation and availability
-Operations and reads metadata from the selected stack. SAM provisions the table
-without TTL independently of Operations.
+The `events.sh` wrapper submits public creation, reservation, confirmation and
+availability Operations and reads metadata from the selected stack. SAM provisions
+the table without TTL independently of Operations.
 
 The table requires separate String keys `tenant` (partition) and `event_id`
 (sort), without TTL. The direct binary uses the pinned SDK's standard AWS
 credentials, profile, Region and endpoint configuration. Authenticate the
 selected identity before table commands; it needs table-scoped `dynamodb:PutItem`
 and `dynamodb:GetItem`. Wrapper execution needs AWS CLI credential export;
-creation, reservations and availability checks additionally need
+creation, reservations, confirmations and availability checks additionally need
 `cloudformation:DescribeStacks` to discover the Function URLs and a valid
 `PASETO_TOKEN`. Wrapper reads need
 `cloudformation:DescribeStackResource` and `dynamodb:GetItem`. These are operator
@@ -2382,8 +2382,9 @@ If credential export fails for a profile configured with `sso_session` or legacy
 once using the same profile selection, then retries export once. Login can open
 the browser and require you to complete sign-in. Login instructions and progress
 go to stderr; stdout retains the command's JSON output. This recovery applies to
-`create`, `read`, `check_seats` and `reserve_seat`. Non-SSO export failures, failed
-login and a failed retry exit `2` before resource discovery or Operation submission.
+`create`, `read`, `check_seats`, `reserve_seat` and `confirm_seats`. Non-SSO export
+failures, failed login and a failed retry exit `2` before resource discovery or
+Operation submission.
 
 Wrapper creation takes required, repeatable `--class TAG=COUNT` arguments instead
 of stdin JSON. There are no default seat classes or counts. It accepts 1–31
@@ -2450,10 +2451,44 @@ a failure contains `code`, such as `insufficient_seats`. The
 [reservation workflow](SEAT_RESERVATION.md#reservation-workflow) defines hold
 lifetime and retry semantics; success does not promise remaining hold lifetime.
 
-Each check or reservation generates a fresh Operation UUID, independently of the
-Event UUID. The handler derives the tenant from the verified token. The wrapper
-takes that tenant from the authenticated intake response and verifies it on
-subsequent query responses, without decoding token
+Wrapper confirmations require `--event-id` and `--reservation-id ID`, using the
+`reservation_id` from a successful reservation Result. The Event ID is a canonical
+UUID. The pending transfer identifies its Seat Class. The reservation ID is a
+canonical ASCII decimal string from 1 through 2^128−2
+(340282366920938463463374607431768211454), without leading zeros, signs or
+whitespace. Missing, duplicate or incompatible options are rejected before AWS
+or HTTP calls. The shared profile, Region and stack selectors apply.
+With AWS credentials and `PASETO_TOKEN` already exported:
+
+```sh
+./events.sh confirm_seats --event-id 00000000-0000-0000-0000-000000000001 \
+  --reservation-id '<reservation_id>'
+
+./events.sh --profile dev --region ca-central-1 --stack-name '<stack-name>' confirm_seats \
+  --event-id=00000000-0000-0000-0000-000000000001 --reservation-id='<reservation_id>'
+```
+
+The confirmation Body contains exactly `command: "confirm_seats"`, `event_id`
+and string `pending_id`, populated from `--reservation-id` without numeric
+conversion. `PASETO_TOKEN` supplies the tenant; `--tenant` overrides are rejected.
+Confirmation posts the full held quantity for any Seat Class of the owned, ready Event.
+A successful Result contains exactly `event_id` and `reservation_id`;
+a failure contains `code`, such as `reservation_expired` or `invalid_reservation`.
+The [confirmation workflow](SEAT_RESERVATION.md#confirmation-workflow) defines
+repeat-confirmation and failure semantics.
+
+When upgrading from class-bearing confirmation requests, stop producers and drain
+the old requests and native completions from queued, delayed and in-flight messages,
+including retained dead-letter messages eligible for replay. Upgrade both seat
+processors together and update callers before resuming submissions. The new request
+and Context decoders reject `class`; they do not accept both schemas. Existing Event
+metadata and pending reservations need no migration, and previously completed
+Operations keep their original Results, including any saved `class` field.
+
+Each check, reservation or confirmation generates a fresh Operation UUID,
+independently of the Event UUID. The handler derives the tenant from the verified
+token. The wrapper takes that tenant from the authenticated intake response and
+verifies it on subsequent query responses, without decoding token
 claims or sending a tenant override in the public Body. No host binary is
 required. Both `IntakeFunctionUrl` and `QueryFunctionUrl` are resolved before
 submission.
@@ -2477,8 +2512,9 @@ contains 1–64 UTF-8 bytes. Reads use AWS IAM for metadata access and do not pa
 or require `PASETO_TOKEN`. They resolve the `SeatEventsTable` logical resource
 through CloudFormation's `describe-stack-resource`, export `EVENTS_TABLE_NAME`,
 and run the host binary. Help also works as
-`create --help`, `read --help`, `check_seats --help` or `reserve_seat --help`, without
-AWS commands, credentials, resource discovery, or a built binary.
+`create --help`, `read --help`, `check_seats --help`, `reserve_seat --help` or
+`confirm_seats --help`, without AWS commands, credentials, resource discovery, or
+a built binary.
 
 ```sh
 # Use the existing AWS environment; no token is required:
@@ -2518,13 +2554,17 @@ Compile the seat handlers for the host without cloud resources:
 
 ```sh
 zig build build-seat-processors
+zig build test-seat-processors
 ```
 
 The [seat reference](SEAT_RESERVATION.md#rejection-workflow) describes runtime
 configuration and current behavior. These host builds create no Lambda ZIPs;
 the full ARM64 build separately installs both seat Lambda bootstraps, and SAM
 provisions their queues and mappings. Host compilation does not establish live IAM,
-trigger delivery or connectivity.
+trigger delivery or connectivity. The composed processor tests exercise confirmation
+submission and completion with mocked DynamoDB and queue effects, including
+class-free Results, native failure mapping and retired-request rejection. They are
+also part of `zig build test`.
 
 ### Global ledger counter utility
 

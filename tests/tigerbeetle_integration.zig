@@ -1497,7 +1497,6 @@ fn confirm_native(
 ) !seat.Result {
     const command: seat.Command = .{ .confirm_seats = .{
         .event_id = event.event_id,
-        .class = event.classes[0].tag,
         .pending_id = options.pending_id,
     } };
     const message = try native_seat_result(arena, client, event, &command, options.posting_id);
@@ -1523,7 +1522,7 @@ fn confirmation_hold(event: *const seat.Event, id: u128) tigerbeetle.Transfer {
     return hold;
 }
 
-test "Seat confirmation posts fully and accepts matching replay or already posted" {
+test "Seat confirmation inherits each class posts fully and accepts replay or already posted" {
     var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer storage.deinit();
     const arena = storage.allocator();
@@ -1531,27 +1530,33 @@ test "Seat confirmation posts fully and accepts matching replay or already poste
     const client = try local_client();
     defer client.destroy();
     const event = try reservation_event(arena, client, &ns, 60);
-    var hold = confirmation_hold(&event, ns.id(8400));
-    hold.amount = 4;
-    try expect_transfers(client, &.{hold}, &.{transfer_created});
     const statuses = [_][]const u8{ "created", "exists", "pending_transfer_already_posted" };
-    for (statuses, [_]u16{ 8401, 8401, 8402 }) |status, posting_offset| {
-        const result = try confirm_native(arena, client, &event, .{
-            .pending_id = hold.id,
-            .posting_id = ns.id(posting_offset),
-            .status = status,
-        });
-        try std.testing.expectEqual(hold.id, result.success.confirm_seats.pending_id);
-        const debit = try observe(client, hold.debit_account_id);
-        const credit = try observe(client, hold.credit_account_id);
-        try std.testing.expectEqual(@as(u128, 0), debit.debits_pending);
-        try std.testing.expectEqual(@as(u128, 4), debit.debits_posted);
-        try std.testing.expectEqual(@as(u128, 0), credit.credits_pending);
-        try std.testing.expectEqual(@as(u128, 4), credit.credits_posted);
+    var posted_total: u128 = 0;
+    for (event.classes, 0..) |class, class_index| {
+        const offset: u16 = @intCast(class_index * 10);
+        var hold = confirmation_hold(&event, ns.id(8400 + offset));
+        hold.debit_account_id = class.tb_account_id;
+        hold.amount = if (class_index == 0) 4 else 2;
+        try expect_transfers(client, &.{hold}, &.{transfer_created});
+        for (statuses, [_]u16{ 8401, 8401, 8402 }) |status, posting_offset| {
+            const result = try confirm_native(arena, client, &event, .{
+                .pending_id = hold.id,
+                .posting_id = ns.id(posting_offset + offset),
+                .status = status,
+            });
+            try std.testing.expectEqual(hold.id, result.success.confirm_seats.pending_id);
+            const debit = try observe(client, hold.debit_account_id);
+            const credit = try observe(client, hold.credit_account_id);
+            try std.testing.expectEqual(@as(u128, 0), debit.debits_pending);
+            try std.testing.expectEqual(hold.amount, debit.debits_posted);
+            try std.testing.expectEqual(@as(u128, 0), credit.credits_pending);
+            try std.testing.expectEqual(posted_total + hold.amount, credit.credits_posted);
+        }
+        posted_total += hold.amount;
     }
 }
 
-test "Seat confirmation checks tenant event class credit ledger and code before and after posting" {
+test "Seat confirmation checks tenant event credit ledger and code before and after posting" {
     var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer storage.deinit();
     const arena = storage.allocator();
@@ -1570,25 +1575,22 @@ test "Seat confirmation checks tenant event class credit ledger and code before 
     var holds = [_]tigerbeetle.Transfer{
         confirmation_hold(&foreign, ns.id(8410)),
         confirmation_hold(&sibling, ns.id(8411)),
-        confirmation_hold(&event, ns.id(8412)),
         confirmation_hold(&event, ns.id(8413)),
         confirmation_hold(&event, ns.id(8414)),
         confirmation_hold(&event, ns.id(8415)),
     };
-    holds[2].debit_account_id = event.classes[1].tb_account_id;
-    holds[3].credit_account_id = foreign.allocation_account_id;
-    holds[4].code = 3;
-    try expect_transfers(client, &holds, &([_]u32{transfer_created} ** 6));
+    holds[2].credit_account_id = foreign.allocation_account_id;
+    holds[3].code = 3;
+    try expect_transfers(client, &holds, &([_]u32{transfer_created} ** 5));
     const statuses = [_][]const u8{
-        "pending_transfer_has_different_debit_account_id",
-        "pending_transfer_has_different_debit_account_id",
-        "pending_transfer_has_different_debit_account_id",
+        "pending_transfer_has_different_credit_account_id",
+        "pending_transfer_has_different_credit_account_id",
         "pending_transfer_has_different_credit_account_id",
         "pending_transfer_has_different_code",
         "pending_transfer_has_different_ledger",
     };
     for (holds, statuses, 0..) |hold, status, index| {
-        const selected = if (index == 5) &wrong_ledger else &event;
+        const selected = if (index == 4) &wrong_ledger else &event;
         for ([_]bool{ false, true }) |posted| {
             if (posted) {
                 var post = post_transfer(ns.id(8430) + index, hold.id, std.math.maxInt(u128));

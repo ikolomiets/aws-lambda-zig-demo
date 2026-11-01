@@ -52,9 +52,12 @@ promising remaining lifetime or synthesizing an expiry timestamp. Avoiding saved
 plans and reservation ownership storage keeps this limitation explicit.
 
 Confirmation generates a separate fresh posting ID and retains only the pending
-reference in Context. Its full-post amount and explicit authorized debit, credit,
-ledger and code bind native execution to the selected Event/class, including when
-the pending transfer is already posted. Matching replay and already-posted outcomes
-persist the same effective success naming the input reservation, without a quantity.
+reference and Event ID alongside the command in Context. Callers need no class:
+the zero debit account ID inherits the held Availability Account, while explicit
+authorized Allocation credit, ledger and code bind native execution to the selected
+Event, including when the pending transfer is already posted. The immutable Event
+credit identity provides this binding without a transfer lookup or reservation
+ownership store. Matching replay and already-posted outcomes persist the same
+effective success naming the Event and input reservation, without a class or quantity.
 The first valid Operation Result still wins across competing confirmation attempts.
 Fresh submission retries may choose new posting IDs; no durable plan is added.

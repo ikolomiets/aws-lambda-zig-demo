@@ -249,25 +249,27 @@ hold; it promises no remaining lifetime and contains no synthetic expiry timesta
 
 ## Confirmation workflow
 
-An owned ready Event admits `confirm_seats` for one configured class. Submission
-generates a fresh posting transfer ID and sends exactly one `post_pending_transfer`
-with the supplied `pending_id`, alias `confirm-${tag}`, amount 2^128−1, explicit
-nonzero Availability debit and Allocation credit IDs, the Event ledger, and code 2.
-There is no timeout. The maximum-u128 amount posts the entire held quantity.
-Context contains exactly the original command, Event ID, class and pending ID;
+An owned ready Event admits `confirm_seats` with its Event ID and a reservation's
+`pending_id`, without a class. Submission generates a fresh posting transfer ID
+and sends exactly one `post_pending_transfer` with the supplied `pending_id`,
+alias `confirm`, amount 2^128−1, zero debit account ID, explicit nonzero Allocation
+credit ID, the Event ledger, and code 2. TigerBeetle inherits the Availability
+debit account from the pending transfer. There is no timeout. The maximum-u128
+amount posts the entire held quantity, for any Seat Class of the authorized Event.
+Context contains exactly the original command, Event ID and pending ID;
 the generated posting ID stays out of Context and the public Result.
 
 Completion rereads the tenant-scoped ready Event and requires exactly one transfer
 outcome with the matching alias and no account creations or lookups. `created`,
 matching `exists` replay, and `pending_transfer_already_posted` establish the same
-effective success. Explicit debit, credit, ledger and code fields bind even an
-already-posted reference to the authorized Event and class. A repeat confirmation
+effective success. Explicit credit, ledger and code fields bind even an
+already-posted reference to the authorized Event. A repeat confirmation
 can use a new posting ID without posting the hold twice.
 
-Success contains exactly `event_id`, `class` and `reservation_id`, naming the input
-pending transfer. It contains no confirmed quantity. Native
+Success contains exactly `event_id` and `reservation_id`, naming the input
+pending transfer. It contains no class or confirmed quantity. Native
 `pending_transfer_expired` becomes code-only `reservation_expired`. Missing,
-non-pending, or debit/credit/ledger/code-mismatched references all become code-only
+non-pending, or credit/ledger/code-mismatched references all become code-only
 `invalid_reservation`, without disclosing which association failed. Already-voided
 references and `id_already_failed` become `operation_rejected`; the original reason
 for a consumed posting ID is not reconstructed.
@@ -329,12 +331,12 @@ optional fields, tenant overrides, routes, flags, ledger or native account IDs.
 | --- | --- |
 | `create_event` | `classes`: tag-to-capacity object; `timeout_seconds`: positive u32 |
 | `reserve_seats` | `event_id`: canonical UUID; `class`: one tag; `quantity`: positive u32 |
-| `confirm_seats` | `event_id`: canonical UUID; `class`: one tag; `pending_id`: native ID string |
+| `confirm_seats` | `event_id`: canonical UUID; `pending_id`: native ID string |
 | `check_seats` | `event_id`: canonical UUID |
 
 Unknown or missing fields, wrong types, nulls and decoded duplicate keys are
-errors. Reserve and confirm accept one scalar class, never arrays or class Maps.
-Create accepts 1–31 classes; check serializes every configured class.
+errors. Reserve accepts one scalar class, never arrays or class Maps. Confirm
+accepts no class. Create accepts 1–31 classes; check serializes every configured class.
 
 Tags contain 1–54 decoded UTF-8 bytes. U+0000–U+001F and U+007F–U+009F, invalid
 UTF-8, and the exact decoded names `capacity` and `allocation` are rejected.
@@ -362,8 +364,8 @@ Capacity, Allocation and Availability Accounts by tag bytes, then funds those
 classes in the same order, without lookups. Funding reuses each Availability
 Account ID as the transfer ID. Reserve serializes one pending transfer with the
 Event's ledger/timeout and class quantity. Confirm serializes one full posting
-with amount 2^128−1, explicit Availability debit, Allocation credit, ledger and
-code 2, and no timeout. Linked flags belong to the native processor's list framing.
+with amount 2^128−1, zero debit for inheritance, explicit Allocation credit, ledger
+and code 2, and no timeout. Linked flags belong to the native processor's list framing.
 Check serializes all Availability lookups in class order. These are pure serializers;
 they perform no native calls or ledger allocation.
 
@@ -373,7 +375,7 @@ Public Results contain the existing `type`/`payload` wrapper:
 | --- | --- |
 | Create | `event_id` |
 | Reserve | `event_id`, `class`, `quantity`, `reservation_id` |
-| Confirm | `event_id`, `class`, `reservation_id` (the input pending ID) |
+| Confirm | `event_id`, `reservation_id` (the input pending ID) |
 | Check | `event_id`, `classes` mapping every tag to `total` and `available` integers |
 
 Failure payloads contain only `code`: `invalid_request`, `event_unavailable`,
@@ -543,7 +545,7 @@ tests cover malformed input, serializer limits, and memory ownership.
 | Admission and messages | All four schemas, decoded duplicates, normalized numbers, UTF-8/tag/ID limits, exact/over byte bounds and transport escaping; invalid input has no allocation, Event write or native dispatch; trusted tenant and explicit Context survive normal and diagnostic hops. |
 | Ownership and cache | Missing/foreign equivalence; authorization before readiness/class disclosure, including cache hits; ready-only entries, full 1 MiB accounting, LRU eviction, oversized-entry bypass and request-arena independence; balances remain uncached. |
 | Allocation and Event insertion | Independent and shared bindings, default/explicit selection, bounds/exhaustion, wrong returned IDs and backing-storage ownership; absent-only setup at 1000, first allocation 1001, explicit uncertainty and no guessed allocation; races resolve to saved Event identities and reconstruct intact initialization chains. |
-| Accounting and observations | Initial funding and account bounds; concurrent all-or-nothing reservations and class independence; full confirmation and effective already-posted success; tenant/Event/class/account/ledger/code mismatches before and after posting; expiry without renewal, delayed success and conservative availability after expiry. |
+| Accounting and observations | Initial funding and account bounds; concurrent all-or-nothing reservations and class independence; full confirmation from every class with inherited debit and effective already-posted success; tenant/Event/credit/ledger/code mismatches before and after posting; expiry without renewal, delayed success and conservative availability after expiry. |
 | Completion and persistence | Exact native families/counts/positions/aliases/fields; invalid evidence creates no public Result; identity/state/absent-Result guards without hash comparison; immutable winners, delayed admission failures, atomic ready/success or failed/failure, coherent readback and contradictory pairs. |
 | Uncertain effects and delivery | Failure before an effect and committed effect followed by lost response at intake write/send, allocation, insertion, dispatch, result publication and finalization; restarts, competing completions, readback errors and response-encoding failure; ordered publication stops at the first failed/uncertain send; acknowledgements reflect publication/persistence or diagnosed unrecoverable input, independently of diagnostic delivery. |
 | Utilities and deployment | Shared validation, bounded I/O, JSON stdout/sanitized stderr, credential-free help and selection precedence; guarded preservation of table/ID bindings, explicit setup and owner-scoped cleanup; deployment procedures follow the guide. |

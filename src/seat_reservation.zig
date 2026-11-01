@@ -46,7 +46,7 @@ pub const Tag = struct {
 pub const Class = struct { tag: Tag, total: u32 };
 pub const CreateEvent = struct { classes: []const Class, timeout_seconds: u32 };
 pub const ReserveSeats = struct { event_id: u128, class: Tag, quantity: u32 };
-pub const ConfirmSeats = struct { event_id: u128, class: Tag, pending_id: u128 };
+pub const ConfirmSeats = struct { event_id: u128, pending_id: u128 };
 pub const Command = union(enum) {
     create_event: CreateEvent,
     reserve_seats: ReserveSeats,
@@ -190,8 +190,12 @@ fn validate_success_payload(payload: *const std.json.Value) !void {
             try exact_fields(payload, &.{ "event_id", "class", "quantity", "reservation_id" });
             _ = try positive_u32(try required(payload, "quantity"));
         } else {
+            // Completed Operations retain their original confirmation Result.
             try exact_fields(payload, &.{ "event_id", "class", "reservation_id" });
         }
+    } else if (payload.object.contains("reservation_id")) {
+        try exact_fields(payload, &.{ "event_id", "reservation_id" });
+        _ = try native_id(try string_value(try required(payload, "reservation_id")));
     } else {
         try exact_fields(payload, &.{"event_id"});
     }
@@ -232,7 +236,6 @@ fn write_success(json: anytype, success: *const Success) !void {
         },
         .confirm_seats => |*confirm| {
             try uuid_field(json, "event_id", confirm.event_id);
-            try field(json, "class", confirm.class.slice());
             try id_field(json, "reservation_id", confirm.pending_id);
         },
         .check_seats => |*check| {
@@ -375,7 +378,7 @@ const NativeTransfer = struct {
     amount: u128,
     ledger: u32,
     code: u16,
-    alias_tag: *const Tag,
+    alias_tag: ?*const Tag = null,
     alias_prefix: []const u8,
     flag: ?[]const u8 = null,
     pending_id: ?u128 = null,
@@ -385,14 +388,18 @@ const NativeTransfer = struct {
 fn write_native_transfer(json: anytype, transfer: *const NativeTransfer) !void {
     std.debug.assert(transfer.id > 0);
     std.debug.assert(transfer.id <= native_id_max);
+    std.debug.assert(transfer.credit > 0);
     std.debug.assert(transfer.debit != transfer.credit);
+    std.debug.assert(transfer.debit > 0 or
+        (transfer.pending_id != null and
+            std.mem.eql(u8, transfer.flag orelse "", "post_pending_transfer")));
     std.debug.assert(transfer.amount > 0);
     std.debug.assert(transfer.ledger > 0);
     var alias_buffer: [64]u8 = undefined;
     const alias = std.fmt.bufPrint(
         &alias_buffer,
         "{s}{s}",
-        .{ transfer.alias_prefix, transfer.alias_tag.slice() },
+        .{ transfer.alias_prefix, if (transfer.alias_tag) |tag| tag.slice() else "" },
     ) catch unreachable;
     try json.beginObject();
     try id_field(json, "id", transfer.id);
@@ -409,34 +416,31 @@ fn write_native_transfer(json: anytype, transfer: *const NativeTransfer) !void {
 }
 
 fn write_seat_transfer(json: anytype, body: *const NativeBody) !void {
-    const tag = switch (body.command.*) {
-        .reserve_seats => |*reserve| &reserve.class,
-        .confirm_seats => |*confirm| &confirm.class,
-        else => unreachable,
-    };
-    const class = &body.event.classes[class_index(body.event, tag).?];
     var transfer: NativeTransfer = .{
         .id = body.attempt_id,
-        .debit = class.tb_account_id,
+        .debit = 0,
         .credit = body.event.allocation_account_id,
         .amount = 0,
         .ledger = body.event.ledger,
         .code = 2,
-        .alias_tag = tag,
         .alias_prefix = undefined,
     };
     switch (body.command.*) {
         .reserve_seats => |*reserve| {
+            const class = &body.event.classes[class_index(body.event, &reserve.class).?];
+            transfer.debit = class.tb_account_id;
+            transfer.alias_tag = &reserve.class;
             transfer.amount = reserve.quantity;
             transfer.flag = "pending";
             transfer.timeout = body.event.timeout_seconds;
             transfer.alias_prefix = "reserve-";
         },
         .confirm_seats => |*confirm| {
+            // Inherit the held class's debit; the explicit credit, ledger and code bind the Event.
             transfer.amount = std.math.maxInt(u128);
             transfer.pending_id = confirm.pending_id;
             transfer.flag = "post_pending_transfer";
-            transfer.alias_prefix = "confirm-";
+            transfer.alias_prefix = "confirm";
         },
         else => unreachable,
     }
@@ -555,13 +559,7 @@ pub fn confirmation_result(
     std.debug.assert(transfers.len == 1);
     const entry = &transfers[0];
     try exact_fields(entry, &.{ "error_code", "alias" });
-    var alias_buffer: [64]u8 = undefined;
-    const alias = try std.fmt.bufPrint(
-        &alias_buffer,
-        "confirm-{s}",
-        .{context.command.confirm_seats.class.slice()},
-    );
-    if (!std.mem.eql(u8, alias, try string_value(try required(entry, "alias")))) {
+    if (!std.mem.eql(u8, "confirm", try string_value(try required(entry, "alias")))) {
         return error.InvalidNativeEvidence;
     }
     const status = try string_value(try required(entry, "error_code"));
@@ -752,7 +750,6 @@ fn validate_command_event(command: *const Command, event: *const Event) !void {
         },
         .confirm_seats => |*confirm| {
             if (confirm.event_id != event.event_id) return error.EventUnavailable;
-            if (class_index(event, &confirm.class) == null) return error.UnknownClass;
         },
         .check_seats => |id| if (id != event.event_id) {
             return error.EventUnavailable;
@@ -950,10 +947,9 @@ pub fn command_from_value(arena: Allocator, value: *const std.json.Value) !Comma
         } };
     }
     if (std.mem.eql(u8, name, "confirm_seats")) {
-        try exact_fields(value, &.{ "command", "event_id", "class", "pending_id" });
+        try exact_fields(value, &.{ "command", "event_id", "pending_id" });
         return .{ .confirm_seats = .{
             .event_id = try canonical_uuid(try string_value(try required(value, "event_id"))),
-            .class = try Tag.init(try string_value(try required(value, "class"))),
             .pending_id = try native_id(try string_value(try required(value, "pending_id"))),
         } };
     }
@@ -990,7 +986,6 @@ pub fn validate_command(command: *const Command) !void {
             if (reserve.quantity == 0) return error.InvalidNumber;
         },
         .confirm_seats => |*confirm| {
-            try validate_tag(&confirm.class);
             try validate_native_id(confirm.pending_id);
         },
         .check_seats => {},
@@ -1240,7 +1235,6 @@ fn write_command(json: anytype, command: *const Command, reservation_id: ?u128) 
         },
         .confirm_seats => |*confirm| {
             try uuid_field(json, "event_id", confirm.event_id);
-            try field(json, "class", confirm.class.slice());
             try id_field(json, "pending_id", confirm.pending_id);
         },
         .check_seats => |id| try uuid_field(json, "event_id", id),
@@ -1312,8 +1306,14 @@ test "reserve Context carries its attempt ID and confirmation carries only the p
         \\{"command":"reserve_seats","event_id":"00000000-0000-0000-0000-000000000001","class":"a","quantity":2,"reservation_id":"123"}
     , try encode_context(arena.allocator(), &reserve, 123));
     const confirm = try decode_command(arena.allocator(),
-        \\{"command":"confirm_seats","event_id":"00000000-0000-0000-0000-000000000001","class":"a","pending_id":"123"}
+        \\{"command":"confirm_seats","event_id":"00000000-0000-0000-0000-000000000001","pending_id":"123"}
     );
+    const decoded = try decode_context(
+        arena.allocator(),
+        try encode_context(arena.allocator(), &confirm, null),
+    );
+    try std.testing.expectEqual(@as(u128, 123), decoded.command.confirm_seats.pending_id);
+    try std.testing.expectEqual(@as(?u128, null), decoded.reservation_id);
     try std.testing.expectEqualStrings(
         try encode_command(arena.allocator(), &confirm),
         try encode_context(arena.allocator(), &confirm, null),
@@ -1322,6 +1322,31 @@ test "reserve Context carries its attempt ID and confirmation carries only the p
         error.InvalidContext,
         encode_context(arena.allocator(), &confirm, 124),
     );
+    try std.testing.expectError(error.InvalidFields, decode_command(arena.allocator(),
+        \\{"command":"confirm_seats","event_id":"00000000-0000-0000-0000-000000000001","class":"a","pending_id":"123"}
+    ));
+}
+
+test "confirmation Results validate new and historical winners with exact fields and native IDs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const payloads = [_][]const u8{
+        \\{"event_id":"00000000-0000-0000-0000-000000000001","reservation_id":"340282366920938463463374607431768211454"}
+        ,
+        \\{"event_id":"00000000-0000-0000-0000-000000000001","class":"a","reservation_id":"123"}
+        ,
+    };
+    for (payloads) |input| {
+        const payload = try parse_value(allocator, input, operation.result_size_max);
+        try validate_completion(&.{ .success = payload });
+        var invalid = try parse_value(allocator, input, operation.result_size_max);
+        try invalid.object.put(allocator, "reservation_id", .{ .string = "0" });
+        try std.testing.expectError(error.InvalidNativeID, validate_completion(&.{ .success = invalid }));
+        invalid = try parse_value(allocator, input, operation.result_size_max);
+        try invalid.object.put(allocator, "pending_id", .{ .string = "1" });
+        try std.testing.expectError(error.InvalidFields, validate_completion(&.{ .success = invalid }));
+    }
 }
 
 test "31 maximum classes pass real serialization admission before generated identities" {
@@ -1392,7 +1417,7 @@ test "all commands enforce exact fields types numbers and canonical identifiers"
         ,
         \\{"command":"reserve_seats","event_id":"00000000-0000-0000-0000-000000000001","class":"a","quantity":1}
         ,
-        \\{"command":"confirm_seats","event_id":"00000000-0000-0000-0000-000000000001","class":"a","pending_id":"1"}
+        \\{"command":"confirm_seats","event_id":"00000000-0000-0000-0000-000000000001","pending_id":"1"}
         ,
         \\{"command":"check_seats","event_id":"00000000-0000-0000-0000-000000000001"}
         ,
@@ -1608,12 +1633,11 @@ test "reserve and full confirm serializers bind authorized accounts and exact pu
     try std.testing.expectEqual(@as(?u128, 123), context.reservation_id);
     const confirm: Command = .{ .confirm_seats = .{
         .event_id = 1,
-        .class = try Tag.init("a"),
         .pending_id = 123,
     } };
     _ = try admit(allocator, &confirm, &event, &options);
     try std.testing.expectEqualStrings(
-        \\{"create_accounts":[],"create_transfers":[{"id":"124","alias":"confirm-a","debit_account_id":"3","credit_account_id":"2","amount":"340282366920938463463374607431768211455","ledger":1001,"code":2,"flags":["post_pending_transfer"],"pending_id":"123"}],"lookup_accounts":[]}
+        \\{"create_accounts":[],"create_transfers":[{"id":"124","alias":"confirm","debit_account_id":"0","credit_account_id":"2","amount":"340282366920938463463374607431768211455","ledger":1001,"code":2,"flags":["post_pending_transfer"],"pending_id":"123"}],"lookup_accounts":[]}
     , try encode_native_body(
         allocator,
         &.{ .command = &confirm, .event = &event, .attempt_id = 124 },
@@ -1627,7 +1651,7 @@ test "reserve and full confirm serializers bind authorized accounts and exact pu
     , try encode_result(allocator, &reserve_result));
     const confirm_result: Result = .{ .success = .{ .confirm_seats = confirm.confirm_seats } };
     try std.testing.expectEqualStrings(
-        \\{"type":"SUCCESS","payload":{"event_id":"00000000-0000-0000-0000-000000000001","class":"a","reservation_id":"123"}}
+        \\{"type":"SUCCESS","payload":{"event_id":"00000000-0000-0000-0000-000000000001","reservation_id":"123"}}
     , try encode_result(allocator, &confirm_result));
     try std.testing.expectEqualStrings(
         \\{"type":"FAILURE","payload":{"code":"invalid_request"}}

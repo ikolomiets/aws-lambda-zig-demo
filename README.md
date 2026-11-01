@@ -45,8 +45,10 @@ Event metadata and reads tenant-scoped records. The `events.sh` wrapper uses
 `PASETO_TOKEN` to submit public creation Operations with explicit `--class TAG=COUNT`
 arguments and `check_seats --event-id UUID` to query current
 availability. `reserve_seat --event-id UUID --class TAG --quantity COUNT` creates
-a timed reservation without confirming it. Checks and reservations each submit
-a fresh Operation and poll every second until completion, printing the Result.
+a timed reservation. `confirm_seats --event-id UUID --reservation-id ID`
+confirms its full held quantity using the returned `reservation_id`.
+Checks, reservations and confirmations each submit a fresh Operation and poll
+every second until completion, printing the Result.
 It uses the host binary to read Event metadata. See the
 [Event utility guide](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-event-metadata-utility).
 The host `ledger-counter` binary and `ledger-counter.sh` wrapper provide explicit

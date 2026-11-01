@@ -739,6 +739,10 @@ pub fn build(b: *std.Build) void {
     const seat_processors_build = b.step("build-seat-processors", "Compile host seat invocation adapters");
     seat_processors_build.dependOn(&seat_submission_exe.step);
     seat_processors_build.dependOn(&seat_completion_exe.step);
+    const seat_processor_tests = b.addTest(.{ .root_module = seat_completion_mod });
+    const run_seat_processor_tests = b.addRunArtifact(seat_processor_tests);
+    b.step("test-seat-processors", "Run composed seat submission and completion tests")
+        .dependOn(&run_seat_processor_tests.step);
 
     const lambda_auth_tests = b.addTest(.{
         .root_module = host_lambda_auth,
@@ -954,6 +958,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_seat_reservation_tests.step);
+    test_step.dependOn(&run_seat_processor_tests.step);
     test_step.dependOn(&run_seat_persistence_tests.step);
     test_step.dependOn(&run_events_cli_tests.step);
     test_step.dependOn(&run_ledger_counter_tests.step);

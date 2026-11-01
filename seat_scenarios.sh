@@ -418,9 +418,9 @@ pending_id="$(printf '%s' "$OPERATION" | jq -r .result.payload.reservation_id)"
 check_payload="$(printf '%s' "$check_payload" | jq -c '.classes.general.available = 1')"
 submit held_check "$check_body" "$owner" "$owner_token" "$check_payload"
 confirm_body="$(jq -cn --arg id "$event_id" --arg pending "$pending_id" \
-    '{command:"confirm_seats",event_id:$id,class:"general",pending_id:$pending}')"
+    '{command:"confirm_seats",event_id:$id,pending_id:$pending}')"
 confirm_payload="$(jq -cn --arg id "$event_id" --arg pending "$pending_id" \
-    '{event_id:$id,class:"general",reservation_id:$pending}')"
+    '{event_id:$id,reservation_id:$pending}')"
 submit confirm "$confirm_body" "$owner" "$owner_token" "$confirm_payload"
 submit final_check "$check_body" "$owner" "$owner_token" "$check_payload"
 if [ -n "$foreign_token" ]; then
