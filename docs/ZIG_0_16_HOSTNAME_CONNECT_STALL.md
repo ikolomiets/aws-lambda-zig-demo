@@ -49,7 +49,76 @@ response or transport error.
 Account-specific values and raw addresses are intentionally omitted. Keep this
 note with the build change while the patched Zig standard library is required.
 
-## Reproduction model
+## Standalone deterministic reproducer
+
+[`tests/hostname_connect_repro.zig`](../tests/hostname_connect_repro.zig) runs
+directly with `zig test`, independently of the project build and dependencies.
+It uses the selected standard library's real `HostName.connect` implementation
+and `std.Io.Threaded` scheduler. Only hostname lookup, IP connection, and socket
+closing are simulated, so no DNS configuration, network access, Docker, or AWS
+credentials are required.
+
+Lookup supplies a pending IPv4 address followed by an immediately successful
+IPv4 address. The pending attempt performs a cancelable one-second sleep; if
+the sleep expires, the fixture records that fact and returns `error.Timeout`.
+Even if `HostName.connect` subsequently returns the successful stream, the test
+fails with `HostNameConnectStalled`. This bounds the injected stall without
+using `ConnectOptions.timeout` or leaving the original bug hanging indefinitely.
+Successful runs also verify the returned address, stream closure, and that any
+started pending attempt is canceled before `HostName.connect` returns.
+
+The three named tests set async limits explicitly to zero, one, and two,
+independently of host CPU count. The concurrent limit remains unlimited,
+matching the threaded backend's default. Zero and one async workers model
+the one- and two-CPU defaults; two workers provide the control.
+
+Run these commands from the repository root with Zig 0.16.0:
+
+```sh
+zig version
+
+# Patched standard library from the sibling checkout.
+zig test tests/hostname_connect_repro.zig -OReleaseSafe \
+  -fno-single-threaded --zig-lib-dir ../zig/lib
+
+# Stock standard library bundled with the installed compiler.
+env -u ZIG_LIB_DIR zig test tests/hostname_connect_repro.zig \
+  -OReleaseSafe -fno-single-threaded
+```
+
+The Zig 0.16.0 results verified on native Apple Silicon macOS are:
+
+| Async workers | Stock library | Patched sibling library |
+| ---: | --- | --- |
+| 0 | `FAIL (HostNameConnectStalled)` | pass |
+| 1 | `FAIL (HostNameConnectStalled)` | pass |
+| 2 | pass | pass |
+
+The stock command intentionally exits with status 1; the patched command exits
+with status 0. The reproducer is kept outside `zig build test` because the
+project's stock Zig 0.16.0 toolchain is expected to fail these regression cases.
+To run only the minimal two-CPU case, append
+`--test-filter 'one async worker'` to either command.
+
+Use the same source with a Zig 0.17 compiler and its bundled library:
+
+```sh
+/path/to/zig-0.17/zig version
+env -u ZIG_LIB_DIR /path/to/zig-0.17/zig test \
+  tests/hostname_connect_repro.zig -OReleaseSafe -fno-single-threaded
+```
+
+All three tests passing means this scheduling reproducer no longer detects the
+stall. A `HostNameConnectStalled` failure means a successful second address
+still waits for the first attempt to expire. A compilation error is an API
+compatibility problem and does not establish whether the stall persists.
+Zig 0.17 is not yet verified by this note.
+
+This fixture isolates address scheduling and cancellation. It does not exercise
+real DNS, TCP sockets, IPv6 routing, or the Linux networking backend, and it does
+not cover reversed address order or every losing-stream cleanup scenario.
+
+## Real-network reproduction model
 
 Use an isolated Linux/aarch64 container network with:
 
@@ -259,7 +328,8 @@ timeout only extends the stall.
 The issue is confirmed against Zig 0.16.0 and the repository-pinned transport.
 `build.zig` selects `../zig/lib` as a temporary standard-library override
 for the TigerBeetle processor executable. That sibling checkout is external to
-this repository; its patch is not pinned or validated by the files here.
+this repository; its patch is not pinned here. The standalone reproducer above
+checks its behavior for the pending-first, two-address scheduling cases.
 Check `zig version` reports 0.16.0 and
 `test -f ../zig/lib/std/Io/net/HostName.zig` succeeds before building. These checks
 establish prerequisites, not that the sibling source contains a verified fix.

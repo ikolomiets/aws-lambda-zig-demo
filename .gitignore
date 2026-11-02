@@ -2,6 +2,7 @@
 .aws-sam/
 zig-out/
 zig-pkg/
+.aws-sam/
 *.zip
 *.log
 .DS_Store
