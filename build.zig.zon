@@ -45,8 +45,8 @@
             .hash = "aws_lambda-0.6.1-AMNperBSAgB3pq0PRvzPA-wbtTTFp5MbNAS7Y33CZ62d",
         },
         .zig_paseto = .{
-            .url = "git+https://github.com/ikolomiets/zig-paseto?ref=main#35b4ae94c88bbdad3c0f634e48e0a4f1c5bc4f28",
-            .hash = "zig_paseto-1.1.6-hHOU6rWfBABjVVnH_iCpsyaGU2J4x0_QdtZ8DkkBOVMh",
+            .url = "git+https://github.com/deatil/zig-paseto?ref=main#54104c831c3c0e3890b131ea2669b29741dc3a0b",
+            .hash = "zig_paseto-1.2.3-hHOU6q6GAwApi9aI0za0V6QUjih9_8JNjuPmdrxSkSbz",
         },
     },
     .paths = .{

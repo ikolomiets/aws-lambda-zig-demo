@@ -65,6 +65,14 @@ to `global`; consumers requiring one sequence share both binding components. See
 - An AWS profile with permission to create Lambda, IAM, and CloudFormation
   resources.
 
+The pinned `deatil/zig-paseto` 1.2.3 and its transitive `zig-rsa` dependency
+declare Zig 0.17.0 minimums. This project's v4.public integration and v4.local
+compatibility tests are verified on Zig 0.16.0; the full upstream API and test
+suite are outside that compatibility scope. The v4.public path uses the standard
+library's Ed25519 implementation. Both dependency revisions and content hashes
+are pinned, adding the upstream RSA package to the dependency maintenance and
+supply-chain review scope without adding RSA work to v4.public requests.
+
 The deployment docs use:
 
 - AWS profile: `dev`

@@ -789,7 +789,8 @@ test "PASETO V4.local dependency compatibility" {
     try encoder.withImplicit(implicit);
 
     var random = std.Random.DefaultPrng.init(0x4c4f43414c);
-    const token = try encoder.encode(random.random(), key);
+    encoder.withRandom(random.random());
+    const token = try encoder.encode(key);
     defer allocator.free(token);
     try std.testing.expect(std.mem.startsWith(u8, token, "v4.local."));
 
@@ -811,13 +812,14 @@ test "PASETO V4.local rejects invalid key sizes" {
     var encoder = implementation.V4Local.init(allocator);
     defer encoder.deinit();
     var random = std.Random.DefaultPrng.init(0x4b455953);
+    encoder.withRandom(random.random());
     try std.testing.expectError(
         error.PasetoInvalidKeySize,
-        encoder.encode(random.random(), key[0 .. key.len - 1]),
+        encoder.encode(key[0 .. key.len - 1]),
     );
     try std.testing.expectError(
         error.PasetoInvalidKeySize,
-        encoder.encode(random.random(), key ++ "x"),
+        encoder.encode(key ++ "x"),
     );
 }
 
@@ -833,7 +835,8 @@ test "PASETO V4.local rejects authenticated mutations" {
     try encoder.withMessage("zig-paseto compatibility");
     try encoder.withImplicit(implicit);
     var random = std.Random.DefaultPrng.init(0x4d5554415445);
-    const token = try encoder.encode(random.random(), key);
+    encoder.withRandom(random.random());
+    const token = try encoder.encode(key);
     defer allocator.free(token);
     const mutated = try allocator.dupe(u8, token);
     defer allocator.free(mutated);
@@ -859,7 +862,8 @@ test "PASETO V4.local rejects the wrong implicit assertion" {
     try encoder.withMessage("zig-paseto compatibility");
     try encoder.withImplicit("tenant=intake-lambda");
     var random = std.Random.DefaultPrng.init(0x494d504c49434954);
-    const token = try encoder.encode(random.random(), key);
+    encoder.withRandom(random.random());
+    const token = try encoder.encode(key);
     defer allocator.free(token);
 
     var decoder = implementation.V4Local.init(allocator);

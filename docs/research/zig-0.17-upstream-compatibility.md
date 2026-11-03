@@ -1,11 +1,16 @@
 # Upstream dependency compatibility with Zig 0.17.0
 
-Checked 2026-11-02 against the revisions in
-[`build.zig.zon`](../../build.zig.zon), using the Zig 0.17.0 release compiler
+Checked 2026-11-02 against the baseline revisions in the inventory below,
+using the Zig 0.17.0 release compiler
 and its bundled standard library on Apple Silicon macOS. The installed default
 compiler remains Zig 0.16.0. `.tigerbeetle_c_artifacts` is excluded.
 
-**The current dependency pins are not compatible with Zig 0.17.0 unchanged.**
+The current pins are maintained in [`build.zig.zon`](../../build.zig.zon).
+The PASETO assessment here covers the earlier `ikolomiets/zig-paseto` 1.1.6
+revision; it does not assess the current `deatil/zig-paseto` 1.2.3 pin or its
+transitive `zig-rsa` dependency on Zig 0.17.0.
+
+**The baseline dependency pins are not compatible with Zig 0.17.0 unchanged.**
 The direct dependencies all have reproducible compilation or build-configuration
 failures. The SDK's transitive test runner also needs an update.
 
@@ -17,7 +22,7 @@ the compiler; they are not inferred solely from minimum-version declarations.
 
 ## Dependency inventory
 
-| Dependency | Pinned revision | Zig 0.17.0 assessment |
+| Dependency | Assessed baseline revision | Zig 0.17.0 assessment |
 | --- | --- | --- |
 | `aws_sdk` | [`778dcfe1423c`][sdk-pin], fork branch `agent/parse-modeled-aws-json-errors` | Incompatible: build APIs, repetition syntax, JSON reflection, and CRC names. |
 | `aws_lambda` | [`e3b15bf9b820`][lambda-pin], fork branch `agent/fix-sqs-review-findings` | Incompatible build configuration; 28 source-level tests pass separately. |
