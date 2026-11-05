@@ -13,6 +13,10 @@ pub const std_options: std.Options = .{
 };
 
 const Allocator = std.mem.Allocator;
+const runtime_tests_enabled = if (@import("builtin").is_test)
+    @import("runtime_test_options").enabled
+else
+    false;
 
 const bad_request_body = "Bad Request\n";
 const cache_entry_count_max: usize = 1024;
@@ -1255,3 +1259,78 @@ pub const test_support = if (@import("builtin").is_test) struct {
         return handleInvocationForTest(allocator, event, &environment, &fake, 1000);
     }
 } else struct {};
+
+test "runtime integration: warm query preserves cache and refreshes invocation metadata" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    const runtime = @import("runtime_test_support");
+    var seen: runtime.Observations = .{};
+    defer seen.deinit();
+    const allocator = seen.arena.allocator();
+    const token = try lambda_auth.testing.issue_token(allocator, .{
+        .seed_byte = 0x71,
+        .now = std.Io.Clock.real.now(std.testing.io).toSeconds(),
+        .ttl_seconds = 300,
+    });
+    const event = try testQueryRequestEvent(token);
+    defer std.testing.allocator.free(event);
+    var tester: runtime.Tester = undefined;
+    try tester.init(std.testing.allocator, &.{
+        .{
+            .request_id = "query-1",
+            .payload = event,
+            .invocation_id = "attempt-1",
+            .xray_trace = "trace-1",
+            .invoked_arn = "function-1",
+            .deadline_ms = 1001,
+        },
+        .{
+            .request_id = "query-2",
+            .payload = event,
+            .invocation_id = "",
+            .xray_trace = "trace-2",
+            .invoked_arn = "function-2",
+            .deadline_ms = 1002,
+        },
+        .{
+            .request_id = "query-3",
+            .payload = event,
+            .invocation_id = "attempt-3",
+            .xray_trace = "",
+            .invoked_arn = "function-3",
+            .deadline_ms = 1003,
+        },
+    });
+    defer tester.deinit();
+    try lambda_auth.testing.put_public_key(&tester.env_map, 0x71);
+    var cache: OperationCache = undefined;
+    OperationCache.init(&cache, std.testing.allocator);
+    defer cache.deinit();
+    var fake: FakeQuery = .{ .response = testOperation("lambda-test-user", .submitted) };
+    installRuntimeQueryAdapter(QueryAdapter.init(&fake, &cache));
+    defer uninstallRuntimeQueryAdapter();
+
+    runtime.run(&tester, &seen, .{ .awake_ns = 1000 }, handler);
+
+    try runtime.expect_protocol(&tester, &seen);
+    try std.testing.expectEqual(@as(u8, 1), fake.read_count);
+    try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
+    for ([_][]const u8{ "query-1", "query-2", "query-3" }, 0..) |id, index| {
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "/2018-06-01/runtime/invocation/{s}/response",
+            .{id},
+        );
+        try tester.expectPath(index, path);
+        const output = try runtime.http_body(allocator, &tester, index, 200);
+        try std.testing.expectEqualStrings("SUBMITTED", output.object.get("state").?.string);
+        try std.testing.expectEqualStrings(
+            "lambda-test-user",
+            output.object.get("tenant").?.string,
+        );
+        try std.testing.expectEqualStrings(
+            "00112233-4455-6677-8899-aabbccddeeff",
+            output.object.get("id").?.string,
+        );
+        try tester.expectBody(index, (try tester.post(0)).body);
+    }
+}

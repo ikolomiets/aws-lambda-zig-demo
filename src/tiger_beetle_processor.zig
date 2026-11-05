@@ -21,6 +21,10 @@ pub const std_options: std.Options = .{
 };
 
 const Allocator = std.mem.Allocator;
+const runtime_tests_enabled = if (@import("builtin").is_test)
+    @import("runtime_test_options").enabled
+else
+    false;
 const record_count_max = 10;
 const tigerbeetle_addresses_default = "10.200.0.2:3000";
 const tigerbeetle_addresses_size_max = 4096;
@@ -4088,4 +4092,125 @@ test "executor unfinished native work logs a correlated retry while diagnostics 
     try std.testing.expectEqualStrings("native", observer.records.items[1].stage);
     try std.testing.expectEqualStrings("NativeDisconnected", observer.records.items[1].reason.?);
     try std.testing.expectEqualStrings("published", observer.records.items[2].outcome);
+}
+
+// Publication observations belong to the test, independently of invocation arenas.
+const RuntimeTestPublisher = struct {
+    allocator: Allocator,
+    messages: [record_count_max][]const u8 = undefined,
+    calls: usize = 0,
+    published: usize = 0,
+    fail_at: ?usize = null,
+
+    fn sendCompletion(
+        self: *RuntimeTestPublisher,
+        _: Allocator,
+        result_queue: ?[]const u8,
+        body: []const u8,
+    ) !void {
+        std.debug.assert(self.calls < self.messages.len);
+        try std.testing.expectEqual(null, result_queue);
+        const index = self.calls;
+        self.calls += 1;
+        if (self.fail_at == index) return error.SendFailed;
+        self.messages[self.published] = try self.allocator.dupe(u8, body);
+        self.published += 1;
+    }
+};
+
+test "runtime integration: malformed SQS invocation reports error and recovers" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    const runtime = @import("runtime_test_support");
+    var seen: runtime.Observations = .{};
+    defer seen.deinit();
+    const allocator = seen.arena.allocator();
+    const message = try test_body_message(allocator, 1,
+        \\{"create_accounts":[{"id":"1","flags":[],"ledger":1,"code":1}]}
+    );
+    const event = try testEvent(allocator, &.{message});
+    var tester: runtime.Tester = undefined;
+    try tester.init(std.testing.allocator, &.{
+        .{
+            .request_id = "bad-sqs",
+            .payload = "{",
+            .invocation_id = "bad-attempt",
+            .xray_trace = "bad-trace",
+        },
+        .{
+            .request_id = "good-sqs",
+            .payload = event,
+            .invocation_id = "good-attempt",
+            .xray_trace = "good-trace",
+        },
+    });
+    defer tester.deinit();
+    var execution: FakeExecution = .{};
+    var publisher: RuntimeTestPublisher = .{ .allocator = allocator };
+    installRuntimeAdapters(ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+    defer uninstallRuntimeAdapters();
+
+    runtime.run(&tester, &seen, .{}, handler);
+
+    try runtime.expect_protocol(&tester, &seen);
+    try tester.expectPath(0, "/2018-06-01/runtime/invocation/bad-sqs/error");
+    const failed = try tester.post(0);
+    try std.testing.expectEqualStrings(
+        "Handler.UnexpectedEndOfInput",
+        failed.header("Lambda-Runtime-Function-Error-Type").?,
+    );
+    const failure = try std.json.parseFromSliceLeaky(std.json.Value, allocator, failed.body, .{});
+    try std.testing.expectEqualStrings(
+        "Handler.UnexpectedEndOfInput",
+        failure.object.get("errorType").?.string,
+    );
+    try tester.expectPath(1, "/2018-06-01/runtime/invocation/good-sqs/response");
+    try tester.expectBody(1, "{\"batchItemFailures\":[]}");
+    try std.testing.expectEqual(@as(usize, 1), execution.account_count);
+    try std.testing.expectEqual(@as(usize, 1), publisher.published);
+    const completion = try processor_message.decode(allocator, publisher.messages[0]);
+    try std.testing.expectEqual(@as(u128, 1), completion.operation_id);
+    try std.testing.expectEqualStrings("tenant-a", completion.tenant);
+    const accounts = completion.body.object.get("create_accounts").?.array.items;
+    try std.testing.expectEqualStrings("created", accounts[0].object.get("error_code").?.string);
+}
+
+test "runtime integration: executor reports only unpublished SQS records for retry" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    const runtime = @import("runtime_test_support");
+    var seen: runtime.Observations = .{};
+    defer seen.deinit();
+    const allocator = seen.arena.allocator();
+    var messages: [3][]const u8 = undefined;
+    for (&messages, 0..) |*message, index| {
+        const body = try std.fmt.allocPrint(
+            allocator,
+            "{{\"create_accounts\":[{{\"id\":\"{d}\"," ++
+                "\"flags\":[],\"ledger\":1,\"code\":1}}]}}",
+            .{index + 1},
+        );
+        message.* = try test_body_message(allocator, index + 1, body);
+    }
+    const event = try testEvent(allocator, &messages);
+    var tester: runtime.Tester = undefined;
+    try tester.init(std.testing.allocator, &.{.{
+        .request_id = "mixed-batch",
+        .payload = event,
+    }});
+    defer tester.deinit();
+    var execution: FakeExecution = .{};
+    var publisher: RuntimeTestPublisher = .{ .allocator = allocator, .fail_at = 1 };
+    installRuntimeAdapters(ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
+    defer uninstallRuntimeAdapters();
+
+    runtime.run(&tester, &seen, .{}, handler);
+
+    try runtime.expect_protocol(&tester, &seen);
+    try tester.expectPath(0, "/2018-06-01/runtime/invocation/mixed-batch/response");
+    try tester.expectBody(0, "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-1\"}," ++
+        "{\"itemIdentifier\":\"message-2\"}]}");
+    try std.testing.expectEqual(@as(usize, 3), execution.account_count);
+    try std.testing.expectEqual(@as(usize, 2), publisher.calls);
+    try std.testing.expectEqual(@as(usize, 1), publisher.published);
+    const completion = try processor_message.decode(allocator, publisher.messages[0]);
+    try std.testing.expectEqual(@as(u128, 1), completion.operation_id);
 }

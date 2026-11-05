@@ -62,7 +62,8 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | Check | Scope and additional prerequisites |
 | --- | --- |
 | `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
-| `zig build test` | Full offline Zig and mocked deployment-helper suite; excludes the live replica and separate ABI checks |
+| `zig build test` | Full offline Zig and mocked deployment-helper suite; excludes socket-based runtime tests, the live replica, and separate ABI checks |
+| `zig build test-runtime` | Five host integration cases through the real Lambda event loop and intake, query, TigerBeetle execution, and Completion handlers; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
 | `zig build test-deploy` | Mocked regression tests for cleanup lifecycle, gateway discovery and interfaces, and processor interfaces; requires Bash and `jq`, with no AWS credentials or network access |
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
 | `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli` | Host counter build and deterministic global allocation/tooling tests |
@@ -81,6 +82,36 @@ deployment checks below have additional prerequisites and distinct evidence scop
 For shell changes, run `bash -n` on each affected script. The
 [complete offline checks](#complete-offline-checks) cover all root entry points
 and recursive shell harnesses under `tests/`.
+
+## Runtime integration checks
+
+Run the socket-based suite separately from the complete offline sequence:
+
+```sh
+zig build test-runtime --system zig-pkg
+```
+
+The target starts a fake Runtime API on `127.0.0.1` with an operating-system-assigned
+port. It exercises authenticated intake, warm query caching, malformed-event
+failure and recovery, partial SQS acknowledgements, and Completion persistence
+retry. It checks response/error paths and bodies, invocation-ID echoing and
+missing-ID compatibility, and refreshed request and trace metadata. Tests copy
+observations before invocation arenas reset and issue tokens against the current
+clock. The query case freezes only the handler's cache clock so host scheduling
+does not expire its one-second cache between scripted invocations.
+
+All external persistence, execution, and publication effects are mocked. Cloud
+resource initialization is bypassed; these tests establish no live AWS or
+TigerBeetle behavior. The seat processor tests retain their existing coverage.
+
+Host test wiring uses `sh`, `ln`, and `cp` to place a test facade beside a symlink
+to the active `aws_lambda` source directory in the build cache. It uses the same
+resolved dependency, including `--fork` overrides, without copying upstream
+sources. The four runtime test variants enable only cases prefixed
+`runtime integration:` and support multiple threads for the fake server.
+Ordinary tests disable these cases, and production threading settings are
+unchanged. Restricted environments need loopback socket permission for this
+target; `zig build test` and `zig build test-deploy` do not start the fake server.
 
 ## Diagnose check-environment failures
 
@@ -105,8 +136,8 @@ and recursive shell harnesses under `tests/`.
 The offline sequence executes no live replica tests, AWS/cloud commands,
 deployment or packaging steps, or documentation examples. Syntax-checking a live
 shell harness does not execute it. The deployment tests use mocked AWS commands.
-Separate ABI and live integration targets retain their existing explicit
-validation paths.
+Socket-based runtime tests, ABI checks, and live integration tests have separate
+explicit validation targets.
 
 Passing checks establishes formatting and tested behavior. Review links, command
 names, options, integration prerequisites, and

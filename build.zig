@@ -567,9 +567,36 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zig-paseto", .module = host_paseto_implementation },
         },
     });
-    const test_runtime = b.dependency("aws_lambda", .{
+    const host_lambda_dependency = b.dependency("aws_lambda", .{
         .target = b.graph.host,
-    }).module("lambda");
+    });
+    // Zig permits each source file in only one module. Upstream's root tests
+    // also import Tester, so expose both through one test facade. Link the
+    // active sources rather than copying them or assuming a package-cache path.
+    const runtime_test_sources = b.addSystemCommand(&.{
+        "sh",                  "-c",
+        \\set -eu
+        \\runtime_source=$(cd "$1" && pwd -P)
+        \\mkdir -p "$3"
+        \\ln -sfn "$runtime_source" "$3/upstream"
+        \\cp "$2" "$3/root.zig"
+        ,
+        "runtime-test-module",
+    });
+    runtime_test_sources.addDirectoryArg(host_lambda_dependency.path("src"));
+    runtime_test_sources.addFileArg(b.path("tests/runtime_api.zig"));
+    const runtime_test_directory = runtime_test_sources.addOutputDirectoryArg(
+        "runtime-test-module",
+    );
+    runtime_test_sources.has_side_effects = false;
+    const test_runtime = b.createModule(.{
+        .target = b.graph.host,
+        .root_source_file = runtime_test_directory.path(b, "root.zig"),
+    });
+    var runtime_imports = host_lambda_dependency.module("lambda").import_table.iterator();
+    while (runtime_imports.next()) |entry| {
+        test_runtime.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    }
     const host_lambda_auth = b.createModule(.{
         .target = b.graph.host,
         .optimize = .Debug,
@@ -1019,6 +1046,53 @@ pub fn build(b: *std.Build) void {
     }) |module| {
         module.addImport("outcome_log", host_outcome_log);
     }
+    const runtime_test_modules = [_]*std.Build.Module{
+        lambda_test_mod,
+        query_test_mod,
+        tiger_beetle_processor_test_mod,
+        tiger_beetle_completion_processor_test_mod,
+    };
+    const ordinary_test_options = b.addOptions();
+    ordinary_test_options.addOption(bool, "enabled", false);
+    const ordinary_test_options_module = ordinary_test_options.createModule();
+    const runtime_test_options = b.addOptions();
+    runtime_test_options.addOption(bool, "enabled", true);
+    const runtime_test_options_module = runtime_test_options.createModule();
+    const runtime_test_support = b.createModule(.{
+        .target = b.graph.host,
+        .root_source_file = b.path("src/runtime_test_support.zig"),
+        .imports = &.{
+            .{ .name = "aws-lambda", .module = test_runtime },
+        },
+    });
+    const runtime_test_step = b.step(
+        "test-runtime",
+        "Run loopback Lambda runtime integration tests",
+    );
+    for (runtime_test_modules) |source| {
+        source.addImport("runtime_test_options", ordinary_test_options_module);
+        const module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .root_source_file = source.root_source_file,
+            .single_threaded = false,
+        });
+        var imports = source.import_table.iterator();
+        while (imports.next()) |entry| {
+            module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        }
+        module.addImport("runtime_test_options", runtime_test_options_module);
+        module.addImport("runtime_test_support", runtime_test_support);
+        const runtime_tests = b.addTest(.{
+            .root_module = module,
+            .filters = &.{"runtime integration:"},
+        });
+        const run_runtime_tests = b.addRunArtifact(runtime_tests);
+        // Socket tests must execute even when their compiled artifacts are cached.
+        run_runtime_tests.has_side_effects = true;
+        runtime_test_step.dependOn(&run_runtime_tests.step);
+    }
+
     const log_tests = b.addTest(.{ .root_module = host_outcome_log });
     const run_log_tests = b.addRunArtifact(log_tests);
     const test_step = b.step("test", "Run unit and integration tests");

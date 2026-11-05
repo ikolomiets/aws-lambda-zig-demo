@@ -16,6 +16,10 @@ pub const std_options: std.Options = .{
 };
 
 const Allocator = std.mem.Allocator;
+const runtime_tests_enabled = if (@import("builtin").is_test)
+    @import("runtime_test_options").enabled
+else
+    false;
 
 const bad_request_body = "Bad Request\n";
 const conflict_body = "Conflict\n";
@@ -1930,4 +1934,68 @@ test "intake matching completed retries log the saved outcome without publicatio
         try std.testing.expectEqualStrings(logging.result_type(&completion), record.result_type.?);
         try std.testing.expectEqual(@as(?u16, 200), record.http_status);
     }
+}
+
+test "runtime integration: authenticated intake persists and publishes through the event loop" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    const runtime = @import("runtime_test_support");
+    var tester: runtime.Tester = undefined;
+    var seen: runtime.Observations = .{};
+    defer seen.deinit();
+    const allocator = seen.arena.allocator();
+    const input =
+        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+        "\"name\":\"TigerBeetle\",\"body\":true}";
+    // The private handler uses the runtime clock, so fixed-time tokens are invalid here.
+    const token = try lambda_auth.testing.issue_token(allocator, .{
+        .seed_byte = 0x62,
+        .now = std.Io.Clock.real.now(std.testing.io).toSeconds(),
+        .ttl_seconds = 300,
+    });
+    const event = try test_authorization_request_event(
+        allocator,
+        .POST,
+        "Authorization",
+        "Bearer",
+        token,
+        input,
+    );
+    try tester.init(std.testing.allocator, &.{.{
+        .request_id = "intake-1",
+        .invocation_id = "intake-attempt-1",
+        .payload = event,
+    }});
+    defer tester.deinit();
+    try lambda_auth.testing.put_public_key(&tester.env_map, 0x62);
+    try tester.env_map.put("TigerBeetleQueue", test_queue_url);
+    var fake: FakeIntake = .{};
+    installRuntimeIntakeAdapter(IntakeAdapter.init(&fake));
+    defer uninstallRuntimeIntakeAdapter();
+
+    runtime.run(&tester, &seen, .{}, handler);
+
+    try runtime.expect_protocol(&tester, &seen);
+    try tester.expectPath(0, "/2018-06-01/runtime/invocation/intake-1/response");
+    const output = try runtime.http_body(allocator, &tester, 0, 200);
+    try std.testing.expectEqualStrings("SUBMITTED", output.object.get("state").?.string);
+    try std.testing.expectEqualStrings(
+        "00112233-4455-6677-8899-aabbccddeeff",
+        output.object.get("id").?.string,
+    );
+    try std.testing.expectEqualStrings("lambda-test-user", output.object.get("tenant").?.string);
+    try std.testing.expectEqualStrings("TigerBeetle", output.object.get("name").?.string);
+    try std.testing.expectEqual(fake.last_updated.?, output.object.get("last_updated").?.integer);
+    try std.testing.expectEqual(fake.last_expires_at.?, output.object.get("expires_at").?.integer);
+    const expected_hash = std.fmt.bytesToHex(fake.last_hash.?, .lower);
+    try std.testing.expectEqualStrings(&expected_hash, output.object.get("hash").?.string);
+    try std.testing.expectEqual(@as(u8, 1), fake.create_count);
+    try std.testing.expectEqual(@as(u8, 1), fake.send_count);
+    try std.testing.expectEqualStrings(test_queue_url, fake.lastQueueURL());
+    try std.testing.expectEqualStrings("true", fake.lastBody());
+    const message = try processor_message.decode(allocator, fake.lastMessage());
+    try std.testing.expectEqual(fake.last_id, message.operation_id);
+    try std.testing.expectEqualStrings(fake.lastTenant(), message.tenant);
+    try std.testing.expect(message.body.bool);
+    try std.testing.expect(message.context == .null);
+    try std.testing.expectEqual(null, message.result_queue);
 }

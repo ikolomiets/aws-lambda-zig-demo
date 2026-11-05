@@ -20,6 +20,10 @@ pub const std_options: std.Options = .{
 };
 
 const Allocator = std.mem.Allocator;
+const runtime_tests_enabled = if (@import("builtin").is_test)
+    @import("runtime_test_options").enabled
+else
+    false;
 const record_count_max = 1;
 
 comptime {
@@ -635,4 +639,77 @@ test "invalid completion envelopes log an error without claiming or persisting a
     try std.testing.expectEqualStrings("envelope_decode", record.stage);
     try std.testing.expectEqual(logging.Level.ERROR, record.level);
     try std.testing.expect(record.result_type == null);
+}
+
+test "runtime integration: Completion retries a transient write then acknowledges durable success" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    const runtime = @import("runtime_test_support");
+    var seen: runtime.Observations = .{};
+    defer seen.deinit();
+    const allocator = seen.arena.allocator();
+    const Store = struct {
+        allocator: Allocator,
+        calls: u8 = 0,
+        saved_id: ?u128 = null,
+        saved_result: []const u8 = "",
+        saved_time: operation.UnixSeconds = 0,
+
+        fn completeById(
+            self: *@This(),
+            _: Allocator,
+            id: u128,
+            completion: *const operation.Completion,
+            now: operation.UnixSeconds,
+        ) !void {
+            std.debug.assert(self.calls < 2);
+            self.calls += 1;
+            if (self.calls == 1) return error.AWSFailure;
+            var buffer: [operation.result_size_max]u8 = undefined;
+            self.saved_result = try self.allocator.dupe(
+                u8,
+                try operation.writeCompletionJSON(&buffer, completion),
+            );
+            self.saved_id = id;
+            self.saved_time = now;
+        }
+    };
+    const input = "{\"operation_id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\"," ++
+        "\"context\":null,\"body\":{\"create_accounts\":[{\"error_code\":\"created\"}]," ++
+        "\"create_transfers\":[],\"lookup_accounts\":[]}}";
+    const event = try testEvent(allocator, &.{input});
+    var tester: runtime.Tester = undefined;
+    try tester.init(std.testing.allocator, &.{
+        .{
+            .request_id = "completion-1",
+            .payload = event,
+            .invocation_id = "write-attempt-1",
+            .xray_trace = "write-trace-1",
+        },
+        .{
+            .request_id = "completion-2",
+            .payload = event,
+            .invocation_id = "write-attempt-2",
+            .xray_trace = "write-trace-2",
+        },
+    });
+    defer tester.deinit();
+    var store: Store = .{ .allocator = allocator };
+    installRuntimeCompletionPersistence(CompletionPersistence.init(&store));
+    defer uninstallRuntimeCompletionPersistence();
+
+    runtime.run(&tester, &seen, .{}, handler);
+
+    try runtime.expect_protocol(&tester, &seen);
+    try tester.expectPath(0, "/2018-06-01/runtime/invocation/completion-1/response");
+    try tester.expectBody(0, "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}");
+    try tester.expectPath(1, "/2018-06-01/runtime/invocation/completion-2/response");
+    try tester.expectBody(1, "{\"batchItemFailures\":[]}");
+    try std.testing.expectEqual(@as(u8, 2), store.calls);
+    try std.testing.expectEqual(try operation.uuidFromString(test_uuid), store.saved_id.?);
+    try std.testing.expect(store.saved_time > 0);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"SUCCESS\",\"payload\":{\"create_accounts\":[{\"error_code\":\"created\"}]," ++
+            "\"create_transfers\":[],\"lookup_accounts\":[]}}",
+        store.saved_result,
+    );
 }

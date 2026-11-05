@@ -387,6 +387,17 @@ imports, including `lambda_test_mod`, `query_test_mod`,
 The existing `zig build test-tigerbeetle-processor` target selects these tests;
 `zig build test` also includes them.
 
+`zig build test-runtime --system zig-pkg` separately exercises the real Lambda
+event loop and private handlers against a fake Runtime API on loopback. Its
+executor cases verify whole-invocation error reporting and recovery, and partial
+acknowledgements after publication failure. Its Completion case verifies retry
+after a transient persistence failure and acknowledgement after a successful
+write. The same target covers intake and warm query invocations, including
+runtime metadata refresh. External effects are mocked and cloud resource
+initialization is bypassed. These socket-based tests require loopback permission
+and are excluded from `zig build test`; see the
+[runtime check guide](agents/local-checks.md#runtime-integration-checks).
+
 Locate the test, helper callers, and host wiring by symbols before reading their
 surrounding declarations:
 
