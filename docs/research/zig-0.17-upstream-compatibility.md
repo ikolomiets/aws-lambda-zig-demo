@@ -7,7 +7,7 @@ compiler remains Zig 0.16.0. `.tigerbeetle_c_artifacts` is excluded.
 
 The current pins are maintained in [`build.zig.zon`](../../build.zig.zon).
 The PASETO assessment here covers the earlier `ikolomiets/zig-paseto` 1.1.6
-revision; it does not assess the current `deatil/zig-paseto` 1.2.3 pin or its
+revision; it does not assess the current `deatil/zig-paseto` pin or its
 transitive `zig-rsa` dependency on Zig 0.17.0.
 
 **The baseline dependency pins are not compatible with Zig 0.17.0 unchanged.**
