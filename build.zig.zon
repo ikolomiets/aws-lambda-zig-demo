@@ -41,8 +41,8 @@
             .hash = "aws_sdk-0.0.1-ApQSL17Y_xOC5IhLm247KBZKDcbCRU3qf7GiiiRHcrND",
         },
         .aws_lambda = .{
-            .url = "git+https://github.com/ikolomiets/aws-lambda-zig?ref=agent/fix-sqs-review-findings#e3b15bf9b820ba0ad16be50e7d988bb114800c72",
-            .hash = "aws_lambda-0.6.1-AMNperBSAgB3pq0PRvzPA-wbtTTFp5MbNAS7Y33CZ62d",
+            .url = "git+https://github.com/ikolomiets/aws-lambda-zig?ref=sqs-event-source-mapping#63ac8ac0c3004dc12bb8343f65b47a1a57662a33",
+            .hash = "aws_lambda-0.7.0-AMNpesEoAwDa91JxDMLcOjcmZp6Rhmatg3dDOp4KkVMv",
         },
         .zig_paseto = .{
             .url = "git+https://github.com/deatil/zig-paseto?ref=v1.2.5#74a5b912497f8f020f004ad9e653edc0137b349b",
