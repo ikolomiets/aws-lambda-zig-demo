@@ -271,7 +271,7 @@ Resources:
     Properties:
       FunctionName: !Ref IntakeFunctionName
       Description: Authenticated operation intake function built with aws-lambda-zig.
-      CodeUri: intake-lambda.zip
+      CodeUri: zig-out/packages/intake-lambda.zip
       Runtime: provided.al2023
       Handler: bootstrap
       Architectures:
@@ -330,7 +330,7 @@ Resources:
     Properties:
       FunctionName: !Ref QueryFunctionName
       Description: Authenticated tenant-scoped operation query built with aws-lambda-zig.
-      CodeUri: query-lambda.zip
+      CodeUri: zig-out/packages/query-lambda.zip
       Runtime: provided.al2023
       Handler: bootstrap
       Architectures:
@@ -437,7 +437,7 @@ Resources:
     Properties:
       FunctionName: !Ref TigerBeetleProcessorName
       Description: SQS-driven TigerBeetle processor built with aws-lambda-zig.
-      CodeUri: tiger-beetle-processor.zip
+      CodeUri: zig-out/packages/tiger-beetle-processor.zip
       Runtime: provided.al2023
       Handler: bootstrap
       Architectures:
@@ -515,7 +515,7 @@ Resources:
     Properties:
       FunctionName: !Ref TigerBeetleCompletionProcessorName
       Description: SQS-driven Completion processor built with aws-lambda-zig.
-      CodeUri: tiger-beetle-completion-processor.zip
+      CodeUri: zig-out/packages/tiger-beetle-completion-processor.zip
       Runtime: provided.al2023
       Handler: bootstrap
       Architectures:
@@ -543,7 +543,7 @@ Resources:
     Properties:
       FunctionName: !Ref SeatReservationProcessorName
       Description: SQS-driven seat submission without native linkage or VPC attachment.
-      CodeUri: seat-reservation-processor.zip
+      CodeUri: zig-out/packages/seat-reservation-processor.zip
       Runtime: provided.al2023
       Handler: bootstrap
       Architectures: [arm64]
@@ -596,7 +596,7 @@ Resources:
     Properties:
       FunctionName: !Ref SeatReservationCompletionProcessorName
       Description: SQS-driven seat finalization with atomic Event and Operation updates.
-      CodeUri: seat-reservation-completion-processor.zip
+      CodeUri: zig-out/packages/seat-reservation-completion-processor.zip
       Runtime: provided.al2023
       Handler: bootstrap
       Architectures: [arm64]

@@ -409,6 +409,22 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&install_tiger_beetle_processor.step);
 
+    const package = b.step("package", "Install executables and package all six Lambda archives");
+    package.dependOn(b.getInstallStep());
+    const lambda_packages = .{
+        .{ intake_lambda_exe, "intake-lambda.zip" },
+        .{ query_lambda_exe, "query-lambda.zip" },
+        .{ tiger_beetle_processor_exe, "tiger-beetle-processor.zip" },
+        .{ tiger_beetle_completion_processor_exe, "tiger-beetle-completion-processor.zip" },
+        .{ seat_submission_lambda, "seat-reservation-processor.zip" },
+        .{ seat_completion_lambda, "seat-reservation-completion-processor.zip" },
+    };
+    inline for (lambda_packages) |entry| {
+        const archive = lambda.addPackageStep(b, entry[0]);
+        const install_archive = b.addInstallFile(archive, "packages/" ++ entry[1]);
+        package.dependOn(&install_archive.step);
+    }
+
     const host_aws_sdk = b.dependency("aws_sdk", .{
         .target = b.graph.host,
         .optimize = optimize,
@@ -935,6 +951,8 @@ pub fn build(b: *std.Build) void {
     gateway_interface_test.addFileArg(
         b.path("tests/deploy_gateway_interface_test.sh"),
     );
+    const packaging_test = b.addSystemCommand(&.{"bash"});
+    packaging_test.addFileArg(b.path("tests/deploy_packaging_test.sh"));
 
     const processor_interface_test = b.addSystemCommand(&.{"bash"});
     processor_interface_test.addFileArg(b.path("tests/processor_interface_test.sh"));
@@ -952,6 +970,7 @@ pub fn build(b: *std.Build) void {
     deploy_test_step.dependOn(&wireguard_discovery_test.step);
     deploy_test_step.dependOn(&cleanup_lifecycle_test.step);
     deploy_test_step.dependOn(&gateway_interface_test.step);
+    deploy_test_step.dependOn(&packaging_test.step);
     deploy_test_step.dependOn(&processor_interface_test.step);
     deploy_test_step.dependOn(&seat_scenarios_test.step);
     deploy_test_step.dependOn(&events_wrapper_test.step);

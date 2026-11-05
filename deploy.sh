@@ -1122,33 +1122,19 @@ validate_lambda_bootstraps() {
     printf '%s\n' "$tiger_beetle_processor_artifact_type"
 }
 
-package_lambda_archives() {
+validate_lambda_archives() {
     local archive archive_contents
 
-    rm -f \
-        intake-lambda.zip \
-        query-lambda.zip \
-        tiger-beetle-processor.zip \
-        tiger-beetle-completion-processor.zip \
-        seat-reservation-processor.zip \
-        seat-reservation-completion-processor.zip
-    zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
-    zip -qj query-lambda.zip zig-out/bin/query/bootstrap
-    zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
-    zip -qj tiger-beetle-completion-processor.zip zig-out/bin/tiger_beetle_completion_processor/bootstrap
-    zip -qj seat-reservation-processor.zip zig-out/bin/seat_reservation_processor/bootstrap
-    zip -qj seat-reservation-completion-processor.zip zig-out/bin/seat_reservation_completion_processor/bootstrap
-
     for archive in \
-        intake-lambda.zip \
-        query-lambda.zip \
-        tiger-beetle-processor.zip \
-        tiger-beetle-completion-processor.zip \
-        seat-reservation-processor.zip \
-        seat-reservation-completion-processor.zip
+        zig-out/packages/intake-lambda.zip \
+        zig-out/packages/query-lambda.zip \
+        zig-out/packages/tiger-beetle-processor.zip \
+        zig-out/packages/tiger-beetle-completion-processor.zip \
+        zig-out/packages/seat-reservation-processor.zip \
+        zig-out/packages/seat-reservation-completion-processor.zip
     do
         [ -s "$archive" ] || fail "$archive was not created or is empty"
-        archive_contents="$(unzip -Z1 "$archive")"
+        archive_contents="$(unzip -Z1 "$archive")" || fail "could not read $archive"
         [ "$archive_contents" = bootstrap ] ||
             fail "$archive must contain only a root-level bootstrap"
     done
@@ -1205,7 +1191,6 @@ run_deployment() {
     fi
 
     need_command zig
-    need_command zip
     need_command unzip
     need_command file
     need_command sam
@@ -1250,14 +1235,14 @@ run_deployment() {
     printf '==> Removing obsolete root Lambda bootstrap\n'
     rm -f zig-out/bin/bootstrap
 
-    printf '==> Building Linux ARM64 Lambda bootstraps\n'
-    zig build "${ZIG_BUILD_ARGS[@]}" --release -Darch=arm
+    printf '==> Building and packaging Linux ARM64 Lambda bootstraps\n'
+    zig build package "${ZIG_BUILD_ARGS[@]}" --release -Darch=arm
 
     validate_lambda_bootstraps
     [ ! -e zig-out/bin/bootstrap ] || fail "obsolete zig-out/bin/bootstrap was recreated"
 
-    printf '==> Refreshing Lambda zip archives\n'
-    package_lambda_archives
+    printf '==> Validating Lambda zip archives\n'
+    validate_lambda_archives
 
     if [ "$DEV" -eq 0 ]; then
         printf '==> Validating SAM template\n'

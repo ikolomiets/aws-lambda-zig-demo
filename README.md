@@ -121,23 +121,27 @@ intake/query/tiger-beetle-completion-processor: ELF 64-bit LSB executable, ARM a
 tiger-beetle-processor:           ELF 64-bit LSB executable, ARM aarch64, dynamically linked, stripped
 ```
 
-Package the executables for Lambda when preparing artifacts manually (`deploy.sh` does this
-automatically):
+Build and package all six Lambdas explicitly when preparing deployment artifacts
+(`deploy.sh` runs this target automatically):
 
 ```sh
-rm -f intake-lambda.zip query-lambda.zip tiger-beetle-processor.zip \
-  tiger-beetle-completion-processor.zip seat-reservation-processor.zip \
-  seat-reservation-completion-processor.zip
-zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
-zip -qj query-lambda.zip zig-out/bin/query/bootstrap
-zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
-zip -qj tiger-beetle-completion-processor.zip zig-out/bin/tiger_beetle_completion_processor/bootstrap
-zip -qj seat-reservation-processor.zip zig-out/bin/seat_reservation_processor/bootstrap
-zip -qj seat-reservation-completion-processor.zip zig-out/bin/seat_reservation_completion_processor/bootstrap
+zig build package --release -Darch=arm
 ```
 
-All six zip archives are intentionally ignored by Git because they are generated
-deployment artifacts.
+This target installs the existing executables and creates:
+
+```text
+zig-out/packages/intake-lambda.zip
+zig-out/packages/query-lambda.zip
+zig-out/packages/tiger-beetle-processor.zip
+zig-out/packages/tiger-beetle-completion-processor.zip
+zig-out/packages/seat-reservation-processor.zip
+zig-out/packages/seat-reservation-completion-processor.zip
+```
+
+Each archive contains only its handler's executable root-level `bootstrap`.
+Ordinary builds and the offline test suite do not create or refresh ZIPs.
+All six archives are ignored by Git as generated deployment artifacts.
 
 ## PASETO Authentication
 

@@ -152,15 +152,16 @@ test_deployed_function_name_outputs() (
 )
 
 test_six_lambda_artifacts() (
-    local artifact_tmp artifact_output expected_file_calls expected_zip_calls
+    local artifact_tmp artifact_output expected_file_calls expected_archive_calls
 
     artifact_tmp="$(mktemp -d "${TMPDIR:-/tmp}/deploy-artifact-test.XXXXXX")"
     trap 'rm -rf -- "$artifact_tmp"' EXIT
     cd "$artifact_tmp"
     MOCK_FILE_CALLS="$artifact_tmp/file-calls.log"
-    MOCK_ZIP_CALLS="$artifact_tmp/zip-calls.log"
+    MOCK_ARCHIVE_CALLS="$artifact_tmp/archive-calls.log"
     : >"$MOCK_FILE_CALLS"
-    : >"$MOCK_ZIP_CALLS"
+    : >"$MOCK_ARCHIVE_CALLS"
+    mkdir -p zig-out/packages
     for archive in \
         intake-lambda.zip \
         query-lambda.zip \
@@ -169,7 +170,7 @@ test_six_lambda_artifacts() (
         seat-reservation-processor.zip \
         seat-reservation-completion-processor.zip
     do
-        printf 'stale archive\n' >"$archive"
+        printf 'mock archive\n' >"zig-out/packages/$archive"
     done
 
     file() {
@@ -190,24 +191,19 @@ test_six_lambda_artifacts() (
             *) fail_test "unexpected artifact validation path: $1" ;;
         esac
     }
-    zip() {
-        [ "$#" -eq 3 ] && [ "$1" = -qj ] ||
-            fail_test "unexpected mocked zip invocation: $*"
-        [ ! -e "$2" ] || fail_test "stale archive was not removed: $2"
-        printf '%s|%s\n' "$2" "$3" >>"$MOCK_ZIP_CALLS"
-        printf 'mock archive\n' >"$2"
-    }
     unzip() {
         [ "$#" -eq 2 ] && [ "$1" = -Z1 ] ||
             fail_test "unexpected mocked unzip invocation: $*"
         [ -s "$2" ] || fail_test "archive validation received an empty file: $2"
-        printf 'bootstrap\n'
+        printf '%s\n' "$2" >>"$MOCK_ARCHIVE_CALLS"
+        printf '%s\n' "${MOCK_ARCHIVE_CONTENTS-bootstrap}"
+        return "${MOCK_UNZIP_STATUS:-0}"
     }
 
     artifact_output="$(validate_lambda_bootstraps)" ||
         fail_test "six-bootstrap artifact validation failed"
     assert_contains "$artifact_output" "zig-out/bin/tiger_beetle_completion_processor/bootstrap"
-    package_lambda_archives
+    validate_lambda_archives
 
     expected_file_calls='zig-out/bin/intake/bootstrap
 zig-out/bin/query/bootstrap
@@ -217,14 +213,40 @@ zig-out/bin/seat_reservation_completion_processor/bootstrap
 zig-out/bin/tiger_beetle_processor/bootstrap'
     [ "$(<"$MOCK_FILE_CALLS")" = "$expected_file_calls" ] ||
         fail_test "bootstrap validation did not retain the six expected paths"
-    expected_zip_calls='intake-lambda.zip|zig-out/bin/intake/bootstrap
-query-lambda.zip|zig-out/bin/query/bootstrap
-tiger-beetle-processor.zip|zig-out/bin/tiger_beetle_processor/bootstrap
-tiger-beetle-completion-processor.zip|zig-out/bin/tiger_beetle_completion_processor/bootstrap
-seat-reservation-processor.zip|zig-out/bin/seat_reservation_processor/bootstrap
-seat-reservation-completion-processor.zip|zig-out/bin/seat_reservation_completion_processor/bootstrap'
-    [ "$(<"$MOCK_ZIP_CALLS")" = "$expected_zip_calls" ] ||
-        fail_test "packaging did not retain the six expected archive mappings"
+    expected_archive_calls='zig-out/packages/intake-lambda.zip
+zig-out/packages/query-lambda.zip
+zig-out/packages/tiger-beetle-processor.zip
+zig-out/packages/tiger-beetle-completion-processor.zip
+zig-out/packages/seat-reservation-processor.zip
+zig-out/packages/seat-reservation-completion-processor.zip'
+    [ "$(<"$MOCK_ARCHIVE_CALLS")" = "$expected_archive_calls" ] ||
+        fail_test "validation did not retain the six expected archive paths"
+
+    for archive in zig-out/packages/*.zip; do
+        rm "$archive"
+        if artifact_output="$(validate_lambda_archives 2>&1)"; then
+            fail_test "missing archive was accepted: $archive"
+        fi
+        assert_contains "$artifact_output" "$archive was not created or is empty"
+        : >"$archive"
+        if artifact_output="$(validate_lambda_archives 2>&1)"; then
+            fail_test "empty archive was accepted: $archive"
+        fi
+        assert_contains "$artifact_output" "$archive was not created or is empty"
+        printf 'mock archive\n' >"$archive"
+    done
+    for MOCK_ARCHIVE_CONTENTS in '' nested/bootstrap $'bootstrap\nextra' $'bootstrap\nbootstrap'; do
+        if artifact_output="$(validate_lambda_archives 2>&1)"; then
+            fail_test "unexpected archive contents were accepted: $MOCK_ARCHIVE_CONTENTS"
+        fi
+        assert_contains "$artifact_output" "must contain only a root-level bootstrap"
+    done
+    MOCK_ARCHIVE_CONTENTS=bootstrap
+    MOCK_UNZIP_STATUS=1
+    if artifact_output="$(validate_lambda_archives 2>&1)"; then
+        fail_test "unreadable archive was accepted"
+    fi
+    assert_contains "$artifact_output" "could not read zig-out/packages/intake-lambda.zip"
 )
 
 test_setup_action_parsing() (

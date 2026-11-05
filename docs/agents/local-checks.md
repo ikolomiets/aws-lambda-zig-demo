@@ -48,7 +48,11 @@ with that directory in each command. Relative paths resolve from the checkout.
 Build-cache environment settings such as `ZIG_LOCAL_CACHE_DIR` and
 `ZIG_GLOBAL_CACHE_DIR` still apply. Provisioning does not upgrade dependency pins.
 The patched sibling Zig standard library is a separate Lambda-build prerequisite;
-the offline sequence does not build deployable Lambdas or refresh zip packages.
+the offline sequence does not build deployable Lambdas or refresh ZIP packages.
+Ordinary builds also leave ZIPs untouched. When deployable packages are requested,
+use the explicit `package` check below and follow the
+[packaging procedure](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#2-build-and-package-the-zig-lambdas)
+for archive filenames and validation.
 
 ## Select checks by affected behavior
 
@@ -70,6 +74,7 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | `zig build test-tigerbeetle-c-abi-linux test-tigerbeetle-wrapper-linux` | Compile ARM64 glibc Linux ABI and wrapper tests; does not execute them |
 | `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` | Live native integration tests against the separately authorized local development replica; establishes no AWS behavior |
 | `zig build --release -Darch=arm` | Stripped ReleaseSafe ARM64 Lambda bootstraps and host CLI tools; requires the [patched sibling Zig library](../../AGENTS.md#build-and-validation). Building does not refresh zip packages; use the [packaging procedure](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#2-build-and-package-the-zig-lambdas) when deployable packages are requested. |
+| `zig build package --release -Darch=arm` | Install the existing executables and create the six Lambda ZIPs under `zig-out/packages/`; requires the same patched sibling Zig library as the Lambda build. |
 | `sam validate --template-file template.yaml --region ca-central-1` | SAM template validation when the template changes; requires SAM CLI |
 | `sam validate --lint --template-file template.yaml --region ca-central-1` | Stricter SAM template validation; requires SAM CLI with lint support |
 

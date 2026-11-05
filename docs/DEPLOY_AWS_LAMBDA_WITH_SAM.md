@@ -40,15 +40,15 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 ## Assumptions
 
 - AWS CLI v2 and SAM CLI are installed.
-- `zip`, `unzip`, and `file` are installed for package validation.
+- `unzip` and `file` are installed for package validation. Zig creates the ZIPs.
 - `jq` 1.6 or newer is installed for deployment guards, `lambda_logs.sh`, deployed seat scenarios, and shell regression tests.
 - Bash 3.2 or newer and curl are installed when running deployed seat scenarios.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
-- `intake-lambda.zip`, `query-lambda.zip`, `tiger-beetle-processor.zip`, and
-  `tiger-beetle-completion-processor.zip` each contain one Linux ARM64 executable named
-  `bootstrap`.
+- The six archives under `zig-out/packages/` listed in
+  [the packaging procedure](#2-build-and-package-the-zig-lambdas) each contain
+  one Linux ARM64 executable named `bootstrap`.
 - Both Lambda Function URLs are intentionally public for authenticated demo testing.
 - The fixed physical name `TigerBeetleQueue` permits only one such queue per AWS
   account and region; deploy only one stack using this template in that scope.
@@ -158,12 +158,12 @@ The deployment-helper tests mock AWS commands, so they require Bash and `jq`,
 with no AWS credentials or network access. `deploy.sh` invokes only `zig build test`,
 which includes these tests exactly once.
 
-Build the stripped ReleaseSafe Lambda executables for AWS Lambda ARM64. ARM64
-is also the project build default; `-Darch=arm` keeps the deployment command
-explicit.
+Build and package the stripped ReleaseSafe Lambda executables for AWS Lambda
+ARM64. ARM64 is also the project build default; `-Darch=arm` keeps the deployment
+command explicit.
 
 ```sh
-zig build --release -Darch=arm
+zig build package --release -Darch=arm
 ```
 
 The build also installs the host-native `paseto` utility and the local command
@@ -223,23 +223,26 @@ and `file` reports it as dynamically linked. Amazon Linux 2023 supplies the
 glibc loader and libraries; do not expect the TigerBeetle processor bootstrap to be
 static.
 
-Create or refresh all six packages. Remove old archives first so stale entries cannot survive.
+The explicit `package` target installs the existing executables and writes these
+six archives relative to the Zig installation prefix (`zig-out` by default):
 
-```sh
-rm -f intake-lambda.zip query-lambda.zip tiger-beetle-processor.zip \
-  tiger-beetle-completion-processor.zip seat-reservation-processor.zip \
-  seat-reservation-completion-processor.zip
-zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
-zip -qj query-lambda.zip zig-out/bin/query/bootstrap
-zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
-zip -qj tiger-beetle-completion-processor.zip zig-out/bin/tiger_beetle_completion_processor/bootstrap
-zip -qj seat-reservation-processor.zip zig-out/bin/seat_reservation_processor/bootstrap
-zip -qj seat-reservation-completion-processor.zip zig-out/bin/seat_reservation_completion_processor/bootstrap
+```text
+zig-out/packages/intake-lambda.zip
+zig-out/packages/query-lambda.zip
+zig-out/packages/tiger-beetle-processor.zip
+zig-out/packages/tiger-beetle-completion-processor.zip
+zig-out/packages/seat-reservation-processor.zip
+zig-out/packages/seat-reservation-completion-processor.zip
 ```
 
 For each archive, `unzip -Z1 <archive>` must print exactly `bootstrap`.
+`deploy.sh` runs the `package` target and validates each archive's presence,
+nonempty size, and single root-level entry after inspecting the bootstraps.
+Ordinary `zig build` and the offline test suite do not create or refresh ZIPs.
 
-SAM reads the packages from the matching `CodeUri` properties in `template.yaml`.
+SAM reads these paths from the matching `CodeUri` properties in `template.yaml`.
+The previous root-level archives with the same filenames are unused. Their
+removal remains manual; neither the build nor the deployment helper deletes them.
 
 ### Deferred TigerBeetle processor cold-start acceptance
 
@@ -1547,11 +1550,12 @@ Development mode retains `.zig-cache-dev` and `.zig-global-cache-dev` across
 successful and failed runs; ordinary deployment does not delete these caches.
 It checks Zig 0.16.0 and the required sibling standard library, runs the existing
 complete `fmt-check` target, and incrementally builds the same ARM64 ReleaseSafe
-targets and host tools. The sibling file check does not verify the hostname workaround;
+targets and host tools through `zig build package`, using the selected caches
+and any package forks. The sibling file check does not verify the hostname workaround;
 see the [hostname-connect note](ZIG_0_16_HOSTNAME_CONNECT_STALL.md). It refreshes
-all six prebuilt ZIPs and verifies stripped ARM64 bootstraps and root-level
-archive contents. It skips the full suite and both SAM validation passes. Build,
-package, and sync failures fail the run.
+all six prebuilt ZIPs under `zig-out/packages/` and verifies stripped ARM64
+bootstraps and root-level archive contents. It skips the full suite and both SAM
+validation passes. Build, package, and sync failures fail the run.
 
 After SSO login and the active-stack guard, the helper runs one-shot
 `sam sync --code --no-watch --no-dependency-layer` against `template.yaml`, using
@@ -2944,16 +2948,7 @@ instead report `sqs: AWS request failed`.
 After changing Zig source code, rebuild and repackage:
 
 ```sh
-zig build --release -Darch=arm
-rm -f intake-lambda.zip query-lambda.zip tiger-beetle-processor.zip \
-  tiger-beetle-completion-processor.zip seat-reservation-processor.zip \
-  seat-reservation-completion-processor.zip
-zip -qj intake-lambda.zip zig-out/bin/intake/bootstrap
-zip -qj query-lambda.zip zig-out/bin/query/bootstrap
-zip -qj tiger-beetle-processor.zip zig-out/bin/tiger_beetle_processor/bootstrap
-zip -qj tiger-beetle-completion-processor.zip zig-out/bin/tiger_beetle_completion_processor/bootstrap
-zip -qj seat-reservation-processor.zip zig-out/bin/seat_reservation_processor/bootstrap
-zip -qj seat-reservation-completion-processor.zip zig-out/bin/seat_reservation_completion_processor/bootstrap
+zig build package --release -Darch=arm
 ```
 
 Then redeploy the stack:
