@@ -1197,9 +1197,7 @@ run_deployment() {
     if [ "$DRY_RUN" -eq 0 ] && [ "$CHECK_URL" -eq 1 ]; then
         need_command curl
     fi
-    [ "$(zig version)" = 0.16.0 ] || fail "Lambda builds require Zig 0.16.0"
-    [ -f ../zig/lib/std/Io/net/HostName.zig ] ||
-        fail "required sibling Zig standard library missing: ../zig/lib/std/Io/net/HostName.zig"
+    [[ "$(zig version)" == 0.17.* ]] || fail "Lambda builds require Zig 0.17.x"
 
     LOCAL_FORKS=()
     if [ "$USE_LOCAL_LIBS" -eq 1 ]; then
@@ -1212,10 +1210,7 @@ run_deployment() {
         LOCAL_FORKS+=("$LOCAL_AWS_LAMBDA_ROOT")
     fi
 
-    ZIG_BUILD_ARGS=(
-        --cache-dir "$CACHE_DIR"
-        --global-cache-dir "$GLOBAL_CACHE_DIR"
-    )
+    ZIG_BUILD_ARGS=(--cache-dir "$CACHE_DIR")
     if [ "${#LOCAL_FORKS[@]}" -gt 0 ]; then
         printf '==> Using local Zig package forks\n'
         for path in "${LOCAL_FORKS[@]}"; do
@@ -1225,18 +1220,18 @@ run_deployment() {
     fi
 
     printf '==> Checking Zig formatting\n'
-    zig build fmt-check "${ZIG_BUILD_ARGS[@]}"
+    ZIG_GLOBAL_CACHE_DIR="$GLOBAL_CACHE_DIR" zig build fmt-check "${ZIG_BUILD_ARGS[@]}"
 
     if [ "$DEV" -eq 0 ]; then
         printf '==> Running Zig tests\n'
-        zig build test "${ZIG_BUILD_ARGS[@]}"
+        ZIG_GLOBAL_CACHE_DIR="$GLOBAL_CACHE_DIR" zig build test "${ZIG_BUILD_ARGS[@]}"
     fi
 
     printf '==> Removing obsolete root Lambda bootstrap\n'
     rm -f zig-out/bin/bootstrap
 
     printf '==> Building and packaging Linux ARM64 Lambda bootstraps\n'
-    zig build package "${ZIG_BUILD_ARGS[@]}" --release -Darch=arm
+    ZIG_GLOBAL_CACHE_DIR="$GLOBAL_CACHE_DIR" zig build package "${ZIG_BUILD_ARGS[@]}" --release -Darch=arm
 
     validate_lambda_bootstraps
     [ ! -e zig-out/bin/bootstrap ] || fail "obsolete zig-out/bin/bootstrap was recreated"

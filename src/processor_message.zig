@@ -308,12 +308,12 @@ test "trusted tenant and route enforce decoded UTF-8 byte bounds on every codec 
     const buffer = try allocator.alloc(u8, encoded_size_max);
     const cases = [_]struct { tenant: []const u8, route: ?[]const u8, failure: ?anyerror }{
         .{ .tenant = "a", .route = null, .failure = null },
-        .{ .tenant = "é" ** 32, .route = "\"" ** 2048, .failure = null },
+        .{ .tenant = std.mem.asBytes(&@as([32][2]u8, @splat("é".*))), .route = &@as([2048]u8, @splat('\"')), .failure = null },
         .{ .tenant = "", .route = null, .failure = error.InvalidTenant },
-        .{ .tenant = "é" ** 32 ++ "a", .route = null, .failure = error.InvalidTenant },
+        .{ .tenant = std.mem.asBytes(&@as([32][2]u8, @splat("é".*))) ++ "a", .route = null, .failure = error.InvalidTenant },
         .{ .tenant = "\xff", .route = null, .failure = error.InvalidTenant },
         .{ .tenant = "a", .route = "", .failure = error.InvalidResultQueue },
-        .{ .tenant = "a", .route = "é" ** 1024 ++ "a", .failure = error.InvalidResultQueue },
+        .{ .tenant = "a", .route = std.mem.asBytes(&@as([1024][2]u8, @splat("é".*))) ++ "a", .failure = error.InvalidResultQueue },
         .{ .tenant = "a", .route = "\xff", .failure = error.InvalidResultQueue },
         .{ .tenant = "a", .route = "a\n", .failure = error.InvalidResultQueue },
         .{ .tenant = "a", .route = "a\x7f", .failure = error.InvalidResultQueue },
@@ -353,13 +353,13 @@ test "decoded metadata rejects missing fields wrong types unknown and duplicate 
         prefix ++ "\"tenant\":null,\"context\":null}",
         prefix ++ "\"tenant\":42,\"context\":null}",
         prefix ++ "\"tenant\":\"\",\"context\":null}",
-        prefix ++ "\"tenant\":\"" ++ "a" ** 65 ++ "\",\"context\":null}",
+        prefix ++ "\"tenant\":\"" ++ &@as([65]u8, @splat('a')) ++ "\",\"context\":null}",
         prefix ++ "\"tenant\":\"a\",\"context\":null,\"\\u0074enant\":\"b\"}",
         prefix ++ "\"tenant\":\"a\",\"context\":null,\"\\u0063ontext\":null}",
         prefix ++ "\"tenant\":\"a\",\"context\":{\"a\":1,\"\\u0061\":2}}",
         prefix ++ "\"tenant\":\"a\",\"context\":null,\"hash\":null}",
         prefix ++ "\"tenant\":\"a\",\"context\":null,\"result_queue\":\"a\\u0000\"}",
-        prefix ++ "\"tenant\":\"a\",\"context\":null,\"result_queue\":\"" ++ "a" ** 2049 ++ "\"}",
+        prefix ++ "\"tenant\":\"a\",\"context\":null,\"result_queue\":\"" ++ &@as([2049]u8, @splat('a')) ++ "\"}",
         prefix ++ "\"tenant\":\"a\",\"context\":null,\"result_queue\":\"a\",\"result_\\u0071ueue\":\"b\"}",
     };
     for (invalid) |input| {
@@ -377,7 +377,7 @@ test "maximum escaped components fit the envelope and raw input has an independe
     const allocator = arena.allocator();
     const body: std.json.Value = .{ .string = try test_escaped_text(allocator, 98304) };
     const context: std.json.Value = .{ .string = try test_escaped_text(allocator, 4096) };
-    const message: Message = .{ .operation_id = std.math.maxInt(u128), .tenant = "\x00" ** 64, .body = body, .context = context, .result_queue = "\"" ** 2048 };
+    const message: Message = .{ .operation_id = std.math.maxInt(u128), .tenant = &@as([64]u8, @splat('\x00')), .body = body, .context = context, .result_queue = &@as([2048]u8, @splat('\"')) };
     const encoded = try encode(allocator, &message);
     // The envelope ceiling reserves six bytes per route byte, conservatively:
     // valid routes exclude the controls that need six-byte JSON escaping.

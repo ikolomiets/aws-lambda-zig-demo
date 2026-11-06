@@ -138,9 +138,9 @@ const ConnectFixture = struct {
         };
     }
 
-    fn net_close(userdata: ?*anyopaque, handles: []const net.Socket.Handle) void {
+    fn net_close(userdata: ?*anyopaque, sockets: []const net.Socket) void {
         const fixture = from_userdata(userdata);
-        assert(handles.len == 1);
-        _ = fixture.closed_streams.fetchAdd(handles.len, .release);
+        assert(sockets.len == 1);
+        _ = fixture.closed_streams.fetchAdd(sockets.len, .release);
     }
 };

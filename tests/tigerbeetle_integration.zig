@@ -1581,7 +1581,7 @@ test "Seat confirmation checks tenant event credit ledger and code before and af
     };
     holds[2].credit_account_id = foreign.allocation_account_id;
     holds[3].code = 3;
-    try expect_transfers(client, &holds, &([_]u32{transfer_created} ** 5));
+    try expect_transfers(client, &holds, &(@as([5]u32, @splat(transfer_created))));
     const statuses = [_][]const u8{
         "pending_transfer_has_different_credit_account_id",
         "pending_transfer_has_different_credit_account_id",

@@ -1360,8 +1360,8 @@ test "31 maximum classes pass real serialization admission before generated iden
     } };
     const options: AdmissionOptions = .{
         .operation_id = std.math.maxInt(u128),
-        .tenant = "\x00" ** 64,
-        .result_queue = "\"" ** 2048,
+        .tenant = &@as([64]u8, @splat('\x00')),
+        .result_queue = &@as([2048]u8, @splat('\"')),
     };
     const sizes = try admit(allocator, &command, null, &options);
     try std.testing.expect(sizes.public_body <= 4096);
@@ -1498,12 +1498,12 @@ fn expect_invalid_command(arena: Allocator, value: *const std.json.Value) !void 
 }
 
 test "tag byte boundaries permit distinct Unicode spellings and exclude every control" {
-    _ = try Tag.init("a" ** 54);
-    _ = try Tag.init("é" ** 27);
+    _ = try Tag.init(&@as([54]u8, @splat('a')));
+    _ = try Tag.init(std.mem.asBytes(&@as([27][2]u8, @splat("é".*))));
     _ = try Tag.init(" ");
     _ = try Tag.init("Capacity");
     _ = try Tag.init("\u{200d}");
-    for ([_][]const u8{ "", "a" ** 55, "é" ** 28, "capacity", "allocation", "\xff" }) |text| {
+    for ([_][]const u8{ "", &@as([55]u8, @splat('a')), std.mem.asBytes(&@as([28][2]u8, @splat("é".*))), "capacity", "allocation", "\xff" }) |text| {
         try std.testing.expectError(error.InvalidTag, Tag.init(text));
     }
     for (0..0xa0) |codepoint| {
@@ -1548,14 +1548,14 @@ test "raw and compact boundaries reject entire inputs without admitting prefixes
     const completion = try std.fmt.allocPrint(
         allocator,
         "{{\"type\":\"SUCCESS\",\"payload\":\"{s}\"}}",
-        .{"x" ** (98304 - 31)},
+        .{&@as([98304 - 31]u8, @splat('x'))},
     );
     try std.testing.expectEqual(@as(usize, 98304), completion.len);
     _ = try operation.parseCompletionJSON(allocator, completion);
     const too_large = try std.fmt.allocPrint(
         allocator,
         "{{\"type\":\"SUCCESS\",\"payload\":\"{s}\"}}",
-        .{"x" ** (98304 - 30)},
+        .{&@as([98304 - 30]u8, @splat('x'))},
     );
     try std.testing.expectError(
         error.ResultTooLarge,

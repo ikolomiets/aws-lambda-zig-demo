@@ -30,8 +30,8 @@ complete run.
 
 ## Host and package prerequisites
 
-Use an ARM64 macOS or ARM64 glibc Linux host, Zig **0.16.0**, Bash (tested with
-**3.2 and 5.3**), `jq`, and `find`.
+Use an ARM64 macOS or ARM64 glibc Linux host, Zig **0.17.x** (minimum **0.17.0**;
+validated with **0.17.1**), Bash (tested with **3.2 and 5.3**), `jq`, and `find`.
 The native TigerBeetle archive in the pinned packages targets glibc 2.27 or newer.
 
 Provision every pinned dependency from [build.zig.zon](../../build.zig.zon),
@@ -47,8 +47,12 @@ fetching. To use another already provisioned package directory, replace `zig-pkg
 with that directory in each command. Relative paths resolve from the checkout.
 Build-cache environment settings such as `ZIG_LOCAL_CACHE_DIR` and
 `ZIG_GLOBAL_CACHE_DIR` still apply. Provisioning does not upgrade dependency pins.
-The patched sibling Zig standard library is a separate Lambda-build prerequisite;
-the offline sequence does not build deployable Lambdas or refresh ZIP packages.
+Use the compiler's bundled standard library for tests and host tools. The
+TigerBeetle processor executable requires a compatible patched library at
+`../zig/lib` through its `build.zig` override; retain that sibling checkout for
+Lambda builds and packaging. See the
+[hostname-connect workaround](../ZIG_0_16_HOSTNAME_CONNECT_STALL.md#status).
+The offline sequence does not build deployable Lambdas or refresh ZIP packages.
 Ordinary builds also leave ZIPs untouched. When deployable packages are requested,
 use the explicit `package` check below and follow the
 [packaging procedure](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#2-build-and-package-the-zig-lambdas)
@@ -74,14 +78,40 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | `zig build test-tigerbeetle-c-abi` | Native C ABI smoke test on Apple Silicon macOS |
 | `zig build test-tigerbeetle-c-abi-linux test-tigerbeetle-wrapper-linux` | Compile ARM64 glibc Linux ABI and wrapper tests; does not execute them |
 | `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` | Live native integration tests against the separately authorized local development replica; establishes no AWS behavior |
-| `zig build --release -Darch=arm` | Stripped ReleaseSafe ARM64 Lambda bootstraps and host CLI tools; requires the [patched sibling Zig library](../../AGENTS.md#build-and-validation). Building does not refresh zip packages; use the [packaging procedure](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#2-build-and-package-the-zig-lambdas) when deployable packages are requested. |
-| `zig build package --release -Darch=arm` | Install the existing executables and create the six Lambda ZIPs under `zig-out/packages/`; requires the same patched sibling Zig library as the Lambda build. |
+| `zig build --release -Darch=arm` | Stripped ARM64 Lambda bootstraps in `safe` mode and host CLI tools; uses a compatible patched library at `../zig/lib` for the TigerBeetle processor and the bundled library for other targets. Building does not refresh zip packages; use the [packaging procedure](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#2-build-and-package-the-zig-lambdas) when deployable packages are requested. |
+| `zig build package --release -Darch=arm` | Install the existing executables and create the six Lambda ZIPs under `zig-out/packages/`; uses the same per-target libraries as the ordinary build. |
 | `sam validate --template-file template.yaml --region ca-central-1` | SAM template validation when the template changes; requires SAM CLI |
 | `sam validate --lint --template-file template.yaml --region ca-central-1` | Stricter SAM template validation; requires SAM CLI with lint support |
 
 For shell changes, run `bash -n` on each affected script. The
 [complete offline checks](#complete-offline-checks) cover all root entry points
 and recursive shell harnesses under `tests/`.
+
+## Socket access in agent sandboxes
+
+Keep formatting, ordinary builds, the complete offline checks, and mocked
+deployment-helper tests in the default sandbox.
+
+When the active agent sandbox restricts network access, request elevated
+execution on the first attempt for each of these socket-based commands:
+
+```sh
+zig build test-runtime --system zig-pkg
+TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle --system zig-pkg
+```
+
+Run each command in a separate tool call with
+`sandbox_permissions = "require_escalated"`. Explain the required access in
+the request: `test-runtime` binds a fake Runtime API to `127.0.0.1` on an
+operating-system-assigned port, with external effects mocked;
+`test-tigerbeetle` connects to and writes test data in the separately authorized
+local replica at `127.0.0.1:3000`. Keep that address explicit in the live command.
+Where supported, scope reusable approval prefixes to `zig build test-runtime`
+and `zig build test-tigerbeetle`, respectively.
+
+If socket access is denied or elevated execution is unavailable, report the
+affected suite as blocked by the environment and continue the unaffected
+checks. A sandbox denial is a validation gap, not a passing or skipped test.
 
 ## Runtime integration checks
 
@@ -105,7 +135,7 @@ resource initialization is bypassed; these tests establish no live AWS or
 TigerBeetle behavior. The seat processor tests retain their existing coverage.
 
 Host test wiring uses `sh`, `ln`, and `cp` to place a test facade beside a symlink
-to the active `aws_lambda` source directory in the build cache. It uses the same
+to the active `aws_lambda` source directory. It uses the same
 resolved dependency, including `--fork` overrides, without copying upstream
 sources. The four runtime test variants enable only cases prefixed
 `runtime integration:` and support multiple threads for the fake server.

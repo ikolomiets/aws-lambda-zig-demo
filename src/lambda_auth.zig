@@ -304,7 +304,7 @@ pub const testing = struct {
     }
 
     fn test_key_pair(seed_byte: u8) paseto.Ed25519.KeyPair {
-        const seed = [_]u8{seed_byte} ** paseto.Ed25519.KeyPair.seed_length;
+        const seed = @as([paseto.Ed25519.KeyPair.seed_length]u8, @splat(seed_byte));
         const key_pair = paseto.Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
         std.debug.assert(
             key_pair.secret_key.toBytes().len == paseto.Ed25519.SecretKey.encoded_length,

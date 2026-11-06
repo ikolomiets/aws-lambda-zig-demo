@@ -110,7 +110,7 @@ const RuntimeResources = struct {
         resources.* = undefined;
     }
 
-    fn create_observed(
+    pub fn create_observed(
         resources: *RuntimeResources,
         arena: Allocator,
         source: *const operation.Operation,
@@ -119,7 +119,7 @@ const RuntimeResources = struct {
         return resources.persistence.create_observed(arena, source, trace);
     }
 
-    fn send_observed(
+    pub fn send_observed(
         resources: *RuntimeResources,
         arena: Allocator,
         queue_url: []const u8,
@@ -162,7 +162,7 @@ const IntakeAdapter = struct {
                 trace: *const logging.Context,
             ) anyerror!operation.Operation {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                if (@hasDecl(pointer_info.pointer.child, "create_observed")) {
+                if (comptime @hasDecl(pointer_info.pointer.child, "create_observed")) {
                     return self.create_observed(allocator, source, trace);
                 }
                 return self.create(allocator, source);
@@ -176,7 +176,7 @@ const IntakeAdapter = struct {
                 trace: *const logging.Context,
             ) anyerror!void {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                if (@hasDecl(pointer_info.pointer.child, "send_observed")) {
+                if (comptime @hasDecl(pointer_info.pointer.child, "send_observed")) {
                     return self.send_observed(allocator, queue_url, message, trace);
                 }
                 return self.send(allocator, queue_url, message);
@@ -682,8 +682,8 @@ test "operation queue keys append Queue for routable names and reject invalid na
         try operation_queue_key("TigerBeetle", &buffer),
     );
     try std.testing.expectEqualStrings(
-        ("a" ** operation.name_size_max) ++ operation_queue_key_suffix,
-        try operation_queue_key("a" ** operation.name_size_max, &buffer),
+        (&@as([operation.name_size_max]u8, @splat('a'))) ++ operation_queue_key_suffix,
+        try operation_queue_key(&@as([operation.name_size_max]u8, @splat('a')), &buffer),
     );
     try std.testing.expectError(
         error.InvalidOperationName,
@@ -691,7 +691,7 @@ test "operation queue keys append Queue for routable names and reject invalid na
     );
     try std.testing.expectError(
         error.InvalidOperationName,
-        operation_queue_key("a" ** (operation.name_size_max + 1), &buffer),
+        operation_queue_key(&@as([operation.name_size_max + 1]u8, @splat('a')), &buffer),
     );
     try std.testing.expectError(
         error.InvalidOperationName,
@@ -782,7 +782,7 @@ test "POST rejects empty and oversized queue mappings before persistence" {
     defer std.testing.allocator.free(event);
     const invalid_urls = [_][]const u8{
         "",
-        "a" ** (sqs_queue.queue_url_size_max + 1),
+        &@as([sqs_queue.queue_url_size_max + 1]u8, @splat('a')),
     };
 
     for (invalid_urls) |queue_url| {
@@ -953,7 +953,7 @@ test "POST derives tenant and hash from distinct bounded verified subjects" {
     try lambda_auth.testing.put_public_key(&environment, 0x49);
     try put_test_queue_url(&environment, "echo");
     const subjects = [_][]const u8{
-        "a" ** lambda_auth.subject_size_max,
+        &@as([lambda_auth.subject_size_max]u8, @splat('a')),
         "tenant-b",
     };
     const input =
@@ -1837,8 +1837,8 @@ test "public intake preserves the 4 KiB cap and rejects internal routing metadat
     try put_test_queue_url(&environment, "echo");
     const prefix = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"name\":\"echo\",\"body\":";
     const cases = [_]struct { input: []const u8, accepted: bool }{
-        .{ .input = prefix ++ "\"" ++ "x" ** 4094 ++ "\"}", .accepted = true },
-        .{ .input = prefix ++ "\"" ++ "x" ** 4095 ++ "\"}", .accepted = false },
+        .{ .input = prefix ++ "\"" ++ &@as([4094]u8, @splat('x')) ++ "\"}", .accepted = true },
+        .{ .input = prefix ++ "\"" ++ &@as([4095]u8, @splat('x')) ++ "\"}", .accepted = false },
         .{ .input = prefix ++ "{},\"result_queue\":\"https://sqs.example.invalid/internal\"}", .accepted = false },
         .{ .input = prefix ++ "{},\"tenant\":\"spoofed\"}", .accepted = false },
         .{ .input = prefix ++ "{},\"context\":null}", .accepted = false },
@@ -1920,7 +1920,7 @@ test "intake matching completed retries log the saved outcome without publicatio
             .state = .{ .completed = completion },
             .last_updated = 1,
             .expires_at = 86401,
-            .hash = .{0} ** 32,
+            .hash = @splat(0),
         } };
         _ = try test_support.submit(arena, &.{
             .input = "{\"id\":\"00000000-0000-0000-0000-000000000001\",\"name\":\"TigerBeetle\",\"body\":null}",

@@ -58,20 +58,33 @@ to `global`; consumers requiring one sequence share both binding components. See
 
 ## Requirements for Zig on AWS Lambda
 
-- Zig 0.16.0 or newer within the supported 0.16.x line.
+- Zig 0.17.x (minimum 0.17.0), plus a compatible patched standard library at
+  `../zig/lib` for the TigerBeetle processor executable. Other targets use the bundled library.
 - AWS CLI v2 and AWS SAM CLI for the SAM deployment flow and stack queries.
 - `jq` for the Lambda log helper, deployed scenario runner, and shell regression tests.
 - Bash 3.2 or newer and curl for the deployed scenario runner.
 - An AWS profile with permission to create Lambda, IAM, and CloudFormation
   resources.
 
+The AWS SDK is pinned to upstream
+[`cloudboss/aws-sdk-zig` revision `993c5a06`](https://github.com/cloudboss/aws-sdk-zig/commit/993c5a06d72cd437a5d517db3f20b6be4e743c1f),
+which ports the SDK to Zig 0.17.0 and retains modeled AWS JSON error parsing.
+The Lambda runtime is pinned to
+[`ikolomiets/aws-lambda-zig` revision `1ad4902b`](https://github.com/ikolomiets/aws-lambda-zig/commit/1ad4902b5a9010612f73cb04f09c7079c830ce80)
+on `sqs-event-source-mapping-zig-0-17`.
+Local runtime forks must also support the selected Zig 0.17.x compiler. The standalone
+[hostname scheduling reproducer](docs/ZIG_0_16_HOSTNAME_CONNECT_STALL.md#standalone-deterministic-reproducer)
+checks the low-worker scheduling defect addressed by the processor's library
+override; see its current results and workaround prerequisites.
+
 The pinned `deatil/zig-paseto` 1.2.5 and its transitive `zig-rsa` dependency
-declare Zig 0.17.0 minimums. This project's v4.public integration and v4.local
-compatibility tests are verified on Zig 0.16.0; the full upstream API and test
-suite are outside that compatibility scope. The v4.public path uses the standard
-library's Ed25519 implementation. Both dependency revisions and content hashes
-are pinned, adding the upstream RSA package to the dependency maintenance and
-supply-chain review scope without adding RSA work to v4.public requests.
+declare a minimum of Zig 0.17.0. This project tests its v4.public integration
+and v4.local compatibility with Zig 0.17.1; the full upstream API and test suite
+are outside that scope.
+The v4.public path uses the standard library's Ed25519 implementation.
+Both dependency revisions and content hashes are pinned, adding the upstream
+RSA package to the dependency maintenance and supply-chain review scope without
+adding RSA work to v4.public requests.
 
 The deployment docs use:
 
@@ -86,7 +99,7 @@ Adjust those values for your AWS account as needed.
 
 ## Build the Lambda Stack
 
-Build the stripped ReleaseSafe Linux ARM64 Lambda executables:
+Build the stripped Linux ARM64 executables in `safe` mode:
 
 ```sh
 zig build --release -Darch=arm
@@ -791,7 +804,7 @@ network access. Run all Zig tests and deployment-helper regression tests with:
 zig build test
 ```
 
-When developing against a sibling checkout of `aws-lambda-zig`, keep
+When developing against a Zig 0.17-compatible sibling checkout of `aws-lambda-zig`, keep
 `build.zig.zon` pinned and override the dependency at build time:
 
 ```sh
@@ -823,7 +836,8 @@ Pass the same cache and fork options as the build being investigated. For exampl
 with alternate build caches or the existing sibling runtime checkout:
 
 ```sh
-zig build dependency-paths --cache-dir .zig-cache-dev --global-cache-dir .zig-global-cache-dev
+ZIG_GLOBAL_CACHE_DIR=.zig-global-cache-dev \
+  zig build dependency-paths --cache-dir .zig-cache-dev
 zig build dependency-paths --fork=../aws-lambda-zig
 ```
 

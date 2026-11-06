@@ -749,7 +749,7 @@ test "31 maximum escaped classes fit logical metadata and the pinned SDK typed i
         };
     }
     const event: seat.Event = .{
-        .tenant = "\x00" ** 64,
+        .tenant = &@as([64]u8, @splat('\x00')),
         .event_id = std.math.maxInt(u128),
         .ledger = std.math.maxInt(u32),
         .timeout_seconds = std.math.maxInt(u32),

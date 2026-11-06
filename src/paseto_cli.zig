@@ -479,8 +479,8 @@ test "subject validation enforces UTF-8 byte boundaries at the adapter" {
     try putPrivateKey(&environment, &key_pair.secret_key);
 
     const valid_subjects = [_][]const u8{
-        "a" ** paseto.subject_size_max,
-        "é" ** (paseto.subject_size_max / 2),
+        &@as([paseto.subject_size_max]u8, @splat('a')),
+        std.mem.asBytes(&@as([paseto.subject_size_max / 2][2]u8, @splat("é".*))),
     };
     for (valid_subjects) |subject| {
         const result = runForTest(
@@ -494,8 +494,8 @@ test "subject validation enforces UTF-8 byte boundaries at the adapter" {
 
     const invalid_subjects = [_][]const u8{
         "",
-        "a" ** (paseto.subject_size_max + 1),
-        ("é" ** (paseto.subject_size_max / 2)) ++ "a",
+        &@as([paseto.subject_size_max + 1]u8, @splat('a')),
+        (std.mem.asBytes(&@as([paseto.subject_size_max / 2][2]u8, @splat("é".*)))) ++ "a",
         "\xff",
     };
     for (invalid_subjects) |subject| {
@@ -550,7 +550,7 @@ test "verify bounds stdin to 16 KiB" {
     defer environment.deinit();
     try putPublicKey(&environment, key_pair.public_key);
 
-    const oversized = "a" ** (stdin_size_max + 1);
+    const oversized = &@as([stdin_size_max + 1]u8, @splat('a'));
     const result = runForTest(&.{ "paseto", "verify" }, oversized, &environment, 1000);
     try std.testing.expectEqual(@as(u8, 1), result.exit_code);
     try std.testing.expectEqualStrings("", result.stdout());
@@ -709,7 +709,7 @@ fn runForTest(
 }
 
 fn testKeyPair(seed_byte: u8) Ed25519.KeyPair {
-    const seed = [_]u8{seed_byte} ** Ed25519.KeyPair.seed_length;
+    const seed = @as([Ed25519.KeyPair.seed_length]u8, @splat(seed_byte));
     const key_pair = Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
     std.debug.assert(key_pair.secret_key.toBytes().len == Ed25519.SecretKey.encoded_length);
     std.debug.assert(key_pair.public_key.toBytes().len == Ed25519.PublicKey.encoded_length);

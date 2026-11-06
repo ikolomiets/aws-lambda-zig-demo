@@ -529,7 +529,7 @@ fn testOperation(tenant: []const u8, state_tag: operation.StateTag) operation.Op
         },
         .last_updated = 1_700_000_123,
         .expires_at = 1_700_086_523,
-        .hash = [_]u8{0xab} ** 32,
+        .hash = @as([32]u8, @splat(0xab)),
     };
 }
 
@@ -595,7 +595,7 @@ test "authenticated GET returns exact SUBMITTED operation JSON and canonicalizes
         "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
         "\\\"state\\\":\\\"SUBMITTED\\\",\\\"last_updated\\\":1700000123," ++
         "\\\"expires_at\\\":1700086523," ++
-        "\\\"hash\\\":\\\"" ++ ("ab" ** 32) ++ "\\\"}\"}";
+        "\\\"hash\\\":\\\"" ++ (std.mem.asBytes(&@as([32][2]u8, @splat("ab".*)))) ++ "\\\"}\"}";
     try std.testing.expectEqualStrings(expected, response);
     try std.testing.expectEqual(
         operation.uuidFromString("00112233-4455-6677-8899-aabbccddeeff") catch unreachable,
@@ -633,7 +633,7 @@ test "authenticated GET returns exact completed success and failure envelopes" {
         "\\\"state\\\":\\\"COMPLETED\\\",\\\"last_updated\\\":1700000123," ++
         "\\\"expires_at\\\":1700086523,\\\"result\\\":{" ++
         "\\\"type\\\":\\\"SUCCESS\\\",\\\"payload\\\":\\\"done\\\"}," ++
-        "\\\"hash\\\":\\\"" ++ ("ab" ** 32) ++ "\\\"}\"}";
+        "\\\"hash\\\":\\\"" ++ (std.mem.asBytes(&@as([32][2]u8, @splat("ab".*)))) ++ "\\\"}\"}";
     try std.testing.expectEqualStrings(expected, response);
 
     var failure = testOperation("lambda-test-user", .completed);
@@ -654,7 +654,7 @@ test "authenticated GET returns exact completed success and failure envelopes" {
         "\\\"state\\\":\\\"COMPLETED\\\",\\\"last_updated\\\":1700000123," ++
         "\\\"expires_at\\\":1700086523,\\\"result\\\":{" ++
         "\\\"type\\\":\\\"FAILURE\\\",\\\"payload\\\":\\\"done\\\"}," ++
-        "\\\"hash\\\":\\\"" ++ ("ab" ** 32) ++ "\\\"}\"}";
+        "\\\"hash\\\":\\\"" ++ (std.mem.asBytes(&@as([32][2]u8, @splat("ab".*)))) ++ "\\\"}\"}";
     try std.testing.expectEqualStrings(expected_failure, failure_response);
 }
 
@@ -1102,7 +1102,7 @@ test "malformed stored output and allocation failures remain sanitized" {
         .state = .submitted,
         .last_updated = 1000,
         .expires_at = 1001,
-        .hash = [_]u8{0} ** 32,
+        .hash = @as([32]u8, @splat(0)),
     };
     const outcome = operationOutputBody(std.testing.allocator, &invalid);
     try std.testing.expectError(error.InvalidExpiresAt, outcome);
@@ -1206,7 +1206,7 @@ test "authenticated query preserves full 96 KiB Result inside HTTP metadata fram
     });
     defer std.testing.allocator.free(event);
     var stored = testOperation("lambda-test-user", .completed);
-    const payload = "a" ** (98304 - 31);
+    const payload = &@as([98304 - 31]u8, @splat('a'));
     stored.state = .{ .completed = .{ .success = .{ .string = payload } } };
     var fake: FakeQuery = .{ .response = stored };
     const response = handleInvocationForTest(std.testing.allocator, event, &environment, &fake, 1000);

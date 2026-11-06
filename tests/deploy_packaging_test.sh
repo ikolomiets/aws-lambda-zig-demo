@@ -12,11 +12,9 @@ fail_test() {
 
 # Run the deployment entry point in an isolated checkout so its artifact cleanup
 # and working-directory changes cannot affect real build outputs.
-mkdir -p "$TEST_TMP_DIR/repo" "$TEST_TMP_DIR/zig/lib/std/Io/net" \
-    "$TEST_TMP_DIR/aws-lambda-zig/src"
+mkdir -p "$TEST_TMP_DIR/repo" "$TEST_TMP_DIR/aws-lambda-zig/src"
 cp "$REPOSITORY_ROOT/deploy.sh" "$TEST_TMP_DIR/repo/"
-touch "$TEST_TMP_DIR/zig/lib/std/Io/net/HostName.zig" \
-    "$TEST_TMP_DIR/aws-lambda-zig/build.zig.zon" \
+touch "$TEST_TMP_DIR/aws-lambda-zig/build.zig.zon" \
     "$TEST_TMP_DIR/aws-lambda-zig/src/root.zig"
 
 cat >"$TEST_TMP_DIR/driver.sh" <<'BASH'
@@ -27,6 +25,7 @@ MOCK_PACKAGE_STATUS="$2"
 shift 2
 PASETO_PUBLIC_KEY=mock-public-key
 LOCAL_AWS_LAMBDA_ROOT=../aws-lambda-zig
+export ZIG_GLOBAL_CACHE_DIR=inherited-global-cache
 
 need_command() { printf 'need:%s\n' "$1" >>"$MOCK_LOG"; }
 prepare_aws_sso_session() { :; }
@@ -37,8 +36,17 @@ invoke_deployment_controller() { :; }
 aws() { printf 'unexpected AWS call\n' >&2; exit 90; }
 zip() { printf 'unexpected shell packaging\n' >&2; exit 91; }
 zig() {
-    [ "$1" != version ] || { printf '0.16.0\n'; return; }
+    [ "$1" != version ] || { printf '%s\n' "${MOCK_ZIG_VERSION:-0.17.1}"; return; }
+    for argument in "$@"; do
+        case "$argument" in
+            --global-cache-dir|--global-cache-dir=*)
+                printf 'error: unrecognized argument: --global-cache-dir\n' >&2
+                return 1
+                ;;
+        esac
+    done
     printf 'zig:%s\n' "$*" >>"$MOCK_LOG"
+    printf 'zig-global-cache:%s:%s\n' "$2" "${ZIG_GLOBAL_CACHE_DIR:-}" >>"$MOCK_LOG"
     if [ "$2" = package ]; then
         [ "$MOCK_PACKAGE_STATUS" -eq 0 ] || return "$MOCK_PACKAGE_STATUS"
         mkdir -p zig-out/packages
@@ -96,8 +104,14 @@ for mode in full dev; do
                 fail_test "$mode dry=$dry_run: expected $package_status, received $status"
             }
             calls="$(cat "$TEST_TMP_DIR/calls.log")"
-            expected="zig:build package --cache-dir .zig-cache-$cache_suffix --global-cache-dir .zig-global-cache-$cache_suffix --fork=../aws-lambda-zig --release -Darch=arm"
+            expected="zig:build package --cache-dir .zig-cache-$cache_suffix --fork=../aws-lambda-zig --release -Darch=arm"
             [[ "$calls" == *"$expected"* ]] || fail_test "packaging options changed: $calls"
+            cache_steps=(fmt-check package)
+            [ "$mode" != full ] || cache_steps+=(test)
+            for step in "${cache_steps[@]}"; do
+                grep -Fxq "zig-global-cache:$step:.zig-global-cache-$cache_suffix" "$TEST_TMP_DIR/calls.log" ||
+                    fail_test "$mode $step did not receive its global cache directory"
+            done
             [[ "$calls" != *'need:zip'* ]] || fail_test "zip is still required"
             if [ "$package_status" -ne 0 ]; then
                 if grep -Eq '^(file:|unzip:|sam:|deploy$)' "$TEST_TMP_DIR/calls.log"; then
@@ -124,6 +138,30 @@ for mode in full dev; do
             fi
         done
     done
+done
+
+for zig_version in 0.17.0 0.17.1 0.17.42; do
+    : >"$TEST_TMP_DIR/calls.log"
+    MOCK_ZIG_VERSION="$zig_version" bash "$TEST_TMP_DIR/driver.sh" "$TEST_TMP_DIR" 0 \
+        --dev --dry-run >"$TEST_TMP_DIR/output.log" 2>&1 || {
+        cat "$TEST_TMP_DIR/output.log" >&2
+        fail_test "supported Zig $zig_version was rejected"
+    }
+    grep -q '^zig:build package ' "$TEST_TMP_DIR/calls.log" ||
+        fail_test "supported Zig $zig_version did not reach packaging"
+done
+
+for zig_version in 0.16.0 0.18.0 1.17.1; do
+    : >"$TEST_TMP_DIR/calls.log"
+    status=0
+    MOCK_ZIG_VERSION="$zig_version" bash "$TEST_TMP_DIR/driver.sh" "$TEST_TMP_DIR" 0 \
+        --dev --dry-run >"$TEST_TMP_DIR/output.log" 2>&1 || status=$?
+    [ "$status" -eq 1 ] || fail_test "unsupported Zig $zig_version was accepted"
+    grep -Fq 'Lambda builds require Zig 0.17.x' "$TEST_TMP_DIR/output.log" ||
+        fail_test "unsupported Zig $zig_version did not report the version requirement"
+    if grep -q '^zig:build ' "$TEST_TMP_DIR/calls.log"; then
+        fail_test "unsupported Zig $zig_version reached the build"
+    fi
 done
 
 printf 'PASS: deployment packaging regression tests\n'

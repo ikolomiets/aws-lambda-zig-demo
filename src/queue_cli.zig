@@ -755,7 +755,7 @@ test "commands require a valid explicit queue logical resource ID" {
         test_tigerbeetle_queue_name,
         test_completion_queue_name,
         "A",
-        "A" ** sqs_queue.environment_variable_name_size_max,
+        &@as([sqs_queue.environment_variable_name_size_max]u8, @splat('A')),
     };
     for (queue_names) |queue_name| {
         const send = try parseCommand(&.{ "sqs", queue_name, "send" });
@@ -776,7 +776,7 @@ test "commands require a valid explicit queue logical resource ID" {
         "1Queue",
         "Queue-Name",
         "Queue_Name",
-        "A" ** (sqs_queue.environment_variable_name_size_max + 1),
+        &@as([sqs_queue.environment_variable_name_size_max + 1]u8, @splat('A')),
     };
     for (invalid_queue_names) |queue_name| {
         try std.testing.expectError(
@@ -788,7 +788,7 @@ test "commands require a valid explicit queue logical resource ID" {
 
 test "send rejects oversized message input" {
     var fake: FakeQueue = .{};
-    const oversized = "a" ** (stdin_size_max + 1);
+    const oversized = &@as([stdin_size_max + 1]u8, @splat('a'));
     const result = runForTest(
         &.{ "sqs", test_tigerbeetle_queue_name, "send" },
         oversized,
@@ -805,7 +805,7 @@ test "send rejects oversized Context as invalid input before contacting SQS" {
     const input = try std.json.Stringify.valueAlloc(arena.allocator(), .{
         .operation_id = "00112233-4455-6677-8899-aabbccddeeff",
         .tenant = "tenant-a",
-        .context = "x" ** 4095,
+        .context = &@as([4095]u8, @splat('x')),
         .body = true,
     }, .{});
     var fake: FakeQueue = .{};

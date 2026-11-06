@@ -81,7 +81,7 @@ allowed within and across lists and Operations. Aliases never resolve references
   range including zero and maximum. Post and void account references additionally admit zero inheritance.
 - Ledger and timeout use unsigned JSON integers within u32; code uses u16. Flags are required arrays
   of canonical, case-sensitive names. Apply mode constraints from the table. Validate the normalized
-  Zig 0.16 Body: numeric `1.0`/`1e0`
+  Zig JSON Body: numeric `1.0`/`1e0`
   may already be `1`; reject remaining fractions, negative zero, negatives and overflow. Add no
   raw-token parser, arbitrary-precision intake contract or u64 input field.
 - Require explicit flags and amount. Pending timeout must be 1 through u32 maximum seconds.

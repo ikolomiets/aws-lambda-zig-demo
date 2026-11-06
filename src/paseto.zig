@@ -513,7 +513,7 @@ test "key generation encoding decoding and wiping preserve matching material" {
     wipeSecretKey(&secret_key);
     try std.testing.expectEqualSlices(
         u8,
-        &([_]u8{0} ** Ed25519.SecretKey.encoded_length),
+        &(@as([Ed25519.SecretKey.encoded_length]u8, @splat(0))),
         &secret_key.bytes,
     );
 }
@@ -695,8 +695,8 @@ test "v4.public verification rejects invalid claims" {
         "{\"sub\":\"\",\"exp\":1100}",
         "{\"sub\":\"a\",\"exp\":1000}",
         "{\"sub\":\"a\",\"exp\":999}",
-        "{\"sub\":\"" ++ ("a" ** 65) ++ "\",\"exp\":1100}",
-        "{\"sub\":\"" ++ (("é" ** 32) ++ "a") ++ "\",\"exp\":1100}",
+        "{\"sub\":\"" ++ (&@as([65]u8, @splat('a'))) ++ "\",\"exp\":1100}",
+        "{\"sub\":\"" ++ ((std.mem.asBytes(&@as([32][2]u8, @splat("é".*)))) ++ "a") ++ "\",\"exp\":1100}",
     };
     for (invalid_payloads) |payload| {
         const token = try signTestToken(&key_pair, payload, footer);
@@ -710,14 +710,14 @@ test "v4.public verification rejects invalid claims" {
 
 test "subject TTL and token bounds are enforced" {
     const valid_subjects = [_][]const u8{
-        "a" ** subject_size_max,
-        "é" ** (subject_size_max / 2),
+        &@as([subject_size_max]u8, @splat('a')),
+        std.mem.asBytes(&@as([subject_size_max / 2][2]u8, @splat("é".*))),
     };
     for (valid_subjects) |subject| try validateSubject(subject);
     const invalid_subjects = [_][]const u8{
         "",
-        "a" ** (subject_size_max + 1),
-        ("é" ** (subject_size_max / 2)) ++ "a",
+        &@as([subject_size_max + 1]u8, @splat('a')),
+        (std.mem.asBytes(&@as([subject_size_max / 2][2]u8, @splat("é".*)))) ++ "a",
         "\xff",
     };
     for (invalid_subjects) |subject| {
@@ -753,7 +753,7 @@ test "subject TTL and token bounds are enforced" {
         error.InvalidToken,
         verify(
             std.testing.allocator,
-            "a" ** (token_size_max + 1),
+            &@as([token_size_max + 1]u8, @splat('a')),
             key_pair.public_key,
             1000,
         ),
@@ -876,7 +876,7 @@ test "PASETO V4.local rejects the wrong implicit assertion" {
 }
 
 fn testKeyPair(seed_byte: u8) Ed25519.KeyPair {
-    const seed = [_]u8{seed_byte} ** Ed25519.KeyPair.seed_length;
+    const seed = @as([Ed25519.KeyPair.seed_length]u8, @splat(seed_byte));
     const key_pair = Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
     std.debug.assert(key_pair.secret_key.toBytes().len == Ed25519.SecretKey.encoded_length);
     std.debug.assert(key_pair.public_key.toBytes().len == Ed25519.PublicKey.encoded_length);

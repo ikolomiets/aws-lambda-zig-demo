@@ -46,8 +46,8 @@ The Lambda VPC had working IPv6 egress but no usable IPv4 internet egress. The
 SQS request began and then reached the 15-second Lambda timeout without an HTTP
 response or transport error.
 
-Account-specific values and raw addresses are intentionally omitted. Keep this
-note with the build change while the patched Zig standard library is required.
+Account-specific values and raw addresses are intentionally omitted. The
+[current build status](#status) records the toolchain and workaround in use.
 
 ## Standalone deterministic reproducer
 
@@ -72,7 +72,9 @@ independently of host CPU count. The concurrent limit remains unlimited,
 matching the threaded backend's default. Zero and one async workers model
 the one- and two-CPU defaults; two workers provide the control.
 
-Run these commands from the repository root with Zig 0.16.0:
+The following historical Zig 0.16.0 commands use the
+[original fixture at revision `c15da407`](https://github.com/ikolomiets/aws-lambda-zig-demo/blob/c15da407207805542e5e22f117206e3e9d357064/tests/hostname_connect_repro.zig)
+in that checkout. The current fixture uses Zig 0.17's socket-closing API:
 
 ```sh
 zig version
@@ -96,23 +98,43 @@ The Zig 0.16.0 results verified on native Apple Silicon macOS are:
 
 The stock command intentionally exits with status 1; the patched command exits
 with status 0. The reproducer is kept outside `zig build test` because the
-project's stock Zig 0.16.0 toolchain is expected to fail these regression cases.
+stock Zig 0.16.0, 0.17.0, and 0.17.1 libraries fail these regression cases.
 To run only the minimal two-CPU case, append
 `--test-filter 'one async worker'` to either command.
 
-Use the same source with a Zig 0.17 compiler and its bundled library:
+Run the current fixture from the repository root with Zig 0.17.1 and each library:
 
 ```sh
-/path/to/zig-0.17/zig version
-env -u ZIG_LIB_DIR /path/to/zig-0.17/zig test \
-  tests/hostname_connect_repro.zig -OReleaseSafe -fno-single-threaded
+zig version
+
+# Stock library: expected to fail the zero- and one-worker cases.
+env -u ZIG_LIB_DIR zig test \
+  tests/hostname_connect_repro.zig -Osafe -fno-single-threaded
+
+# Patched Zig 0.17.1 library used by the TigerBeetle processor executable.
+zig test tests/hostname_connect_repro.zig -Osafe \
+  -fno-single-threaded --zig-lib-dir ../zig/lib
 ```
 
 All three tests passing means this scheduling reproducer no longer detects the
 stall. A `HostNameConnectStalled` failure means a successful second address
 still waits for the first attempt to expire. A compilation error is an API
 compatibility problem and does not establish whether the stall persists.
-Zig 0.17 is not yet verified by this note.
+On 2026-11-06, the Zig 0.17.0 release compiler with its bundled library on
+Apple Silicon macOS passes the two-worker control and fails the zero- and
+one-worker cases with `HostNameConnectStalled`. The scheduling defect remains
+reproducible with Zig 0.17.0. The fixture uses its `netClose` socket API.
+
+The same check on 2026-11-06 with Zig 0.17.1 on Apple Silicon macOS produces:
+
+| Async workers | Bundled 0.17.1 library | Patched sibling 0.17.1 library |
+| ---: | --- | --- |
+| 0 | `FAIL (HostNameConnectStalled)` | pass |
+| 1 | `FAIL (HostNameConnectStalled)` | pass |
+| 2 | pass | pass |
+
+The sibling checkout's scheduling patch is commit `8bc16754`. The patched
+command exits with status 0; the stock command exits with status 1.
 
 This fixture isolates address scheduling and cancellation. It does not exercise
 real DNS, TCP sockets, IPv6 routing, or the Linux networking backend, and it does
@@ -326,13 +348,19 @@ timeout only extends the stall.
 ## Status
 
 The issue is confirmed against Zig 0.16.0 and the repository-pinned transport.
-`build.zig` selects `../zig/lib` as a temporary standard-library override
-for the TigerBeetle processor executable. That sibling checkout is external to
-this repository; its patch is not pinned here. The standalone reproducer above
-checks its behavior for the pending-first, two-address scheduling cases.
-Check `zig version` reports 0.16.0 and
-`test -f ../zig/lib/std/Io/net/HostName.zig` succeeds before building. These checks
-establish prerequisites, not that the sibling source contains a verified fix.
+The standalone scheduling reproducer also detects the defect in stock Zig
+0.17.0 and 0.17.1 as recorded above. The build supports Zig 0.17.x starting at
+0.17.0; the verified compiler and patched library pair is 0.17.1. In `build.zig`,
+only `tiger_beetle_processor_exe` selects the compatible patched standard library
+with `.zig_lib_dir = .{ .cwd_relative = "../zig/lib" }`.
+Keep that sibling checkout and its hostname-connect scheduling patch available
+for Lambda builds and packaging. The checkout is external to this repository
+and its patch is not pinned in `build.zig.zon`. The other five Lambda
+executables, host tools, and ordinary tests use the compiler's bundled library.
+
+The patched library passes all three standalone scheduling cases. These checks
+establish compiler compatibility and simulated scheduling behavior; they do not
+validate real DNS, Linux networking, or deployed Lambda connectivity.
 
 Production diagnostic instrumentation was removed after evidence
 collection, and the deployed Lambda was restored to the uninstrumented

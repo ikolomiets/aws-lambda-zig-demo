@@ -504,7 +504,7 @@ fn writeOperation(context: Context, source: *const operation.Operation) !void {
 }
 
 const test_id = "00112233-4455-6677-8899-aabbccddeeff";
-const test_hash = [_]u8{0xAB} ** 32;
+const test_hash = @as([32]u8, @splat(0xAB));
 
 const FakePersistence = struct {
     stored: operation.Operation = .{
@@ -670,8 +670,8 @@ test "help works without AWS configuration and invocation is bounded" {
 test "create requires one valid bounded tenant flag" {
     const valid = [_][]const u8{
         "a",
-        "a" ** operation.tenant_size_max,
-        "é" ** (operation.tenant_size_max / 2),
+        &@as([operation.tenant_size_max]u8, @splat('a')),
+        std.mem.asBytes(&@as([operation.tenant_size_max / 2][2]u8, @splat("é".*))),
     };
     for (valid) |tenant| {
         const command = try parseCommand(&.{ "dynamodb", "create", "--tenant", tenant });
@@ -680,8 +680,8 @@ test "create requires one valid bounded tenant flag" {
 
     const invalid = [_][]const u8{
         "",
-        "a" ** (operation.tenant_size_max + 1),
-        ("é" ** (operation.tenant_size_max / 2)) ++ "a",
+        &@as([operation.tenant_size_max + 1]u8, @splat('a')),
+        (std.mem.asBytes(&@as([operation.tenant_size_max / 2][2]u8, @splat("é".*)))) ++ "a",
         &.{0xFF},
     };
     try std.testing.expectError(
@@ -750,7 +750,7 @@ test "matching create retry writes the authoritative stored timestamp" {
 
 test "create bounds stdin and reports conflict and invalid input outcomes" {
     var fake: FakePersistence = .{};
-    const oversized = "a" ** (stdin_size_max + 1);
+    const oversized = &@as([stdin_size_max + 1]u8, @splat('a'));
     const large = runForTest(
         &.{ "dynamodb", "create", "--tenant", "tenant-a" },
         oversized,
@@ -852,7 +852,7 @@ test "update accepts submitted refresh and both completed envelopes" {
             .expected = "{\"id\":\"" ++ test_id ++ "\",\"tenant\":\"tenant-a\"," ++
                 "\"name\":\"echo\",\"state\":\"SUBMITTED\"," ++
                 "\"last_updated\":1700000001,\"expires_at\":1700086401," ++
-                "\"hash\":\"" ++ ("ab" ** 32) ++ "\"}\n",
+                "\"hash\":\"" ++ (std.mem.asBytes(&@as([32][2]u8, @splat("ab".*)))) ++ "\"}\n",
         },
         .{
             .state = .completed,
@@ -861,7 +861,7 @@ test "update accepts submitted refresh and both completed envelopes" {
                 "\"name\":\"echo\",\"state\":\"COMPLETED\"," ++
                 "\"last_updated\":1700000001,\"expires_at\":1700086401," ++
                 "\"result\":{\"type\":\"SUCCESS\",\"payload\":{\"new\":true}}," ++
-                "\"hash\":\"" ++ ("ab" ** 32) ++ "\"}\n",
+                "\"hash\":\"" ++ (std.mem.asBytes(&@as([32][2]u8, @splat("ab".*)))) ++ "\"}\n",
         },
         .{
             .state = .completed,
@@ -870,7 +870,7 @@ test "update accepts submitted refresh and both completed envelopes" {
                 "\"name\":\"echo\",\"state\":\"COMPLETED\"," ++
                 "\"last_updated\":1700000001,\"expires_at\":1700086401," ++
                 "\"result\":{\"type\":\"FAILURE\",\"payload\":{" ++
-                "\"reason\":\"rejected\"}},\"hash\":\"" ++ ("ab" ** 32) ++ "\"}\n",
+                "\"reason\":\"rejected\"}},\"hash\":\"" ++ (std.mem.asBytes(&@as([32][2]u8, @splat("ab".*)))) ++ "\"}\n",
         },
     };
     for (cases) |case| {
@@ -986,7 +986,7 @@ test "update rejects submitted input and malformed completion envelopes" {
         try std.testing.expectEqual(@as(u8, 2), result.exit_code);
     }
     const oversized = "{\"type\":\"FAILURE\",\"payload\":\"" ++
-        ("a" ** (operation.result_size_max - 30)) ++ "\"}";
+        (&@as([operation.result_size_max - 30]u8, @splat('a'))) ++ "\"}";
     const large = runForTest(
         &.{ "dynamodb", "update", "--id", test_id, "--state", "COMPLETED" },
         oversized,
@@ -1000,7 +1000,7 @@ test "update rejects submitted input and malformed completion envelopes" {
 test "update accepts a full completion envelope at the exact size bound" {
     var fake: FakePersistence = .{};
     const maximum = "{\"type\":\"SUCCESS\",\"payload\":\"" ++
-        ("a" ** (operation.result_size_max - 31)) ++ "\"}";
+        (&@as([operation.result_size_max - 31]u8, @splat('a'))) ++ "\"}";
     comptime std.debug.assert(maximum.len == operation.result_size_max);
     const result = runForTest(
         &.{ "dynamodb", "update", "--id", test_id, "--state", "COMPLETED" },

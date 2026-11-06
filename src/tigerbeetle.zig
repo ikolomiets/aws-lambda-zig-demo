@@ -41,19 +41,19 @@ pub fn create_transfer_status_name(status: u32) ?[]const u8 {
 
 fn creation_status_name(comptime prefix: []const u8, status: u32) ?[]const u8 {
     @setEvalBranchQuota(100_000);
-    inline for (@typeInfo(c).@"struct".decls) |decl| {
-        if (comptime std.mem.startsWith(u8, decl.name, prefix) and
-            !std.mem.eql(u8, decl.name, prefix ++ "STATUS"))
+    inline for (@typeInfo(c).@"struct".decl_names) |name| {
+        if (comptime std.mem.startsWith(u8, name, prefix) and
+            !std.mem.eql(u8, name, prefix ++ "STATUS"))
         {
-            if (status == @field(c, decl.name)) {
-                const name = comptime blk: {
-                    const suffix = decl.name[prefix.len..];
+            if (status == @field(c, name)) {
+                const lowercase_name = comptime blk: {
+                    const suffix = name[prefix.len..];
                     assert(suffix.len > 0);
                     var lowercase: [suffix.len]u8 = undefined;
                     _ = std.ascii.lowerString(&lowercase, suffix);
                     break :blk lowercase;
                 };
-                return &name;
+                return &lowercase_name;
             }
         }
     }
@@ -64,13 +64,13 @@ test "canonical creation status names cover pinned native families" {
     @setEvalBranchQuota(100_000);
     inline for (.{ "TB_CREATE_ACCOUNT_", "TB_CREATE_TRANSFER_" }) |prefix| {
         var count: usize = 0;
-        inline for (@typeInfo(c).@"struct".decls) |decl| {
-            if (comptime std.mem.startsWith(u8, decl.name, prefix) and
-                !std.mem.eql(u8, decl.name, prefix ++ "STATUS"))
+        inline for (@typeInfo(c).@"struct".decl_names) |name| {
+            if (comptime std.mem.startsWith(u8, name, prefix) and
+                !std.mem.eql(u8, name, prefix ++ "STATUS"))
             {
-                const name = creation_status_name(prefix, @field(c, decl.name)).?;
-                try std.testing.expect(std.ascii.eqlIgnoreCase(decl.name[prefix.len..], name));
-                for (name) |byte| try std.testing.expect(!std.ascii.isUpper(byte));
+                const lowercase_name = creation_status_name(prefix, @field(c, name)).?;
+                try std.testing.expect(std.ascii.eqlIgnoreCase(name[prefix.len..], lowercase_name));
+                for (lowercase_name) |byte| try std.testing.expect(!std.ascii.isUpper(byte));
                 count += 1;
             }
         }
@@ -902,7 +902,7 @@ test "delayed callback copies ephemeral bytes before borrowed storage can be reu
 }
 
 test "callback rejects unaligned source without modifying borrowed output" {
-    var output = [_]u8{42} ** 16;
+    var output = @as([16]u8, @splat(42));
     var source: [17]u8 align(16) = @splat(0);
     var request: Request = .{
         .io = std.testing.io,

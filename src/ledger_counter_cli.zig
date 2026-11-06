@@ -346,7 +346,7 @@ test "selected command and configuration validation precedes persistence effects
         &.{ "ledger-counter", "--counter-id", "", "read" },
         &.{ "ledger-counter", "--counter-id", "a/b", "init" },
         &.{ "ledger-counter", "--counter-id", "-a", "allocate" },
-        &.{ "ledger-counter", "--counter-id", "a" ** 129, "read" },
+        &.{ "ledger-counter", "--counter-id", &@as([129]u8, @splat('a')), "read" },
         &.{ "ledger-counter", "--counter-id", "a", "--counter-id", "b", "read" },
         &.{ "ledger-counter", "--counter-id", "a", "read", "extra" },
         &.{ "ledger-counter", "read", "--counter-id", "a" },
@@ -371,7 +371,7 @@ test "selected command and configuration validation precedes persistence effects
             stderr.written(),
         );
     }
-    for ([_][]const u8{ "", ".a", "a b", "é", "a" ** 129 }) |id| {
+    for ([_][]const u8{ "", ".a", "a b", "é", &@as([129]u8, @splat('a')) }) |id| {
         var stdout = std.Io.Writer.Allocating.init(std.testing.allocator);
         defer stdout.deinit();
         var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
@@ -396,7 +396,7 @@ test "selected command and configuration validation precedes persistence effects
 
 test "all selected commands accept boundary IDs and help ignores environment configuration" {
     for ([_][]const u8{ "init", "read", "allocate" }) |command| {
-        for ([_][]const u8{ "0", "a" ** 128 }) |id| {
+        for ([_][]const u8{ "0", &@as([128]u8, @splat('a')) }) |id| {
             var stdout = std.Io.Writer.Allocating.init(std.testing.allocator);
             defer stdout.deinit();
             var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
@@ -459,7 +459,7 @@ test "counter commands print bounded JSON and reject invalid invocations before 
         &.{ "ledger-counter", "delete-all" },
         &.{ "ledger-counter", "read", "extra" },
         &.{ "ledger-counter", "read", "--cluster-id", "1" },
-        &.{ "ledger-counter", "a" ** (argument_size_max + 1) },
+        &.{ "ledger-counter", &@as([argument_size_max + 1]u8, @splat('a')) },
         &.{ "ledger-counter", "help", "extra" },
     };
     for (invalid) |arguments| {

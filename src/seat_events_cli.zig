@@ -413,7 +413,7 @@ test "Events invalid identity state schema and limits leave storage absent" {
             backend,
         ),
     );
-    for ([_][]const u8{ "{}", "null", fixture_json ++ "{}", "x" ** 16385 }) |input| {
+    for ([_][]const u8{ "{}", "null", fixture_json ++ "{}", &@as([16385]u8, @splat('x')) }) |input| {
         try std.testing.expectEqual(
             @as(u8, 2),
             run(
@@ -489,7 +489,7 @@ test "Events reports sanitized failures and rejects unbounded or unsupported inv
             "events",
             "read",
             "--tenant",
-            "x" ** 65,
+            &@as([65]u8, @splat('x')),
             "--event-id",
             "00000000-0000-0000-0000-000000000001",
         },
@@ -501,7 +501,7 @@ test "Events reports sanitized failures and rejects unbounded or unsupported inv
             "--event-id",
             "00112233-4455-6677-8899-AABBCCDDEEFF",
         },
-        &.{ "events", "x" ** 4097 },
+        &.{ "events", &@as([4097]u8, @splat('x')) },
     };
     for (cases) |arguments| {
         stderr.clearRetainingCapacity();

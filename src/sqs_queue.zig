@@ -303,7 +303,7 @@ test "initialization requires a nonempty bounded URL for either requested settin
         );
         const invalid_urls = [_][]const u8{
             "",
-            "a" ** (queue_url_size_max + 1),
+            &@as([queue_url_size_max + 1]u8, @splat('a')),
         };
         for (invalid_urls) |queue_url| {
             try environment.put(setting, queue_url);
@@ -352,7 +352,7 @@ test "initialization rejects invalid environment variable names" {
     var queue: Queue = undefined;
     const invalid_names = [_][]const u8{
         "",
-        "a" ** (environment_variable_name_size_max + 1),
+        &@as([environment_variable_name_size_max + 1]u8, @splat('a')),
         "QUEUE=URL",
         "QUEUE\x00URL",
     };
@@ -389,7 +389,7 @@ test "send and delete requests reject empty and oversized values" {
     );
     try std.testing.expectError(
         error.InvalidQueueURL,
-        send_request("a" ** (queue_url_size_max + 1), "queued-operation"),
+        send_request(&@as([queue_url_size_max + 1]u8, @splat('a')), "queued-operation"),
     );
     try std.testing.expectError(
         error.InvalidMessage,
@@ -491,12 +491,12 @@ test "attributes preserve all entries and reject malformed service data" {
     try std.testing.expectEqualStrings("é", attributes[1].value);
 
     const entry: aws.map.StringMapEntry = .{ .key = "key", .value = "value" };
-    const too_many = [_]aws.map.StringMapEntry{entry} ** (attribute_count_max + 1);
+    const too_many = @as([attribute_count_max + 1]aws.map.StringMapEntry, @splat(entry));
     const invalid = [_][]const aws.map.StringMapEntry{
         &too_many,
         &.{.{ .key = "", .value = "value" }},
-        &.{.{ .key = "k" ** (attribute_name_size_max + 1), .value = "value" }},
-        &.{.{ .key = "key", .value = "v" ** (attribute_value_size_max + 1) }},
+        &.{.{ .key = &@as([attribute_name_size_max + 1]u8, @splat('k')), .value = "value" }},
+        &.{.{ .key = "key", .value = &@as([attribute_value_size_max + 1]u8, @splat('v')) }},
         &.{.{ .key = &.{0xFF}, .value = "value" }},
         &.{.{ .key = "key", .value = &.{0xFF} }},
     };

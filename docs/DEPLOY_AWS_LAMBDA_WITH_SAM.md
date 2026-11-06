@@ -126,11 +126,16 @@ profiles are unsupported. Dry runs make no AWS authentication calls.
 
 ## 2. Build and package the Zig Lambdas
 
-The TigerBeetle processor currently uses the sibling standard library at
-`../zig/lib`. Check `zig version` reports 0.16.0 and
-`test -f ../zig/lib/std/Io/net/HostName.zig` succeeds before building. File presence
-alone does not verify the workaround; see the
-[hostname-connect note](ZIG_0_16_HOSTNAME_CONNECT_STALL.md) for its status.
+Use Zig 0.17.x (minimum 0.17.0). Check `zig version` reports a `0.17.*` version
+before building. The TigerBeetle processor executable requires a compatible
+patched standard library at `../zig/lib` through its `build.zig` override.
+The validated compiler and patched library pair is 0.17.1. Keep that sibling
+checkout available for builds and packaging. The other five Lambda functions
+and the host tools use the compiler's bundled library.
+The build resolves the Zig 0.17-compatible Lambda runtime pinned in
+[`build.zig.zon`](../build.zig.zon). The
+[hostname scheduling reproducer](ZIG_0_16_HOSTNAME_CONNECT_STALL.md#standalone-deterministic-reproducer)
+documents the low-worker scheduling defect, the patch, and current checks.
 
 Check Zig and shell formatting/syntax before the test graph:
 
@@ -158,7 +163,7 @@ The deployment-helper tests mock AWS commands, so they require Bash and `jq`,
 with no AWS credentials or network access. `deploy.sh` invokes only `zig build test`,
 which includes these tests exactly once.
 
-Build and package the stripped ReleaseSafe Lambda executables for AWS Lambda
+Build and package the stripped Lambda executables in `safe` mode for AWS Lambda
 ARM64. ARM64 is also the project build default; `-Darch=arm` keeps the deployment
 command explicit.
 
@@ -1458,7 +1463,7 @@ copy-ready peer configuration before the intake and query Function URL checks.
 
 Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run --use-local-libs`
-to build with local dependency checkouts. The `aws_lambda` checkout defaults
+to build with Zig 0.17-compatible local dependency checkouts. The `aws_lambda` checkout defaults
 to `../aws-lambda-zig`; override it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
 
 Both deployment modes run `zig build fmt-check` with their selected local and
@@ -1548,12 +1553,12 @@ flow, outputs, smoke checks, and deletion of `.zig-cache-deploy` and
 
 Development mode retains `.zig-cache-dev` and `.zig-global-cache-dev` across
 successful and failed runs; ordinary deployment does not delete these caches.
-It checks Zig 0.16.0 and the required sibling standard library, runs the existing
-complete `fmt-check` target, and incrementally builds the same ARM64 ReleaseSafe
-targets and host tools through `zig build package`, using the selected caches
-and any package forks. The sibling file check does not verify the hostname workaround;
-see the [hostname-connect note](ZIG_0_16_HOSTNAME_CONNECT_STALL.md). It refreshes
-all six prebuilt ZIPs under `zig-out/packages/` and verifies stripped ARM64
+Both deployment modes select the local cache with `--cache-dir` and the global
+cache with `ZIG_GLOBAL_CACHE_DIR` for every Zig build command. Zig 0.17 does not
+accept `--global-cache-dir` for `zig build`.
+Development mode checks for Zig 0.17.x, runs the complete `fmt-check` target, and incrementally builds the same ARM64
+targets in `safe` mode and host tools through `zig build package`, using the selected caches
+and any Zig 0.17-compatible package forks. It refreshes all six prebuilt ZIPs under `zig-out/packages/` and verifies stripped ARM64
 bootstraps and root-level archive contents. It skips the full suite and both SAM
 validation passes. Build, package, and sync failures fail the run.
 

@@ -911,7 +911,7 @@ test "input parses an arena-owned body Value and defaults state" {
 }
 
 test "hash verification requires an exact present 32-byte match" {
-    const hash = [_]u8{0xAB} ** 32;
+    const hash = @as([32]u8, @splat(0xAB));
     var source: Operation = .{
         .id = 1,
         .tenant = "tenant",
@@ -927,7 +927,7 @@ test "hash verification requires an exact present 32-byte match" {
     try std.testing.expect(!verifyHash(&source, &mismatched));
     try std.testing.expect(!verifyHash(&source, hash[0 .. hash.len - 1]));
 
-    const oversized = [_]u8{0xAB} ** 33;
+    const oversized = @as([33]u8, @splat(0xAB));
     try std.testing.expect(!verifyHash(&source, &oversized));
 
     source.hash = null;
@@ -953,15 +953,15 @@ test "input copies validated tenant metadata into the Operation arena" {
 test "tenant validation enforces UTF-8 byte boundaries" {
     const valid = [_][]const u8{
         "a",
-        "a" ** tenant_size_max,
-        "é" ** (tenant_size_max / 2),
+        &@as([tenant_size_max]u8, @splat('a')),
+        std.mem.asBytes(&@as([tenant_size_max / 2][2]u8, @splat("é".*))),
     };
     for (valid) |tenant| try validateTenant(tenant);
 
     const invalid = [_][]const u8{
         "",
-        "a" ** (tenant_size_max + 1),
-        ("é" ** (tenant_size_max / 2)) ++ "a",
+        &@as([tenant_size_max + 1]u8, @splat('a')),
+        (std.mem.asBytes(&@as([tenant_size_max / 2][2]u8, @splat("é".*)))) ++ "a",
         &.{0xFF},
     };
     for (invalid) |tenant| {
@@ -1225,7 +1225,7 @@ test "input requires id name and body and validates name bounds" {
         error.InvalidName,
         parseTestInput(arena.allocator(), empty, test_now),
     );
-    const long_name = [_]u8{'a'} ** (name_size_max + 1);
+    const long_name = @as([name_size_max + 1]u8, @splat('a'));
     const long = try testInput(std.testing.allocator, &long_name, "null", null);
     defer std.testing.allocator.free(long);
     try std.testing.expectError(
@@ -1233,7 +1233,7 @@ test "input requires id name and body and validates name bounds" {
         parseTestInput(arena.allocator(), long, test_now),
     );
 
-    const maximum_name = [_]u8{'a'} ** name_size_max;
+    const maximum_name = @as([name_size_max]u8, @splat('a'));
     const maximum = try testInput(std.testing.allocator, &maximum_name, "null", null);
     defer std.testing.allocator.free(maximum);
     const operation = try parseTestInput(
@@ -1276,7 +1276,7 @@ test "input rejects expiration timestamp overflow" {
 }
 
 test "persistent validation enforces state completion invariants" {
-    const hash = [_]u8{0xAB} ** 32;
+    const hash = @as([32]u8, @splat(0xAB));
     var operation = Operation{
         .id = try uuidFromString(test_uuid),
         .tenant = test_tenant,
@@ -1446,9 +1446,9 @@ test "completion codec rejects null and malformed payloads" {
 
 test "completion envelope enforces input and compact output bounds" {
     const maximum = "{\"type\":\"SUCCESS\",\"payload\":\"" ++
-        ("a" ** (result_size_max - 31)) ++ "\"}";
+        (&@as([result_size_max - 31]u8, @splat('a'))) ++ "\"}";
     const oversized = "{\"type\":\"SUCCESS\",\"payload\":\"" ++
-        ("a" ** (result_size_max - 30)) ++ "\"}";
+        (&@as([result_size_max - 30]u8, @splat('a'))) ++ "\"}";
     comptime std.debug.assert(maximum.len == result_size_max);
     comptime std.debug.assert(oversized.len == result_size_max + 1);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1462,7 +1462,7 @@ test "completion envelope enforces input and compact output bounds" {
     );
 
     const large_completion: Completion = .{
-        .success = .{ .string = "a" ** (result_size_max - 30) },
+        .success = .{ .string = &@as([result_size_max - 30]u8, @splat('a')) },
     };
     var buffer: [result_size_max]u8 = undefined;
     try std.testing.expectError(
@@ -1473,7 +1473,7 @@ test "completion envelope enforces input and compact output bounds" {
 
 test "completion parser bounds compact normalization independently of input" {
     const expanding = "{\"type\":\"SUCCESS\",\"payload\":[" ++
-        ("1e20," ** 19000) ++ "1e20]}";
+        (std.mem.asBytes(&@as([19000][5]u8, @splat("1e20,".*)))) ++ "1e20]}";
     comptime std.debug.assert(expanding.len <= result_size_max);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1554,7 +1554,7 @@ test "persistent view rejects body and requires timestamps and hash" {
         .state = .submitted,
         .last_updated = test_now,
         .expires_at = test_now + ttl_seconds,
-        .hash = [_]u8{0} ** 32,
+        .hash = @as([32]u8, @splat(0)),
     };
     try std.testing.expectError(
         error.UnexpectedBody,
@@ -1606,7 +1606,7 @@ test "output writes exact completed success and failure envelopes" {
         },
         .last_updated = test_now,
         .expires_at = test_now + ttl_seconds,
-        .hash = [_]u8{0xAB} ** 32,
+        .hash = @as([32]u8, @splat(0xAB)),
     };
     var output_buffer: [512]u8 = undefined;
     var output: std.Io.Writer = .fixed(&output_buffer);
@@ -1658,7 +1658,7 @@ test "output distinguishes object explicit-null and absent bodies" {
         .state = .submitted,
         .last_updated = test_now + 1,
         .expires_at = test_now + 1 + ttl_seconds,
-        .hash = [_]u8{0xAB} ** 32,
+        .hash = @as([32]u8, @splat(0xAB)),
     };
     const object_output = try testOutput(&operation);
     defer std.testing.allocator.free(object_output);
@@ -1710,7 +1710,7 @@ test "every valid output shape round trips through the output parser" {
                 .state = state,
                 .last_updated = test_now,
                 .expires_at = test_now + ttl_seconds,
-                .hash = [_]u8{0xAB} ** 32,
+                .hash = @as([32]u8, @splat(0xAB)),
             };
             const serialized = try testOutput(&source);
             defer std.testing.allocator.free(serialized);
@@ -1732,7 +1732,7 @@ test "output parser preserves strings and JSON Values in its arena" {
             "\"body\":{\"message\":\"hello\"},\"state\":\"COMPLETED\"," ++
             "\"last_updated\":1700000000,\"expires_at\":1700086400," ++
             "\"result\":{\"type\":\"SUCCESS\",\"payload\":{\"success\":true}}," ++
-            "\"hash\":\"" ++ ("ab" ** 32) ++ "\"}",
+            "\"hash\":\"" ++ (std.mem.asBytes(&@as([32][2]u8, @splat("ab".*)))) ++ "\"}",
     );
     defer std.testing.allocator.free(serialized);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1749,7 +1749,7 @@ test "output parser preserves strings and JSON Values in its arena" {
 }
 
 test "output parser requires all owned fields and rejects extra fields" {
-    const hash = "ab" ** 32;
+    const hash = std.mem.asBytes(&@as([32][2]u8, @splat("ab".*)));
     const missing = [_][]const u8{
         "{\"tenant\":\"tenant-a\",\"name\":\"echo\",\"state\":\"SUBMITTED\"," ++
             "\"last_updated\":1700000000,\"expires_at\":1700086400,\"hash\":\"" ++ hash ++ "\"}",
@@ -1795,7 +1795,7 @@ test "output parser rejects oversized and invariant-breaking fields" {
         "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"echo\",";
     const suffix =
         ",\"last_updated\":1700000000,\"expires_at\":1700086400," ++
-        "\"hash\":\"" ++ ("ab" ** 32) ++ "\"}";
+        "\"hash\":\"" ++ (std.mem.asBytes(&@as([32][2]u8, @splat("ab".*)))) ++ "\"}";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1804,7 +1804,7 @@ test "output parser rejects oversized and invariant-breaking fields" {
         parseOutputJSON(
             arena.allocator(),
             "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"" ++
-                ("a" ** (tenant_size_max + 1)) ++ "\",\"name\":\"echo\"," ++
+                (&@as([tenant_size_max + 1]u8, @splat('a'))) ++ "\",\"name\":\"echo\"," ++
                 "\"state\":\"SUBMITTED\"" ++ suffix,
         ),
     );
@@ -1813,14 +1813,14 @@ test "output parser rejects oversized and invariant-breaking fields" {
         parseOutputJSON(
             arena.allocator(),
             "{\"id\":\"" ++ test_uuid ++ "\",\"tenant\":\"tenant-a\",\"name\":\"" ++
-                ("a" ** (name_size_max + 1)) ++ "\",\"state\":\"SUBMITTED\"" ++ suffix,
+                (&@as([name_size_max + 1]u8, @splat('a'))) ++ "\",\"state\":\"SUBMITTED\"" ++ suffix,
         ),
     );
     try std.testing.expectError(
         error.BodyTooLarge,
         parseOutputJSON(
             arena.allocator(),
-            prefix ++ "\"body\":\"" ++ ("a" ** (body_size_max - 1)) ++
+            prefix ++ "\"body\":\"" ++ (&@as([body_size_max - 1]u8, @splat('a'))) ++
                 "\",\"state\":\"SUBMITTED\"" ++ suffix,
         ),
     );
@@ -1830,12 +1830,12 @@ test "output parser rejects oversized and invariant-breaking fields" {
             arena.allocator(),
             prefix ++ "\"state\":\"COMPLETED\",\"result\":" ++
                 "{\"type\":\"SUCCESS\",\"payload\":\"" ++
-                ("a" ** (result_size_max - 1)) ++ "\"}" ++ suffix,
+                (&@as([result_size_max - 1]u8, @splat('a'))) ++ "\"}" ++ suffix,
         ),
     );
     try std.testing.expectError(
         error.OutputTooLarge,
-        parseOutputJSON(arena.allocator(), " " ** (output_size_max + 1)),
+        parseOutputJSON(arena.allocator(), &@as([output_size_max + 1]u8, @splat(' '))),
     );
     try std.testing.expectError(
         error.UnexpectedResult,
@@ -1879,7 +1879,7 @@ test "output parser rejects oversized and invariant-breaking fields" {
             arena.allocator(),
             prefix ++ "\"state\":\"SUBMITTED\"" ++
                 ",\"last_updated\":1700000000,\"expires_at\":1700086401," ++
-                "\"hash\":\"" ++ ("ab" ** 32) ++ "\"}",
+                "\"hash\":\"" ++ (std.mem.asBytes(&@as([32][2]u8, @splat("ab".*)))) ++ "\"}",
         ),
     );
     try std.testing.expectError(
@@ -1888,7 +1888,7 @@ test "output parser rejects oversized and invariant-breaking fields" {
             arena.allocator(),
             prefix ++ "\"state\":\"SUBMITTED\"," ++
                 "\"last_updated\":1700000000,\"expires_at\":1700086400," ++
-                "\"hash\":\"" ++ ("AB" ** 32) ++ "\"}",
+                "\"hash\":\"" ++ (std.mem.asBytes(&@as([32][2]u8, @splat("AB".*)))) ++ "\"}",
         ),
     );
 }

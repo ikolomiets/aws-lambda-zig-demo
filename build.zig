@@ -8,7 +8,7 @@ fn add_tigerbeetle_c_module(
     b: *std.Build,
     tigerbeetle_c_artifacts: *std.Build.Dependency,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
 ) *std.Build.Module {
     const translated_c = b.addTranslateC(.{
         .root_source_file = tigerbeetle_c_artifacts.path("include/tb_client.h"),
@@ -28,7 +28,7 @@ fn add_tigerbeetle_c_module(
 fn add_tigerbeetle_module(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.builtin.Optimize,
     tigerbeetle_c: *std.Build.Module,
 ) *std.Build.Module {
     return b.createModule(.{
@@ -85,12 +85,12 @@ fn resolve_tiger_beetle_processor_target(
 
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{
-        .preferred_optimize_mode = .ReleaseSafe,
+        .preferred_optimize_mode = .safe,
     });
     // Set this before any dependency resolves, including source-path discovery.
-    if (b.release_mode == .any) {
-        std.debug.assert(optimize == .ReleaseSafe);
-        b.release_mode = .safe;
+    if (b.graph.release_mode == .any) {
+        std.debug.assert(optimize == .safe);
+        b.graph.release_mode = .safe;
     }
     const dependency_paths = b.addSystemCommand(&.{ "printf", "%s\t%s\n" });
     for (b.available_deps) |dependency| {
@@ -101,7 +101,12 @@ pub fn build(b: *std.Build) void {
         .dependOn(&dependency_paths.step);
 
     const fmt_check = b.addFmt(.{
-        .paths = &.{ "build.zig", "build.zig.zon", "src", "tests" },
+        .paths = &.{
+            b.path("build.zig"),
+            b.path("build.zig.zon"),
+            b.path("src"),
+            b.path("tests"),
+        },
         .check = true,
     });
     b.step("fmt-check", "Check formatting of project Zig sources and tests")
@@ -436,12 +441,12 @@ pub fn build(b: *std.Build) void {
         b,
         tigerbeetle_c_artifacts,
         b.graph.host,
-        .Debug,
+        .debug,
     );
     const tigerbeetle_host = add_tigerbeetle_module(
         b,
         b.graph.host,
-        .Debug,
+        .debug,
         tigerbeetle_c_host,
     );
     const host_operation = b.createModule(.{
@@ -599,7 +604,7 @@ pub fn build(b: *std.Build) void {
     }
     const host_lambda_auth = b.createModule(.{
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
         .root_source_file = b.path("src/lambda_auth.zig"),
         .imports = &.{
             .{ .name = "aws-lambda", .module = test_runtime },
@@ -658,7 +663,7 @@ pub fn build(b: *std.Build) void {
 
     const lambda_test_mod = b.createModule(.{
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
         .root_source_file = b.path("src/intake_lambda.zig"),
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
@@ -678,7 +683,7 @@ pub fn build(b: *std.Build) void {
 
     const query_test_mod = b.createModule(.{
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
         .root_source_file = b.path("src/query_lambda.zig"),
         .imports = &.{
             .{ .name = "aws", .module = host_aws },
@@ -695,7 +700,7 @@ pub fn build(b: *std.Build) void {
 
     const tiger_beetle_completion_processor_test_mod = b.createModule(.{
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .root_source_file = b.path("src/tiger_beetle_completion_processor.zig"),
         .single_threaded = true,
         .imports = &.{
@@ -714,7 +719,7 @@ pub fn build(b: *std.Build) void {
 
     const tiger_beetle_processor_test_mod = b.createModule(.{
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .root_source_file = b.path("src/tiger_beetle_processor.zig"),
         .single_threaded = false,
         .imports = &.{
@@ -739,7 +744,7 @@ pub fn build(b: *std.Build) void {
 
     const seat_submission_mod = b.createModule(.{
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
         .single_threaded = true,
         .root_source_file = b.path("src/seat_reservation_processor.zig"),
         .imports = &.{
@@ -756,7 +761,7 @@ pub fn build(b: *std.Build) void {
     });
     const seat_completion_mod = b.createModule(.{
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
         .single_threaded = true,
         .root_source_file = b.path("src/seat_reservation_completion_processor.zig"),
         .imports = &.{
@@ -815,7 +820,7 @@ pub fn build(b: *std.Build) void {
 
     const paseto_test_mod = b.createModule(.{
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
         .root_source_file = b.path("src/paseto.zig"),
         .imports = &.{
             .{ .name = "zig-paseto", .module = host_paseto_implementation },
@@ -828,7 +833,7 @@ pub fn build(b: *std.Build) void {
 
     const cli_test_mod = b.createModule(.{
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
         .root_source_file = b.path("src/paseto_cli.zig"),
         .imports = &.{
             .{ .name = "paseto", .module = paseto_test_mod },
@@ -852,7 +857,7 @@ pub fn build(b: *std.Build) void {
 
     const tigerbeetle_c_abi_macos_test_mod = b.createModule(.{
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
         .root_source_file = b.path("tests/tigerbeetle_c_abi.zig"),
         .imports = &.{
             .{ .name = tigerbeetle_c_import_name, .module = tigerbeetle_c_host },
@@ -883,7 +888,7 @@ pub fn build(b: *std.Build) void {
 
     const tigerbeetle_integration_test_mod = b.createModule(.{
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
         .root_source_file = b.path("tests/tigerbeetle_integration.zig"),
         .imports = &.{
             .{ .name = tigerbeetle_import_name, .module = tigerbeetle_host },
@@ -920,11 +925,11 @@ pub fn build(b: *std.Build) void {
         b,
         tigerbeetle_c_artifacts,
         tigerbeetle_linux_target,
-        .Debug,
+        .debug,
     );
     const tigerbeetle_c_abi_linux_test_mod = b.createModule(.{
         .target = tigerbeetle_linux_target,
-        .optimize = .Debug,
+        .optimize = .debug,
         .root_source_file = b.path("tests/tigerbeetle_c_abi.zig"),
         .imports = &.{
             .{ .name = tigerbeetle_c_import_name, .module = tigerbeetle_c_linux },
@@ -947,7 +952,7 @@ pub fn build(b: *std.Build) void {
     const tigerbeetle_linux = add_tigerbeetle_module(
         b,
         tigerbeetle_linux_target,
-        .Debug,
+        .debug,
         tigerbeetle_c_linux,
     );
     const tigerbeetle_linux_test = b.addTest(.{
@@ -1073,7 +1078,7 @@ pub fn build(b: *std.Build) void {
         source.addImport("runtime_test_options", ordinary_test_options_module);
         const module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .root_source_file = source.root_source_file,
             .single_threaded = false,
         });

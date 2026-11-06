@@ -2,7 +2,7 @@
 
 ## Repository and Sources of Truth
 
-This is a Zig 0.16.0 AWS Lambda example with six handlers and host-native
+This is a Zig 0.17.x AWS Lambda example with six handlers and host-native
 `paseto`, `dynamodb`, `sqs`, `events`, and `ledger-counter` CLI tools. `build.zig` and `build.zig.zon` own
 supported targets, optimization, executables, and pinned dependencies, including
 `aws_lambda`.
@@ -121,14 +121,15 @@ the AWS CLI query that retrieves it instead of recording the value itself.
 Before selecting targeted checks, running final validation or diagnosing
 check-environment failures, read the [local-check guide](docs/agents/local-checks.md).
 Use its targeted checks during implementation and its complete offline checks
-after final fixes.
+after final fixes. Before running socket-based runtime or live-replica tests in
+a restricted agent sandbox, follow its
+[socket-access instructions](docs/agents/local-checks.md#socket-access-in-agent-sandboxes).
 
-The TigerBeetle processor build currently requires the sibling Zig standard
-library at `../zig/lib`. Before a Lambda build, check `zig version` (0.16.0) and
-`test -f ../zig/lib/std/Io/net/HostName.zig`. A missing checkout is an environment
-prerequisite failure. File presence does not verify the patch; consult the
-[hostname-connect workaround note](docs/ZIG_0_16_HOSTNAME_CONNECT_STALL.md) when
-setting up or diagnosing this build.
+Use Zig 0.17.x (minimum 0.17.0). The TigerBeetle processor executable requires a
+compatible patched standard library at `../zig/lib` through its `build.zig`
+override; all other targets use the compiler's bundled standard library. Check
+`zig version` before selecting validation commands. `build.zig.zon` pins the
+Lambda runtime's Zig 0.17-compatible source revision.
 
 For Zig code or build changes, check formatting and build the affected targets,
 then select tests for the changed behavior. Documentation-only changes need link

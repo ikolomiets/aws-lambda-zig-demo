@@ -89,7 +89,7 @@ const RuntimeResources = struct {
         resources.* = undefined;
     }
 
-    fn complete_by_id_observed(
+    pub fn complete_by_id_observed(
         resources: *RuntimeResources,
         arena: Allocator,
         operation_id: u128,
@@ -134,7 +134,7 @@ const CompletionPersistence = struct {
                 trace: *const logging.Context,
             ) anyerror!void {
                 const self: Pointer = @ptrCast(@alignCast(context));
-                if (@hasDecl(pointer_info.pointer.child, "complete_by_id_observed")) {
+                if (comptime @hasDecl(pointer_info.pointer.child, "complete_by_id_observed")) {
                     return self.complete_by_id_observed(arena, operation_id, completion, now, trace);
                 }
                 return self.completeById(arena, operation_id, completion, now);
@@ -426,7 +426,7 @@ const FakePersistence = struct {
     operation_ids: [test_call_count_max]u128 = undefined,
     completions: [test_call_count_max]operation.Completion = undefined,
     times: [test_call_count_max]operation.UnixSeconds = undefined,
-    errors: [test_call_count_max]?anyerror = .{null} ** test_call_count_max,
+    errors: [test_call_count_max]?anyerror = @splat(null),
     clock: ?*const FakeClock = null,
     call_count: u8 = 0,
 
@@ -537,7 +537,7 @@ test "completion derives success and failure from native bodies and preserves de
 pub const test_support = if (@import("builtin").is_test) struct {
     pub const interpret = interpret_result;
     pub fn invoke(allocator: Allocator, message: []const u8, store: anytype) ![]const u8 {
-        var clock = FakeClock.init(&([_]operation.UnixSeconds{1_800_000_000} ** 10));
+        var clock = FakeClock.init(&(@as([10]operation.UnixSeconds, @splat(1_800_000_000))));
         return handleInvocation(allocator, try testEvent(allocator, &.{message}), CompletionPersistence.init(store), Clock.init(&clock));
     }
 } else struct {};

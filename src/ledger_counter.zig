@@ -769,7 +769,7 @@ test "configured counter owns its table binding and requests outlive configurati
         error.InvalidConfiguration,
         Counter.init(&counter, std.testing.allocator, &config, &environment),
     );
-    for ([_][]const u8{ "", "ab", "a" ** 256, "table with spaces", "x/y" }) |table| {
+    for ([_][]const u8{ "", "ab", &@as([256]u8, @splat('a')), "table with spaces", "x/y" }) |table| {
         try environment.put("LEDGER_COUNTER_TABLE_NAME", table);
         try std.testing.expectError(
             error.InvalidConfiguration,
@@ -844,7 +844,7 @@ test "selected ID boundaries fail before effects" {
     const memory = arena.allocator();
     var database: SelectedTestDatabase = .{};
     const invalid_ids = [_][]const u8{
-        "",   "a" ** 129, ".a", "_a", "-a", "a b", "a/b", "a\n",
+        "",   &@as([129]u8, @splat('a')), ".a", "_a", "-a", "a b", "a/b", "a\n",
         "é",
         " a", "a ",
     };
@@ -868,7 +868,7 @@ test "selected ID boundaries fail before effects" {
         try std.testing.expectEqual(@as(u8, 0), record.gets);
         try std.testing.expectEqual(@as(u8, 0), record.updates);
     }
-    for ([_][]const u8{ "a", "0", "Z.a_9-", "a" ** 128 }) |id| {
+    for ([_][]const u8{ "a", "0", "Z.a_9-", &@as([128]u8, @splat('a')) }) |id| {
         const input = try read_request_selected(
             memory,
             &.{ .table_name = "shared-ledgers", .id = id },
@@ -885,7 +885,7 @@ test "retained bindings own configuration and explicit selection overrides it" {
     try environment.put("LEDGER_COUNTER_TABLE_NAME", "shared-ledgers");
     var config: aws.Config = undefined;
     var store: Counter = undefined;
-    for ([_][]const u8{ "", "a/b", "a" ** 129 }) |id| {
+    for ([_][]const u8{ "", "a/b", &@as([129]u8, @splat('a')) }) |id| {
         try environment.put("LEDGER_COUNTER_ID", id);
         try std.testing.expectError(
             error.InvalidCounterId,

@@ -247,14 +247,14 @@ test "ready cache retains maximum tenant and every class without borrowing sourc
             .tb_account_id = index + 100,
         };
     }
-    event.tenant = "é" ** 32;
+    event.tenant = std.mem.asBytes(&@as([32][2]u8, @splat("é".*)));
     event.classes = &classes;
     var cache: ReadyCache = undefined;
     try cache.init(std.testing.allocator, memory_size_max);
     defer cache.deinit();
     try cache.put(&event);
     for (&classes) |*class| class.total = 1;
-    const saved = (try cache.get(&.{ .tenant = "é" ** 32, .event_id = 2 })).?;
+    const saved = (try cache.get(&.{ .tenant = std.mem.asBytes(&@as([32][2]u8, @splat("é".*))), .event_id = 2 })).?;
     try std.testing.expectEqual(@as(usize, 64), saved.tenant.len);
     try std.testing.expectEqual(@as(usize, 31), saved.classes.len);
     try std.testing.expectEqualStrings("00", saved.classes[0].tag.slice());

@@ -25,7 +25,7 @@
     .fingerprint = 0xf2ae4bcb8a143ba1, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -37,12 +37,12 @@
             .hash = "tigerbeetle_c_artifacts-65535.0.0+g97c7a8ef3.pr3695-fTLGi0aNGQC3xlGJoqTt6DVm9fZPGoBrSKcdqoZZgjNd",
         },
         .aws_sdk = .{
-            .url = "git+https://github.com/ikolomiets/aws-sdk-zig?ref=agent/parse-modeled-aws-json-errors#778dcfe1423cf3b3a1bfe56e1e461b99b80124bd",
-            .hash = "aws_sdk-0.0.1-ApQSL17Y_xOC5IhLm247KBZKDcbCRU3qf7GiiiRHcrND",
+            .url = "git+https://github.com/cloudboss/aws-sdk-zig#993c5a06d72cd437a5d517db3f20b6be4e743c1f",
+            .hash = "aws_sdk-0.0.1-ApQSL7NPngrzOWc3SMsGYi0u-YJAq4T4Qx2mkx5BaHSM",
         },
         .aws_lambda = .{
-            .url = "git+https://github.com/ikolomiets/aws-lambda-zig?ref=sqs-event-source-mapping#63ac8ac0c3004dc12bb8343f65b47a1a57662a33",
-            .hash = "aws_lambda-0.7.0-AMNpesEoAwDa91JxDMLcOjcmZp6Rhmatg3dDOp4KkVMv",
+            .url = "git+https://github.com/ikolomiets/aws-lambda-zig?ref=sqs-event-source-mapping-zig-0-17#1ad4902b5a9010612f73cb04f09c7079c830ce80",
+            .hash = "aws_lambda-0.7.0-AMNpeiYpAwDJiPfyufcd7EOquXGftZB4pKVaiobXj2Kc",
         },
         .zig_paseto = .{
             .url = "git+https://github.com/deatil/zig-paseto?ref=v1.2.5#74a5b912497f8f020f004ad9e653edc0137b349b",

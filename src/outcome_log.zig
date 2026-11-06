@@ -174,7 +174,7 @@ test "JSON escaping, bounded metadata and observer failures do not escape emissi
     context.emit();
     try std.testing.expectEqualStrings("quote\"\n\\", observer.records.items[0].sqs_message_id.?);
     try std.testing.expectEqualStrings("00000000-0000-0000-0000-000000000001", observer.records.items[0].operation_id.?);
-    context.record.sqs_message_id = "x" ** 10000;
+    context.record.sqs_message_id = &@as([10000]u8, @splat('x'));
     context.emit();
     try std.testing.expectEqual(@as(usize, 128), observer.records.items[1].sqs_message_id.?.len);
     try std.testing.expect(observer.records.items[1].result_type == null);
@@ -185,7 +185,7 @@ test "oversized detail is dropped as a whole and service messages never enter re
     defer arena.deinit();
     var observer = TestObserver.init(arena.allocator());
     var context = Context.init(observer.logger(), .intake);
-    context.record.reason = "x" ** (size_max + 1);
+    context.record.reason = &@as([size_max + 1]u8, @splat('x'));
     context.emit();
     try std.testing.expectEqual(@as(usize, 0), observer.records.items.len);
     context.record.reason = null;

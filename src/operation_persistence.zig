@@ -821,7 +821,7 @@ fn stateEqual(first: *const operation.State, second: *const operation.State) !bo
 }
 
 const test_id = "00112233-4455-6677-8899-aabbccddeeff";
-const test_hash = [_]u8{0xAB} ** 32;
+const test_hash = @as([32]u8, @splat(0xAB));
 
 fn testOperation(state_tag: operation.StateTag, completion: ?operation.Completion) operation.Operation {
     return .{
@@ -986,7 +986,7 @@ test "decoder rejects missing and malformed tenant attributes" {
     const invalid_values = [_]AttributeValue{
         .{ .n = "1" },
         .{ .s = "" },
-        .{ .s = "a" ** (operation.tenant_size_max + 1) },
+        .{ .s = &@as([operation.tenant_size_max + 1]u8, @splat('a')) },
         .{ .s = &.{0xFF} },
     };
     for (invalid_values) |invalid| {
@@ -1049,7 +1049,7 @@ test "decoder rejects duplicate unknown wrong and malformed attributes" {
         decodeItem(arena.allocator(), malformed[0..7]),
     );
     malformed = request.items;
-    malformed[6].value = .{ .s = "AB" ** 32 };
+    malformed[6].value = .{ .s = std.mem.asBytes(&@as([32][2]u8, @splat("AB".*))) };
     try std.testing.expectError(
         error.InvalidItem,
         decodeItem(arena.allocator(), malformed[0..7]),
@@ -1109,7 +1109,7 @@ test "decoder enforces completion presence type canonical envelope and size" {
     malformed[7].value = .{ .s = "{\"type\":\"SUCCESS\",\"payload\":null}" };
     try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &malformed));
     const oversized = "{\"type\":\"SUCCESS\",\"payload\":\"" ++
-        ("a" ** (operation.result_size_max - 30)) ++ "\"}";
+        (&@as([operation.result_size_max - 30]u8, @splat('a'))) ++ "\"}";
     malformed = request.items;
     malformed[7].value = .{ .s = oversized };
     try std.testing.expectError(error.InvalidItem, decodeItem(arena.allocator(), &malformed));
@@ -1117,7 +1117,7 @@ test "decoder enforces completion presence type canonical envelope and size" {
 
 test "completion envelopes round trip through canonical DynamoDB strings" {
     const inputs = [_][]const u8{
-        "{\"type\":\"SUCCESS\",\"payload\":\"" ++ ("a" ** (98304 - 31)) ++ "\"}",
+        "{\"type\":\"SUCCESS\",\"payload\":\"" ++ (&@as([98304 - 31]u8, @splat('a'))) ++ "\"}",
         "{\"type\":\"SUCCESS\",\"payload\":true}",
         "{\"type\":\"FAILURE\",\"payload\":42}",
         "{\"type\":\"SUCCESS\",\"payload\":\"text\"}",
@@ -1232,7 +1232,7 @@ test "completion condition matches queued identity without timestamp conditions"
     try std.testing.expectEqualStrings("SUBMITTED", try stringValue(
         findAttribute(&request.values, ":submitted").?,
     ));
-    try std.testing.expectEqualStrings("ab" ** 32, try stringValue(
+    try std.testing.expectEqualStrings(std.mem.asBytes(&@as([32][2]u8, @splat("ab".*))), try stringValue(
         findAttribute(&request.values, ":hash").?,
     ));
 }
@@ -1288,7 +1288,7 @@ test "completion request enforces the full 98304 byte envelope boundary" {
     var queued = testOperation(.submitted, null);
     queued.body = .{ .bool = true };
     const maximum: operation.Completion = .{
-        .success = .{ .string = "a" ** (operation.result_size_max - 31) },
+        .success = .{ .string = &@as([operation.result_size_max - 31]u8, @splat('a')) },
     };
     var request: CompletionRequest = undefined;
     try completionRequestInit(&request, &queued, &maximum, 1_800_000_123);
@@ -1298,7 +1298,7 @@ test "completion request enforces the full 98304 byte envelope boundary" {
     );
 
     const oversized: operation.Completion = .{
-        .success = .{ .string = "a" ** (operation.result_size_max - 30) },
+        .success = .{ .string = &@as([operation.result_size_max - 30]u8, @splat('a')) },
     };
     try std.testing.expectError(
         error.ResultTooLarge,
@@ -1384,7 +1384,7 @@ test "ID-only completion persists exact envelopes and caller timestamps" {
 test "ID-only completion enforces the full 98304 byte envelope boundary" {
     const id = operation.uuidFromString(test_id) catch unreachable;
     const maximum: operation.Completion = .{
-        .success = .{ .string = "a" ** (operation.result_size_max - 31) },
+        .success = .{ .string = &@as([operation.result_size_max - 31]u8, @splat('a')) },
     };
     var request: CompletionByIdRequest = undefined;
     try completionByIdRequestInit(&request, id, &maximum, 1_800_000_123);
@@ -1394,7 +1394,7 @@ test "ID-only completion enforces the full 98304 byte envelope boundary" {
     );
 
     const oversized: operation.Completion = .{
-        .failure = .{ .string = "a" ** (operation.result_size_max - 30) },
+        .failure = .{ .string = &@as([operation.result_size_max - 30]u8, @splat('a')) },
     };
     try std.testing.expectError(
         error.ResultTooLarge,
@@ -1720,7 +1720,7 @@ test "initialization rejects malformed and oversized table configuration" {
         "ab",
         "operations/table",
         "operations table",
-        "a" ** 256,
+        &@as([256]u8, @splat('a')),
     };
 
     for (invalid_names) |table_name| {
@@ -1744,7 +1744,7 @@ test "initialization retains valid table configuration and shared AWS configurat
     const valid_names = [_][]const u8{
         "abc",
         "operations-table.1",
-        "a" ** 255,
+        &@as([255]u8, @splat('a')),
     };
 
     for (valid_names) |table_name| {
@@ -1767,7 +1767,7 @@ test "initialization retains valid table configuration and shared AWS configurat
 /// It models the DynamoDB condition; it does not establish the service's atomicity guarantee.
 pub const test_support = if (@import("builtin").is_test) struct {
     pub const Store = struct {
-        entries: [3]?operation.Operation = .{null} ** 3,
+        entries: [3]?operation.Operation = @splat(null),
         writes: usize = 0,
         calls: usize = 0,
         fail_at: ?usize = null,

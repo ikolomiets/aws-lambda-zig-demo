@@ -1,4 +1,4 @@
-# Zig 0.16 Wrapper for TigerBeetle
+# Zig Wrapper for TigerBeetle
 
 The maintained [processor design](TIGER_BEETLE_PROCESSOR.md) owns Body validation, execution,
 replay and public Results. This reference owns native ABI, client packaging and lifetime mechanics.
@@ -429,4 +429,4 @@ only its own temporary cluster rather than attempting record deletion.
 - Account creation: `docs/reference/requests/create_accounts.md` in the pinned documentation
 - Transfer creation: `docs/reference/requests/create_transfers.md` in the pinned documentation
 - Account lookup: `docs/reference/requests/lookup_accounts.md` in the pinned documentation
-- Zig event memory ordering: `std.Io.Event` in the Zig 0.16 standard library
+- Zig event memory ordering: `std.Io.Event` in the Zig 0.17 standard library
