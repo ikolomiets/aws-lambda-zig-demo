@@ -66,8 +66,9 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | Check | Scope and additional prerequisites |
 | --- | --- |
 | `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
+| `zig build check` | Combined offline and eleven-case runtime suite through the existing `test` and `test-runtime` runners; requires loopback socket permission, with no AWS credentials or live replica. Formatting remains separate. |
 | `zig build test` | Full offline Zig and mocked deployment-helper suite; excludes socket-based runtime tests, the live replica, and separate ABI checks |
-| `zig build test-runtime` | Five host integration cases through the real Lambda event loop and intake, query, TigerBeetle execution, and Completion handlers; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
+| `zig build test-runtime` | Eleven host integration cases through the real Lambda event loop and all six handlers; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
 | `zig build test-deploy` | Mocked regression tests for cleanup lifecycle, gateway discovery and interfaces, and processor interfaces; requires Bash and `jq`, with no AWS credentials or network access |
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
 | `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli` | Host counter build and deterministic global allocation/tooling tests |
@@ -96,18 +97,19 @@ When the active agent sandbox restricts network access, request elevated
 execution on the first attempt for each of these socket-based commands:
 
 ```sh
+zig build check --system zig-pkg --summary all
 zig build test-runtime --system zig-pkg
 TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle --system zig-pkg
 ```
 
 Run each command in a separate tool call with
 `sandbox_permissions = "require_escalated"`. Explain the required access in
-the request: `test-runtime` binds a fake Runtime API to `127.0.0.1` on an
-operating-system-assigned port, with external effects mocked;
-`test-tigerbeetle` connects to and writes test data in the separately authorized
+the request: `check` includes the offline suite and `test-runtime`, which binds
+a fake Runtime API to `127.0.0.1` on an operating-system-assigned port, with
+external effects mocked; `test-tigerbeetle` connects to and writes test data in the separately authorized
 local replica at `127.0.0.1:3000`. Keep that address explicit in the live command.
-Where supported, scope reusable approval prefixes to `zig build test-runtime`
-and `zig build test-tigerbeetle`, respectively.
+Where supported, scope reusable approval prefixes to `zig build check`,
+`zig build test-runtime`, and `zig build test-tigerbeetle`, respectively.
 
 If socket access is denied or elevated execution is unavailable, report the
 affected suite as blocked by the environment and continue the unaffected
@@ -118,10 +120,22 @@ checks. A sandbox denial is a validation gap, not a passing or skipped test.
 Run the socket-based suite separately from the complete offline sequence:
 
 ```sh
-zig build test-runtime --system zig-pkg
+zig build test-runtime --system zig-pkg --summary all
 ```
 
-The target starts a fake Runtime API on `127.0.0.1` with an operating-system-assigned
+To run both the offline and runtime suites through the shared gate, use:
+
+```sh
+zig build check --system zig-pkg --summary all
+```
+
+`deploy.sh` runs `fmt-check`, then `check`, then `package` in both full and
+development modes, including dry runs, using the selected caches and dependency
+forks. A check failure stops packaging and deployment. Running the helper therefore
+requires loopback socket access too; the complete offline checks continue to mock
+deployment commands. Ordinary builds and `package` do not depend on tests.
+
+`test-runtime` starts a fake Runtime API on `127.0.0.1` with an operating-system-assigned
 port. It exercises authenticated intake, warm query caching, malformed-event
 failure and recovery, partial SQS acknowledgements, and Completion persistence
 retry. It checks response/error paths and bodies, invocation-ID echoing and
@@ -130,14 +144,24 @@ observations before invocation arenas reset and issue tokens against the current
 clock. The query case freezes only the handler's cache clock so host scheduling
 does not expire its one-second cache between scripted invocations.
 
+Both Seat Reservation handlers use the same
+[test support](../../tests/seat_test_support.zig). Their six cases
+exercise ready-Event cache reuse across warm invocations, submission publication
+retry, Completion retry after an uncertain write with authoritative submitted-state
+readback, and malformed-SQS error reporting followed by successful processing.
+Captured publications, writes and logs use test-owned memory so assertions remain
+valid after invocation arena resets. The summary reports eleven passing cases;
+cached compilation still executes all runtime tests.
+
 All external persistence, execution, and publication effects are mocked. Cloud
 resource initialization is bypassed; these tests establish no live AWS or
-TigerBeetle behavior. The seat processor tests retain their existing coverage.
+TigerBeetle behavior. The socket-free seat processor tests retain their existing
+coverage under `test-seat-processors` and the ordinary `test` target.
 
 Host test wiring uses `sh`, `ln`, and `cp` to place a test facade beside a symlink
 to the active `aws_lambda` source directory. It uses the same
 resolved dependency, including `--fork` overrides, without copying upstream
-sources. The four runtime test variants enable only cases prefixed
+sources. The six runtime test variants enable only cases prefixed
 `runtime integration:` and support multiple threads for the fake server.
 Ordinary tests disable these cases, and production threading settings are
 unchanged. Restricted environments need loopback socket permission for this

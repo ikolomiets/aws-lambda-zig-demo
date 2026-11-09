@@ -367,7 +367,11 @@ without unrelated refactors.
 
 ## Test navigation
 
-Deterministic tests are embedded beside the implementation in `src/`. The composed
+Deterministic test cases and handler-specific fakes are embedded beside the
+implementation in `src/`. Both TigerBeetle handlers use the shared
+`sqs_batch_event` builder in [runtime test support](../src/runtime_test_support.zig)
+for socket-free and runtime tests, preserving source order and message IDs for
+partial-batch assertions. The composed
 test `authenticated pipeline retains Results through diagnostics duplicates and failed sends`
 in [the processor source](../src/tiger_beetle_processor.zig) exercises authenticated
 intake → native execution adapter → Completion → authenticated query, including
@@ -393,7 +397,11 @@ executor cases verify whole-invocation error reporting and recovery, and partial
 acknowledgements after publication failure. Its Completion case verifies retry
 after a transient persistence failure and acknowledgement after a successful
 write. The same target covers intake and warm query invocations, including
-runtime metadata refresh. External effects are mocked and cloud resource
+runtime metadata refresh. These four handlers use `runtime_test_support.Fixture`
+to own the fake Runtime API and test observation arena, clean up resources, and
+check invocation metadata after the event loop runs. Native execution,
+publication, and persistence fakes remain beside the tests for their respective
+interfaces. External effects are mocked and cloud resource
 initialization is bypassed. These socket-based tests require loopback permission
 and are excluded from `zig build test`; see the
 [runtime check guide](agents/local-checks.md#runtime-integration-checks).

@@ -471,26 +471,7 @@ const FakeClock = struct {
     }
 };
 
-fn testEvent(allocator: Allocator, bodies: []const []const u8) ![]u8 {
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
-    try output.writer.writeAll("{\"Records\":[");
-    for (bodies, 0..) |body, index| {
-        if (index > 0) try output.writer.writeByte(',');
-        try output.writer.print(
-            "{{\"messageId\":\"message-{d}\",\"receiptHandle\":\"receipt-{d}\",\"body\":",
-            .{ index, index },
-        );
-        try std.json.Stringify.value(body, .{}, &output.writer);
-        try output.writer.writeAll(
-            ",\"attributes\":{},\"messageAttributes\":{}," ++
-                "\"eventSource\":\"aws:sqs\",\"eventSourceARN\":\"arn\"," ++
-                "\"awsRegion\":\"ca-central-1\"}",
-        );
-    }
-    try output.writer.writeAll("]}");
-    return output.toOwnedSlice();
-}
+const testEvent = @import("runtime_test_support").sqs_batch_event;
 
 fn expectCompletionJSON(
     expected: []const u8,
@@ -644,9 +625,9 @@ test "invalid completion envelopes log an error without claiming or persisting a
 test "runtime integration: Completion retries a transient write then acknowledges durable success" {
     if (comptime !runtime_tests_enabled) return error.SkipZigTest;
     const runtime = @import("runtime_test_support");
-    var seen: runtime.Observations = .{};
-    defer seen.deinit();
-    const allocator = seen.arena.allocator();
+    var fixture: runtime.Fixture = .{};
+    defer fixture.deinit();
+    const allocator = fixture.allocator();
     const Store = struct {
         allocator: Allocator,
         calls: u8 = 0,
@@ -677,8 +658,7 @@ test "runtime integration: Completion retries a transient write then acknowledge
         "\"context\":null,\"body\":{\"create_accounts\":[{\"error_code\":\"created\"}]," ++
         "\"create_transfers\":[],\"lookup_accounts\":[]}}";
     const event = try testEvent(allocator, &.{input});
-    var tester: runtime.Tester = undefined;
-    try tester.init(std.testing.allocator, &.{
+    try fixture.init(&.{
         .{
             .request_id = "completion-1",
             .payload = event,
@@ -692,18 +672,15 @@ test "runtime integration: Completion retries a transient write then acknowledge
             .xray_trace = "write-trace-2",
         },
     });
-    defer tester.deinit();
     var store: Store = .{ .allocator = allocator };
     installRuntimeCompletionPersistence(CompletionPersistence.init(&store));
     defer uninstallRuntimeCompletionPersistence();
 
-    runtime.run(&tester, &seen, .{}, handler);
-
-    try runtime.expect_protocol(&tester, &seen);
-    try tester.expectPath(0, "/2018-06-01/runtime/invocation/completion-1/response");
-    try tester.expectBody(0, "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}");
-    try tester.expectPath(1, "/2018-06-01/runtime/invocation/completion-2/response");
-    try tester.expectBody(1, "{\"batchItemFailures\":[]}");
+    try fixture.run_handler(.{}, handler);
+    try fixture.tester.expectPath(0, "/2018-06-01/runtime/invocation/completion-1/response");
+    try fixture.tester.expectBody(0, "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-0\"}]}");
+    try fixture.tester.expectPath(1, "/2018-06-01/runtime/invocation/completion-2/response");
+    try fixture.tester.expectBody(1, "{\"batchItemFailures\":[]}");
     try std.testing.expectEqual(@as(u8, 2), store.calls);
     try std.testing.expectEqual(try operation.uuidFromString(test_uuid), store.saved_id.?);
     try std.testing.expect(store.saved_time > 0);

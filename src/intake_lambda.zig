@@ -1939,10 +1939,9 @@ test "intake matching completed retries log the saved outcome without publicatio
 test "runtime integration: authenticated intake persists and publishes through the event loop" {
     if (comptime !runtime_tests_enabled) return error.SkipZigTest;
     const runtime = @import("runtime_test_support");
-    var tester: runtime.Tester = undefined;
-    var seen: runtime.Observations = .{};
-    defer seen.deinit();
-    const allocator = seen.arena.allocator();
+    var fixture: runtime.Fixture = .{};
+    defer fixture.deinit();
+    const allocator = fixture.allocator();
     const input =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"name\":\"TigerBeetle\",\"body\":true}";
@@ -1960,23 +1959,20 @@ test "runtime integration: authenticated intake persists and publishes through t
         token,
         input,
     );
-    try tester.init(std.testing.allocator, &.{.{
+    try fixture.init(&.{.{
         .request_id = "intake-1",
         .invocation_id = "intake-attempt-1",
         .payload = event,
     }});
-    defer tester.deinit();
-    try lambda_auth.testing.put_public_key(&tester.env_map, 0x62);
-    try tester.env_map.put("TigerBeetleQueue", test_queue_url);
+    try lambda_auth.testing.put_public_key(&fixture.tester.env_map, 0x62);
+    try fixture.tester.env_map.put("TigerBeetleQueue", test_queue_url);
     var fake: FakeIntake = .{};
     installRuntimeIntakeAdapter(IntakeAdapter.init(&fake));
     defer uninstallRuntimeIntakeAdapter();
 
-    runtime.run(&tester, &seen, .{}, handler);
-
-    try runtime.expect_protocol(&tester, &seen);
-    try tester.expectPath(0, "/2018-06-01/runtime/invocation/intake-1/response");
-    const output = try runtime.http_body(allocator, &tester, 0, 200);
+    try fixture.run_handler(.{}, handler);
+    try fixture.tester.expectPath(0, "/2018-06-01/runtime/invocation/intake-1/response");
+    const output = try runtime.http_body(allocator, &fixture.tester, 0, 200);
     try std.testing.expectEqualStrings("SUBMITTED", output.object.get("state").?.string);
     try std.testing.expectEqualStrings(
         "00112233-4455-6677-8899-aabbccddeeff",

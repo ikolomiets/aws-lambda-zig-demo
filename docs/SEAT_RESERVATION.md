@@ -577,6 +577,13 @@ across simulated invocation restarts. Assertions cover emitted requests, durable
 state, public Results, and source acknowledgements together. Focused boundary
 tests cover malformed input, serializer limits, and memory ownership.
 
+The separate `test-runtime` target runs both private seat handlers through the
+real Lambda event loop against a loopback Runtime API. It verifies warm ready-Event
+cache reuse, refreshed invocation metadata and request IDs in outcome logs,
+publication and persistence retries, and malformed-SQS error reporting and recovery.
+External effects remain mocked, and test-owned observations survive invocation arena
+resets. The existing domain and composed tests remain socket-free.
+
 | Area | Required scenarios |
 | --- | --- |
 | Admission and messages | All four schemas, decoded duplicates, normalized numbers, UTF-8/tag/ID limits, exact/over byte bounds and transport escaping; invalid input has no allocation, Event write or native dispatch; trusted tenant and explicit Context survive normal and diagnostic hops. |

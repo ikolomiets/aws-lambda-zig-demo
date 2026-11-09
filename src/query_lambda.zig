@@ -1263,9 +1263,9 @@ pub const test_support = if (@import("builtin").is_test) struct {
 test "runtime integration: warm query preserves cache and refreshes invocation metadata" {
     if (comptime !runtime_tests_enabled) return error.SkipZigTest;
     const runtime = @import("runtime_test_support");
-    var seen: runtime.Observations = .{};
-    defer seen.deinit();
-    const allocator = seen.arena.allocator();
+    var fixture: runtime.Fixture = .{};
+    defer fixture.deinit();
+    const allocator = fixture.allocator();
     const token = try lambda_auth.testing.issue_token(allocator, .{
         .seed_byte = 0x71,
         .now = std.Io.Clock.real.now(std.testing.io).toSeconds(),
@@ -1273,8 +1273,7 @@ test "runtime integration: warm query preserves cache and refreshes invocation m
     });
     const event = try testQueryRequestEvent(token);
     defer std.testing.allocator.free(event);
-    var tester: runtime.Tester = undefined;
-    try tester.init(std.testing.allocator, &.{
+    try fixture.init(&.{
         .{
             .request_id = "query-1",
             .payload = event,
@@ -1300,8 +1299,7 @@ test "runtime integration: warm query preserves cache and refreshes invocation m
             .deadline_ms = 1003,
         },
     });
-    defer tester.deinit();
-    try lambda_auth.testing.put_public_key(&tester.env_map, 0x71);
+    try lambda_auth.testing.put_public_key(&fixture.tester.env_map, 0x71);
     var cache: OperationCache = undefined;
     OperationCache.init(&cache, std.testing.allocator);
     defer cache.deinit();
@@ -1309,9 +1307,7 @@ test "runtime integration: warm query preserves cache and refreshes invocation m
     installRuntimeQueryAdapter(QueryAdapter.init(&fake, &cache));
     defer uninstallRuntimeQueryAdapter();
 
-    runtime.run(&tester, &seen, .{ .awake_ns = 1000 }, handler);
-
-    try runtime.expect_protocol(&tester, &seen);
+    try fixture.run_handler(.{ .awake_ns = 1000 }, handler);
     try std.testing.expectEqual(@as(u8, 1), fake.read_count);
     try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
     for ([_][]const u8{ "query-1", "query-2", "query-3" }, 0..) |id, index| {
@@ -1320,8 +1316,8 @@ test "runtime integration: warm query preserves cache and refreshes invocation m
             "/2018-06-01/runtime/invocation/{s}/response",
             .{id},
         );
-        try tester.expectPath(index, path);
-        const output = try runtime.http_body(allocator, &tester, index, 200);
+        try fixture.tester.expectPath(index, path);
+        const output = try runtime.http_body(allocator, &fixture.tester, index, 200);
         try std.testing.expectEqualStrings("SUBMITTED", output.object.get("state").?.string);
         try std.testing.expectEqualStrings(
             "lambda-test-user",
@@ -1331,6 +1327,6 @@ test "runtime integration: warm query preserves cache and refreshes invocation m
             "00112233-4455-6677-8899-aabbccddeeff",
             output.object.get("id").?.string,
         );
-        try tester.expectBody(index, (try tester.post(0)).body);
+        try fixture.tester.expectBody(index, (try fixture.tester.post(0)).body);
     }
 }

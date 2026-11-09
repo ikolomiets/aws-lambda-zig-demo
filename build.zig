@@ -1056,6 +1056,8 @@ pub fn build(b: *std.Build) void {
         query_test_mod,
         tiger_beetle_processor_test_mod,
         tiger_beetle_completion_processor_test_mod,
+        seat_submission_mod,
+        seat_completion_mod,
     };
     const ordinary_test_options = b.addOptions();
     ordinary_test_options.addOption(bool, "enabled", false);
@@ -1074,8 +1076,25 @@ pub fn build(b: *std.Build) void {
         "test-runtime",
         "Run loopback Lambda runtime integration tests",
     );
+    const seat_test_support = b.createModule(.{
+        .target = b.graph.host,
+        .root_source_file = b.path("tests/seat_test_support.zig"),
+        .imports = &.{
+            .{ .name = "dynamodb", .module = host_dynamodb },
+            .{ .name = "operation", .module = host_operation },
+            .{ .name = "operation_persistence", .module = host_operation_persistence },
+            .{ .name = "processor_message", .module = host_processor_message },
+            .{ .name = "seat_reservation", .module = host_seat_reservation },
+            .{ .name = "seat_reservation_persistence", .module = host_seat_persistence },
+            .{ .name = "outcome_log", .module = host_outcome_log },
+            .{ .name = "runtime_test_support", .module = runtime_test_support },
+        },
+    });
+    seat_submission_mod.addImport("seat_test_support", seat_test_support);
+    seat_completion_mod.addImport("seat_test_support", seat_test_support);
     for (runtime_test_modules) |source| {
         source.addImport("runtime_test_options", ordinary_test_options_module);
+        source.addImport("runtime_test_support", runtime_test_support);
         const module = b.createModule(.{
             .target = b.graph.host,
             .optimize = .safe,
@@ -1087,7 +1106,6 @@ pub fn build(b: *std.Build) void {
             module.addImport(entry.key_ptr.*, entry.value_ptr.*);
         }
         module.addImport("runtime_test_options", runtime_test_options_module);
-        module.addImport("runtime_test_support", runtime_test_support);
         const runtime_tests = b.addTest(.{
             .root_module = module,
             .filters = &.{"runtime integration:"},
@@ -1123,4 +1141,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_queue_cli_tests.step);
     test_step.dependOn(&run_tigerbeetle_tests.step);
     test_step.dependOn(deploy_test_step);
+
+    const check_step = b.step("check", "Run offline and loopback runtime tests");
+    check_step.dependOn(test_step);
+    check_step.dependOn(runtime_test_step);
 }

@@ -10,6 +10,11 @@ const ledger_counter = @import("ledger_counter");
 const sqs_queue = @import("sqs_queue");
 const logging = @import("outcome_log");
 const Allocator = std.mem.Allocator;
+const test_support = @import("seat_test_support");
+const runtime_tests_enabled = if (@import("builtin").is_test)
+    @import("runtime_test_options").enabled
+else
+    false;
 
 pub const Options = struct {
     logger: logging.Logger = .{},
@@ -22,7 +27,7 @@ pub const Options = struct {
 pub const Stage = enum { submission, completion };
 pub const diagnostic_size_max = 8192;
 const preview_size_max = 512;
-var runtime: ?*Runtime = null;
+var runtime: ?*const InvocationAdapter = null;
 
 pub fn main(init: std.process.Init) void {
     var resources: Runtime = undefined;
@@ -33,21 +38,60 @@ pub fn main(init: std.process.Init) void {
         return;
     };
     defer resources.deinit();
-    std.debug.assert(runtime == null);
-    runtime = &resources;
-    defer runtime = null;
-    lambda.handle(init, handler, .{});
-}
-
-fn handler(context: lambda.Context, input: []const u8) ![]const u8 {
-    const resources = runtime orelse return error.NotInitialized;
-    return handle_invocation(context.arena, input, &.{
-        .logger = .{ .request_id = context.request.id },
+    var adapter: InvocationAdapter = undefined;
+    adapter.init(&resources, &.{
         .events_table = resources.events.table_name,
         .completion_queue = resources.completion_queue,
         .native_queue = resources.native_queue,
         .ready_cache = &resources.ready_cache,
-    }, resources);
+    });
+    install_runtime_adapter(&adapter);
+    defer uninstall_runtime_adapter();
+    lambda.handle(init, handler, .{});
+}
+
+fn handler(context: lambda.Context, input: []const u8) ![]const u8 {
+    const adapter = runtime orelse return error.NotInitialized;
+    var options = adapter.options;
+    options.logger.request_id = context.request.id;
+    return adapter.invoke(adapter.backend, context.arena, input, &options);
+}
+
+// Erase only the backend type; every adapter runs the same invocation implementation.
+const InvocationAdapter = struct {
+    backend: *anyopaque,
+    options: Options,
+    invoke: *const fn (*anyopaque, Allocator, []const u8, *const Options) anyerror![]const u8,
+
+    fn init(self: *InvocationAdapter, backend: anytype, options: *const Options) void {
+        const Pointer = @TypeOf(backend);
+        comptime std.debug.assert(@typeInfo(Pointer) == .pointer);
+        comptime std.debug.assert(@typeInfo(Pointer).pointer.size == .one);
+        const Bridge = struct {
+            fn invoke(
+                pointer: *anyopaque,
+                arena: Allocator,
+                input: []const u8,
+                invocation_options: *const Options,
+            ) anyerror![]const u8 {
+                const typed_backend: Pointer = @ptrCast(@alignCast(pointer));
+                return handle_invocation(arena, input, invocation_options, typed_backend);
+            }
+        };
+        self.* = .{ .backend = backend, .options = options.*, .invoke = Bridge.invoke };
+    }
+};
+
+fn install_runtime_adapter(adapter: *const InvocationAdapter) void {
+    std.debug.assert(runtime == null);
+    runtime = adapter;
+    std.debug.assert(runtime != null);
+}
+
+fn uninstall_runtime_adapter() void {
+    std.debug.assert(runtime != null);
+    runtime = null;
+    std.debug.assert(runtime == null);
 }
 
 const Runtime = struct {
@@ -512,4 +556,55 @@ fn escaped_bytes(input: []const u8, output: []u8) []const u8 {
         }
     }
     return output[0..count];
+}
+
+fn run_runtime_test(
+    fixture: *test_support.RuntimeFixture,
+    script: []const test_support.RuntimeEvent,
+) !void {
+    var adapter: InvocationAdapter = undefined;
+    adapter.init(&fixture.backend, &.{
+        .logger = fixture.observer.logger(),
+        .events_table = "Events",
+        .native_queue = "native",
+        .completion_queue = "completion",
+        .ready_cache = &fixture.cache,
+    });
+    install_runtime_adapter(&adapter);
+    defer uninstall_runtime_adapter();
+    try fixture.run(script, handler);
+}
+
+test "runtime integration: seat submission reuses ready metadata across warm invocations" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    var fixture: test_support.RuntimeFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const script = try fixture.warm_events(.submission);
+    try run_runtime_test(&fixture, &script);
+    try fixture.expect_warm();
+    try fixture.backend.expect_effects(.{ .event_reads = 1, .generated = 3, .send_attempts = 3, .published = 3 });
+}
+
+test "runtime integration: seat submission retries a failed publication then acknowledges" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    var fixture: test_support.RuntimeFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const script = try fixture.retry_events(.submission);
+    fixture.backend.fail_next_send = error.SendFailed;
+    try run_runtime_test(&fixture, &script);
+    try fixture.expect_retry("dispatched");
+    try fixture.backend.expect_effects(.{ .event_reads = 1, .generated = 2, .send_attempts = 2, .published = 1 });
+}
+
+test "runtime integration: seat submission reports malformed SQS input and recovers" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    var fixture: test_support.RuntimeFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const script = try fixture.recovery_events(.submission);
+    try run_runtime_test(&fixture, &script);
+    try fixture.expect_recovery();
+    try fixture.backend.expect_effects(.{ .event_reads = 1, .generated = 1, .send_attempts = 1, .published = 1 });
 }

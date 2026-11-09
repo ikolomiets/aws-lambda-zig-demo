@@ -804,6 +804,18 @@ network access. Run all Zig tests and deployment-helper regression tests with:
 zig build test
 ```
 
+Run the offline suite and all eleven Lambda runtime integration cases together with:
+
+```sh
+zig build check --summary all
+```
+
+`check` requires loopback socket access for the fake Runtime API on `127.0.0.1`.
+External effects are mocked; no AWS credentials or live TigerBeetle replica are
+required. Run only the runtime cases with `zig build test-runtime --summary all`.
+Formatting remains a separate check. Both deployment modes, including dry runs,
+run `fmt-check`, `check`, then `package`; development mode skips SAM validation.
+
 When developing against a Zig 0.17-compatible sibling checkout of `aws-lambda-zig`, keep
 `build.zig.zon` pinned and override the dependency at build time:
 

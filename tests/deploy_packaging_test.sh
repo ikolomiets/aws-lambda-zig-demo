@@ -47,6 +47,9 @@ zig() {
     done
     printf 'zig:%s\n' "$*" >>"$MOCK_LOG"
     printf 'zig-global-cache:%s:%s\n' "$2" "${ZIG_GLOBAL_CACHE_DIR:-}" >>"$MOCK_LOG"
+    if [ "$2" = check ]; then
+        return "${MOCK_CHECK_STATUS:-0}"
+    fi
     if [ "$2" = package ]; then
         [ "$MOCK_PACKAGE_STATUS" -eq 0 ] || return "$MOCK_PACKAGE_STATUS"
         mkdir -p zig-out/packages
@@ -93,40 +96,57 @@ for mode in full dev; do
     for dry_run in yes no; do
         dry_args=(--use-local-libs)
         [ "$dry_run" != yes ] || dry_args+=(--dry-run)
-        for package_status in 0 42; do
+        for failure_step in none check package; do
+            check_status=0
+            package_status=0
+            expected_status=0
+            case "$failure_step" in
+                check) check_status=43; expected_status=43 ;;
+                package) package_status=42; expected_status=42 ;;
+            esac
             : >"$TEST_TMP_DIR/calls.log"
             status=0
-            bash "$TEST_TMP_DIR/driver.sh" "$TEST_TMP_DIR" "$package_status" \
+            MOCK_CHECK_STATUS="$check_status" \
+                bash "$TEST_TMP_DIR/driver.sh" "$TEST_TMP_DIR" "$package_status" \
                 "${mode_args[@]}" "${dry_args[@]}" \
                 >"$TEST_TMP_DIR/output.log" 2>&1 || status=$?
-            [ "$status" -eq "$package_status" ] || {
+            [ "$status" -eq "$expected_status" ] || {
                 cat "$TEST_TMP_DIR/output.log" >&2
-                fail_test "$mode dry=$dry_run: expected $package_status, received $status"
+                fail_test "$mode dry=$dry_run $failure_step: expected $expected_status, received $status"
             }
             calls="$(cat "$TEST_TMP_DIR/calls.log")"
-            expected="zig:build package --cache-dir .zig-cache-$cache_suffix --fork=../aws-lambda-zig --release -Darch=arm"
-            [[ "$calls" == *"$expected"* ]] || fail_test "packaging options changed: $calls"
-            cache_steps=(fmt-check package)
-            [ "$mode" != full ] || cache_steps+=(test)
+            expected="zig:build check --cache-dir .zig-cache-$cache_suffix --fork=../aws-lambda-zig --summary all"
+            [ "$(grep -Fxc "$expected" "$TEST_TMP_DIR/calls.log")" -eq 1 ] ||
+                fail_test "expected exactly one combined check with cache/fork options: $calls"
+            cache_steps=(fmt-check check)
+            if [ "$failure_step" != check ]; then
+                cache_steps+=(package)
+                expected="zig:build package --cache-dir .zig-cache-$cache_suffix --fork=../aws-lambda-zig --release -Darch=arm"
+                grep -Fxq "$expected" "$TEST_TMP_DIR/calls.log" ||
+                    fail_test "packaging options changed: $calls"
+            fi
+            actual_steps="$(sed -n 's/^zig:build \([^ ]*\).*/\1/p' "$TEST_TMP_DIR/calls.log")"
+            [ "$actual_steps" = "$(printf '%s\n' "${cache_steps[@]}")" ] ||
+                fail_test "$mode $failure_step: unexpected build sequence: $calls"
             for step in "${cache_steps[@]}"; do
                 grep -Fxq "zig-global-cache:$step:.zig-global-cache-$cache_suffix" "$TEST_TMP_DIR/calls.log" ||
                     fail_test "$mode $step did not receive its global cache directory"
             done
             [[ "$calls" != *'need:zip'* ]] || fail_test "zip is still required"
-            if [ "$package_status" -ne 0 ]; then
+            if [ "$expected_status" -ne 0 ]; then
                 if grep -Eq '^(file:|unzip:|sam:|deploy$)' "$TEST_TMP_DIR/calls.log"; then
-                    fail_test "packaging failure did not stop validation/deployment: $calls"
+                    fail_test "$failure_step failure did not stop validation/deployment: $calls"
                 fi
                 continue
             fi
             [ "$(grep -c '^unzip:-Z1 zig-out/packages/.*\.zip$' "$TEST_TMP_DIR/calls.log")" -eq 6 ] ||
                 fail_test "deployment did not validate six packages"
             if [ "$mode" = dev ]; then
-                [[ "$calls" != *'zig:build test '* && "$calls" != *'sam:validate '* ]] ||
-                    fail_test "development mode ran full checks"
+                [[ "$calls" != *'sam:validate '* ]] ||
+                    fail_test "development mode ran SAM validation"
             else
-                [[ "$calls" == *'zig:build test '* && "$calls" == *'sam:validate --lint '* ]] ||
-                    fail_test "full mode skipped required checks"
+                [[ "$calls" == *'sam:validate --template-file '* && "$calls" == *'sam:validate --lint '* ]] ||
+                    fail_test "full mode skipped SAM validation"
             fi
             if [ "$dry_run" = yes ]; then
                 [[ "$calls" != *'sam:sync '* && "$calls" != *$'\ndeploy' ]] ||

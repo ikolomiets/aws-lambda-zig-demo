@@ -10,6 +10,11 @@ const events = @import("seat_reservation_persistence");
 const submission = @import("seat_reservation_processor");
 const logging = @import("outcome_log");
 const Allocator = std.mem.Allocator;
+const test_support = @import("seat_test_support");
+const runtime_tests_enabled = if (@import("builtin").is_test)
+    @import("runtime_test_options").enabled
+else
+    false;
 
 pub const Options = struct {
     logger: logging.Logger = .{},
@@ -19,7 +24,7 @@ pub const Options = struct {
     response_allocator: ?Allocator = null,
     ready_cache: ?*events.ReadyCache = null,
 };
-var runtime: ?*Runtime = null;
+var runtime: ?*const InvocationAdapter = null;
 
 pub fn main(init: std.process.Init) void {
     var resources: Runtime = undefined;
@@ -30,21 +35,61 @@ pub fn main(init: std.process.Init) void {
         return;
     };
     defer resources.deinit();
-    std.debug.assert(runtime == null);
-    runtime = &resources;
-    defer runtime = null;
+    var adapter: InvocationAdapter = undefined;
+    adapter.init(&resources, &.{
+        .operations_table = resources.persistence.table_name,
+        .events_table = resources.events_table,
+        .now = 0, // Replaced by the handler's current invocation clock.
+        .ready_cache = &resources.ready_cache,
+    });
+    install_runtime_adapter(&adapter);
+    defer uninstall_runtime_adapter();
     lambda.handle(init, handler, .{});
 }
 
 fn handler(context: lambda.Context, input: []const u8) ![]const u8 {
-    const resources = runtime orelse return error.NotInitialized;
-    return handle_invocation(context.arena, input, &.{
-        .logger = .{ .request_id = context.request.id },
-        .operations_table = resources.persistence.table_name,
-        .events_table = resources.events_table,
-        .now = std.Io.Clock.real.now(context.io).toSeconds(),
-        .ready_cache = &resources.ready_cache,
-    }, resources);
+    const adapter = runtime orelse return error.NotInitialized;
+    var options = adapter.options;
+    options.logger.request_id = context.request.id;
+    options.now = std.Io.Clock.real.now(context.io).toSeconds();
+    return adapter.invoke(adapter.backend, context.arena, input, &options);
+}
+
+// Erase only the backend type; every adapter runs the same invocation implementation.
+const InvocationAdapter = struct {
+    backend: *anyopaque,
+    options: Options,
+    invoke: *const fn (*anyopaque, Allocator, []const u8, *const Options) anyerror![]const u8,
+
+    fn init(self: *InvocationAdapter, backend: anytype, options: *const Options) void {
+        const Pointer = @TypeOf(backend);
+        comptime std.debug.assert(@typeInfo(Pointer) == .pointer);
+        comptime std.debug.assert(@typeInfo(Pointer).pointer.size == .one);
+        const Bridge = struct {
+            fn invoke(
+                pointer: *anyopaque,
+                arena: Allocator,
+                input: []const u8,
+                invocation_options: *const Options,
+            ) anyerror![]const u8 {
+                const typed_backend: Pointer = @ptrCast(@alignCast(pointer));
+                return handle_invocation(arena, input, invocation_options, typed_backend);
+            }
+        };
+        self.* = .{ .backend = backend, .options = options.*, .invoke = Bridge.invoke };
+    }
+};
+
+fn install_runtime_adapter(adapter: *const InvocationAdapter) void {
+    std.debug.assert(runtime == null);
+    runtime = adapter;
+    std.debug.assert(runtime != null);
+}
+
+fn uninstall_runtime_adapter() void {
+    std.debug.assert(runtime != null);
+    runtime = null;
+    std.debug.assert(runtime == null);
 }
 
 const Runtime = struct {
@@ -396,134 +441,17 @@ fn read_winner(
 }
 
 // Replace only external effects while exercising both processors' real codecs and adapters.
-const ConfirmationTestBackend = struct {
-    event: seat.Event,
-    output: ?[]const u8 = null,
-    queue: ?[]const u8 = null,
-    result: ?[]const u8 = null,
-    reads: usize = 0,
-    generated: usize = 0,
-    reports: usize = 0,
-    operation_item: ?[]const events.Attribute = null,
-    read_error: ?anyerror = null,
-    write_error: ?anyerror = null,
-    send_error: ?anyerror = null,
-
-    pub fn get(
-        self: *ConfirmationTestBackend,
-        arena: Allocator,
-        request: dynamodb.GetItemInput,
-    ) !?[]const aws.map.MapEntry(dynamodb.types.AttributeValue) {
-        if (self.read_error) |err| return err;
-        if (std.mem.eql(u8, request.table_name, "Operations")) return self.operation_item;
-        try std.testing.expectEqualStrings("Events", request.table_name);
-        try std.testing.expectEqual(true, request.consistent_read.?);
-        const expected = try events.read_request(arena, "Events", &.{
-            .tenant = self.event.tenant,
-            .event_id = self.event.event_id,
-        });
-        try std.testing.expectEqualDeep(expected.key, request.key);
-        self.reads += 1;
-        return try events.encode_item(arena, &self.event);
-    }
-
-    pub fn generate_id(self: *ConfirmationTestBackend) !u128 {
-        self.generated += 1;
-        return 124;
-    }
-
-    pub fn send(
-        self: *ConfirmationTestBackend,
-        arena: Allocator,
-        queue: []const u8,
-        body: []const u8,
-    ) !void {
-        if (self.send_error) |err| return err;
-        try std.testing.expect(self.output == null);
-        self.queue = try arena.dupe(u8, queue);
-        self.output = try arena.dupe(u8, body);
-    }
-
-    pub fn update(
-        self: *ConfirmationTestBackend,
-        _: Allocator,
-        request: dynamodb.types.Update,
-    ) !void {
-        try std.testing.expectEqualStrings("Operations", request.table_name);
-        if (self.write_error) |err| return err;
-        try std.testing.expect(self.result == null);
-        for (request.expression_attribute_values.?) |entry| {
-            if (std.mem.eql(u8, entry.key, ":result")) self.result = entry.value.s.?;
-        }
-        try std.testing.expect(self.result != null);
-    }
-
-    pub fn report(self: *ConfirmationTestBackend, _: []const u8) !void {
-        self.reports += 1;
-    }
-
-    pub fn allocate(_: *ConfirmationTestBackend, _: Allocator) !u32 {
-        return error.UnexpectedEffect;
-    }
-
-    pub fn put(_: *ConfirmationTestBackend, _: Allocator, _: dynamodb.PutItemInput) !void {
-        return error.UnexpectedEffect;
-    }
-
-    pub fn transact_write(
-        _: *ConfirmationTestBackend,
-        _: Allocator,
-        _: dynamodb.TransactWriteItemsInput,
-    ) !void {
-        return error.UnexpectedEffect;
-    }
-
-    pub fn transact_get(
-        _: *ConfirmationTestBackend,
-        _: Allocator,
-        _: dynamodb.TransactGetItemsInput,
-    ) !dynamodb.TransactGetItemsOutput {
-        return error.UnexpectedEffect;
-    }
-};
-
-fn confirmation_test_event(arena: Allocator) !seat.Event {
-    return seat.decode_event(arena,
-        \\{"tenant":"tenant-a","event_id":"00000000-0000-0000-0000-000000000001","ledger":1001,"timeout_seconds":30,"capacity_account_id":"1","allocation_account_id":"2","state":"ready","classes":{"a":{"total":10,"tb_account_id":"3"},"b":{"total":5,"tb_account_id":"4"}}}
-    );
-}
-
-fn confirmation_test_invocation(arena: Allocator, message: []const u8) ![]const u8 {
-    return std.json.Stringify.valueAlloc(arena, .{
-        .Records = &.{.{
-            .messageId = "confirmation",
-            .receiptHandle = "receipt",
-            .body = message,
-            .attributes = std.json.Value{ .object = .empty },
-            .messageAttributes = std.json.Value{ .object = .empty },
-            .md5OfBody = "md5",
-            .eventSource = "aws:sqs",
-            .eventSourceARN = "arn",
-            .awsRegion = "ca-central-1",
-        }},
-    }, .{});
-}
-
 fn submit_test_confirmation(arena: Allocator, body: []const u8, backend: anytype) !messages.Message {
-    const input = try messages.encode(arena, &.{
-        .operation_id = 5,
-        .tenant = "tenant-a",
-        .body = try seat.parse_value(arena, body, messages.body_size_max),
-        .context = .null,
-    });
+    const input = try test_support.submission_message(arena, 5, body);
     const response = try submission.handle_invocation(
         arena,
-        try confirmation_test_invocation(arena, input),
+        try test_support.sqs_event(arena, "confirmation", input),
         &.{ .events_table = "Events", .native_queue = "native", .completion_queue = "completion" },
         backend,
     );
     try std.testing.expectEqualStrings("{\"batchItemFailures\":[]}", response);
-    return messages.decode(arena, backend.output orelse return error.MissingDispatch);
+    try std.testing.expectEqual(@as(usize, 1), backend.effects.published);
+    return messages.decode(arena, backend.outputs[0].body);
 }
 
 test "confirmation flows through submission native evidence and completion" {
@@ -551,11 +479,11 @@ test "confirmation flows through submission native evidence and completion" {
         var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer storage.deinit();
         const arena = storage.allocator();
-        var backend: ConfirmationTestBackend = .{ .event = try confirmation_test_event(arena) };
+        var backend: test_support.Backend = .{ .allocator = arena, .event = try test_support.ready_event(arena) };
         const dispatched = try submit_test_confirmation(arena,
             \\{"command":"confirm_seats","event_id":"00000000-0000-0000-0000-000000000001","pending_id":"340282366920938463463374607431768211454"}
         , &backend);
-        try std.testing.expectEqualStrings("native", backend.queue.?);
+        try std.testing.expectEqualStrings("native", backend.outputs[0].queue);
         try std.testing.expectEqualStrings("completion", dispatched.result_queue.?);
         const context_json = try seat.encode_bounded(arena, dispatched.context, messages.context_size_max);
         const context = try seat.decode_context(arena, context_json);
@@ -578,7 +506,7 @@ test "confirmation flows through submission native evidence and completion" {
         observer.fail = true;
         const response = try handle_invocation(
             arena,
-            try confirmation_test_invocation(arena, completion),
+            try test_support.sqs_event(arena, "confirmation", completion),
             &.{ .operations_table = "Operations", .events_table = "Events", .now = 1, .logger = observer.logger() },
             &backend,
         );
@@ -590,18 +518,27 @@ test "confirmation flows through submission native evidence and completion" {
         if (case.inconsistent) {
             try std.testing.expectEqualStrings("evidence_validate", record.stage);
             try std.testing.expect(record.result_type == null);
-            try std.testing.expect(backend.result == null);
+            try std.testing.expectEqual(@as(usize, 0), backend.effects.completed);
         } else {
             const expected: seat.Result = if (case.failure) |failure|
                 .{ .failure = failure }
             else
                 .{ .success = .{ .confirm_seats = context.command.confirm_seats } };
             try std.testing.expectEqualStrings(if (case.failure != null) "FAILURE" else "SUCCESS", record.result_type.?);
-            try std.testing.expectEqualStrings(try seat.encode_result(arena, &expected), backend.result.?);
+            try std.testing.expectEqual(@as(usize, 1), backend.effects.completed);
+            try std.testing.expectEqualStrings(try seat.encode_result(arena, &expected), backend.writes[0].result);
         }
-        try std.testing.expectEqual(@as(usize, 2), backend.reads);
-        try std.testing.expectEqual(@as(usize, 1), backend.generated);
-        try std.testing.expectEqual(@as(usize, @intFromBool(case.inconsistent)), backend.reports);
+        const inconsistent = @intFromBool(case.inconsistent);
+        try backend.expect_effects(.{
+            .event_reads = 2,
+            .generated = 1,
+            .send_attempts = 1,
+            .published = 1,
+            .update_attempts = 1 - inconsistent,
+            .completed = 1 - inconsistent,
+            .report_attempts = inconsistent,
+            .reports = inconsistent,
+        });
     }
 }
 
@@ -609,27 +546,13 @@ test "confirmation schema rejects unknown fields before metadata reads or ID gen
     var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer storage.deinit();
     const arena = storage.allocator();
-    var backend: ConfirmationTestBackend = .{ .event = try confirmation_test_event(arena) };
+    var backend: test_support.Backend = .{ .allocator = arena, .event = try test_support.ready_event(arena) };
     const dispatched = try submit_test_confirmation(arena,
         \\{"command":"confirm_seats","event_id":"00000000-0000-0000-0000-000000000001","extra":true,"pending_id":"123"}
     , &backend);
-    try std.testing.expectEqualStrings("completion", backend.queue.?);
+    try std.testing.expectEqualStrings("completion", backend.outputs[0].queue);
     try std.testing.expectEqual(seat.FailureCode.invalid_request, try seat.local_failure(&dispatched.body));
-    try std.testing.expectEqual(@as(usize, 0), backend.reads);
-    try std.testing.expectEqual(@as(usize, 0), backend.generated);
-}
-
-fn stored_test_operation(arena: Allocator, result_json: ?[]const u8) ![]const events.Attribute {
-    const pending = try operation.parseInputJSON(arena, "{\"id\":\"00000000-0000-0000-0000-000000000001\",\"name\":\"SeatReservation\",\"body\":null}", .{ .tenant = "tenant-a", .now = 1 });
-    const request = try operations.create_request(arena, "Operations", &pending);
-    if (result_json == null) return request.item;
-    const items = try arena.alloc(events.Attribute, request.item.len + 1);
-    @memcpy(items[0..request.item.len], request.item);
-    for (items[0..request.item.len]) |*attribute| {
-        if (std.mem.eql(u8, attribute.key, "state")) attribute.value = .{ .s = "COMPLETED" };
-    }
-    items[request.item.len] = .{ .key = "result", .value = .{ .s = result_json.? } };
-    return items;
+    try backend.expect_effects(.{ .send_attempts = 1, .published = 1 });
 }
 
 test "seat finalization summaries describe authoritative winners and retain retries" {
@@ -650,11 +573,12 @@ test "seat finalization summaries describe authoritative winners and retain retr
         const arena = storage.allocator();
         var observer = logging.TestObserver.init(arena);
         observer.fail = true;
-        var backend: ConfirmationTestBackend = .{
-            .event = try confirmation_test_event(arena),
-            .operation_item = try stored_test_operation(arena, case.stored),
+        var backend: test_support.Backend = .{
+            .allocator = arena,
+            .event = try test_support.ready_event(arena),
+            .operation_item = try test_support.stored_operation(arena, case.stored),
             .read_error = case.read_error,
-            .write_error = case.write_error,
+            .fail_next_update = case.write_error,
         };
         const input = try messages.encode(arena, &.{
             .operation_id = 1,
@@ -662,7 +586,8 @@ test "seat finalization summaries describe authoritative winners and retain retr
             .body = try seat.parse_value(arena, "{\"code\":\"invalid_request\"}", messages.body_size_max),
             .context = .null,
         });
-        const response = try handle_invocation(arena, try confirmation_test_invocation(arena, input), &.{
+        const event = try test_support.sqs_event(arena, "confirmation", input);
+        const response = try handle_invocation(arena, event, &.{
             .operations_table = "Operations",
             .now = 2,
             .logger = observer.logger(),
@@ -677,7 +602,13 @@ test "seat finalization summaries describe authoritative winners and retain retr
         if (std.mem.eql(u8, case.outcome, "retry")) {
             try std.testing.expectEqualStrings(if (case.read_error != null) "winner_read" else "winner_validate", record.stage);
         }
-        try std.testing.expectEqual(@as(usize, 0), backend.reads);
+        try backend.expect_effects(.{
+            .update_attempts = 1,
+            .completed = @intFromBool(case.write_error == null),
+            .operation_reads = @intFromBool(case.write_error != null),
+            .report_attempts = @intFromBool(std.mem.eql(u8, case.outcome, "acknowledged_invalid")),
+            .reports = @intFromBool(std.mem.eql(u8, case.outcome, "acknowledged_invalid")),
+        });
     }
 }
 
@@ -693,9 +624,10 @@ test "confirmation schema errors log safe reasons and public codes only after pu
             defer storage.deinit();
             const arena = storage.allocator();
             var observer = logging.TestObserver.init(arena);
-            var backend: ConfirmationTestBackend = .{
-                .event = try confirmation_test_event(arena),
-                .send_error = if (fail_send) error.SendFailed else null,
+            var backend: test_support.Backend = .{
+                .allocator = arena,
+                .event = try test_support.ready_event(arena),
+                .fail_next_send = if (fail_send) error.SendFailed else null,
             };
             const input = try messages.encode(arena, &.{
                 .operation_id = 1,
@@ -703,7 +635,8 @@ test "confirmation schema errors log safe reasons and public codes only after pu
                 .body = try seat.parse_value(arena, body, messages.body_size_max),
                 .context = .null,
             });
-            _ = try submission.handle_invocation(arena, try confirmation_test_invocation(arena, input), &.{
+            const event = try test_support.sqs_event(arena, "confirmation", input);
+            _ = try submission.handle_invocation(arena, event, &.{
                 .events_table = "Events",
                 .completion_queue = "completion",
                 .native_queue = "native",
@@ -714,45 +647,92 @@ test "confirmation schema errors log safe reasons and public codes only after pu
             try std.testing.expectEqualStrings("invalid_request", record.failure_code.?);
             try std.testing.expect(record.reason != null);
             try std.testing.expectEqualStrings("rejection_publish", record.stage);
-            try std.testing.expectEqual(@as(usize, 0), backend.reads);
-            try std.testing.expectEqual(@as(usize, 0), backend.generated);
+            try backend.expect_effects(.{
+                .send_attempts = 1,
+                .published = @intFromBool(!fail_send),
+            });
         }
     }
 }
 
 test "creation finalization returns the coherent winner even when the proposal differs" {
-    const Backend = struct {
-        event: []const events.Attribute,
-        operation_item: []const events.Attribute,
-        fail_write: bool,
-        pub fn transact_write(self: *@This(), _: Allocator, _: dynamodb.TransactWriteItemsInput) !void {
-            if (self.fail_write) return error.AWSFailure;
-        }
-        pub fn transact_get(self: *@This(), arena: Allocator, _: dynamodb.TransactGetItemsInput) !dynamodb.TransactGetItemsOutput {
-            const pair = try arena.alloc(dynamodb.types.ItemResponse, 2);
-            pair[0] = .{ .item = self.event };
-            pair[1] = .{ .item = self.operation_item };
-            return .{ .responses = pair };
-        }
-    };
     var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer storage.deinit();
     const arena = storage.allocator();
-    var saved = try confirmation_test_event(arena);
+    var saved = try test_support.ready_event(arena);
     const winner = saved;
     saved.state = .creating;
-    var backend: Backend = .{
-        .event = try events.encode_item(arena, &winner),
-        .operation_item = try stored_test_operation(arena, "{\"type\":\"SUCCESS\",\"payload\":{\"event_id\":\"00000000-0000-0000-0000-000000000001\"}}"),
-        .fail_write = true,
+    var backend: test_support.Backend = .{
+        .allocator = arena,
+        .event = saved,
+        .transactions = .{
+            .responses = &.{
+                .{ .item = try events.encode_item(arena, &winner) },
+                .{ .item = try test_support.stored_operation(arena, "{\"type\":\"SUCCESS\",\"payload\":{\"event_id\":\"00000000-0000-0000-0000-000000000001\"}}") },
+            },
+            .fail_next_write = error.AWSFailure,
+        },
     };
     const proposal = try operation.parseCompletionJSON(arena, "{\"type\":\"FAILURE\",\"payload\":{\"code\":\"operation_rejected\"}}");
     const options: events.FinalizationOptions = .{ .events_table = "Events", .operations_table = "Operations", .now = 2 };
     const observed = try events.finalize_creation(arena, &options, &saved, &proposal, &backend);
     try std.testing.expect(observed.winner);
     try std.testing.expect(observed.result == .success);
-    backend.fail_write = false;
     const written = try events.finalize_creation(arena, &options, &saved, &proposal, &backend);
     try std.testing.expect(!written.winner);
     try std.testing.expect(written.result == .failure);
+    try backend.expect_effects(.{ .transaction_writes = 2, .transaction_reads = 1 });
+}
+
+fn run_runtime_test(
+    fixture: *test_support.RuntimeFixture,
+    script: []const test_support.RuntimeEvent,
+) !void {
+    var adapter: InvocationAdapter = undefined;
+    adapter.init(&fixture.backend, &.{
+        .logger = fixture.observer.logger(),
+        .events_table = "Events",
+        .operations_table = "Operations",
+        .now = -1, // The real handler must supply the invocation timestamp.
+        .ready_cache = &fixture.cache,
+    });
+    install_runtime_adapter(&adapter);
+    defer uninstall_runtime_adapter();
+    try fixture.run(script, handler);
+}
+
+test "runtime integration: seat completion reuses ready metadata across warm invocations" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    var fixture: test_support.RuntimeFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const script = try fixture.warm_events(.completion);
+    try run_runtime_test(&fixture, &script);
+    try fixture.expect_warm();
+    try fixture.backend.expect_effects(.{ .event_reads = 1, .update_attempts = 3, .completed = 3 });
+}
+
+test "runtime integration: seat completion retries an uncertain write then acknowledges" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    var fixture: test_support.RuntimeFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const script = try fixture.retry_events(.completion);
+    fixture.backend.fail_next_update = error.AWSFailure;
+    // Authoritative SUBMITTED readback keeps the uncertain first write retryable.
+    fixture.backend.operation_item = try test_support.stored_operation(fixture.backend.allocator, null);
+    try run_runtime_test(&fixture, &script);
+    try fixture.expect_retry("finalized");
+    try fixture.backend.expect_effects(.{ .event_reads = 1, .operation_reads = 1, .update_attempts = 2, .completed = 1 });
+}
+
+test "runtime integration: seat completion reports malformed SQS input and recovers" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    var fixture: test_support.RuntimeFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const script = try fixture.recovery_events(.completion);
+    try run_runtime_test(&fixture, &script);
+    try fixture.expect_recovery();
+    try fixture.backend.expect_effects(.{ .event_reads = 1, .update_attempts = 1, .completed = 1 });
 }

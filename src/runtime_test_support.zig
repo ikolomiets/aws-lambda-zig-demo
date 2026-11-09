@@ -3,6 +3,83 @@ const std = @import("std");
 const lambda = @import("aws-lambda");
 pub const Tester = lambda.Tester;
 
+/// Own the fake Runtime API and observations independently of invocation arenas.
+/// Keep the fixture in place after init(), since Tester holds pointers to itself.
+pub const Fixture = struct {
+    seen: Observations = .{},
+    tester: Tester = undefined,
+    tester_initialized: bool = false,
+
+    pub fn allocator(self: *Fixture) std.mem.Allocator {
+        return self.seen.arena.allocator();
+    }
+
+    pub fn init(self: *Fixture, script: []const Tester.Event) !void {
+        std.debug.assert(!self.tester_initialized);
+        try self.tester.init(std.testing.allocator, script);
+        self.tester_initialized = true;
+    }
+
+    pub fn deinit(self: *Fixture) void {
+        if (self.tester_initialized) self.tester.deinit();
+        self.seen.deinit();
+        self.* = undefined;
+    }
+
+    pub fn run_handler(
+        self: *Fixture,
+        options: RunOptions,
+        comptime application_handler: anytype,
+    ) !void {
+        std.debug.assert(self.tester_initialized);
+        run(&self.tester, &self.seen, options, application_handler);
+        try expect_protocol(&self.tester, &self.seen);
+    }
+};
+
+/// Build one SQS delivery using the real event parser's required fields.
+pub fn sqs_event(
+    allocator: std.mem.Allocator,
+    message_id: []const u8,
+    body: []const u8,
+) ![]const u8 {
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .Records = &.{.{
+            .messageId = message_id,
+            .receiptHandle = "receipt",
+            .body = body,
+            .attributes = std.json.Value{ .object = .empty },
+            .messageAttributes = std.json.Value{ .object = .empty },
+            .md5OfBody = "md5",
+            .eventSource = "aws:sqs",
+            .eventSourceARN = "arn",
+            .awsRegion = "ca-central-1",
+        }},
+    }, .{});
+}
+
+/// Preserve source ordering and stable message IDs for partial-batch assertions.
+pub fn sqs_batch_event(allocator: std.mem.Allocator, bodies: []const []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try output.writer.writeAll("{\"Records\":[");
+    for (bodies, 0..) |body, index| {
+        if (index > 0) try output.writer.writeByte(',');
+        try output.writer.print(
+            "{{\"messageId\":\"message-{d}\",\"receiptHandle\":\"receipt-{d}\",\"body\":",
+            .{ index, index },
+        );
+        try std.json.Stringify.value(body, .{}, &output.writer);
+        try output.writer.writeAll(
+            ",\"attributes\":{},\"messageAttributes\":{}," ++
+                "\"eventSource\":\"aws:sqs\",\"eventSourceARN\":\"arn\"," ++
+                "\"awsRegion\":\"ca-central-1\"}",
+        );
+    }
+    try output.writer.writeAll("]}");
+    return output.toOwnedSlice();
+}
+
 pub const Observations = struct {
     arena: std.heap.ArenaAllocator = .init(std.testing.allocator),
     entries: [8]Entry = undefined,
@@ -35,11 +112,13 @@ pub const Observations = struct {
     }
 };
 
+pub const RunOptions = struct { awake_ns: ?i96 = null };
+
 /// Observe metadata at the real private handler boundary without production hooks.
 pub fn run(
     tester: *Tester,
     seen: *Observations,
-    options: struct { awake_ns: ?i96 = null },
+    options: RunOptions,
     comptime application_handler: anytype,
 ) void {
     const Runner = struct {

@@ -958,26 +958,7 @@ fn test_legacy_message(allocator: Allocator, id: u128) ![]u8 {
     return output.toOwnedSlice();
 }
 
-fn testEvent(allocator: Allocator, bodies: []const []const u8) ![]u8 {
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
-    try output.writer.writeAll("{\"Records\":[");
-    for (bodies, 0..) |body, index| {
-        if (index > 0) try output.writer.writeByte(',');
-        try output.writer.print(
-            "{{\"messageId\":\"message-{d}\",\"receiptHandle\":\"receipt-{d}\",\"body\":",
-            .{ index, index },
-        );
-        try std.json.Stringify.value(body, .{}, &output.writer);
-        try output.writer.writeAll(
-            ",\"attributes\":{},\"messageAttributes\":{}," ++
-                "\"eventSource\":\"aws:sqs\",\"eventSourceARN\":\"arn\"," ++
-                "\"awsRegion\":\"ca-central-1\"}",
-        );
-    }
-    try output.writer.writeAll("]}");
-    return output.toOwnedSlice();
-}
+const testEvent = @import("runtime_test_support").sqs_batch_event;
 
 test "TigerBeetle configuration defaults and validates overrides" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
@@ -4120,15 +4101,14 @@ const RuntimeTestPublisher = struct {
 test "runtime integration: malformed SQS invocation reports error and recovers" {
     if (comptime !runtime_tests_enabled) return error.SkipZigTest;
     const runtime = @import("runtime_test_support");
-    var seen: runtime.Observations = .{};
-    defer seen.deinit();
-    const allocator = seen.arena.allocator();
+    var fixture: runtime.Fixture = .{};
+    defer fixture.deinit();
+    const allocator = fixture.allocator();
     const message = try test_body_message(allocator, 1,
         \\{"create_accounts":[{"id":"1","flags":[],"ledger":1,"code":1}]}
     );
     const event = try testEvent(allocator, &.{message});
-    var tester: runtime.Tester = undefined;
-    try tester.init(std.testing.allocator, &.{
+    try fixture.init(&.{
         .{
             .request_id = "bad-sqs",
             .payload = "{",
@@ -4142,17 +4122,14 @@ test "runtime integration: malformed SQS invocation reports error and recovers" 
             .xray_trace = "good-trace",
         },
     });
-    defer tester.deinit();
     var execution: FakeExecution = .{};
     var publisher: RuntimeTestPublisher = .{ .allocator = allocator };
     installRuntimeAdapters(ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
     defer uninstallRuntimeAdapters();
 
-    runtime.run(&tester, &seen, .{}, handler);
-
-    try runtime.expect_protocol(&tester, &seen);
-    try tester.expectPath(0, "/2018-06-01/runtime/invocation/bad-sqs/error");
-    const failed = try tester.post(0);
+    try fixture.run_handler(.{}, handler);
+    try fixture.tester.expectPath(0, "/2018-06-01/runtime/invocation/bad-sqs/error");
+    const failed = try fixture.tester.post(0);
     try std.testing.expectEqualStrings(
         "Handler.UnexpectedEndOfInput",
         failed.header("Lambda-Runtime-Function-Error-Type").?,
@@ -4162,8 +4139,8 @@ test "runtime integration: malformed SQS invocation reports error and recovers" 
         "Handler.UnexpectedEndOfInput",
         failure.object.get("errorType").?.string,
     );
-    try tester.expectPath(1, "/2018-06-01/runtime/invocation/good-sqs/response");
-    try tester.expectBody(1, "{\"batchItemFailures\":[]}");
+    try fixture.tester.expectPath(1, "/2018-06-01/runtime/invocation/good-sqs/response");
+    try fixture.tester.expectBody(1, "{\"batchItemFailures\":[]}");
     try std.testing.expectEqual(@as(usize, 1), execution.account_count);
     try std.testing.expectEqual(@as(usize, 1), publisher.published);
     const completion = try processor_message.decode(allocator, publisher.messages[0]);
@@ -4176,9 +4153,9 @@ test "runtime integration: malformed SQS invocation reports error and recovers" 
 test "runtime integration: executor reports only unpublished SQS records for retry" {
     if (comptime !runtime_tests_enabled) return error.SkipZigTest;
     const runtime = @import("runtime_test_support");
-    var seen: runtime.Observations = .{};
-    defer seen.deinit();
-    const allocator = seen.arena.allocator();
+    var fixture: runtime.Fixture = .{};
+    defer fixture.deinit();
+    const allocator = fixture.allocator();
     var messages: [3][]const u8 = undefined;
     for (&messages, 0..) |*message, index| {
         const body = try std.fmt.allocPrint(
@@ -4190,22 +4167,18 @@ test "runtime integration: executor reports only unpublished SQS records for ret
         message.* = try test_body_message(allocator, index + 1, body);
     }
     const event = try testEvent(allocator, &messages);
-    var tester: runtime.Tester = undefined;
-    try tester.init(std.testing.allocator, &.{.{
+    try fixture.init(&.{.{
         .request_id = "mixed-batch",
         .payload = event,
     }});
-    defer tester.deinit();
     var execution: FakeExecution = .{};
     var publisher: RuntimeTestPublisher = .{ .allocator = allocator, .fail_at = 1 };
     installRuntimeAdapters(ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher));
     defer uninstallRuntimeAdapters();
 
-    runtime.run(&tester, &seen, .{}, handler);
-
-    try runtime.expect_protocol(&tester, &seen);
-    try tester.expectPath(0, "/2018-06-01/runtime/invocation/mixed-batch/response");
-    try tester.expectBody(0, "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-1\"}," ++
+    try fixture.run_handler(.{}, handler);
+    try fixture.tester.expectPath(0, "/2018-06-01/runtime/invocation/mixed-batch/response");
+    try fixture.tester.expectBody(0, "{\"batchItemFailures\":[{\"itemIdentifier\":\"message-1\"}," ++
         "{\"itemIdentifier\":\"message-2\"}]}");
     try std.testing.expectEqual(@as(usize, 3), execution.account_count);
     try std.testing.expectEqual(@as(usize, 2), publisher.calls);

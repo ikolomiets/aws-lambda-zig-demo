@@ -68,8 +68,9 @@ Options:
   --use-local-libs       Use local dependency checkouts with zig build --fork.
                          aws_lambda defaults to ../aws-lambda-zig.
   --dev                  Build/package with persistent caches and sync only code
-                         to an existing development stack. Skips tests and SAM
-                         validation. Configuration changes require full deployment.
+                         to an existing development stack. Runs offline and runtime
+                         tests; skips SAM validation. Configuration changes require
+                         full deployment.
                          Automatically accepts SAM's development-stack confirmation.
   --cleanup              Tear down the selected stack only. Permanently deletes
                          owned tables (all counters) and queued messages. Completes
@@ -91,6 +92,11 @@ Authentication:
   clears inherited static credentials, selects the configured profile, and
   always runs aws sso login to obtain a fresh token before AWS inspection or
   local build work. Dry runs make no AWS authentication calls.
+
+Local checks:
+  Both deployment modes, including dry runs, run zig build check before packaging.
+  It includes offline and runtime tests on 127.0.0.1. External effects are mocked;
+  loopback access is required.
 EOF
 }
 
@@ -1222,10 +1228,8 @@ run_deployment() {
     printf '==> Checking Zig formatting\n'
     ZIG_GLOBAL_CACHE_DIR="$GLOBAL_CACHE_DIR" zig build fmt-check "${ZIG_BUILD_ARGS[@]}"
 
-    if [ "$DEV" -eq 0 ]; then
-        printf '==> Running Zig tests\n'
-        ZIG_GLOBAL_CACHE_DIR="$GLOBAL_CACHE_DIR" zig build test "${ZIG_BUILD_ARGS[@]}"
-    fi
+    printf '==> Running offline and Lambda runtime tests\n'
+    ZIG_GLOBAL_CACHE_DIR="$GLOBAL_CACHE_DIR" zig build check "${ZIG_BUILD_ARGS[@]}" --summary all
 
     printf '==> Removing obsolete root Lambda bootstrap\n'
     rm -f zig-out/bin/bootstrap
