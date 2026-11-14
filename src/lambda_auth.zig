@@ -1,5 +1,5 @@
 const std = @import("std");
-const lambda = @import("aws-lambda");
+const http = @import("http");
 const paseto = @import("paseto");
 
 const authorization_header_count_max = 256;
@@ -11,7 +11,7 @@ pub const Error = error{
     Unauthorized,
 };
 
-/// Owns the authenticated identity for the lifetime of a Lambda invocation.
+/// Owns the authenticated identity for the lifetime of a request.
 pub const Identity = struct {
     subject: []u8,
     allocator: std.mem.Allocator,
@@ -26,11 +26,11 @@ pub const Identity = struct {
 
 pub fn authenticate(
     allocator: std.mem.Allocator,
-    request: *const lambda.url.Request,
+    headers: []const http.Header,
     environment: *const std.process.Environ.Map,
     now: i64,
 ) Error!Identity {
-    const token = bearerToken(request) catch return error.Unauthorized;
+    const token = bearerToken(headers) catch return error.Unauthorized;
     const public_key_encoded = environment.get("PASETO_PUBLIC_KEY") orelse {
         return error.InternalFailure;
     };
@@ -53,13 +53,13 @@ pub fn authenticate(
     };
 }
 
-fn bearerToken(request: *const lambda.url.Request) error{InvalidCredentials}![]const u8 {
-    if (request.headers.len > authorization_header_count_max) {
+fn bearerToken(headers: []const http.Header) error{InvalidCredentials}![]const u8 {
+    if (headers.len > authorization_header_count_max) {
         return error.InvalidCredentials;
     }
 
     var authorization: ?[]const u8 = null;
-    for (request.headers) |header| {
+    for (headers) |header| {
         if (!std.ascii.eqlIgnoreCase(header.key, "Authorization")) continue;
         if (authorization != null) return error.InvalidCredentials;
         authorization = header.value;
@@ -99,18 +99,13 @@ test "valid bearer token authenticates its subject" {
     defer environment.deinit();
     try testing.put_public_key(&environment, 0x41);
 
-    const event = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"headers\":{{\"Authorization\":\"Bearer {s}\"}}}}",
-        .{token},
-    );
-    defer std.testing.allocator.free(event);
-    const request = try lambda.url.parseRequest(std.testing.allocator, event);
-    defer request.deinit(std.testing.allocator);
+    const bearer = try std.fmt.allocPrint(std.testing.allocator, "Bearer {s}", .{token});
+    defer std.testing.allocator.free(bearer);
+    const headers: []const http.Header = &.{.{ .key = "Authorization", .value = bearer }};
 
     var identity = try authenticate(
         std.testing.allocator,
-        &request,
+        headers,
         &environment,
         1000,
     );
@@ -128,18 +123,13 @@ test "authorization header and bearer scheme are case insensitive" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try testing.put_public_key(&environment, 0x42);
-    const event = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"headers\":{{\"authorization\":\"bEaReR {s}\"}}}}",
-        .{token},
-    );
-    defer std.testing.allocator.free(event);
-    const request = try lambda.url.parseRequest(std.testing.allocator, event);
-    defer request.deinit(std.testing.allocator);
+    const bearer = try std.fmt.allocPrint(std.testing.allocator, "bEaReR {s}", .{token});
+    defer std.testing.allocator.free(bearer);
+    const headers: []const http.Header = &.{.{ .key = "authorization", .value = bearer }};
 
     var identity = try authenticate(
         std.testing.allocator,
-        &request,
+        headers,
         &environment,
         1000,
     );
@@ -151,26 +141,32 @@ test "missing malformed duplicate and oversized bearer credentials are unauthori
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
 
-    const events = [_][]const u8{
-        "{\"headers\":{}}",
-        "{\"headers\":{\"Authorization\":\"\"}}",
-        "{\"headers\":{\"Authorization\":\"Bearer\"}}",
-        "{\"headers\":{\"Authorization\":\"Bearer \"}}",
-        "{\"headers\":{\"Authorization\":\"Basic token\"}}",
-        "{\"headers\":{\"Authorization\":\"Bearertoken\"}}",
-        "{\"headers\":{\"Authorization\":\"Bearer token extra\"}}",
-        "{\"headers\":{\"Authorization\":\"Bearer\\ttoken\"}}",
-        "{\"headers\":{\"Authorization\":\"Bearer one\"," ++
-            "\"authorization\":\"Bearer two\"}}",
+    const values = [_][]const u8{
+        "",
+        "Bearer",
+        "Bearer ",
+        "Basic token",
+        "Bearertoken",
+        "Bearer token extra",
+        "Bearer\ttoken",
+        "Bearer one,Bearer two",
     };
-    for (events) |event| {
-        const request = try lambda.url.parseRequest(std.testing.allocator, event);
-        defer request.deinit(std.testing.allocator);
-        try std.testing.expectError(
-            error.Unauthorized,
-            authenticate(std.testing.allocator, &request, &environment, 1000),
-        );
+    try std.testing.expectError(
+        error.Unauthorized,
+        authenticate(std.testing.allocator, &.{}, &environment, 1000),
+    );
+    for (values) |value| {
+        try std.testing.expectError(error.Unauthorized, authenticate(
+            std.testing.allocator,
+            &.{.{ .key = "Authorization", .value = value }},
+            &environment,
+            1000,
+        ));
     }
+    try std.testing.expectError(error.Unauthorized, authenticate(std.testing.allocator, &.{
+        .{ .key = "Authorization", .value = "Bearer one" },
+        .{ .key = "authorization", .value = "Bearer two" },
+    }, &environment, 1000));
 
     const oversized_token = try std.testing.allocator.alloc(
         u8,
@@ -178,26 +174,14 @@ test "missing malformed duplicate and oversized bearer credentials are unauthori
     );
     defer std.testing.allocator.free(oversized_token);
     @memset(oversized_token, 'a');
-    const oversized_event = try std.fmt.allocPrint(
+    const bearer = try std.fmt.allocPrint(std.testing.allocator, "Bearer {s}", .{oversized_token});
+    defer std.testing.allocator.free(bearer);
+    try std.testing.expectError(error.Unauthorized, authenticate(
         std.testing.allocator,
-        "{{\"headers\":{{\"Authorization\":\"Bearer {s}\"}}}}",
-        .{oversized_token},
-    );
-    defer std.testing.allocator.free(oversized_event);
-    const oversized_request = try lambda.url.parseRequest(
-        std.testing.allocator,
-        oversized_event,
-    );
-    defer oversized_request.deinit(std.testing.allocator);
-    try std.testing.expectError(
-        error.Unauthorized,
-        authenticate(
-            std.testing.allocator,
-            &oversized_request,
-            &environment,
-            1000,
-        ),
-    );
+        &.{.{ .key = "Authorization", .value = bearer }},
+        &environment,
+        1000,
+    ));
 }
 
 test "expired and wrongly signed tokens are unauthorized" {
@@ -219,17 +203,12 @@ test "expired and wrongly signed tokens are unauthorized" {
     try testing.put_public_key(&environment, 0x51);
 
     for ([_][]const u8{ wrong_token, expired_token }) |token| {
-        const event = try std.fmt.allocPrint(
-            std.testing.allocator,
-            "{{\"headers\":{{\"Authorization\":\"Bearer {s}\"}}}}",
-            .{token},
-        );
-        defer std.testing.allocator.free(event);
-        const request = try lambda.url.parseRequest(std.testing.allocator, event);
-        defer request.deinit(std.testing.allocator);
+        const bearer = try std.fmt.allocPrint(std.testing.allocator, "Bearer {s}", .{token});
+        defer std.testing.allocator.free(bearer);
+        const headers: []const http.Header = &.{.{ .key = "Authorization", .value = bearer }};
         try std.testing.expectError(
             error.Unauthorized,
-            authenticate(std.testing.allocator, &request, &environment, 1001),
+            authenticate(std.testing.allocator, headers, &environment, 1001),
         );
     }
 }
@@ -241,25 +220,20 @@ test "missing and invalid public key configuration are internal failures" {
         .ttl_seconds = 60,
     });
     defer std.testing.allocator.free(token);
-    const event = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "{{\"headers\":{{\"Authorization\":\"Bearer {s}\"}}}}",
-        .{token},
-    );
-    defer std.testing.allocator.free(event);
-    const request = try lambda.url.parseRequest(std.testing.allocator, event);
-    defer request.deinit(std.testing.allocator);
+    const bearer = try std.fmt.allocPrint(std.testing.allocator, "Bearer {s}", .{token});
+    defer std.testing.allocator.free(bearer);
+    const headers: []const http.Header = &.{.{ .key = "Authorization", .value = bearer }};
 
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try std.testing.expectError(
         error.InternalFailure,
-        authenticate(std.testing.allocator, &request, &environment, 1000),
+        authenticate(std.testing.allocator, headers, &environment, 1000),
     );
     try environment.put("PASETO_PUBLIC_KEY", "invalid-public-key-marker");
     try std.testing.expectError(
         error.InternalFailure,
-        authenticate(std.testing.allocator, &request, &environment, 1000),
+        authenticate(std.testing.allocator, headers, &environment, 1000),
     );
 }
 

@@ -1,6 +1,9 @@
 const std = @import("std");
 const aws = @import("aws");
 const lambda = @import("aws-lambda");
+const http = @import("http");
+const http_test = if (@import("builtin").is_test) @import("http_test_support") else void;
+const aws_http = @import("aws_http");
 const lambda_auth = @import("lambda_auth");
 const operation = @import("operation");
 const processor_message = @import("processor_message");
@@ -26,9 +29,7 @@ const conflict_body = "Conflict\n";
 const content_type_json = "application/json";
 const content_type_text = "text/plain; charset=utf-8";
 const internal_server_error_body = "Internal Server Error\n";
-const internal_server_error_response =
-    "{\"statusCode\":500,\"headers\":{\"Content-Type\":\"" ++ content_type_text ++
-    "\"},\"body\":\"Internal Server Error\\n\"}";
+const internal_server_error_response = aws_http.internal_server_error_response;
 const method_not_allowed_body = "Method Not Allowed\n";
 const operation_message_size_max = 8 * 1024;
 const operation_queue_key_suffix = "Queue";
@@ -132,7 +133,7 @@ const RuntimeResources = struct {
     }
 };
 
-const IntakeAdapter = struct {
+pub const IntakeAdapter = struct {
     context: *anyopaque,
     create_fn: *const fn (
         *anyopaque,
@@ -148,7 +149,7 @@ const IntakeAdapter = struct {
         *const logging.Context,
     ) anyerror!void,
 
-    fn init(pointer: anytype) IntakeAdapter {
+    pub fn init(pointer: anytype) IntakeAdapter {
         const Pointer = @TypeOf(pointer);
         const pointer_info = @typeInfo(Pointer);
         comptime std.debug.assert(pointer_info == .pointer);
@@ -241,26 +242,61 @@ fn handle_invocation_observed(
 ) []const u8 {
     var trace = logging.Context.init(logger, .intake);
     defer trace.emit();
-    const outcome = invocationOutcome(allocator, event, env, intake, now, &trace);
-    trace.record.http_status = switch (outcome) {
-        .success => 200,
-        .bad_request => 400,
-        .conflict => 409,
-        .method_not_allowed => 405,
-        .service_unavailable => 503,
-        .unauthorized => 401,
-        .internal_server_error => 500,
+    var transport = aws_http.Request.parse(allocator, event) catch |err| {
+        trace.finish(.ERROR, "event_parse", "failed", @errorName(err));
+        trace.record.http_status = 500;
+        const response = response_from_outcome(allocator, .internal_server_error);
+        return encode_response_observed(allocator, &response, &trace);
     };
+    defer transport.deinit(allocator);
+    const request = transport.application_request();
+    var response = handle_http_observed(allocator, &request, env, intake, now, &trace);
+    defer response.deinit();
+    return encode_response_observed(allocator, &response, &trace);
+}
+
+fn encode_response_observed(
+    allocator: Allocator,
+    response: *const http.HttpResponse,
+    trace: *logging.Context,
+) []const u8 {
+    return aws_http.encode_response(allocator, response) catch |err| {
+        trace.record.http_status = 500;
+        trace.finish(.ERROR, "response_encode", "failed", @errorName(err));
+        return internal_server_error_response;
+    };
+}
+
+pub fn handle_http(
+    allocator: Allocator,
+    request: *const http.HttpRequest,
+    env: *const std.process.Environ.Map,
+    intake: IntakeAdapter,
+    now: i64,
+    logger: logging.Logger,
+) http.HttpResponse {
+    var trace = logging.Context.init(logger, .intake);
+    defer trace.emit();
+    return handle_http_observed(allocator, request, env, intake, now, &trace);
+}
+
+fn handle_http_observed(
+    allocator: Allocator,
+    request: *const http.HttpRequest,
+    env: *const std.process.Environ.Map,
+    intake: IntakeAdapter,
+    now: i64,
+    trace: *logging.Context,
+) http.HttpResponse {
+    const outcome = invocationOutcome(allocator, request, env, intake, now, trace);
+    const response = response_from_outcome(allocator, outcome);
+    trace.record.http_status = @backingInt(response.status);
     if (outcome != .success) {
         const status = trace.record.http_status.?;
         trace.record.level = if (status >= 500) .ERROR else if (status == 409) .INFO else .WARN;
         trace.record.outcome = if (status == 409) "conflict" else if (status >= 500) "failed" else "rejected";
     }
-    return encodeOutcome(allocator, outcome) catch |err| {
-        trace.record.http_status = 500;
-        trace.finish(.ERROR, "response_encode", "failed", @errorName(err));
-        return internal_server_error_response;
-    };
+    return response;
 }
 
 const InvocationOutcome = union(enum) {
@@ -275,27 +311,20 @@ const InvocationOutcome = union(enum) {
 
 const Success = struct {
     body: []const u8,
-    content_type: []const u8,
 };
 
 const test_queue_url = "https://sqs.example.invalid/tigerbeetle";
 
 fn invocationOutcome(
     allocator: Allocator,
-    event: []const u8,
+    request: *const http.HttpRequest,
     env: *const std.process.Environ.Map,
     intake: IntakeAdapter,
     now: i64,
     trace: *logging.Context,
 ) InvocationOutcome {
-    trace.record.stage = "event_parse";
-    const request = lambda.url.parseRequest(allocator, event) catch |err| {
-        trace.record.reason = @errorName(err);
-        return .internal_server_error;
-    };
-    defer request.deinit(allocator);
     trace.record.stage = "authenticate";
-    var identity = lambda_auth.authenticate(allocator, &request, env, now) catch |err| {
+    var identity = lambda_auth.authenticate(allocator, request.headers, env, now) catch |err| {
         trace.record.reason = @errorName(err);
         return switch (err) {
             error.Unauthorized => .unauthorized,
@@ -305,24 +334,27 @@ fn invocationOutcome(
     defer identity.deinit();
 
     trace.record.stage = "method";
-    const method = request.request_context.http.method orelse {
+    const method = request.method orelse {
         return .method_not_allowed;
     };
     if (method != .POST) return .method_not_allowed;
-    return post_invocation_outcome(allocator, identity.subject, &request, env, intake, now, trace);
+    return post_invocation_outcome(allocator, identity.subject, request, env, intake, now, trace);
 }
 
 fn post_invocation_outcome(
     allocator: Allocator,
     tenant: []const u8,
-    request: *const lambda.url.Request,
+    request: *const http.HttpRequest,
     env: *const std.process.Environ.Map,
     intake: IntakeAdapter,
     now: operation.UnixSeconds,
     trace: *logging.Context,
 ) InvocationOutcome {
     trace.record.stage = "request_parse";
-    const input_json = request.body orelse {
+    const input_json = (request.read_body(allocator) catch |err| {
+        trace.record.reason = @errorName(err);
+        return .internal_server_error;
+    }) orelse {
         trace.record.reason = "MissingBody";
         return .bad_request;
     };
@@ -430,7 +462,6 @@ fn operation_success_outcome(
     };
     return .{ .success = .{
         .body = body,
-        .content_type = content_type_json,
     } };
 }
 
@@ -449,54 +480,50 @@ fn operation_output_body(
     return output.toOwnedSlice();
 }
 
-fn encodeOutcome(
-    allocator: std.mem.Allocator,
-    outcome: InvocationOutcome,
-) ![]const u8 {
+fn response_from_outcome(allocator: Allocator, outcome: InvocationOutcome) http.HttpResponse {
     return switch (outcome) {
-        .success => |response| success: {
-            defer allocator.free(response.body);
-            break :success lambda.url.encodeResponse(allocator, .{
-                .content_type = response.content_type,
-                .body = .{ .textual = response.body },
-            });
+        .success => |success| .{
+            .status = .ok,
+            .headers = &.{.{ .key = "Content-Type", .value = content_type_json }},
+            .body = success.body,
+            .body_allocator = allocator,
         },
-        .bad_request => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type_text,
-            .status_code = .bad_request,
-            .body = .{ .textual = bad_request_body },
-        }),
-        .conflict => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type_text,
-            .status_code = .conflict,
-            .body = .{ .textual = conflict_body },
-        }),
-        .method_not_allowed => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type_text,
-            .status_code = .method_not_allowed,
+        .bad_request => .{
+            .status = .bad_request,
+            .headers = &.{.{ .key = "Content-Type", .value = content_type_text }},
+            .body = bad_request_body,
+        },
+        .method_not_allowed => .{
+            .status = .method_not_allowed,
             .headers = &.{
+                .{ .key = "Content-Type", .value = content_type_text },
                 .{ .key = "Allow", .value = "POST" },
             },
-            .body = .{ .textual = method_not_allowed_body },
-        }),
-        .service_unavailable => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type_text,
-            .status_code = .service_unavailable,
-            .body = .{ .textual = service_unavailable_body },
-        }),
-        .unauthorized => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type_text,
-            .status_code = .unauthorized,
+            .body = method_not_allowed_body,
+        },
+        .service_unavailable => .{
+            .status = .service_unavailable,
+            .headers = &.{.{ .key = "Content-Type", .value = content_type_text }},
+            .body = service_unavailable_body,
+        },
+        .unauthorized => .{
+            .status = .unauthorized,
             .headers = &.{
+                .{ .key = "Content-Type", .value = content_type_text },
                 .{ .key = "WWW-Authenticate", .value = "Bearer" },
             },
-            .body = .{ .textual = unauthorized_body },
-        }),
-        .internal_server_error => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type_text,
-            .status_code = .internal_server_error,
-            .body = .{ .textual = internal_server_error_body },
-        }),
+            .body = unauthorized_body,
+        },
+        .internal_server_error => .{
+            .status = .internal_server_error,
+            .headers = &.{.{ .key = "Content-Type", .value = content_type_text }},
+            .body = internal_server_error_body,
+        },
+        .conflict => .{
+            .status = .conflict,
+            .headers = &.{.{ .key = "Content-Type", .value = content_type_text }},
+            .body = conflict_body,
+        },
     };
 }
 
@@ -770,16 +797,15 @@ test "POST rejects empty and oversized queue mappings before persistence" {
         .ttl_seconds = 60,
     });
     defer std.testing.allocator.free(token);
-    const event = try test_authorization_request_event(
-        std.testing.allocator,
-        .POST,
-        "Authorization",
-        "Bearer",
-        token,
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .POST,
+        .header_name = "Authorization",
+        .scheme = "Bearer",
+        .token = token,
+        .body = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"TigerBeetle\",\"body\":true}",
-    );
-    defer std.testing.allocator.free(event);
+    });
+    defer fixture.deinit(std.testing.allocator);
     const invalid_urls = [_][]const u8{
         "",
         &@as([sqs_queue.queue_url_size_max + 1]u8, @splat('a')),
@@ -791,21 +817,117 @@ test "POST rejects empty and oversized queue mappings before persistence" {
         try lambda_auth.testing.put_public_key(&environment, 0x63);
         try environment.put("TigerBeetleQueue", queue_url);
         var fake: FakeIntake = .{};
-        const response = handleInvocationForTest(
+        var response = handle_http(
             std.testing.allocator,
-            event,
-            .{},
-            .{},
+            &fixture.request,
             &environment,
-            &fake,
+            IntakeAdapter.init(&fake),
             1000,
+            .{},
         );
-        defer std.testing.allocator.free(response);
+        defer response.deinit();
 
-        try expectBadRequest(response);
+        try http_test.expect_text_response(
+            .bad_request,
+            bad_request_body,
+            &response,
+        );
         try std.testing.expectEqual(@as(u8, 0), fake.create_count);
         try std.testing.expectEqual(@as(u8, 0), fake.send_count);
     }
+}
+
+test "generic HTTP submission authenticates before method and deferred body access" {
+    const Body = struct {
+        bytes: ?[]const u8 = null,
+        reads: u8 = 0,
+
+        fn read(context: *anyopaque, _: Allocator) anyerror!?[]const u8 {
+            const body: *@This() = @ptrCast(@alignCast(context));
+            body.reads += 1;
+            return body.bytes orelse error.BodyMustNotBeRead;
+        }
+    };
+    var body: Body = .{};
+    var request: http.HttpRequest = .{
+        .method = .GET,
+        .path = "/",
+        .body = .{ .deferred = .{ .context = &body, .read_fn = Body.read } },
+    };
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try lambda_auth.testing.put_public_key(&environment, 0x42);
+    var fake: FakeIntake = .{};
+    var unauthorized = handle_http(
+        std.testing.allocator,
+        &request,
+        &environment,
+        IntakeAdapter.init(&fake),
+        1000,
+        .{},
+    );
+    defer unauthorized.deinit();
+    try std.testing.expectEqual(.unauthorized, unauthorized.status);
+    const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
+        .seed_byte = 0x42,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
+    defer std.testing.allocator.free(token);
+    const bearer = try std.fmt.allocPrint(std.testing.allocator, "Bearer {s}", .{token});
+    defer std.testing.allocator.free(bearer);
+    request.headers = &.{.{ .key = "Authorization", .value = bearer }};
+    var unsupported = handle_http(
+        std.testing.allocator,
+        &request,
+        &environment,
+        IntakeAdapter.init(&fake),
+        1000,
+        .{},
+    );
+    defer unsupported.deinit();
+    try std.testing.expectEqual(.method_not_allowed, unsupported.status);
+    try std.testing.expectEqual(@as(u8, 0), body.reads);
+    request.method = .POST;
+    body.bytes = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"name\":\"echo\",\"body\":42}";
+    try put_test_queue_url(&environment, "echo");
+    var accepted = handle_http(
+        std.testing.allocator,
+        &request,
+        &environment,
+        IntakeAdapter.init(&fake),
+        1000,
+        .{},
+    );
+    defer accepted.deinit();
+    try std.testing.expectEqual(.ok, accepted.status);
+    try expectContains(accepted.body, "\"tenant\":\"lambda-test-user\"");
+    try expectContains(accepted.body, "\"state\":\"SUBMITTED\"");
+    try std.testing.expectEqualStrings("42", fake.lastBody());
+    try std.testing.expectEqual(@as(u8, 1), fake.create_count);
+    try std.testing.expectEqual(@as(u8, 1), fake.send_count);
+    try std.testing.expectEqual(@as(u8, 1), body.reads);
+}
+
+test "AWS encoding retains an owned HTTP response and sanitizes allocation failure" {
+    var response = response_from_outcome(std.testing.allocator, .{ .success = .{
+        .body = try std.testing.allocator.dupe(u8, "{\"result\":\"private-value\"}"),
+    } });
+    defer response.deinit();
+    var trace = logging.Context.init(.{}, .intake);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const fallback = encode_response_observed(failing.allocator(), &response, &trace);
+    try std.testing.expectEqualStrings(internal_server_error_response, fallback);
+    try std.testing.expectEqual(@as(?u16, 500), trace.record.http_status);
+    try std.testing.expectEqualStrings("response_encode", trace.record.stage);
+    // Encoding failure leaves the response valid for its owner to release or encode again.
+    const encoded = try aws_http.encode_response(std.testing.allocator, &response);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqualStrings(
+        "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
+            "\"body\":\"{\\\"result\\\":\\\"private-value\\\"}\"}",
+        encoded,
+    );
 }
 
 test "authenticated POST persists and queues SUBMITTED then returns without its body" {
@@ -919,30 +1041,28 @@ test "POST queues every JSON body variant as exact minimal Processor Message JSO
             .{body},
         );
         defer std.testing.allocator.free(input);
-        const event = try test_authorization_request_event(
-            std.testing.allocator,
-            .POST,
-            "Authorization",
-            "Bearer",
-            token,
-            input,
-        );
-        defer std.testing.allocator.free(event);
+        var fixture = try http_test.Request.init(std.testing.allocator, .{
+            .method = .POST,
+            .header_name = "Authorization",
+            .scheme = "Bearer",
+            .token = token,
+            .body = input,
+        });
+        defer fixture.deinit(std.testing.allocator);
         var fake: FakeIntake = .{};
-        const response = handleInvocationForTest(
+        var response = handle_http(
             std.testing.allocator,
-            event,
-            .{},
-            .{},
+            &fixture.request,
             &environment,
-            &fake,
+            IntakeAdapter.init(&fake),
             1_700_000_000,
+            .{},
         );
-        defer std.testing.allocator.free(response);
+        defer response.deinit();
 
         try std.testing.expectEqualStrings(expected_message, fake.lastMessage());
-        try expectContains(response, "\\\"state\\\":\\\"SUBMITTED\\\"");
-        try expectNotContains(response, "\\\"body\\\":");
+        try expectContains(response.body, "\"state\":\"SUBMITTED\"");
+        try expectNotContains(response.body, "\"body\":");
         try std.testing.expectEqual(@as(u8, 1), fake.send_count);
     }
 }
@@ -969,28 +1089,26 @@ test "POST derives tenant and hash from distinct bounded verified subjects" {
             .ttl_seconds = 60,
         });
         defer std.testing.allocator.free(token);
-        const event = try test_authorization_request_event(
-            std.testing.allocator,
-            .POST,
-            "Authorization",
-            "Bearer",
-            token,
-            input,
-        );
-        defer std.testing.allocator.free(event);
+        var fixture = try http_test.Request.init(std.testing.allocator, .{
+            .method = .POST,
+            .header_name = "Authorization",
+            .scheme = "Bearer",
+            .token = token,
+            .body = input,
+        });
+        defer fixture.deinit(std.testing.allocator);
         var fake: FakeIntake = .{};
-        const response = handleInvocationForTest(
+        var response = handle_http(
             std.testing.allocator,
-            event,
-            .{},
-            .{},
+            &fixture.request,
             &environment,
-            &fake,
+            IntakeAdapter.init(&fake),
             1000,
+            .{},
         );
-        defer std.testing.allocator.free(response);
+        defer response.deinit();
 
-        try expectContains(response, subject);
+        try expectContains(response.body, subject);
         try std.testing.expectEqualStrings(subject, fake.lastTenant());
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -1016,15 +1134,14 @@ test "matching SUBMITTED POST requeues and returns the stored snapshot" {
     const input =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
-    const event = try test_authorization_request_event(
-        std.testing.allocator,
-        .POST,
-        "Authorization",
-        "Bearer",
-        token,
-        input,
-    );
-    defer std.testing.allocator.free(event);
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .POST,
+        .header_name = "Authorization",
+        .scheme = "Bearer",
+        .token = token,
+        .body = input,
+    });
+    defer fixture.deinit(std.testing.allocator);
     var expected_hash: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(
         &expected_hash,
@@ -1042,20 +1159,19 @@ test "matching SUBMITTED POST requeues and returns the stored snapshot" {
         .hash = expected_hash,
     } };
 
-    const response = handleInvocationForTest(
+    var response = handle_http(
         std.testing.allocator,
-        event,
-        .{},
-        .{},
+        &fixture.request,
         &environment,
-        &fake,
+        IntakeAdapter.init(&fake),
         1_700_000_500,
+        .{},
     );
-    defer std.testing.allocator.free(response);
+    defer response.deinit();
 
-    try expectContains(response, "\\\"state\\\":\\\"SUBMITTED\\\"");
-    try expectContains(response, "\\\"last_updated\\\":1699999000");
-    try expectContains(response, "\\\"expires_at\\\":1700085400");
+    try expectContains(response.body, "\"state\":\"SUBMITTED\"");
+    try expectContains(response.body, "\"last_updated\":1699999000");
+    try expectContains(response.body, "\"expires_at\":1700085400");
     try expectContains(fake.lastMessage(), "\"body\":{\"message\":\"hello\",\"count\":2}");
     try expectNotContains(fake.lastMessage(), "last_updated");
     try std.testing.expectEqual(@as(u8, 1), fake.send_count);
@@ -1102,37 +1218,35 @@ test "matching POST retry returns the latest stored persistent view" {
     const input =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
-    const event = try test_authorization_request_event(
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .POST,
+        .header_name = "Authorization",
+        .scheme = "Bearer",
+        .token = token,
+        .body = input,
+    });
+    defer fixture.deinit(std.testing.allocator);
+    var response = handle_http(
         std.testing.allocator,
-        .POST,
-        "Authorization",
-        "Bearer",
-        token,
-        input,
-    );
-    defer std.testing.allocator.free(event);
-    const response = handleInvocationForTest(
-        std.testing.allocator,
-        event,
-        .{},
-        .{},
+        &fixture.request,
         &environment,
-        &fake,
+        IntakeAdapter.init(&fake),
         1_700_000_000,
+        .{},
     );
-    defer std.testing.allocator.free(response);
+    defer response.deinit();
 
-    const expected =
-        "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
-        "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
-        "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
-        "\\\"state\\\":\\\"COMPLETED\\\"," ++
-        "\\\"last_updated\\\":1700000123," ++
-        "\\\"expires_at\\\":1700086523," ++
-        "\\\"result\\\":{\\\"type\\\":\\\"SUCCESS\\\"," ++
-        "\\\"payload\\\":{\\\"message\\\":\\\"done\\\"}}," ++
-        "\\\"hash\\\":\\\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c\\\"}\"}";
-    try std.testing.expectEqualStrings(expected, response);
+    const expected = http.HttpResponse{
+        .status = .ok,
+        .headers = &.{.{ .key = "Content-Type", .value = "application/json" }},
+        .body = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"" ++
+            "lambda-test-user\",\"name\":\"echo\",\"state\":\"COMPLETED\",\"la" ++
+            "st_updated\":1700000123,\"expires_at\":1700086523,\"result\"" ++
+            ":{\"type\":\"SUCCESS\",\"payload\":{\"message\":\"done\"}},\"hash\"" ++
+            ":\"471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebf" ++
+            "e39863b672c\"}",
+    };
+    try http_test.expect_response(&expected, &response);
     try std.testing.expectEqual(@as(u8, 1), fake.create_count);
 }
 
@@ -1150,15 +1264,14 @@ test "matching POST with every completed outcome returns without enqueueing" {
     const input =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
         "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
-    const event = try test_authorization_request_event(
-        std.testing.allocator,
-        .POST,
-        "Authorization",
-        "Bearer",
-        token,
-        input,
-    );
-    defer std.testing.allocator.free(event);
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .POST,
+        .header_name = "Authorization",
+        .scheme = "Bearer",
+        .token = token,
+        .body = input,
+    });
+    defer fixture.deinit(std.testing.allocator);
     var expected_hash: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(
         &expected_hash,
@@ -1181,20 +1294,19 @@ test "matching POST with every completed outcome returns without enqueueing" {
             .expires_at = 1_700_086_523,
             .hash = expected_hash,
         } };
-        const response = handleInvocationForTest(
+        var response = handle_http(
             std.testing.allocator,
-            event,
-            .{},
-            .{},
+            &fixture.request,
             &environment,
-            &fake,
+            IntakeAdapter.init(&fake),
             1_700_000_000,
+            .{},
         );
-        defer std.testing.allocator.free(response);
-        try expectContains(response, "\\\"state\\\":\\\"COMPLETED\\\"");
-        try expectContains(response, switch (completion) {
-            .success => "\\\"type\\\":\\\"SUCCESS\\\"",
-            .failure => "\\\"type\\\":\\\"FAILURE\\\"",
+        defer response.deinit();
+        try expectContains(response.body, "\"state\":\"COMPLETED\"");
+        try expectContains(response.body, switch (completion) {
+            .success => "\"type\":\"SUCCESS\"",
+            .failure => "\"type\":\"FAILURE\"",
         });
         try std.testing.expectEqual(@as(u8, 1), fake.create_count);
         try std.testing.expectEqual(@as(u8, 0), fake.send_count);
@@ -1213,29 +1325,31 @@ test "POST conflict returns only the static conflict response" {
     try lambda_auth.testing.put_public_key(&environment, 0x46);
     try put_test_queue_url(&environment, "conflict-marker");
     var fake = FakeIntake{ .create_error = error.OperationConflict };
-    const event = try test_authorization_request_event(
-        std.testing.allocator,
-        .POST,
-        "Authorization",
-        "Bearer",
-        token,
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .POST,
+        .header_name = "Authorization",
+        .scheme = "Bearer",
+        .token = token,
+        .body = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"conflict-marker\",\"body\":true}",
-    );
-    defer std.testing.allocator.free(event);
-    const response = handleInvocationForTest(
+    });
+    defer fixture.deinit(std.testing.allocator);
+    var response = handle_http(
         std.testing.allocator,
-        event,
-        .{},
-        .{},
+        &fixture.request,
         &environment,
-        &fake,
+        IntakeAdapter.init(&fake),
         1000,
+        .{},
     );
-    defer std.testing.allocator.free(response);
+    defer response.deinit();
 
-    try expectConflict(response);
-    try expectNotContains(response, "conflict-marker");
+    try http_test.expect_text_response(
+        .conflict,
+        conflict_body,
+        &response,
+    );
+    try expectNotContains(response.body, "conflict-marker");
     try std.testing.expectEqual(@as(u8, 1), fake.create_count);
 }
 
@@ -1250,16 +1364,15 @@ test "POST persistence failures return only the static internal error" {
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x47);
     try put_test_queue_url(&environment, "failure-marker");
-    const event = try test_authorization_request_event(
-        std.testing.allocator,
-        .POST,
-        "Authorization",
-        "Bearer",
-        token,
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .POST,
+        .header_name = "Authorization",
+        .scheme = "Bearer",
+        .token = token,
+        .body = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"failure-marker\",\"body\":true}",
-    );
-    defer std.testing.allocator.free(event);
+    });
+    defer fixture.deinit(std.testing.allocator);
 
     const failures = [_]anyerror{
         error.AWSFailure,
@@ -1269,19 +1382,22 @@ test "POST persistence failures return only the static internal error" {
     };
     for (failures) |failure| {
         var fake = FakeIntake{ .create_error = failure };
-        const response = handleInvocationForTest(
+        var response = handle_http(
             std.testing.allocator,
-            event,
-            .{},
-            .{},
+            &fixture.request,
             &environment,
-            &fake,
+            IntakeAdapter.init(&fake),
             1000,
+            .{},
         );
-        defer std.testing.allocator.free(response);
+        defer response.deinit();
 
-        try expectInternalServerError(response);
-        try expectNotContains(response, "failure-marker");
+        try http_test.expect_text_response(
+            .internal_server_error,
+            internal_server_error_body,
+            &response,
+        );
+        try expectNotContains(response.body, "failure-marker");
         try std.testing.expectEqual(@as(u8, 1), fake.create_count);
     }
 }
@@ -1297,33 +1413,35 @@ test "SQS failure leaves SUBMITTED unchanged and a matching POST can requeue" {
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x50);
     try put_test_queue_url(&environment, "queue-failure-marker");
-    const event = try test_authorization_request_event(
-        std.testing.allocator,
-        .POST,
-        "Authorization",
-        "Bearer",
-        token,
-        "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .POST,
+        .header_name = "Authorization",
+        .scheme = "Bearer",
+        .token = token,
+        .body = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
             "\"name\":\"queue-failure-marker\",\"body\":true}",
-    );
-    defer std.testing.allocator.free(event);
+    });
+    defer fixture.deinit(std.testing.allocator);
     var fake: FakeIntake = .{};
     const failures = [_]anyerror{ error.AWSFailure, error.OutOfMemory };
     for (failures, 0..) |failure, index| {
         fake.send_error = failure;
-        const failed = handleInvocationForTest(
+        var failed = handle_http(
             std.testing.allocator,
-            event,
-            .{},
-            .{},
+            &fixture.request,
             &environment,
-            &fake,
+            IntakeAdapter.init(&fake),
             1000,
+            .{},
         );
-        defer std.testing.allocator.free(failed);
-        try expectServiceUnavailable(failed);
-        try expectNotContains(failed, "queue-failure-marker");
-        try expectNotContains(failed, @errorName(failure));
+        defer failed.deinit();
+        try http_test.expect_text_response(
+            .service_unavailable,
+            service_unavailable_body,
+            &failed,
+        );
+        try expectNotContains(failed.body, "queue-failure-marker");
+        try expectNotContains(failed.body, @errorName(failure));
         const expected_count: u8 = @intCast(index + 1);
         try std.testing.expectEqual(expected_count, fake.create_count);
         try std.testing.expectEqual(expected_count, fake.send_count);
@@ -1331,17 +1449,16 @@ test "SQS failure leaves SUBMITTED unchanged and a matching POST can requeue" {
     }
 
     fake.send_error = null;
-    const retried = handleInvocationForTest(
+    var retried = handle_http(
         std.testing.allocator,
-        event,
-        .{},
-        .{},
+        &fixture.request,
         &environment,
-        &fake,
+        IntakeAdapter.init(&fake),
         1001,
+        .{},
     );
-    defer std.testing.allocator.free(retried);
-    try expectContains(retried, "SUBMITTED");
+    defer retried.deinit();
+    try expectContains(retried.body, "SUBMITTED");
     try std.testing.expectEqual(@as(u8, failures.len + 1), fake.create_count);
     try std.testing.expectEqual(@as(u8, failures.len + 1), fake.send_count);
     try std.testing.expectEqualStrings(test_queue_url, fake.lastQueueURL());
@@ -1426,29 +1543,31 @@ test "authenticated POST rejects missing and invalid operation JSON" {
             "\"name\":\"echo\",\"body\":null,\"state\":\"COMPLETED\"}",
     };
     for (invalid_inputs) |input| {
-        const event = try test_authorization_request_event(
+        var fixture = try http_test.Request.init(std.testing.allocator, .{
+            .method = .POST,
+            .header_name = "Authorization",
+            .scheme = "Bearer",
+            .token = token,
+            .body = input,
+        });
+        defer fixture.deinit(std.testing.allocator);
+        var response = handle_http(
             std.testing.allocator,
-            .POST,
-            "Authorization",
-            "Bearer",
-            token,
-            input,
-        );
-        defer std.testing.allocator.free(event);
-        const response = handleInvocationForTest(
-            std.testing.allocator,
-            event,
-            .{},
-            .{},
+            &fixture.request,
             &environment,
-            &fake,
+            IntakeAdapter.init(&fake),
             1000,
+            .{},
         );
-        defer std.testing.allocator.free(response);
+        defer response.deinit();
 
-        try expectBadRequest(response);
-        try expectNotContains(response, "invalid-json-marker");
-        try expectNotContains(response, "UNKNOWN");
+        try http_test.expect_text_response(
+            .bad_request,
+            bad_request_body,
+            &response,
+        );
+        try expectNotContains(response.body, "invalid-json-marker");
+        try expectNotContains(response.body, "UNKNOWN");
     }
     try std.testing.expectEqual(@as(u8, 0), fake.create_count);
 }
@@ -1845,31 +1964,33 @@ test "public intake preserves the 4 KiB cap and rejects internal routing metadat
     };
     for (cases) |case| {
         var fake: FakeIntake = .{};
-        const event = try test_authorization_request_event(
+        var fixture = try http_test.Request.init(allocator, .{
+            .method = .POST,
+            .header_name = "Authorization",
+            .scheme = "Bearer",
+            .token = token,
+            .body = case.input,
+        });
+        defer fixture.deinit(allocator);
+        var response = handle_http(
             allocator,
-            .POST,
-            "Authorization",
-            "Bearer",
-            token,
-            case.input,
-        );
-        defer allocator.free(event);
-        const response = handleInvocationForTest(
-            allocator,
-            event,
-            .{},
-            .{},
+            &fixture.request,
             &environment,
-            &fake,
+            IntakeAdapter.init(&fake),
             1000,
+            .{},
         );
-        defer allocator.free(response);
+        defer response.deinit();
         if (case.accepted) {
-            try expectContains(response, "\"statusCode\":200");
+            try std.testing.expectEqual(std.http.Status.ok, response.status);
             try std.testing.expectEqual(@as(u8, 1), fake.send_count);
             try expectNotContains(fake.lastMessage(), "result_queue");
         } else {
-            try expectBadRequest(response);
+            try http_test.expect_text_response(
+                .bad_request,
+                bad_request_body,
+                &response,
+            );
             try std.testing.expectEqual(@as(u8, 0), fake.create_count);
             try std.testing.expectEqual(@as(u8, 0), fake.send_count);
         }

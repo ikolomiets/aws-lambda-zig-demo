@@ -413,6 +413,25 @@ response.
 Malformed stored items and other unexpected failures receive the static
 `500 Internal Server Error` response.
 
+Intake and Query expose `handle_http` through the application-owned
+[`HttpRequest` and `HttpResponse`](src/http.zig) types. Requests carry method,
+path, headers, and deferred body access; authentication accepts headers,
+environment, allocator, and clock time. Authentication and method checks precede
+body access, and Query never reads the body. Callers release responses with
+`deinit` after consuming or encoding them. Existing persistence/publication
+adapters and the process-owned Query cache remain the effect and lifetime seams.
+
+The [`AWS adapter`](src/aws_http.zig) owns Function URL parsing and response
+encoding with the pinned Lambda library. Lambda entry points retain runtime
+context and invocation arenas, and keep response bodies alive through encoding,
+including the sanitized encoding-failure fallback. The current parser still
+copies the event body during parsing and rejects named gateway routes; this
+interface does not add gateway or base64 support. Public Function URLs and paths
+remain as documented here. `zig build test-http --system zig-pkg` exercises the
+generic HTTP interface, authentication, and Function URL adapter; the separate
+[runtime suite](docs/agents/local-checks.md#runtime-integration-checks) exercises
+the real pinned Lambda event loop with external effects mocked.
+
 Tenant is server-owned metadata, part of idempotency identity, and the query
 authorization boundary. The DynamoDB `id` partition key remains globally
 scoped; query authorization is enforced after `GetItem` by comparing the stored

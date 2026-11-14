@@ -68,6 +68,7 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
 | `zig build check` | Combined offline and eleven-case runtime suite through the existing `test` and `test-runtime` runners; requires loopback socket permission, with no AWS credentials or live replica. Formatting remains separate. |
 | `zig build test` | Full offline Zig and mocked deployment-helper suite; excludes socket-based runtime tests, the live replica, and separate ABI checks |
+| `zig build test-http` | Intake, Query, and PASETO authentication through application-owned HTTP types and the Function URL adapter, with persistence and publication mocked |
 | `zig build test-runtime` | Eleven host integration cases through the real Lambda event loop and all six handlers; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
 | `zig build test-deploy` | Mocked regression tests for cleanup lifecycle, gateway discovery and interfaces, and processor interfaces; requires Bash and `jq`, with no AWS credentials or network access |
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
