@@ -785,7 +785,11 @@ Callers back off with increasing delay and jitter after native gateway `429`
 responses, whose bodies need not match handler errors. After an uncertain
 submission, reuse the same Operation UUID, tenant, name, and original Body when
 retrying. Matching retries may republish work; delivery remains at least once.
-Structured access logs remain a subsequent independent slice.
+The API writes structured JSON access logs to a stack-owned CloudWatch log group
+with seven-day retention; deleting the stack deletes the group. Records contain
+request identifiers, route templates, statuses, and timings. Credentials, request
+and response bodies, query strings, and client IP addresses are excluded. See
+[API access-log discovery and correlation](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#inspect-api-access-logs).
 
 ## Project Structure
 
