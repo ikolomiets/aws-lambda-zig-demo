@@ -776,8 +776,16 @@ disabled. API Gateway can invoke only the intended Intake and Query routes;
 processors remain SQS-driven. Introducing this API requires a full stack update;
 code-only development updates do not create routes or replace public invocation
 infrastructure. Stack deletion removes the API and its invocation grants.
-Per-route throttle controls and structured access logs are subsequent slices and
-are not configured by this endpoint change.
+Each route has configurable shared, best-effort throttle targets: submission
+defaults to 10 requests/second with burst 20, and querying to 50 with burst 100.
+Account/Region constraints also apply; these are not tenant quotas, a hard cost
+limit, or downstream capacity guarantees. Use a full deployment to change them;
+see [throttle parameters and overrides](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#route-throttle-configuration).
+Callers back off with increasing delay and jitter after native gateway `429`
+responses, whose bodies need not match handler errors. After an uncertain
+submission, reuse the same Operation UUID, tenant, name, and original Body when
+retrying. Matching retries may republish work; delivery remains at least once.
+Structured access logs remain a subsequent independent slice.
 
 ## Project Structure
 

@@ -6,6 +6,10 @@ REGION="${REGION:-ca-central-1}"
 STACK_NAME="${STACK_NAME:-aws-lambda-zig-demo}"
 INTAKE_FUNCTION_NAME="${INTAKE_FUNCTION_NAME:-intake-lambda}"
 QUERY_FUNCTION_NAME="${QUERY_FUNCTION_NAME:-query-lambda}"
+SUBMISSION_THROTTLING_RATE_LIMIT="${SUBMISSION_THROTTLING_RATE_LIMIT-10}"
+SUBMISSION_THROTTLING_BURST_LIMIT="${SUBMISSION_THROTTLING_BURST_LIMIT-20}"
+QUERY_THROTTLING_RATE_LIMIT="${QUERY_THROTTLING_RATE_LIMIT-50}"
+QUERY_THROTTLING_BURST_LIMIT="${QUERY_THROTTLING_BURST_LIMIT-100}"
 TIGER_BEETLE_PROCESSOR_NAME="${TIGER_BEETLE_PROCESSOR_NAME:-tiger-beetle-processor}"
 TIGER_BEETLE_COMPLETION_PROCESSOR_NAME="${TIGER_BEETLE_COMPLETION_PROCESSOR_NAME:-tiger-beetle-completion-processor}"
 SEAT_RESERVATION_PROCESSOR_NAME="${SEAT_RESERVATION_PROCESSOR_NAME-seat-reservation-processor}"
@@ -47,6 +51,15 @@ Options:
                          Intake Lambda name. Defaults to intake-lambda.
   --query-function-name NAME
                          Query Lambda name. Defaults to query-lambda.
+  --submission-throttling-rate-limit NUMBER
+                         POST /operations requests/second target. Defaults to 10.
+  --submission-throttling-burst-limit INTEGER
+                         POST /operations burst capacity. Defaults to 20.
+  --query-throttling-rate-limit NUMBER
+                         GET /operations/{id} requests/second target. Defaults to 50.
+  --query-throttling-burst-limit INTEGER
+                         GET /operations/{id} burst capacity. Defaults to 100.
+                         Throttle settings require full deployment; --dev syncs code only.
   --tiger-beetle-processor-name NAME
                          TigerBeetle processor name. Defaults to tiger-beetle-processor.
   --tiger-beetle-completion-processor-name NAME
@@ -81,6 +94,8 @@ Options:
 
 Environment overrides:
   PROFILE, REGION, STACK_NAME, INTAKE_FUNCTION_NAME, QUERY_FUNCTION_NAME,
+  SUBMISSION_THROTTLING_RATE_LIMIT, SUBMISSION_THROTTLING_BURST_LIMIT,
+  QUERY_THROTTLING_RATE_LIMIT, QUERY_THROTTLING_BURST_LIMIT,
   TIGER_BEETLE_PROCESSOR_NAME, TIGER_BEETLE_COMPLETION_PROCESSOR_NAME, TIGERBEETLE_CLUSTER_ID,
   TIGERBEETLE_ADDRESSES, LAMBDA_PRINCIPAL, PASETO_PRIVATE_KEY,
   SEAT_RESERVATION_PROCESSOR_NAME, SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME,
@@ -131,6 +146,18 @@ reject_retired_processor_overrides() {
         fail "EXECUTION_FUNCTION_NAME is retired; unset it and use TIGER_BEETLE_PROCESSOR_NAME"
     [ "${COMPLETION_FUNCTION_NAME+x}" != x ] ||
         fail "COMPLETION_FUNCTION_NAME is retired; unset it and use TIGER_BEETLE_COMPLETION_PROCESSOR_NAME"
+}
+
+validate_route_throttles() {
+    local variable
+    for variable in SUBMISSION_THROTTLING_RATE_LIMIT QUERY_THROTTLING_RATE_LIMIT; do
+        [[ "${!variable}" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+            fail "$variable must be a nonnegative decimal number"
+    done
+    for variable in SUBMISSION_THROTTLING_BURST_LIMIT QUERY_THROTTLING_BURST_LIMIT; do
+        [[ "${!variable}" =~ ^[0-9]+$ ]] ||
+            fail "$variable must be a nonnegative integer"
+    done
 }
 
 validate_tiger_beetle_completion_processor_name() {
@@ -403,6 +430,10 @@ build_sam_parameter_overrides() {
     SAM_PARAMETER_OVERRIDES=(
         "IntakeFunctionName=$INTAKE_FUNCTION_NAME"
         "QueryFunctionName=$QUERY_FUNCTION_NAME"
+        "SubmissionThrottlingRateLimit=$SUBMISSION_THROTTLING_RATE_LIMIT"
+        "SubmissionThrottlingBurstLimit=$SUBMISSION_THROTTLING_BURST_LIMIT"
+        "QueryThrottlingRateLimit=$QUERY_THROTTLING_RATE_LIMIT"
+        "QueryThrottlingBurstLimit=$QUERY_THROTTLING_BURST_LIMIT"
         "TigerBeetleProcessorName=$TIGER_BEETLE_PROCESSOR_NAME"
         "TigerBeetleCompletionProcessorName=$TIGER_BEETLE_COMPLETION_PROCESSOR_NAME"
         "SeatReservationProcessorName=$SEAT_RESERVATION_PROCESSOR_NAME"
@@ -897,6 +928,8 @@ parse_deployment_options() {
     while [ "$#" -gt 0 ]; do
         case "${1%%=*}" in
             --intake-function-name | --query-function-name | \
+                --submission-throttling-rate-limit | --submission-throttling-burst-limit | \
+                --query-throttling-rate-limit | --query-throttling-burst-limit | \
                 --tiger-beetle-processor-name | --tiger-beetle-completion-processor-name | \
                 --seat-reservation-processor-name | --seat-reservation-completion-processor-name | \
                 --existing-ledger-counter-table-name | --ledger-counter-id | \
@@ -965,6 +998,27 @@ parse_deployment_options() {
                 [ -n "$QUERY_FUNCTION_NAME" ] ||
                     fail "empty value for --query-function-name"
                 shift
+                ;;
+            --submission-throttling-rate-limit | --submission-throttling-rate-limit=* | \
+                --submission-throttling-burst-limit | --submission-throttling-burst-limit=* | \
+                --query-throttling-rate-limit | --query-throttling-rate-limit=* | \
+                --query-throttling-burst-limit | --query-throttling-burst-limit=*)
+                local throttle_option="${1%%=*}" throttle_value
+                if [[ "$1" = *=* ]]; then
+                    throttle_value="${1#*=}"
+                    [ -n "$throttle_value" ] || fail "empty value for $throttle_option"
+                    shift
+                else
+                    need_value "$1" "${2:-}"
+                    throttle_value="$2"
+                    shift 2
+                fi
+                case "$throttle_option" in
+                    --submission-throttling-rate-limit) SUBMISSION_THROTTLING_RATE_LIMIT="$throttle_value" ;;
+                    --submission-throttling-burst-limit) SUBMISSION_THROTTLING_BURST_LIMIT="$throttle_value" ;;
+                    --query-throttling-rate-limit) QUERY_THROTTLING_RATE_LIMIT="$throttle_value" ;;
+                    --query-throttling-burst-limit) QUERY_THROTTLING_BURST_LIMIT="$throttle_value" ;;
+                esac
                 ;;
             --tiger-beetle-processor-name)
                 need_value "$1" "${2:-}"
@@ -1195,6 +1249,7 @@ run_deployment() {
         return
     fi
     if [ "$DEV" -eq 0 ]; then
+        validate_route_throttles
         validate_tiger_beetle_completion_processor_name
         validate_seat_configuration
     fi

@@ -707,9 +707,14 @@ invocations retain their existing method checks and `Allow` headers.
 `OperationsApiUrl` is the common HTTPS origin. No public Function URL resources,
 public URL grants, or former endpoint output aliases are declared. The API and its
 invocation grants are stack-owned and are deleted through normal stack cleanup.
-Per-route throttle settings and structured access logs are subsequent independent
-slices; this endpoint slice does not configure them. Existing function names,
-memory, timeouts, runtime, execution policies, and thread settings are preserved.
+The default stage applies separate configurable rate and burst targets to each
+named route; polling initially has a larger allowance than submission. All callers
+share each route's allowance. These are best-effort targets subject to account/Region
+constraints, not tenant quotas, a hard cost limit, or a guarantee of downstream
+processor capacity. No separate aggregate API-wide quota is configured. See
+[route throttle configuration](#route-throttle-configuration) for defaults and overrides.
+Structured access logs remain a subsequent independent slice. Existing function
+names, memory, timeouts, runtime, execution policies, and thread settings are preserved.
 `LambdaPrincipal` configures only the `LAMBDA_PRINCIPAL` environment variable; it
 does not change gateway invocation permissions or authenticate HTTP callers.
 
@@ -798,6 +803,47 @@ The optional gateway parameters are:
 | `WireGuardWorkstationPublicKey` | Padded Base64 public key matching the workstation private key. |
 | `WireGuardAmiId` | Concrete pinned ARM64 AMI ID; required when enabled, otherwise defaults to empty. |
 | `WireGuardInstanceType` | ARM64 gateway instance type; defaults to `t4g.nano`. |
+
+### Route throttle configuration
+
+Full deployment configures the following settings on the `$default` stage:
+
+| Route | SAM rate parameter (requests/second) | Default | SAM burst parameter | Default |
+| --- | --- | ---: | --- | ---: |
+| `POST /operations` | `SubmissionThrottlingRateLimit` | 10 | `SubmissionThrottlingBurstLimit` | 20 |
+| `GET /operations/{id}` | `QueryThrottlingRateLimit` | 50 | `QueryThrottlingBurstLimit` | 100 |
+
+`deploy.sh` accepts `SUBMISSION_THROTTLING_RATE_LIMIT`,
+`SUBMISSION_THROTTLING_BURST_LIMIT`, `QUERY_THROTTLING_RATE_LIMIT`, and
+`QUERY_THROTTLING_BURST_LIMIT` environment overrides. Explicit command-line options
+take precedence over those values. Rates accept nonnegative decimal numbers;
+burst capacities require nonnegative integers. An explicitly empty value is rejected.
+The helper passes all four settings on every full deployment, using the table's
+defaults when unset; it does not inherit throttle values saved in `samconfig.toml`
+or read previous stack throttle values. Repeat custom values in the environment or
+options on later full deployments to retain them.
+
+For example, with deployment credentials and PASETO keys configured as above:
+
+```sh
+./deploy.sh --profile dev --region ca-central-1 --stack-name aws-lambda-zig-demo \
+  --submission-throttling-rate-limit 12.5 --submission-throttling-burst-limit 25 \
+  --query-throttling-rate-limit 60 --query-throttling-burst-limit 120
+```
+
+For direct SAM deployment, supply these same four SAM parameter names through
+`sam deploy --guided` or add them to the existing `--parameter-overrides` list;
+SAM can save them in local `samconfig.toml` for later direct SAM deployments.
+Keep all other required parameters when supplying that list. Throttle changes
+require a full stack update. `--dev` syncs function code only, ignores throttle
+environment values, and rejects explicit throttle options. `--cleanup` also
+rejects those options. Changing throttles does not change processor concurrency.
+
+[AWS documents route throttles](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-throttling.html)
+as best-effort targets with account/Region constraints. Local template and mocked
+helper tests establish the declared settings and parameter propagation, not
+deployed enforcement. Traffic validation requires separate authorization and a
+bounded experiment; the configured rate is not an exact rejection threshold.
 
 ### Pin the gateway image
 
@@ -1122,6 +1168,10 @@ Stack Name: aws-lambda-zig-demo
 AWS Region: ca-central-1
 Parameter IntakeFunctionName: <existing-physical-name-or-intake-lambda>
 Parameter QueryFunctionName: query-lambda
+Parameter SubmissionThrottlingRateLimit: 10
+Parameter SubmissionThrottlingBurstLimit: 20
+Parameter QueryThrottlingRateLimit: 50
+Parameter QueryThrottlingBurstLimit: 100
 Parameter TigerBeetleProcessorName: tiger-beetle-processor
 Parameter TigerBeetleCompletionProcessorName: tiger-beetle-completion-processor
 Parameter LambdaPrincipal: *
@@ -1564,6 +1614,8 @@ update removes the former public Function URLs and grants and creates the API,
 route-scoped grants, and `OperationsApiUrl` together. There is no manual URL teardown
 or compatibility period. Use separate stacks for separate deployments; the default
 API stage is unrelated to development code-update mode.
+Changing route rate or burst parameters also requires full deployment; a code-only
+sync does not apply gateway configuration.
 Establish the six-function baseline with a full deployment first; a
 four-function stack cannot use seat development sync. The helper requires both
 seat function-name outputs before building or syncing. Both modes run the same
@@ -2077,6 +2129,19 @@ accepted. The 4,096-byte bound applies to the serialized Operation Body fragment
 including escaping and internal whitespace; the full envelope can be larger.
 Successful submissions and queries retain `200`, their existing JSON views, and
 matching retry, conflict, tenant authorization, and warm Query cache behavior.
+
+API Gateway can return native `429 Too Many Requests` responses before Lambda
+invocation. Their body format is independent of handler errors; callers must not
+require the application's error schema. After `429`, back off before retrying
+submission or polling, increasing the delay and adding jitter to avoid synchronized
+retry bursts. The repository adds no automatic retry policy or new SDK.
+
+After a submission times out, loses its response, or otherwise has an uncertain
+outcome, retry with the same Operation UUID, verified tenant, name, and original
+Body. Keep that input available and use the same UUID when polling; do not generate
+a new UUID for the retry. A matching submitted retry can republish work, so this
+does not provide exactly-once execution. Existing Events and seat tooling retain
+their current explicit UUID and retry behavior.
 
 The SQS message is compact `{operation_id,tenant,context,body}` JSON with no trailing newline.
 Intake supplies the verified PASETO subject as tenant, null Context, and the submitted Body, and

@@ -99,9 +99,9 @@ for overrides in empty populated; do
     contains "$output" 'TigerBeetleProcessorName=env-tb'
     contains "$output" 'TigerBeetleCompletionProcessorName=env-completion'
     if [ "$overrides" = empty ]; then
-        contains "$output" 'ArgumentCount=11'
+        contains "$output" 'ArgumentCount=15'
     else
-        contains "$output" 'ArgumentCount=14'
+        contains "$output" 'ArgumentCount=18'
         contains "$output" $'EnableWireGuardGateway=true\nWireGuardPrivateKeyParameterName=/fixture path/with spaces\nWireGuardGatewayPublicKey=fixture+key='
     fi
 done

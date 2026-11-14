@@ -20,6 +20,26 @@ Parameters:
     Type: String
     Default: query-lambda
     Description: Name of the operation query Lambda function.
+  SubmissionThrottlingRateLimit:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    Description: Shared best-effort requests per second for POST /operations.
+  SubmissionThrottlingBurstLimit:
+    Type: Number
+    Default: 20
+    MinValue: 0
+    Description: Shared best-effort burst capacity for POST /operations (integer).
+  QueryThrottlingRateLimit:
+    Type: Number
+    Default: 50
+    MinValue: 0
+    Description: Shared best-effort requests per second for GET /operations/{id}.
+  QueryThrottlingBurstLimit:
+    Type: Number
+    Default: 100
+    MinValue: 0
+    Description: Shared best-effort burst capacity for GET /operations/{id} (integer).
   TigerBeetleProcessorName:
     Type: String
     Default: tiger-beetle-processor
@@ -305,6 +325,13 @@ Resources:
     Properties:
       StageName: $default
       DisableExecuteApiEndpoint: false
+      RouteSettings:
+        "POST /operations":
+          ThrottlingRateLimit: !Ref SubmissionThrottlingRateLimit
+          ThrottlingBurstLimit: !Ref SubmissionThrottlingBurstLimit
+        "GET /operations/{id}":
+          ThrottlingRateLimit: !Ref QueryThrottlingRateLimit
+          ThrottlingBurstLimit: !Ref QueryThrottlingBurstLimit
       DefinitionBody:
         openapi: 3.0.1
         info:

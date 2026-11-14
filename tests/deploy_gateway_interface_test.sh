@@ -119,7 +119,7 @@ test_completion_parameter_preserves_stack_state() (
     assert_contains "$overrides" " TigerBeetleCompletionProcessorName=completion-explicit "
     assert_contains "$overrides" " EnableWireGuardGateway=true "
     assert_contains "$overrides" " VpcId=vpc-00000001 "
-    [ "${#SAM_PARAMETER_OVERRIDES[@]}" -eq 13 ] ||
+    [ "${#SAM_PARAMETER_OVERRIDES[@]}" -eq 17 ] ||
         fail_test "completion parameter propagation changed preserved stack state"
 )
 
