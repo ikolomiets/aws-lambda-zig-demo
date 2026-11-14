@@ -320,11 +320,44 @@ Resources:
           OPERATIONS_TABLE_NAME: !Ref OperationsTable
           PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
 
+  OperationsApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 7
+
+  OperationsApiAccessLogPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-operations-api-access-logs'
+      # LogGroup.Arn already includes the log-stream wildcard.
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "delivery.logs.amazonaws.com"},
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "${OperationsApiAccessLogGroup.Arn}",
+            "Condition": {
+              "StringEquals": {"aws:SourceAccount": "${AWS::AccountId}"},
+              "ArnLike": {"aws:SourceArn": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"}
+            }
+          }]
+        }
+
   OperationsApi:
     Type: AWS::Serverless::HttpApi
+    DependsOn: OperationsApiAccessLogPolicy
     Properties:
       StageName: $default
       DisableExecuteApiEndpoint: false
+      AccessLogSettings:
+        DestinationArn: !GetAtt OperationsApiAccessLogGroup.Arn
+        Format: '{"request_id":"$context.requestId","integration_request_id":"$context.integration.requestId","route_key":"$context.routeKey","status":"$context.status","response_latency_ms":"$context.responseLatency","integration_latency_ms":"$context.integration.latency"}'
       RouteSettings:
         "POST /operations":
           ThrottlingRateLimit: !Ref SubmissionThrottlingRateLimit

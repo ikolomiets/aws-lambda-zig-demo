@@ -56,6 +56,76 @@ contains "$output" 'OperationsApiUrl:'
 contains "$output" 'https://${OperationsApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
 absent "$(cat "$REPOSITORY_ROOT/template.yaml")" 'FunctionUrl'
 absent "$(cat "$REPOSITORY_ROOT/template.yaml")" 'AWS::Lambda::Url'
+
+# Check the access-log lifecycle and delivery grant without contacting AWS.
+log_group="$(sed -n '/^  OperationsApiAccessLogGroup:/,/^  [A-Za-z]/p' "$REPOSITORY_ROOT/template.yaml" | sed '$d')"
+contains "$log_group" 'Type: AWS::Logs::LogGroup'
+contains "$log_group" 'RetentionInDays: 7'
+contains "$log_group" 'DeletionPolicy: Delete'
+contains "$log_group" 'UpdateReplacePolicy: Delete'
+contains "$api" 'DestinationArn: !GetAtt OperationsApiAccessLogGroup.Arn'
+contains "$api" 'DependsOn: OperationsApiAccessLogPolicy'
+log_policy="$(sed -n '/^  OperationsApiAccessLogPolicy:/,/^  [A-Za-z]/p' "$REPOSITORY_ROOT/template.yaml" | sed '$d')"
+contains "$log_policy" 'Type: AWS::Logs::ResourcePolicy'
+contains "$log_policy" 'PolicyName: !Sub'
+contains "$log_policy" 'DeletionPolicy: Delete'
+policy_document="$(sed -n '/^      PolicyDocument: !Sub |/,/^      [A-Za-z]/p' <<<"$log_policy" | sed '1d; /^      [A-Za-z]/d')"
+jq -se 'length == 1 and (.[0] |
+    .Version == "2012-10-17" and (.Statement | length) == 1 and
+    (.Statement[0] |
+        .Effect == "Allow" and
+        .Principal == {"Service": "delivery.logs.amazonaws.com"} and
+        (.Action | sort) == ["logs:CreateLogStream", "logs:PutLogEvents"] and
+        .Resource == "${OperationsApiAccessLogGroup.Arn}" and
+        .Condition == {
+            "StringEquals": {"aws:SourceAccount": "${AWS::AccountId}"},
+            "ArnLike": {"aws:SourceArn": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"}
+        }))
+' <<<"$policy_document" >/dev/null || fail_test 'access-log delivery grant is missing or too broad'
+
+log_format="$(sed -n "s/^        Format: '\(.*\)'$/\1/p" <<<"$api")"
+# An exact field allowlist excludes raw paths, credentials, bodies, query strings,
+# IP addresses, and extra identity/business data. All substitutions are strings.
+jq -se 'length == 1 and .[0] == {
+    "request_id": "$context.requestId",
+    "integration_request_id": "$context.integration.requestId",
+    "route_key": "$context.routeKey",
+    "status": "$context.status",
+    "response_latency_ms": "$context.responseLatency",
+    "integration_latency_ms": "$context.integration.latency"
+}' <<<"$log_format" >/dev/null || fail_test 'unexpected access-log fields or unsafe substitutions'
+# Substitute into the raw format before parsing, as the gateway does. Missing
+# values below are representative inputs, not promises about AWS placeholders.
+for scenario in success unauthorized throttled unmatched; do
+    for missing in '-' '' 'unavailable' 'null'; do
+        jq -en --arg format "$log_format" --arg scenario "$scenario" --arg missing "$missing" '
+            (if $scenario == "success" then
+                {request_id: "gateway-success", integration_request_id: "lambda-success",
+                 route_key: "GET /operations/{id}", status: "200",
+                 response_latency_ms: "12", integration_latency_ms: "10"}
+             elif $scenario == "unauthorized" then
+                {request_id: "gateway-unauthorized", integration_request_id: "lambda-unauthorized",
+                 route_key: "POST /operations", status: "401",
+                 response_latency_ms: "8", integration_latency_ms: "5"}
+             else
+                {request_id: "gateway-rejected", integration_request_id: $missing,
+                 route_key: (if $scenario == "throttled" then "POST /operations" else $missing end),
+                 status: (if $scenario == "throttled" then "429" else "404" end),
+                 response_latency_ms: "2", integration_latency_ms: $missing}
+             end) as $expected |
+            {
+                "$context.requestId": $expected.request_id,
+                "$context.integration.requestId": $expected.integration_request_id,
+                "$context.routeKey": $expected.route_key,
+                "$context.status": $expected.status,
+                "$context.responseLatency": $expected.response_latency_ms,
+                "$context.integration.latency": $expected.integration_latency_ms
+            } as $values |
+            (reduce ($values | to_entries[]) as $entry
+                ($format; split($entry.key) | join($entry.value)) | fromjson) == $expected
+        ' >/dev/null || fail_test "invalid rendered access log for $scenario ($missing)"
+    done
+done
 printf 'Operations API configuration tests passed.\n'
 
 # Exercise discovery and public probe semantics with no AWS credentials or sockets.

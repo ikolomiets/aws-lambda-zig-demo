@@ -32,7 +32,7 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 - [Stack resources](#4-understand-what-the-template-creates) · [Deployment values](#5-preserve-the-intake-function-name-and-choose-deployment-values)
 - [Full deployment](#6-deploy-with-sam-guided-mode) · [Development code updates](#development-code-updates) · [Rebuild and redeploy](#12-update-the-deployed-lambda-code)
 - [Gateway operation](#7-configure-and-operate-the-wireguard-gateway) · [Gateway diagnostics](#diagnose-failures) · [Key rotation](#rotate-wireguard-keys)
-- [API checks](#8-test-query-get-and-intake-post) · [Lambda logs](#9-download-lambda-logs)
+- [API checks](#8-test-query-get-and-intake-post) · [API access logs](#inspect-api-access-logs) · [Lambda logs](#9-download-lambda-logs)
 - [Operation persistence utility](#10-create-read-update-and-delete-persisted-operations) · [Seat Event utility](#seat-event-metadata-utility) · [Ledger counter utility](#global-ledger-counter-utility) · [Queue utility](#11-send-receive-and-check-queued-operations)
 - [Persistence configuration diagnostics](#troubleshoot-persistence-command-configuration) · [Lambda initialization diagnostics](#troubleshoot-lambda-initialization)
 - [Stack deletion](#13-delete-the-sam-stack) · [Security note](#security-note)
@@ -319,6 +319,11 @@ Both commands should report that `template.yaml` is valid.
 - `IntakeFunction`: `AWS::Serverless::Function`
 - `QueryFunction`: `AWS::Serverless::Function`
 - `OperationsApi`: `AWS::Serverless::HttpApi` and its generated `$default` stage
+- `OperationsApiAccessLogGroup`: `AWS::Logs::LogGroup` with seven-day retention,
+  deleted on stack deletion or replacement
+- `OperationsApiAccessLogPolicy`: stack-owned `AWS::Logs::ResourcePolicy` allowing
+  `delivery.logs.amazonaws.com` to create streams and write events only in that
+  access-log group, conditioned on the stack's account and Region
 - `IntakeApiPermission` and `QueryApiPermission`: `lambda:InvokeFunction` grants
   to `apigateway.amazonaws.com`, restricted to this API's default stage and the
   intended POST or GET route, within the stack's account
@@ -713,7 +718,15 @@ share each route's allowance. These are best-effort targets subject to account/R
 constraints, not tenant quotas, a hard cost limit, or a guarantee of downstream
 processor capacity. No separate aggregate API-wide quota is configured. See
 [route throttle configuration](#route-throttle-configuration) for defaults and overrides.
-Structured access logs remain a subsequent independent slice. Existing function
+The stage writes structured JSON access logs to `OperationsApiAccessLogGroup`.
+The delivery policy exists before the API and stage are created and is deleted
+with the stack. It uses one CloudWatch Logs resource-policy slot in the account
+and Region. The deployment identity needs log-group/retention and resource-policy
+lifecycle permissions, plus the
+[HTTP API log-delivery setup permissions](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-logging.html#http-api-logging-permissions).
+The service delivery grant covers only this group's streams; Lambda execution
+roles receive no additional permissions. See [API access logs](#inspect-api-access-logs)
+for discovery and the selected fields. Existing function
 names, memory, timeouts, runtime, execution policies, and thread settings are preserved.
 `LambdaPrincipal` configures only the `LAMBDA_PRINCIPAL` environment variable; it
 does not change gateway invocation permissions or authenticate HTTP callers.
@@ -1616,6 +1629,8 @@ or compatibility period. Use separate stacks for separate deployments; the defau
 API stage is unrelated to development code-update mode.
 Changing route rate or burst parameters also requires full deployment; a code-only
 sync does not apply gateway configuration.
+Adding or changing access-log resources, delivery permissions, retention, or the
+stage log format also requires a full stack update.
 Establish the six-function baseline with a full deployment first; a
 four-function stack cannot use seat development sync. The helper requires both
 seat function-name outputs before building or syncing. Both modes run the same
@@ -2399,6 +2414,71 @@ created by earlier versions of the helper with `[event-id=...]` headers are
 unsupported; remove or rename the existing log before running the updated
 helper.
 
+### Inspect API access logs
+
+The API stage sends six fields to a separate stack-owned CloudWatch log group.
+All values are JSON strings, including status and millisecond timings, so absent
+integration data does not leave an unquoted value in the JSON format.
+
+| Field | Meaning |
+| --- | --- |
+| `request_id` | Gateway request ID (`$context.requestId`) |
+| `integration_request_id` | Integration endpoint request ID, when available (`$context.integration.requestId`) |
+| `route_key` | Configured method and route template (`$context.routeKey`), such as `GET /operations/{id}` |
+| `status` | HTTP response status (`$context.status`) |
+| `response_latency_ms` | Total gateway response latency (`$context.responseLatency`) |
+| `integration_latency_ms` | Integration latency, when available (`$context.integration.latency`) |
+
+These are the [HTTP API access-log variables](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-logging-variables.html).
+The format excludes credentials, request/response bodies, query strings, client
+IPs, raw caller paths, and additional identity or business fields. The configured
+route template does not expose the caller's Operation UUID. For unmatched routes,
+route metadata can be unavailable; the format does not fall back to the raw path.
+
+Discover the generated group name from the selected stack, using the existing
+profile and Region context. Run these read-only commands when inspecting a
+deployed stack:
+
+```sh
+STACK_NAME="${STACK_NAME:-aws-lambda-zig-demo}"
+ACCESS_LOG_GROUP="$(aws cloudformation describe-stack-resource \
+  --stack-name "$STACK_NAME" \
+  --logical-resource-id OperationsApiAccessLogGroup \
+  --query 'StackResourceDetail.PhysicalResourceId' --output text \
+  --profile "${AWS_PROFILE:-dev}" --region "${AWS_REGION:-ca-central-1}")"
+
+aws logs tail "$ACCESS_LOG_GROUP" --since 1h --format short \
+  --profile "${AWS_PROFILE:-dev}" --region "${AWS_REGION:-ca-central-1}"
+```
+
+The caller needs `cloudformation:DescribeStackResource` and log-reading permissions
+(`logs:DescribeLogStreams` and `logs:FilterLogEvents` for this example).
+Select that group and a time window in CloudWatch Logs Insights to inspect fields:
+
+```text
+fields @timestamp, request_id, integration_request_id, route_key, status,
+       response_latency_ms, integration_latency_ms
+| sort @timestamp desc
+| limit 100
+```
+
+When `integration_request_id` is available for a Lambda invocation, use it to
+look for the corresponding request in the routed Intake or Query function's
+logs. Runtime START/END/REPORT lines contain the Lambda request ID; structured
+Intake diagnostics also expose `lambda_request_id`. The gateway `request_id` is
+a separate identifier. Pre-integration rejections such as throttling or unmatched
+routes may have no integration ID or timing and no Lambda invocation. Treat
+unavailable values as missing; no exact placeholder representation is guaranteed.
+Service request IDs aid diagnosis and are not authorization evidence. These
+diagnostics do not promise universal correlation or a complete audit ledger.
+
+Records have seven-day retention. Normal stack cleanup deletes the access-log
+group and delivery policy, including the group's remaining records. Existing
+Lambda application-log configuration and retention are unchanged.
+Local configuration and rendered-format tests establish declared behavior and
+representative JSON validity. Actual AWS log delivery and retention behavior
+require separately authorized cloud validation; local checks do not prove receipt.
+
 ### Investigate structured outcomes
 
 Select the log groups for the five instrumented functions and the relevant time
@@ -3102,7 +3182,8 @@ Explicit owned-resource teardown is a separate mode:
 **This permanently deletes owned data.** Cleanup removes all six SAM-managed
 functions and roles, Operations and Events, every counter in an owned counter
 table, all four queues and queued messages, the HTTP API and stage, invocation
-permissions, and the remaining stack resources. It preserves a referenced counter table and every
+permissions, the API access-log group and its remaining records, its delivery
+policy, and the remaining stack resources. It preserves a referenced counter table and every
 counter in that table, regardless of the selected counter ID.
 
 Cleanup accepts only stack/profile/Region selection. It rejects `--dev`,
