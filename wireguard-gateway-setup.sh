@@ -93,7 +93,7 @@ Options:
   --use-local-libs       Use local dependency checkouts with zig build --fork.
                          aws_lambda defaults to ../aws-lambda-zig.
   --dry-run              Run local checks, build, package, and validation only.
-  --no-url-check         Skip the post-deploy Function URL HTTP status check.
+  --no-url-check         Skip the post-deploy Operations API HTTP status checks.
   -h, --help             Show this help.
 
 Environment overrides:

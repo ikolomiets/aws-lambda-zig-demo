@@ -10,9 +10,9 @@ stack-aware `persistence.sh` and `queue.sh` commands manage Operations in
 DynamoDB and SQS, while `lambda_logs.sh` downloads any function's CloudWatch
 logs. The HTTP handlers use `src/lambda_auth.zig` to authenticate a PASETO v4.public
 bearer token through the `aws-lambda-zig` runtime package. The query Lambda
-accepts only `GET /<uuid>`, strongly reads the Operation from DynamoDB, and
+accepts only `GET /operations/{id}`, strongly reads the Operation from DynamoDB, and
 returns it only when its tenant matches the verified token subject. The intake
-Lambda accepts only POST, validates and hashes an
+Lambda accepts `POST /operations`, validates and hashes an
 Operation JSON document, derives required tenant metadata from the verified
 token subject, resolves the exact `<name>Queue` environment mapping, persists
 the Operation idempotently in DynamoDB, submits new work to that SQS queue, and
@@ -386,7 +386,7 @@ Once an event source mapping is enabled, `queue.sh <queue-name> receive`
 competes with that queue's Lambda consumer. In this stack, `TigerBeetleQueue`
 feeds TigerBeetle processor and `CompletionQueue` feeds the Completion processor.
 
-Both Lambda Function URLs require the token in an HTTP authorization header:
+Both Operation API routes require the token in an HTTP authorization header:
 
 ```text
 Authorization: Bearer <token>
@@ -396,10 +396,12 @@ Header names and the `Bearer` scheme are case-insensitive. Missing, malformed,
 expired, or unverifiable credentials receive `401 Unauthorized` with
 `WWW-Authenticate: Bearer`. Missing or invalid public-key configuration and
 internal failures receive a sanitized `500 Internal Server Error`.
-Invalid POST operation documents receive `400 Bad Request`. Authenticated
-non-POST intake methods receive `405 Method Not Allowed` with `Allow: POST`;
-authenticated non-GET query methods receive `405` with `Allow: GET`. Query
-paths that are not exactly one UUID segment receive `400 Bad Request`. Missing
+Invalid POST Operation documents receive `400 Bad Request`. The public API exposes
+only `POST /operations` and `GET /operations/{id}`; unmatched paths and methods
+receive native gateway `404` responses without invoking Lambda. Gateway errors
+retain their own body formats. Direct handler invocations retain `405 Method Not
+Allowed` with `Allow: POST` or `Allow: GET` for unsupported methods, and `400` for
+Query paths that are not exactly `/operations/{uuid}`. Missing
 Operations and Operations owned by another tenant both receive the same static
 `404 Not Found` response. A POST that
 reuses an Operation ID with a different server-computed hash receives a
@@ -421,14 +423,19 @@ body access, and Query never reads the body. Callers release responses with
 `deinit` after consuming or encoding them. Existing persistence/publication
 adapters and the process-owned Query cache remain the effect and lifetime seams.
 
-The [`AWS adapter`](src/aws_http.zig) owns Function URL parsing and response
-encoding with the pinned Lambda library. Lambda entry points retain runtime
-context and invocation arenas, and keep response bodies alive through encoding,
-including the sanitized encoding-failure fallback. The current parser still
-copies the event body during parsing and rejects named gateway routes; this
-interface does not add gateway or base64 support. Public Function URLs and paths
-remain as documented here. `zig build test-http --system zig-pkg` exercises the
-generic HTTP interface, authentication, and Function URL adapter; the separate
+The [`AWS adapter`](src/aws_http.zig) accepts HTTP API and Function URL payload
+2.0 events, including named gateway routes. It scans the envelope without copying
+the body string, materializes it only after authentication and method checks,
+and decodes standard base64 when indicated. Malformed base64 returns `400` after
+those checks; Query never decodes its body. Decoding preserves original JSON bytes,
+Content-Type remains optional, and the 4,096-byte bound applies to the serialized
+Operation Body, including escaping and internal whitespace, rather than the full
+envelope. Function URL event support does not expose public Function URLs.
+
+Lambda entry points retain the pinned runtime contract, invocation arenas, and
+response bodies through encoding, including the sanitized encoding-failure fallback.
+`zig build test-http --system zig-pkg` exercises the generic interface,
+authentication, and both AWS event shapes; the separate
 [runtime suite](docs/agents/local-checks.md#runtime-integration-checks) exercises
 the real pinned Lambda event loop with external effects mocked.
 
@@ -597,8 +604,9 @@ Override them with `TIGER_BEETLE_PROCESSOR_NAME`, `TIGER_BEETLE_COMPLETION_PROCE
 The template outputs
 `IntakeFunctionName`, `QueryFunctionName`, `TigerBeetleProcessorName`, and
 `TigerBeetleCompletionProcessorName`, plus `IntakeFunctionArn`, `QueryFunctionArn`,
-`TigerBeetleProcessorArn`, and `TigerBeetleCompletionProcessorArn`; only intake and query have Function URL
-outputs. Resolve deployed values instead of recording them in documentation:
+`TigerBeetleProcessorArn`, and `TigerBeetleCompletionProcessorArn`, plus the common
+HTTPS origin `OperationsApiUrl`. Resolve deployed values instead of recording them
+in documentation:
 
 ```sh
 aws cloudformation describe-stacks \
@@ -670,11 +678,11 @@ for the full SAM workflow.
 
 ## Test the Authenticated APIs
 
-After deployment, call either Function URL printed by SAM:
+After a full stack deployment, call the matching routes at `OperationsApiUrl`:
 
 ```sh
-curl -i -L <IntakeFunctionUrl>
-curl -i -L <QueryFunctionUrl>
+curl -i -L -X POST <OperationsApiUrl>/operations
+curl -i -L <OperationsApiUrl>/operations/00112233-4455-6677-8899-aabbccddeeff
 ```
 
 An unauthenticated request receives:
@@ -705,7 +713,7 @@ curl -L \
   --data \
     '{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"TigerBeetle","body":{"lookup_accounts":[{"id":"101"}]}}' \
-  <IntakeFunctionUrl>
+  <OperationsApiUrl>/operations
 ```
 
 For a new ID, the response has `SUBMITTED` state, the invocation timestamp, its
@@ -730,13 +738,14 @@ Read the Operation with the same token subject and UUID:
 ```sh
 curl -L \
   -H "Authorization: Bearer $token" \
-  <QueryFunctionUrl>/00112233-4455-6677-8899-aabbccddeeff
+  <OperationsApiUrl>/operations/00112233-4455-6677-8899-aabbccddeeff
 ```
 
 The query response is the same compact bodyless Operation output JSON shown
 above. `COMPLETED` Operations additionally include `result`; `SUBMITTED` Operations
-do not. The ID comes only from the single `rawPath` segment: query strings and
-GET bodies neither provide nor alter it. A different token subject receives the
+do not. The ID comes only from the exact `/operations/{id}` application path: query
+strings, GET bodies, and gateway path parameters neither provide nor alter it.
+A different token subject receives the
 same `404 Not Found` response as a missing Operation.
 
 For `SUBMITTED`, intake sends compact `{operation_id,tenant,context,body}` JSON to SQS, using
@@ -761,13 +770,14 @@ unfinished Operation, including those sharing the failed request. Completion pub
 retries the failed message's source record and every later unpublished record; earlier successful
 sends remain acknowledgement-eligible. DynamoDB uncertainty replays the single Completion message.
 
-The template intentionally creates publicly reachable intake POST and query
-GET Function URLs for demo testing, while both Function URL handlers enforce PASETO bearer
-authentication. The TigerBeetle processor has no Function URL and is invoked from SQS.
-The Completion processor likewise has no Function URL and is invoked from its SQS mapping.
-Production endpoints should also consider stricter infrastructure
-authorization, narrower IAM policies, or a fronting layer such as API Gateway
-or CloudFront.
+The template exposes one public HTTP API with the two authenticated Operation
+routes, the AWS-generated hostname, and a prefix-free `$default` stage. CORS is
+disabled. API Gateway can invoke only the intended Intake and Query routes;
+processors remain SQS-driven. Introducing this API requires a full stack update;
+code-only development updates do not create routes or replace public invocation
+infrastructure. Stack deletion removes the API and its invocation grants.
+Per-route throttle controls and structured access logs are subsequent slices and
+are not configured by this endpoint change.
 
 ## Project Structure
 
@@ -789,7 +799,7 @@ or CloudFront.
 - `lambda_logs.sh`: explicit six-handler CloudWatch log download helper.
 - `build.zig`: Zig build graph for all six bootstraps, local commands, and tests.
 - `build.zig.zon`: package metadata and pinned dependencies.
-- `template.yaml`: SAM template for all six Lambdas, two Function URLs, four queue mappings, permissions, and the optional EC2 WireGuard gateway.
+- `template.yaml`: SAM template for all six Lambdas, one Operation HTTP API, four queue mappings, permissions, and the optional EC2 WireGuard gateway.
 - `docs/EC2-WireGuard-Gateway.md`: implemented gateway architecture, lifecycle, security, and ownership reference.
 - `docs/`: the SAM deployment guide, ADRs, and the Zig style reference.
 - `AGENTS.md`: repository guidance for coding agents.

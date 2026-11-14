@@ -261,12 +261,13 @@ check_json '(.Stacks[0].Outputs // []) | type == "array" and
     ([.[].OutputKey]|length == (unique|length))' 'invalid or duplicate stack output'
 binding="$(printf '%s' "$JSON" | jq -c '.Stacks[0].Outputs | map({key:.OutputKey,value:.OutputValue}) | from_entries')"
 JSON="$binding"
-for key in IntakeFunctionUrl QueryFunctionUrl; do
+for key in OperationsApiUrl; do
     check_json '.[$key] | type == "string" and test("^https://(\\[[0-9a-fA-F:.]+\\]|[^/?#@:[:space:]]+)(:[0-9]+)?/?$")' \
         "missing or invalid $key output" --arg key "$key"
 done
-intake_url="$(printf '%s' "$binding" | jq -r .IntakeFunctionUrl)"
-query_url="$(printf '%s' "$binding" | jq -r .QueryFunctionUrl)"
+operations_api_url="$(printf '%s' "$binding" | jq -r .OperationsApiUrl)"
+intake_url="${operations_api_url%/}/operations"
+query_url="$intake_url"
 for key in SeatEventsTableName LedgerCounterTableName; do
     check_json '.[$key] | type == "string" and test("^[A-Za-z0-9_.-]{3,255}$")' \
         "missing or invalid $key output" --arg key "$key"

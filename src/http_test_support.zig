@@ -59,3 +59,42 @@ pub fn expect_text_response(
         .body = body,
     }, actual);
 }
+
+/// Realistic payload 2.0 metadata; Function URL variants omit gateway routing metadata.
+pub fn aws_event(allocator: std.mem.Allocator, options: struct {
+    method: std.http.Method = .POST,
+    path: []const u8 = "/operations",
+    route: ?[]const u8 = "POST /operations",
+    token: ?[]const u8 = null,
+    body: ?[]const u8 = null,
+    base64: bool = false,
+    content_type: ?[]const u8 = null,
+}) ![]u8 {
+    const bearer = if (options.token) |token|
+        try std.fmt.allocPrint(allocator, "Bearer {s}", .{token})
+    else
+        null;
+    defer if (bearer) |value| allocator.free(value);
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .version = "2.0",
+        .routeKey = options.route orelse "$default",
+        .rawPath = options.path,
+        .rawQueryString = "id=ffffffff-ffff-ffff-ffff-ffffffffffff",
+        .pathParameters = if (options.route != null)
+            @as(?struct { id: []const u8 }, .{ .id = "ffffffff-ffff-ffff-ffff-ffffffffffff" })
+        else
+            null,
+        .headers = .{
+            .aUtHoRiZaTiOn = bearer orelse "",
+            .@"content-type" = options.content_type,
+        },
+        .requestContext = .{
+            .stage = "$default",
+            .requestId = "request-id",
+            .domainName = "example.execute-api.ca-central-1.amazonaws.com",
+            .http = .{ .method = @tagName(options.method), .path = options.path },
+        },
+        .body = options.body,
+        .isBase64Encoded = options.base64,
+    }, .{ .emit_null_optional_fields = false });
+}

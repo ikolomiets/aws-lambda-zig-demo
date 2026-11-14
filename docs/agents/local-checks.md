@@ -68,7 +68,7 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
 | `zig build check` | Combined offline and eleven-case runtime suite through the existing `test` and `test-runtime` runners; requires loopback socket permission, with no AWS credentials or live replica. Formatting remains separate. |
 | `zig build test` | Full offline Zig and mocked deployment-helper suite; excludes socket-based runtime tests, the live replica, and separate ABI checks |
-| `zig build test-http` | Intake, Query, and PASETO authentication through application-owned HTTP types and the Function URL adapter, with persistence and publication mocked |
+| `zig build test-http` | Intake, Query, and PASETO authentication through application-owned HTTP types and the shared AWS payload 2.0 adapter, with persistence and publication mocked |
 | `zig build test-runtime` | Eleven host integration cases through the real Lambda event loop and all six handlers; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
 | `zig build test-deploy` | Mocked regression tests for cleanup lifecycle, gateway discovery and interfaces, and processor interfaces; requires Bash and `jq`, with no AWS credentials or network access |
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
@@ -137,7 +137,8 @@ requires loopback socket access too; the complete offline checks continue to moc
 deployment commands. Ordinary builds and `package` do not depend on tests.
 
 `test-runtime` starts a fake Runtime API on `127.0.0.1` with an operating-system-assigned
-port. It exercises authenticated intake, warm query caching, malformed-event
+port. It exercises named HTTP API and Function URL events, base64 intake, authentication
+precedence, cross-tenant warm query caching, malformed-event
 failure and recovery, partial SQS acknowledgements, and Completion persistence
 retry. It checks response/error paths and bodies, invocation-ID echoing and
 missing-ID compatibility, and refreshed request and trace metadata. Tests copy

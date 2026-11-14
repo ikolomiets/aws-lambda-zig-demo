@@ -62,8 +62,8 @@ case "$1 $2" in
     'cloudformation describe-stack-resource') printf 'fixture-events\n' ;;
     'cloudformation describe-stacks')
         case "$*" in
-            *QueryFunctionUrl*) printf '%s\n' "${QUERY_URL:-https://query.invalid/}" ;;
-            *) printf '%s\n' "${INTAKE_URL:-https://intake.invalid/}" ;;
+            *OperationsApiUrl*) printf '%s\n' "${OPERATIONS_API_URL:-https://operations.invalid/}" ;;
+            *) exit 96 ;;
         esac ;;
     *) exit 95 ;;
 esac
@@ -83,7 +83,7 @@ state=SUBMITTED
 tenant="${RESPONSE_TENANT-fixture-owner}"
 case "$method" in
     POST)
-        [ "$url" = https://intake.invalid/ ] || exit 92
+        [ "$url" = https://operations.invalid/operations ] || exit 92
         printf '%s\n' "$config" | sed -n 's/^data = //p' | jq -r . >"$REQUEST_FILE"
         printf '0\n' >"$QUERY_COUNT"
         if [ "${CURL_FAILURE:-false}" = true ]; then exit 7; fi
@@ -91,7 +91,7 @@ case "$method" in
         status="${HTTP_STATUS:-200}" ;;
     GET)
         operation_id="$(jq -r .id "$REQUEST_FILE")"
-        [ "$url" = "https://query.invalid/$operation_id" ] || exit 94
+        [ "$url" = "https://operations.invalid/operations/$operation_id" ] || exit 94
         case "$config" in *'data = '*) exit 95 ;; esac
         if [ "${QUERY_CURL_FAILURE:-false}" = true ]; then exit 7; fi
         if [ "${BAD_QUERY_RESPONSE:-false}" = true ]; then printf '{}\n200\n'; exit; fi
@@ -249,11 +249,10 @@ printf '%s' "$output" | jq -se --arg id "$operation_id" --arg event "$EVENT_ID" 
     .[-1].result == {type:"SUCCESS",payload:{event_id:$event,classes:{general:{total:100,available:97}}}}' >/dev/null
 [ "$(cat "$QUERY_COUNT")" = 3 ] || fail_test 'check did not poll until completion'
 [ "$(wc -l <"$SLEEP_CALLS" | tr -d ' ')" = 2 ] || fail_test 'check did not wait between submitted reads'
-[ "$(cat "$HTTP_CALLS")" = "$(printf 'POST https://intake.invalid/\nGET https://query.invalid/%s\nGET https://query.invalid/%s\nGET https://query.invalid/%s' \
+[ "$(cat "$HTTP_CALLS")" = "$(printf 'POST https://operations.invalid/operations\nGET https://operations.invalid/operations/%s\nGET https://operations.invalid/operations/%s\nGET https://operations.invalid/operations/%s' \
     "$operation_id" "$operation_id" "$operation_id")" ] || fail_test 'unexpected check HTTP calls'
 calls="$(cat "$AWS_CALLS")"
-contains "$calls" IntakeFunctionUrl
-contains "$calls" QueryFunctionUrl
+contains "$calls" OperationsApiUrl
 contains "$calls" '--stack-name check-stack'
 case "$calls" in *describe-stack-resource*) fail_test 'check read Event metadata' ;; esac
 
@@ -284,11 +283,10 @@ printf '%s' "$output" | jq -se --arg id "$operation_id" --arg event "$EVENT_ID" 
     .[-1].result == {type:"SUCCESS",payload:{event_id:$event,class:"general",quantity:2,reservation_id:"123"}}' >/dev/null
 [ "$(cat "$QUERY_COUNT")" = 3 ] || fail_test 'reserve did not poll until completion'
 [ "$(wc -l <"$SLEEP_CALLS" | tr -d ' ')" = 2 ] || fail_test 'reserve did not wait between submitted reads'
-[ "$(cat "$HTTP_CALLS")" = "$(printf 'POST https://intake.invalid/\nGET https://query.invalid/%s\nGET https://query.invalid/%s\nGET https://query.invalid/%s' \
+[ "$(cat "$HTTP_CALLS")" = "$(printf 'POST https://operations.invalid/operations\nGET https://operations.invalid/operations/%s\nGET https://operations.invalid/operations/%s\nGET https://operations.invalid/operations/%s' \
     "$operation_id" "$operation_id" "$operation_id")" ] || fail_test 'unexpected reserve HTTP calls'
 calls="$(cat "$AWS_CALLS")"
-contains "$calls" IntakeFunctionUrl
-contains "$calls" QueryFunctionUrl
+contains "$calls" OperationsApiUrl
 contains "$calls" '--profile reserve-profile'
 contains "$calls" '--region ca-central-1'
 contains "$calls" '--stack-name reserve-stack'
@@ -331,11 +329,10 @@ printf '%s' "$output" | jq -se --arg id "$operation_id" --arg event "$EVENT_ID" 
     .[-1].result == {type:"SUCCESS",payload:{event_id:$event,reservation_id:"123"}}' >/dev/null
 [ "$(cat "$QUERY_COUNT")" = 3 ] || fail_test 'confirm did not poll until completion'
 [ "$(wc -l <"$SLEEP_CALLS" | tr -d ' ')" = 2 ] || fail_test 'confirm did not wait between submitted reads'
-[ "$(cat "$HTTP_CALLS")" = "$(printf 'POST https://intake.invalid/\nGET https://query.invalid/%s\nGET https://query.invalid/%s\nGET https://query.invalid/%s' \
+[ "$(cat "$HTTP_CALLS")" = "$(printf 'POST https://operations.invalid/operations\nGET https://operations.invalid/operations/%s\nGET https://operations.invalid/operations/%s\nGET https://operations.invalid/operations/%s' \
     "$operation_id" "$operation_id" "$operation_id")" ] || fail_test 'unexpected confirm HTTP calls'
 calls="$(cat "$AWS_CALLS")"
-contains "$calls" IntakeFunctionUrl
-contains "$calls" QueryFunctionUrl
+contains "$calls" OperationsApiUrl
 contains "$calls" '--profile confirm-profile'
 contains "$calls" '--region ca-central-1'
 contains "$calls" '--stack-name confirm-stack'
@@ -436,7 +433,7 @@ for command_name in check_seats reserve_seat confirm_seats; do
     command_args=("$command_name" --event-id "$EVENT_ID")
     if [ "$command_name" = reserve_seat ]; then command_args+=(--class general --quantity 2); fi
     if [ "$command_name" = confirm_seats ]; then command_args+=(--reservation-id 123); fi
-    for endpoint in INTAKE_URL QUERY_URL; do
+    for endpoint in OPERATIONS_API_URL; do
         : >"$HTTP_CALLS"
         if output="$(env "$endpoint=http://invalid/" bash "$TEST_DIR/repo/events.sh" \
             "${command_args[@]}" 2>&1)"; then fail_test 'accepted invalid endpoint'; fi

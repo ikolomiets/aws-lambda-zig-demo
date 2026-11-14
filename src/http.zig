@@ -17,8 +17,8 @@ pub const HttpRequest = struct {
         bytes: []const u8,
         deferred: struct {
             context: *anyopaque,
-            // The caller owns returned bytes through the handler call. Any allocation
-            // uses the supplied request arena; the accessor preserves original bytes.
+            // Bytes remain valid through the handler call. Storage uses the supplied
+            // allocator or the transport request owner; original bytes are preserved.
             read_fn: *const fn (*anyopaque, std.mem.Allocator) anyerror!?[]const u8,
         },
     };

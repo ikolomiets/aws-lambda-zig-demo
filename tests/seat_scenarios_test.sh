@@ -34,8 +34,7 @@ case "${0##*/}" in
             'cloudformation describe-stacks')
                 cat <<'JSON'
 {"Stacks":[{"Outputs":[
-  {"OutputKey":"IntakeFunctionUrl","OutputValue":"https://intake.invalid/"},
-  {"OutputKey":"QueryFunctionUrl","OutputValue":"https://query.invalid/"},
+  {"OutputKey":"OperationsApiUrl","OutputValue":"https://operations.invalid/"},
   {"OutputKey":"SeatEventsTableName","OutputValue":"fixture-events"},
   {"OutputKey":"LedgerCounterTableName","OutputValue":"fixture-counter"},
   {"OutputKey":"LedgerCounterId","OutputValue":"fixture-sequence"}
@@ -49,6 +48,7 @@ JSON
     curl)
         config="$(cat)"
         url="$(printf '%s\n' "$config" | sed -n 's/^url = //p' | jq -r .)"
+        case "$url" in https://operations.invalid/operations|https://operations.invalid/operations/*) ;; *) exit 97 ;; esac
         method="$(printf '%s\n' "$config" | sed -n 's/^request = //p' | jq -r .)"
         header="$(printf '%s\n' "$config" | sed -n '/^header = .*Authorization:/s/^header = //p' | jq -r .)"
         if [ -z "$header" ]; then printf '{}\n401\n'; exit; fi

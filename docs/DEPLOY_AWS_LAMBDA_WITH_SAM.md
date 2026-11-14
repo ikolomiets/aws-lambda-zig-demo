@@ -4,7 +4,7 @@ This guide documents how to deploy the six Zig Lambda packages in this repositor
 using AWS SAM and `template.yaml`.
 
 SAM deploys all six Lambda functions as one CloudFormation-managed stack. It creates
-their execution roles, public Function URLs for intake and query, the DynamoDB
+their execution roles, one public HTTP API for intake and query, the DynamoDB
 operations table, the TigerBeetle queue sent by intake and consumed by the TigerBeetle processor,
 and the Completion queue sent by the TigerBeetle processor and consumed by the Completion processor.
 It also creates seat submission/completion queues, durable Events and an owned or
@@ -49,7 +49,7 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 - The six archives under `zig-out/packages/` listed in
   [the packaging procedure](#2-build-and-package-the-zig-lambdas) each contain
   one Linux ARM64 executable named `bootstrap`.
-- Both Lambda Function URLs are intentionally public for authenticated demo testing.
+- The Operation HTTP API is intentionally public for authenticated demo testing.
 - The fixed physical name `TigerBeetleQueue` permits only one such queue per AWS
   account and region; deploy only one stack using this template in that scope.
 - `LAMBDA_PRINCIPAL` defaults to `'*'` unless you override the
@@ -317,15 +317,11 @@ Both commands should report that `template.yaml` is valid.
 - `TigerBeetleQueue`: `AWS::SQS::Queue`
 - `CompletionQueue`: `AWS::SQS::Queue`
 - `IntakeFunction`: `AWS::Serverless::Function`
-- `IntakeFunctionUrl`: `AWS::Lambda::Url`
-- `FunctionUrlInvokeFunctionUrlPermission`: allows `lambda:InvokeFunctionUrl`
-- `FunctionUrlInvokeFunctionPermission`: allows `lambda:InvokeFunction` only
-  through the Function URL
 - `QueryFunction`: `AWS::Serverless::Function`
-- `QueryFunctionUrl`: `AWS::Lambda::Url`
-- `QueryFunctionUrlInvokeFunctionUrlPermission`: allows `lambda:InvokeFunctionUrl`
-- `QueryFunctionUrlInvokeFunctionPermission`: allows `lambda:InvokeFunction` only
-  through the query Function URL
+- `OperationsApi`: `AWS::Serverless::HttpApi` and its generated `$default` stage
+- `IntakeApiPermission` and `QueryApiPermission`: `lambda:InvokeFunction` grants
+  to `apigateway.amazonaws.com`, restricted to this API's default stage and the
+  intended POST or GET route, within the stack's account
 - `TigerBeetleProcessor`: `AWS::Serverless::Function`
 - `TigerBeetleProcessorRole`: `AWS::IAM::Role`
 - `TigerBeetleProcessorQueueMapping`: `AWS::Lambda::EventSourceMapping`
@@ -700,21 +696,22 @@ at `expires_at` but may remain readable until DynamoDB removes it.
 CloudFormation configures TTL, so the Lambda role does not need an additional
 DynamoDB control-plane permission.
 
-The Function URLs use `AuthType: NONE` and buffered invocation. CORS is not
-configured because the service targets non-browser HTTP clients. The handlers
-enforce the supported methods: intake allows only POST and query allows only
-`GET /<uuid>`. Their public permissions use the existing intake logical IDs and new
-query-specific logical IDs.
+The Operation HTTP API uses Lambda proxy payload format 2.0 and the AWS-generated
+HTTPS hostname. Its `$default` stage adds no stage prefix. Exactly `POST /operations`
+and `GET /operations/{id}` invoke the separate Intake and Query functions. There
+is no catch-all route, custom domain, version prefix, or CORS configuration.
+Unsupported public methods and paths receive native gateway `404` responses without
+invoking a handler; gateway errors keep their own body formats. Direct handler
+invocations retain their existing method checks and `Allow` headers.
 
-```yaml
-AuthType: NONE
-InvokeMode: BUFFERED
-```
-
-`AuthType: NONE` and `Principal: "*"` make the Function URL public.
-
-`LambdaPrincipal` configures only the `LAMBDA_PRINCIPAL` environment variable
-inside the function. It does not change the Function URL resource permissions.
+`OperationsApiUrl` is the common HTTPS origin. No public Function URL resources,
+public URL grants, or former endpoint output aliases are declared. The API and its
+invocation grants are stack-owned and are deleted through normal stack cleanup.
+Per-route throttle settings and structured access logs are subsequent independent
+slices; this endpoint slice does not configure them. Existing function names,
+memory, timeouts, runtime, execution policies, and thread settings are preserved.
+`LambdaPrincipal` configures only the `LAMBDA_PRINCIPAL` environment variable; it
+does not change gateway invocation permissions or authenticate HTTP callers.
 
 `PasetoPublicKey` is a required parameter that configures the
 `PASETO_PUBLIC_KEY` used by the handler to verify PASETO v4.public bearer
@@ -1419,11 +1416,12 @@ preflight is deferred.
 `deploy.sh` reads the required `PASETO_PUBLIC_KEY` from the host environment and
 passes it as the `PasetoPublicKey` SAM parameter. When post-deploy checks are
 enabled, it also requires the corresponding `PASETO_PRIVATE_KEY` to issue a
-short-lived test token. It verifies unauthenticated HTTP 401 for both URLs,
-an authenticated query of a valid UUID with a unique test subject returns a
-tenant-safe 404, authenticated wrong methods return 405, and an authenticated
-bodyless intake POST returns 400. The private key and test token are not printed
-or passed to the Lambda environment. Use
+short-lived test token. It probes matching submission and query routes for
+unauthenticated HTTP 401, an authenticated query of a valid UUID with a unique
+subject for tenant-safe 404, and authenticated bodyless or invalid submissions
+for 400. Wrong methods, the API root, and unmatched paths must return native
+gateway 404. The root is not an authentication probe. The private key and test
+token are not printed or passed to the Lambda environment. Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run` to run the
 local checks, rebuild all six Lambda zip archives, and validate `template.yaml` without
 deploying to AWS.
@@ -1479,7 +1477,7 @@ resolve its physical URL when needed instead of recording it.
 After a successful enablement, the setup script resolves and validates the
 gateway endpoint, gateway public key, workstation address, and deployed Lambda
 subnet CIDR. It then prints the conditional network outputs and a delimited,
-copy-ready peer configuration before the intake and query Function URL checks.
+copy-ready peer configuration before the Operation API route checks.
 
 Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run --use-local-libs`
@@ -1560,7 +1558,13 @@ connectivity, or delivery evidence.
 ### Development code updates
 
 Use `./deploy.sh --dev` for compatible code changes on an existing development
-stack. Establish the six-function baseline with a full deployment first; a
+stack. Introducing the Operation HTTP API requires a full stack update; code-only
+sync does not create routes or replace public invocation infrastructure. The full
+update removes the former public Function URLs and grants and creates the API,
+route-scoped grants, and `OperationsApiUrl` together. There is no manual URL teardown
+or compatibility period. Use separate stacks for separate deployments; the default
+API stage is unrelated to development code-update mode.
+Establish the six-function baseline with a full deployment first; a
 four-function stack cannot use seat development sync. The helper requires both
 seat function-name outputs before building or syncing. Both modes run the same
 offline and runtime test gate. Plain `./deploy.sh` also runs both SAM validation
@@ -1598,7 +1602,7 @@ prebuilt ZIPs, unchanged-code detection, upload, and update waiting. SAM may ask
 for its development-stack opt-in on first use; selecting `--dev` automatically
 answers that confirmation with a single `Y`. The warning remains visible, and
 any further prompt receives EOF. The helper then retains the
-existing read-only table/queue summaries, Function URL outputs, and HTTP probes;
+existing read-only table/queue summaries, `OperationsApiUrl`, and HTTP probes;
 `--no-url-check` skips those HTTP probes and the private-key requirement.
 The public key is not required in development mode because the deployed
 configuration supplies it. Run `zig build test` separately for the full local
@@ -1631,10 +1635,9 @@ After deployment, SAM prints stack outputs. Look for:
 ```text
 IntakeFunctionName
 IntakeFunctionArn
-IntakeFunctionUrl
+OperationsApiUrl
 QueryFunctionName
 QueryFunctionArn
-QueryFunctionUrl
 TigerBeetleProcessorName
 TigerBeetleProcessorArn
 TigerBeetleCompletionProcessorName
@@ -1658,7 +1661,7 @@ You can also query it later with CloudFormation:
 ```sh
 aws cloudformation describe-stacks \
   --stack-name aws-lambda-zig-demo \
-  --query "Stacks[0].Outputs[?OutputKey=='QueryFunctionUrl'].OutputValue" \
+  --query "Stacks[0].Outputs[?OutputKey=='OperationsApiUrl'].OutputValue" \
   --output text \
   --profile dev \
   --region ca-central-1
@@ -1989,11 +1992,11 @@ and the Completion processor's DynamoDB update.
 
 ## 8. Test query GET and intake POST
 
-Call both Function URLs returned by SAM.
+Call the matching routes at the common `OperationsApiUrl` returned by SAM.
 
 ```sh
-curl -i -L <IntakeFunctionUrl>
-curl -i -L <QueryFunctionUrl>
+curl -i -L -X POST <OperationsApiUrl>/operations
+curl -i -L <OperationsApiUrl>/operations/00112233-4455-6677-8899-aabbccddeeff
 ```
 
 An unauthenticated request is rejected by the handler:
@@ -2022,7 +2025,7 @@ curl -L \
   --data \
     '{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"TigerBeetle","body":{"message":"hello","count":2}}' \
-  <IntakeFunctionUrl>
+  <OperationsApiUrl>/operations
 ```
 
 For a new ID, the handler persists `SUBMITTED`, attaches the body only to the queued
@@ -2047,19 +2050,33 @@ Read the Operation with the same token subject and UUID:
 ```sh
 curl -L \
   -H "Authorization: Bearer $token" \
-  <QueryFunctionUrl>/00112233-4455-6677-8899-aabbccddeeff
+  <OperationsApiUrl>/operations/00112233-4455-6677-8899-aabbccddeeff
 ```
 
 The query performs a strongly consistent read and returns the same compact
 bodyless Operation JSON shown above with `Content-Type: application/json`.
 `COMPLETED` Operations also include the complete tagged `result`; `SUBMITTED`
 Operations do not. The path
-must contain exactly one UUID segment. Query strings and GET bodies cannot
-supply or alter the ID. Missing and cross-tenant Operations both return the
+must be exactly `/operations/{id}` with one UUID after `/operations/`. Uppercase
+hexadecimal is accepted and normalized in output; extra path content is rejected.
+Query strings, GET bodies, and gateway metadata cannot supply or alter the ID.
+Missing and cross-tenant Operations both return the
 same static `404 Not Found` response. DynamoDB request or service failures
 return static HTTP 503; malformed items and other unexpected failures remain
 sanitized HTTP 500 responses. DynamoDB TTL remains asynchronous, so an item is
 readable while it is still stored even after `expires_at`.
+
+The shared AWS adapter accepts named HTTP API and Function URL payload 2.0 event
+shapes through the unchanged pinned Lambda runtime. Supporting Function URL events
+does not retain public Function URLs. Authentication and method checks precede
+body materialization and standard base64 decoding; Query never decodes a body.
+Malformed base64 returns `400` only after those checks, and missing bodies retain
+`400`. Allocation and internal errors remain sanitized `500` responses. JSON bytes
+are passed unchanged to Operation validation. Missing or differing Content-Type is
+accepted. The 4,096-byte bound applies to the serialized Operation Body fragment,
+including escaping and internal whitespace; the full envelope can be larger.
+Successful submissions and queries retain `200`, their existing JSON views, and
+matching retry, conflict, tenant authorization, and warm Query cache behavior.
 
 The SQS message is compact `{operation_id,tenant,context,body}` JSON with no trailing newline.
 Intake supplies the verified PASETO subject as tenant, null Context, and the submitted Body, and
@@ -2153,7 +2170,7 @@ overrides are disabled for discovery. Read utilities receive empty shared config
 and credentials files (`/dev/null`) with the exported credentials and explicit
 Region; a profile-level SDK endpoint override cannot redirect inspection.
 
-The runner discovers `IntakeFunctionUrl`, `QueryFunctionUrl`, `SeatEventsTableName`,
+The runner discovers `OperationsApiUrl`, `SeatEventsTableName`,
 `LedgerCounterTableName`, and `LedgerCounterId` from the selected stack's outputs.
 It discovers `OperationsTable` through its physical resource, since there is no
 Operations table-name output. The counter table output works for owned and
@@ -2196,7 +2213,7 @@ manifest records authenticated tenants, generated Operation IDs, tenant-isolatio
 coverage and `running`, `failed`, or `passed`; failures include stage, Operation
 UUID where applicable, and a sanitized
 reason. A stopped invocation may retain `running`. Raw service errors, stack outputs,
-table names, Function URLs, credentials, signing keys and bearer tokens are not
+table names, API origins, credentials, signing keys and bearer tokens are not
 captured. Do not redirect AWS discovery/debug output into fixtures or publish local
 deployment output. An unrun runner, mocked pass, or incomplete/failed manifest is
 **not a passing cloud result**. Record executed revision, time and covered paths
@@ -2442,7 +2459,7 @@ credentials, profile, Region and endpoint configuration. Authenticate the
 selected identity before table commands; it needs table-scoped `dynamodb:PutItem`
 and `dynamodb:GetItem`. Wrapper execution needs AWS CLI credential export;
 creation, reservations, confirmations and availability checks additionally need
-`cloudformation:DescribeStacks` to discover the Function URLs and a valid
+`cloudformation:DescribeStacks` to discover `OperationsApiUrl` and a valid
 `PASETO_TOKEN`. Wrapper reads need
 `cloudformation:DescribeStackResource` and `dynamodb:GetItem`. These are operator
 permissions; this utility adds no Lambda IAM or SAM resources.
@@ -2513,8 +2530,8 @@ distinct classes with positive u32 counts; tags follow the
 [public command contract](SEAT_RESERVATION.md#commands). `--timeout-seconds`
 defaults to 300 and accepts a positive u32 reservation timeout. `PASETO_TOKEN`
 authenticates a `SeatReservation` Operation containing `create_event` at the
-stack's `IntakeFunctionUrl`; the handler verifies the tenant, and processors
-allocate the ledger and native IDs. No host binary is required for creation.
+stack's `OperationsApiUrl` at `POST /operations`; the handler verifies the tenant,
+and processors allocate the ledger and native IDs. No host binary is required for creation.
 
 With AWS credentials and `PASETO_TOKEN` already exported:
 
@@ -2611,8 +2628,8 @@ independently of the Event UUID. The handler derives the tenant from the verifie
 token. The wrapper takes that tenant from the authenticated intake response and
 verifies it on subsequent query responses, without decoding token
 claims or sending a tenant override in the public Body. No host binary is
-required. Both `IntakeFunctionUrl` and `QueryFunctionUrl` are resolved before
-submission.
+required. `OperationsApiUrl` is resolved and validated as an HTTPS origin before
+submission; the wrapper constructs both routes from it.
 
 After submission, the wrapper immediately queries the new Operation and waits
 one second between subsequent reads while its state is `SUBMITTED`. It has no
@@ -2895,7 +2912,7 @@ returns a sanitized HTTP 503, leaving the row available for a matching retry.
 The query Lambda requires only `OPERATIONS_TABLE_NAME`; it has no queue
 configuration. A missing or invalid table-name setting exits during query INIT.
 A nonexistent table, missing `GetItem` permission, or DynamoDB service failure
-is discovered by the first authenticated `GET /<uuid>` and returns a sanitized
+is discovered by the first authenticated `GET /operations/{id}` and returns a sanitized
 HTTP 503. A malformed stored item returns a sanitized HTTP 500.
 
 The TigerBeetle processor requires `COMPLETION_QUEUE_URL`,
@@ -3019,8 +3036,8 @@ Explicit owned-resource teardown is a separate mode:
 
 **This permanently deletes owned data.** Cleanup removes all six SAM-managed
 functions and roles, Operations and Events, every counter in an owned counter
-table, all four queues and queued messages, Function URLs, permissions, and the
-remaining stack resources. It preserves a referenced counter table and every
+table, all four queues and queued messages, the HTTP API and stage, invocation
+permissions, and the remaining stack resources. It preserves a referenced counter table and every
 counter in that table, regardless of the selected counter ID.
 
 Cleanup accepts only stack/profile/Region selection. It rejects `--dev`,
@@ -3118,12 +3135,10 @@ rmdir '<private-key-directory>'
 
 ## Security note
 
-This demo intentionally creates two publicly reachable Lambda Function URLs,
-and both Function URL handlers require a valid PASETO bearer token. The
-TigerBeetle processor has no Function URL and is invoked from SQS. For production,
-consider combining application authentication with stricter infrastructure
-authorization, narrower IAM policies, or an API Gateway/CloudFront layer. The
-Completion processor also has no Function URL and is invoked from its SQS mapping.
+This demo exposes one public HTTP API with two routes whose handlers require a
+valid PASETO bearer token. Public Function URLs are removed, and invocation grants
+are scoped to the API and routes. Processors are invoked from SQS. Production
+configurations can further restrict infrastructure authorization and IAM policies.
 
 When the gateway is enabled, IPv4 UDP/51820 is deliberately open from
 `0.0.0.0/0` because the NAT public address of the development workstation is

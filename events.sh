@@ -29,7 +29,7 @@ Usage:
 Commands:
   create
     Requires explicit seat classes and counts and PASETO_TOKEN; no stdin JSON.
-    Submits a SeatReservation create_event Operation to IntakeFunctionUrl.
+    Submits a SeatReservation create_event Operation to POST /operations at OperationsApiUrl.
     The verified token supplies the tenant; processors allocate the ledger
     and native IDs. Output is the submitted Operation, not readiness evidence.
 
@@ -342,14 +342,15 @@ http_operation() {
     ' 2>/dev/null || fail "invalid $method Operation response for $operation_id"
 }
 
-intake_url="$(stack_url IntakeFunctionUrl)"
+operations_api_url="$(stack_url OperationsApiUrl)"
+intake_url="${operations_api_url%/}/operations"
 if [ "$command_name" = create ]; then
     http_operation POST "$intake_url" "$request"
     exit 0
 fi
 
-# Resolve both endpoints before submitting work, so discovery failures create no Operation.
-query_url="$(stack_url QueryFunctionUrl)"
+# Both routes use the validated origin resolved before submitting work.
+query_url="$intake_url"
 operation="$(http_operation POST "$intake_url" "$request")"
 # The authenticated handler supplies the tenant; preserve its exact JSON string.
 expected_tenant="$(printf '%s' "$operation" | jq -c .tenant)"

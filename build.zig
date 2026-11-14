@@ -1034,10 +1034,14 @@ pub fn build(b: *std.Build) void {
     const events_wrapper_test = b.addSystemCommand(&.{"bash"});
     events_wrapper_test.addFileArg(b.path("tests/events_wrapper_test.sh"));
 
+    const operations_api_test = b.addSystemCommand(&.{"bash"});
+    operations_api_test.addFileArg(b.path("tests/operations_api_test.sh"));
+
     const deploy_test_step = b.step(
         "test-deploy",
         "Run deployment helper regression tests",
     );
+    deploy_test_step.dependOn(&operations_api_test.step);
     deploy_test_step.dependOn(&wireguard_discovery_test.step);
     deploy_test_step.dependOn(&cleanup_lifecycle_test.step);
     deploy_test_step.dependOn(&gateway_interface_test.step);

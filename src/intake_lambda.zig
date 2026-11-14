@@ -248,7 +248,7 @@ fn handle_invocation_observed(
         const response = response_from_outcome(allocator, .internal_server_error);
         return encode_response_observed(allocator, &response, &trace);
     };
-    defer transport.deinit(allocator);
+    defer transport.deinit();
     const request = transport.application_request();
     var response = handle_http_observed(allocator, &request, env, intake, now, &trace);
     defer response.deinit();
@@ -353,7 +353,10 @@ fn post_invocation_outcome(
     trace.record.stage = "request_parse";
     const input_json = (request.read_body(allocator) catch |err| {
         trace.record.reason = @errorName(err);
-        return .internal_server_error;
+        return switch (err) {
+            error.InvalidBodyEncoding => .bad_request,
+            else => .internal_server_error,
+        };
     }) orelse {
         trace.record.reason = "MissingBody";
         return .bad_request;
@@ -638,7 +641,7 @@ fn handleInvocationForTest(
     );
 }
 
-/// Composed tests authenticate real Function URL requests and replace only external effects.
+/// Composed tests authenticate payload 2.0 requests and replace only external effects.
 pub const test_support = if (@import("builtin").is_test) struct {
     pub const Submission = struct {
         logger: logging.Logger = .{},
@@ -2072,19 +2075,24 @@ test "runtime integration: authenticated intake persists and publishes through t
         .now = std.Io.Clock.real.now(std.testing.io).toSeconds(),
         .ttl_seconds = 300,
     });
-    const event = try test_authorization_request_event(
-        allocator,
-        .POST,
-        "Authorization",
-        "Bearer",
-        token,
-        input,
-    );
-    try fixture.init(&.{.{
-        .request_id = "intake-1",
-        .invocation_id = "intake-attempt-1",
-        .payload = event,
-    }});
+    var encoded: [std.base64.standard.Encoder.calcSize(input.len)]u8 = undefined;
+    const event = try http_test.aws_event(allocator, .{
+        .token = token,
+        .body = std.base64.standard.Encoder.encode(&encoded, input),
+        .base64 = true,
+    });
+    const unauthorized = try http_test.aws_event(allocator, .{ .body = "!", .base64 = true });
+    const malformed = try http_test.aws_event(allocator, .{
+        .token = token,
+        .body = "!",
+        .base64 = true,
+    });
+    try fixture.init(&.{
+        .{ .request_id = "intake-invalid-event", .payload = "{" },
+        .{ .request_id = "intake-unauthorized", .payload = unauthorized },
+        .{ .request_id = "intake-invalid-base64", .payload = malformed },
+        .{ .request_id = "intake-1", .invocation_id = "intake-attempt-1", .payload = event },
+    });
     try lambda_auth.testing.put_public_key(&fixture.tester.env_map, 0x62);
     try fixture.tester.env_map.put("TigerBeetleQueue", test_queue_url);
     var fake: FakeIntake = .{};
@@ -2092,8 +2100,21 @@ test "runtime integration: authenticated intake persists and publishes through t
     defer uninstallRuntimeIntakeAdapter();
 
     try fixture.run_handler(.{}, handler);
-    try fixture.tester.expectPath(0, "/2018-06-01/runtime/invocation/intake-1/response");
-    const output = try runtime.http_body(allocator, &fixture.tester, 0, 200);
+    for ([_]u16{ 500, 401, 400 }, 0..) |status, index| {
+        const envelope = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            (try fixture.tester.post(index)).body,
+            .{},
+        );
+        defer envelope.deinit();
+        try std.testing.expectEqual(
+            @as(i64, status),
+            envelope.value.object.get("statusCode").?.integer,
+        );
+    }
+    try fixture.tester.expectPath(3, "/2018-06-01/runtime/invocation/intake-1/response");
+    const output = try runtime.http_body(allocator, &fixture.tester, 3, 200);
     try std.testing.expectEqualStrings("SUBMITTED", output.object.get("state").?.string);
     try std.testing.expectEqualStrings(
         "00112233-4455-6677-8899-aabbccddeeff",
@@ -2115,4 +2136,280 @@ test "runtime integration: authenticated intake persists and publishes through t
     try std.testing.expect(message.body.bool);
     try std.testing.expect(message.context == .null);
     try std.testing.expectEqual(null, message.result_queue);
+}
+
+test "named HTTP API routes and Function URL events submit equivalent plain and base64 input" {
+    const allocator = std.testing.allocator;
+    const token = try lambda_auth.testing.issue_token(allocator, .{
+        .seed_byte = 0x43,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
+    defer allocator.free(token);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try lambda_auth.testing.put_public_key(&environment, 0x43);
+    try put_test_queue_url(&environment, "echo");
+    const input = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"name\":\"echo\"," ++
+        "\"body\": { \"message\" : \"hello\", \"count\": 2 }}";
+    var encoded: [std.base64.standard.Encoder.calcSize(input.len)]u8 = undefined;
+    const base64 = std.base64.standard.Encoder.encode(&encoded, input);
+    for ([_]?[]const u8{ "POST /operations", null }) |route| {
+        for ([_]bool{ false, true }) |is_base64| {
+            const event = try http_test.aws_event(allocator, .{
+                .route = route,
+                .token = token,
+                .body = if (is_base64) base64 else input,
+                .base64 = is_base64,
+                .content_type = "text/plain",
+            });
+            defer allocator.free(event);
+            var fake: FakeIntake = .{};
+            const response = handleInvocationForTest(
+                allocator,
+                event,
+                .{},
+                .{},
+                &environment,
+                &fake,
+                1000,
+            );
+            defer allocator.free(response);
+            try expectContains(response, "\"statusCode\":200");
+            try expectContains(
+                response,
+                "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
+            );
+            try std.testing.expectEqualStrings(
+                "{\"message\":\"hello\",\"count\":2}",
+                fake.lastBody(),
+            );
+            try std.testing.expectEqual(@as(u8, 1), fake.send_count);
+        }
+    }
+}
+
+test "transport body materialization is deferred beyond authentication and method rejection" {
+    const allocator = std.testing.allocator;
+    const token = try lambda_auth.testing.issue_token(allocator, .{
+        .seed_byte = 0x43,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
+    defer allocator.free(token);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try lambda_auth.testing.put_public_key(&environment, 0x43);
+    for ([_]std.http.Method{ .POST, .GET }) |method| {
+        const event = try http_test.aws_event(allocator, .{
+            .method = method,
+            .token = if (method == .GET) token else null,
+            .body = &@as([32768]u8, @splat('!')),
+            .base64 = true,
+        });
+        defer allocator.free(event);
+        // Enough for metadata, but not a body-sized allocation (even while unescaping JSON).
+        var buffer: [8192]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+        var transport = try aws_http.Request.parse(fixed.allocator(), event);
+        defer transport.deinit();
+        const request = transport.application_request();
+        var fake: FakeIntake = .{};
+        var response = handle_http(
+            allocator,
+            &request,
+            &environment,
+            IntakeAdapter.init(&fake),
+            1000,
+            .{},
+        );
+        defer response.deinit();
+        try std.testing.expectEqual(
+            if (method == .GET) std.http.Status.method_not_allowed else .unauthorized,
+            response.status,
+        );
+        try std.testing.expectEqual(@as(u8, 0), fake.create_count);
+    }
+}
+
+test "base64 errors missing bodies and ambiguous credentials preserve rejection precedence" {
+    const allocator = std.testing.allocator;
+    const token = try lambda_auth.testing.issue_token(allocator, .{
+        .seed_byte = 0x43,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
+    defer allocator.free(token);
+    const combined = try std.fmt.allocPrint(allocator, "{s},Bearer {s}", .{ token, token });
+    defer allocator.free(combined);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try lambda_auth.testing.put_public_key(&environment, 0x43);
+    const cases = [_]struct {
+        method: std.http.Method = .POST,
+        token: ?[]const u8,
+        body: ?[]const u8 = "!bad-base64",
+        status: i64,
+    }{
+        .{ .token = null, .status = 401 },
+        .{ .token = combined, .status = 401 },
+        .{ .method = .GET, .token = token, .status = 405 },
+        .{ .token = token, .status = 400 },
+        .{ .token = token, .body = "YQ=", .status = 400 },
+        .{ .token = token, .body = "____", .status = 400 },
+        .{ .token = token, .body = null, .status = 400 },
+    };
+    for (cases) |case| {
+        const event = try http_test.aws_event(allocator, .{
+            .method = case.method,
+            .token = case.token,
+            .body = case.body,
+            .base64 = true,
+        });
+        defer allocator.free(event);
+        var fake: FakeIntake = .{};
+        const response = handleInvocationForTest(
+            allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            &fake,
+            1000,
+        );
+        defer allocator.free(response);
+        const outer = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer outer.deinit();
+        try std.testing.expectEqual(
+            case.status,
+            outer.value.object.get("statusCode").?.integer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), fake.create_count);
+    }
+}
+
+test "plain and base64 transport preserve serialized Operation Body bounds and validation" {
+    const allocator = std.testing.allocator;
+    const token = try lambda_auth.testing.issue_token(allocator, .{
+        .seed_byte = 0x43,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
+    defer allocator.free(token);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try lambda_auth.testing.put_public_key(&environment, 0x43);
+    try put_test_queue_url(&environment, "echo");
+    const prefix = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"name\":\"echo\",\"body\":";
+    const escaped = std.mem.asBytes(&@as([682][6]u8, @splat("\\u0061".*)));
+    const cases = [_]struct { input: []const u8, status: i64 }{
+        .{ .input = prefix ++ "\"" ++ &@as([4094]u8, @splat('x')) ++ "\"}", .status = 200 },
+        .{ .input = prefix ++ "\"" ++ &@as([4095]u8, @splat('x')) ++ "\"}", .status = 400 },
+        .{ .input = prefix ++ "[" ++ &@as([4093]u8, @splat(' ')) ++ "0]}", .status = 200 },
+        .{ .input = prefix ++ "[" ++ &@as([4094]u8, @splat(' ')) ++ "0]}", .status = 400 },
+        .{ .input = prefix ++ "\"" ++ escaped ++ "xx\"}", .status = 200 },
+        .{ .input = prefix ++ "\"" ++ escaped ++ "xxx\"}", .status = 400 },
+        .{ .input = prefix ++ "{\"x\":1,\"\\u0078\":2}}", .status = 400 },
+        .{ .input = " \n" ++ prefix ++ " true }\t\n", .status = 200 },
+    };
+    for (cases) |case| {
+        const encoded = try allocator.alloc(
+            u8,
+            std.base64.standard.Encoder.calcSize(case.input.len),
+        );
+        defer allocator.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, case.input);
+        for ([_]bool{ false, true }) |is_base64| {
+            const event = try http_test.aws_event(allocator, .{
+                .token = token,
+                .body = if (is_base64) encoded else case.input,
+                .base64 = is_base64,
+            });
+            defer allocator.free(event);
+            var fake: FakeIntake = .{};
+            const response = handleInvocationForTest(
+                allocator,
+                event,
+                .{},
+                .{},
+                &environment,
+                &fake,
+                1000,
+            );
+            defer allocator.free(response);
+            const outer = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+            defer outer.deinit();
+            try std.testing.expectEqual(
+                case.status,
+                outer.value.object.get("statusCode").?.integer,
+            );
+            try std.testing.expectEqual(@as(u8, if (case.status == 200) 1 else 0), fake.send_count);
+        }
+    }
+}
+
+test "AWS adaptation releases allocations across parse decode and response encoding failures" {
+    const event = try http_test.aws_event(std.testing.allocator, .{
+        .body = "e30=",
+        .base64 = true,
+    });
+    defer std.testing.allocator.free(event);
+    const Case = struct {
+        fn run(allocator: Allocator, input: []const u8) !void {
+            var transport = try aws_http.Request.parse(allocator, input);
+            defer transport.deinit();
+            const request = transport.application_request();
+            const body = (try request.read_body(allocator)).?;
+            try std.testing.expectEqualStrings("{}", body);
+            const encoded = aws_http.encode_response(allocator, &.{
+                .status = .ok,
+                .headers = &.{},
+                .body = body,
+            }) catch |err| switch (err) {
+                // The pinned writer maps allocation failure to WriteFailed.
+                error.WriteFailed => return error.OutOfMemory,
+                else => return err,
+            };
+            defer allocator.free(encoded);
+            try std.testing.expectEqualStrings("{\"statusCode\":200,\"body\":\"{}\"}", encoded);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{event});
+}
+
+test "AWS adaptation preserves duplicate decoded Authorization keys for rejection" {
+    const allocator = std.testing.allocator;
+    const token = try lambda_auth.testing.issue_token(allocator, .{
+        .seed_byte = 0x43,
+        .now = 1000,
+        .ttl_seconds = 60,
+    });
+    defer allocator.free(token);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try lambda_auth.testing.put_public_key(&environment, 0x43);
+    for ([_][]const u8{ "Authorization", "authorization", "\\u0041uthorization" }) |key| {
+        const event = try std.fmt.allocPrint(
+            allocator,
+            "{{\"version\":\"2.0\",\"routeKey\":\"POST /operations\",\"headers\":{{" ++
+                "\"Authorization\":\"Bearer {s}\",\"{s}\":\"Bearer {s}\"}}," ++
+                "\"requestContext\":{{\"http\":{{\"method\":\"POST\"}}}}," ++
+                "\"body\":\"!\",\"isBase64Encoded\":true}}",
+            .{ token, key, token },
+        );
+        defer allocator.free(event);
+        var fake: FakeIntake = .{};
+        const response = handleInvocationForTest(
+            allocator,
+            event,
+            .{},
+            .{},
+            &environment,
+            &fake,
+            1000,
+        );
+        defer allocator.free(response);
+        try expectUnauthorized(response);
+        try std.testing.expectEqual(@as(u8, 0), fake.create_count);
+    }
 }

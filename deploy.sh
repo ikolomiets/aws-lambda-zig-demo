@@ -76,7 +76,7 @@ Options:
                          owned tables (all counters) and queued messages. Completes
                          guarded WireGuard disable first; preserves external resources.
   --dry-run              Run local checks, build, package, and validation only.
-  --no-url-check         Skip the post-deploy Function URL HTTP status check.
+  --no-url-check         Skip the post-deploy Operations API HTTP status checks.
   -h, --help             Show this help.
 
 Environment overrides:
@@ -1146,6 +1146,46 @@ validate_lambda_archives() {
     done
 }
 
+resolve_operations_api_url() {
+    OPERATIONS_API_URL="$(aws cloudformation describe-stacks \
+        --stack-name "$STACK_NAME" \
+        --query "Stacks[0].Outputs[?OutputKey=='OperationsApiUrl'].OutputValue | [0]" \
+        --output text --region "$REGION")"
+    printf '%s' "$OPERATIONS_API_URL" | jq -Rse \
+        'test("^https://(\\[[0-9a-fA-F:.]+\\]|[^/?#@:[:space:]]+)(:[0-9]+)?/?$")' \
+        >/dev/null || fail "stack output OperationsApiUrl is missing or invalid"
+}
+
+probe_operations_api() {
+    local expected="$1" method="$2" path="$3" token="${4:-}" body="${5:-}"
+    local status
+    local arguments=(-L -sS -o /dev/null -w '%{http_code}' -X "$method")
+    if [ -n "$token" ]; then arguments+=(-H "Authorization: Bearer $token"); fi
+    if [ -n "$body" ]; then arguments+=(--data-binary "$body"); fi
+    status="$(curl "${arguments[@]}" "${OPERATIONS_API_URL%/}$path")"
+    [ "$status" = "$expected" ] ||
+        fail "$method $path returned HTTP $status; expected $expected"
+    printf '%s %s: HTTP %s (expected %s)\n' "$method" "$path" "$status" "$expected"
+}
+
+check_operations_api() {
+    local id=00000000-0000-4000-8000-000000000000 token
+    printf '==> Checking matching-route authentication\n'
+    probe_operations_api 401 POST /operations
+    probe_operations_api 401 GET "/operations/$id"
+    token="$(./zig-out/bin/paseto issue \
+        --subject "deploy-query-test-${RANDOM}-${RANDOM}" --ttl-seconds 60)"
+    printf '==> Checking authenticated missing Operation and invalid submissions\n'
+    probe_operations_api 404 GET "/operations/$id" "$token"
+    probe_operations_api 400 POST /operations "$token"
+    probe_operations_api 400 POST /operations "$token" '{}'
+    printf '==> Checking native gateway unmatched routes and methods\n'
+    probe_operations_api 404 GET /operations "$token"
+    probe_operations_api 404 POST "/operations/$id" "$token"
+    probe_operations_api 404 GET / "$token"
+    probe_operations_api 404 GET /unsupported "$token"
+}
+
 run_deployment() {
     parse_deployment_options "$@"
     if [ "$CLEANUP" -eq 1 ]; then
@@ -1190,7 +1230,7 @@ run_deployment() {
     fi
     if [ "$DRY_RUN" -eq 0 ] && [ "$CHECK_URL" -eq 1 ]; then
         [ -n "${PASETO_PRIVATE_KEY:-}" ] ||
-            fail "PASETO_PRIVATE_KEY is required for the authenticated Function URL check"
+            fail "PASETO_PRIVATE_KEY is required for the authenticated Operations API checks"
     fi
     if [ "$DEV" -eq 0 ]; then
         invoke_deployment_controller plan
@@ -1366,70 +1406,10 @@ run_deployment() {
         --output json \
         --region "$REGION"
 
-    INTAKE_FUNCTION_URL="$(aws cloudformation describe-stacks \
-        --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='IntakeFunctionUrl'].OutputValue | [0]" \
-        --output text \
-        --region "$REGION")"
-    QUERY_FUNCTION_URL="$(aws cloudformation describe-stacks \
-        --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='QueryFunctionUrl'].OutputValue | [0]" \
-        --output text \
-        --region "$REGION")"
-    case "$INTAKE_FUNCTION_URL" in
-        "" | None) fail "stack output IntakeFunctionUrl is missing or empty" ;;
-    esac
-    case "$QUERY_FUNCTION_URL" in
-        "" | None) fail "stack output QueryFunctionUrl is missing or empty" ;;
-    esac
-
-    printf 'IntakeFunctionUrl: %s\n' "$INTAKE_FUNCTION_URL"
-    printf 'QueryFunctionUrl: %s\n' "$QUERY_FUNCTION_URL"
-
+    resolve_operations_api_url
+    printf 'OperationsApiUrl: %s\n' "$OPERATIONS_API_URL"
     if [ "$CHECK_URL" -eq 1 ]; then
-        printf '==> Checking unauthenticated intake and query statuses\n'
-        for function_url in "$INTAKE_FUNCTION_URL" "$QUERY_FUNCTION_URL"; do
-            HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' "$function_url")"
-            [ "$HTTP_STATUS" = 401 ] ||
-                fail "unauthenticated Function URL returned HTTP $HTTP_STATUS; expected 401"
-            printf 'HTTP %s (expected 401)\n' "$HTTP_STATUS"
-        done
-
-        printf '==> Checking authenticated tenant-scoped query GET status\n'
-        PASETO_SUBJECT="deploy-query-test-${RANDOM}-${RANDOM}"
-        PASETO_TOKEN="$(
-            ./zig-out/bin/paseto issue --subject "$PASETO_SUBJECT" --ttl-seconds 60
-        )"
-        HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${PASETO_TOKEN}" \
-            "${QUERY_FUNCTION_URL%/}/00000000-0000-4000-8000-000000000000")"
-        [ "$HTTP_STATUS" = 404 ] ||
-            fail "authenticated query GET returned HTTP $HTTP_STATUS; expected 404"
-        printf 'HTTP %s (expected tenant-safe 404)\n' "$HTTP_STATUS"
-
-        printf '==> Checking authenticated wrong-method statuses\n'
-        HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${PASETO_TOKEN}" \
-            "$INTAKE_FUNCTION_URL")"
-        [ "$HTTP_STATUS" = 405 ] ||
-            fail "authenticated intake GET returned HTTP $HTTP_STATUS; expected 405"
-        printf 'Intake GET: HTTP %s (expected 405)\n' "$HTTP_STATUS"
-        HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
-            -X POST \
-            -H "Authorization: Bearer ${PASETO_TOKEN}" \
-            "$QUERY_FUNCTION_URL")"
-        [ "$HTTP_STATUS" = 405 ] ||
-            fail "authenticated query POST returned HTTP $HTTP_STATUS; expected 405"
-        printf 'Query POST: HTTP %s (expected 405)\n' "$HTTP_STATUS"
-
-        printf '==> Checking authenticated bodyless intake POST status\n'
-        HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
-            -X POST \
-            -H "Authorization: Bearer ${PASETO_TOKEN}" \
-            "$INTAKE_FUNCTION_URL")"
-        [ "$HTTP_STATUS" = 400 ] ||
-            fail "authenticated bodyless intake POST returned HTTP $HTTP_STATUS; expected 400"
-        printf 'HTTP %s (expected 400)\n' "$HTTP_STATUS"
+        check_operations_api
     fi
 
     trap - ERR
