@@ -130,6 +130,11 @@ after final fixes. Before running socket-based runtime or live-replica tests in
 a restricted agent sandbox, follow its
 [socket-access instructions](docs/agents/local-checks.md#socket-access-in-agent-sandboxes).
 
+When changing an existing shell script, select and run the applicable `tests/*.sh`
+checks directly using the [shell regression table](docs/agents/local-checks.md#shell-regression-checks).
+Update those checks when behavior changes. Shell regression tests belong outside
+the Zig build graph; `build.zig` owns Zig builds, formatting, packaging, and tests.
+
 Use Zig 0.17.x (minimum 0.17.0). The TigerBeetle processor executable requires a
 compatible patched standard library at `../zig/lib` through its `build.zig`
 override; all other targets use the compiler's bundled standard library. Check

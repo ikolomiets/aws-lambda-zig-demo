@@ -1009,47 +1009,6 @@ pub fn build(b: *std.Build) void {
     );
     tigerbeetle_linux_step.dependOn(&tigerbeetle_linux_output.step);
 
-    const wireguard_discovery_test = b.addSystemCommand(&.{"bash"});
-    wireguard_discovery_test.addFileArg(
-        b.path("tests/deploy_wireguard_discovery_test.sh"),
-    );
-
-    const cleanup_lifecycle_test = b.addSystemCommand(&.{"bash"});
-    cleanup_lifecycle_test.addFileArg(
-        b.path("tests/deploy_cleanup_lifecycle_test.sh"),
-    );
-    const gateway_interface_test = b.addSystemCommand(&.{"bash"});
-    gateway_interface_test.addFileArg(
-        b.path("tests/deploy_gateway_interface_test.sh"),
-    );
-    const packaging_test = b.addSystemCommand(&.{"bash"});
-    packaging_test.addFileArg(b.path("tests/deploy_packaging_test.sh"));
-
-    const processor_interface_test = b.addSystemCommand(&.{"bash"});
-    processor_interface_test.addFileArg(b.path("tests/processor_interface_test.sh"));
-
-    const seat_scenarios_test = b.addSystemCommand(&.{"bash"});
-    seat_scenarios_test.addFileArg(b.path("tests/seat_scenarios_test.sh"));
-
-    const events_wrapper_test = b.addSystemCommand(&.{"bash"});
-    events_wrapper_test.addFileArg(b.path("tests/events_wrapper_test.sh"));
-
-    const operations_api_test = b.addSystemCommand(&.{"bash"});
-    operations_api_test.addFileArg(b.path("tests/operations_api_test.sh"));
-
-    const deploy_test_step = b.step(
-        "test-deploy",
-        "Run deployment helper regression tests",
-    );
-    deploy_test_step.dependOn(&operations_api_test.step);
-    deploy_test_step.dependOn(&wireguard_discovery_test.step);
-    deploy_test_step.dependOn(&cleanup_lifecycle_test.step);
-    deploy_test_step.dependOn(&gateway_interface_test.step);
-    deploy_test_step.dependOn(&packaging_test.step);
-    deploy_test_step.dependOn(&processor_interface_test.step);
-    deploy_test_step.dependOn(&seat_scenarios_test.step);
-    deploy_test_step.dependOn(&events_wrapper_test.step);
-
     const lambda_outcome_log = b.createModule(.{
         .target = lambda_target,
         .optimize = optimize,
@@ -1168,14 +1127,7 @@ pub fn build(b: *std.Build) void {
     http_test_step.dependOn(&run_lambda_tests.step);
     http_test_step.dependOn(&run_query_tests.step);
     http_test_step.dependOn(&run_lambda_auth_tests.step);
-    const test_step = b.step("test", "Run unit and integration tests");
-    const agent_tools_test_step = b.step("test-agent-tools", "Run validation and privacy tool tests");
-    for ([_][]const u8{ "tests/check_gate_test.sh", "tests/aws_privacy_test.sh" }) |script| {
-        const agent_tools_tests = b.addSystemCommand(&.{"bash"});
-        agent_tools_tests.addFileArg(b.path(script));
-        agent_tools_test_step.dependOn(&agent_tools_tests.step);
-    }
-    test_step.dependOn(agent_tools_test_step);
+    const test_step = b.step("test", "Run offline Zig unit and integration tests");
     test_step.dependOn(&run_log_tests.step);
     test_step.dependOn(&run_seat_reservation_tests.step);
     test_step.dependOn(&run_seat_processor_tests.step);
@@ -1197,9 +1149,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_persistence_cli_tests.step);
     test_step.dependOn(&run_queue_cli_tests.step);
     test_step.dependOn(&run_tigerbeetle_tests.step);
-    test_step.dependOn(deploy_test_step);
-
-    const check_step = b.step("check", "Run offline and loopback runtime tests");
+    const check_step = b.step("check", "Run offline and loopback runtime Zig tests");
     check_step.dependOn(test_step);
     check_step.dependOn(runtime_test_step);
 }

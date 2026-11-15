@@ -338,7 +338,8 @@ Relevant existing checks are:
 | --- | --- |
 | `zig build test-http --system zig-pkg` | Generic handler/authentication behavior plus separate AWS adapter compatibility tests. |
 | `bash tests/operations_api_test.sh` | Declared routes, payload format, permissions, output, throttle defaults/overrides, access-log policy/format/lifecycle, and mocked discovery/probes. |
-| `zig build test-deploy --system zig-pkg` | Mocked deployment, Events, and seat-tool integration with common-origin discovery. |
+| `bash tests/events_wrapper_test.sh` | Mocked Events integration with common-origin discovery. |
+| `bash tests/seat_scenarios_test.sh` | Mocked seat-tool integration with common-origin discovery. |
 | `zig build test-runtime --system zig-pkg` | Real Lambda event loop with a fake loopback Runtime API and external effects mocked across all six handlers. |
 | SAM validation described in the [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md#3-validate-the-sam-template) | Template validity; no cloud enforcement evidence. |
 

@@ -47,8 +47,8 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 - `unzip` and `file` are installed for package validation. Zig creates the ZIPs.
 - `jq` 1.6 or newer is installed for deployment guards, `lambda_logs.sh`, deployed seat scenarios, and shell regression tests.
 - Bash 3.2 or newer and curl are installed when running deployed seat scenarios.
-- Git is installed when running `./check.sh` for the validation-tooling tests.
-  These shell tests use Bash and `jq`.
+- Git is installed for AWS privacy checks and their regression tests.
+  Shell regression tests use Bash and `jq`.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
@@ -145,8 +145,8 @@ documents the low-worker scheduling defect, the patch, and current checks.
 
 After [provisioning the pinned packages](agents/local-checks.md#host-and-package-prerequisites),
 run the repository check gate separately before deployment. It checks Zig
-formatting and shell syntax, then runs the offline Zig, validation-tooling,
-mocked deployment-helper, and all eleven Lambda runtime integration tests:
+formatting and shell syntax, then runs the offline Zig tests and all eleven
+Lambda runtime integration tests:
 
 ```sh
 ./check.sh
@@ -158,16 +158,12 @@ To run the complete socket-free offline gate, use:
 ./check.sh --offline
 ```
 
-To run only the deployment-helper regression tests, use:
-
-```sh
-zig build test-deploy
-```
-
+When changing existing shell scripts, select and run the applicable direct Bash
+commands from the [shell regression table](agents/local-checks.md#shell-regression-checks).
 The deployment-helper tests mock AWS commands, so they require Bash and `jq`,
-with no AWS credentials or network access. The `check` target depends on `test`
-and `test-runtime`, reusing their runners and including the deployment-helper
-tests exactly once.
+with no AWS credentials or network access. Shell regression suites execute only
+when selected, outside the Zig build graph, `check.sh`, and CI. The Zig `check`
+target depends on the offline `test` and loopback `test-runtime` aggregates.
 
 To run only the Lambda runtime integration suite, use:
 
@@ -1552,7 +1548,7 @@ global caches and any `--use-local-libs` package forks. They validate deployment
 configuration, the compiler version, Linux ARM64 bootstraps, and all six ZIPs;
 full deployment also runs both SAM template validation passes. These checks also
 run during dry runs, and a failure stops deployment or sync. Formatting, shell
-syntax, offline regression tests, and loopback runtime tests belong to the
+syntax, offline Zig tests, and loopback runtime tests belong to the
 separate `./check.sh` gate and CI.
 
 ### Durable-data guards and first-time counter setup

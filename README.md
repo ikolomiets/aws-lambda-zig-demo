@@ -843,21 +843,19 @@ committing Zig changes:
 zig build fmt-check
 ```
 
-Run only the local deployment-helper regression tests with:
+When changing existing shell scripts, run the applicable regression scripts
+directly using the [shell regression table](docs/agents/local-checks.md#shell-regression-checks).
+These checks mock external commands and require no AWS credentials or network
+access. Shell regression suites run only when selected; `check.sh` and CI check
+shell syntax without executing them.
 
-```sh
-zig build test-deploy
-```
-
-The shell tests mock AWS commands, so they require no AWS credentials or
-network access. Run the aggregate offline suite, including Zig, validation tooling,
-and deployment-helper tests, with:
+Run the aggregate offline Zig test suite with:
 
 ```sh
 zig build test
 ```
 
-Run the offline suite and all eleven Lambda runtime integration cases together with:
+Run the offline Zig suite and all eleven Lambda runtime integration cases together with:
 
 ```sh
 zig build check --summary all

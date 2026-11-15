@@ -13,8 +13,10 @@ Run the executable gate against the current working tree:
 
 The [gate](../../check.sh) checks the compiler version, formatting, root shell
 entry points, recursive shell scripts under `tests/` and `scripts/`, the optional
-commit hook, and the existing aggregate offline test graph. Each failure stops the gate and
-preserves its exit status, including when output is redirected to a log.
+commit hook, and the aggregate offline Zig tests. Shell regression suites are
+selected and run directly using the [selection table](#shell-regression-checks);
+the gate checks their syntax only. Each failure stops the gate and preserves its
+exit status, including when output is redirected to a log.
 `ZIG_PACKAGE_DIR` selects an already provisioned package directory (default:
 `zig-pkg`); build-cache environment settings also apply. The gate performs no
 dependency fetching, packaging, or deployment.
@@ -36,7 +38,10 @@ requests using `ubuntu-24.04-arm`. It provisions the pinned Zig 0.17.1 compiler
 with SHA-256 verification and the packages pinned by `build.zig.zon`, then runs
 `./check.sh`. Provisioning requires network access; the checks use the
 provisioned packages and mock external effects. The runtime suite uses loopback.
-This workflow needs no AWS credentials or deployment permissions.
+Shell regression suites are agent-selected checks outside the Zig build graph
+and do not run through `check.sh` or CI. The workflow independently runs the
+[AWS privacy scanner](#aws-privacy-check). This workflow needs no AWS credentials
+or deployment permissions.
 
 After publishing the workflow, configure the GitHub branch rules to require
 **Offline and runtime checks** before merging. A workflow file alone does not
@@ -91,12 +96,10 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | Check | Scope and additional prerequisites |
 | --- | --- |
 | `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
-| `zig build check` | Combined offline and eleven-case runtime suite through the existing `test` and `test-runtime` runners; requires loopback socket permission, with no AWS credentials or live replica. Formatting remains separate. |
-| `zig build test` | Full offline Zig and mocked deployment-helper suite; excludes socket-based runtime tests, the live replica, and separate ABI checks |
+| `zig build check` | Combined offline and eleven-case runtime Zig suite through the existing `test` and `test-runtime` runners; requires loopback socket permission, with no AWS credentials or live replica. Formatting remains separate. |
+| `zig build test` | Full offline Zig suite; excludes socket-based runtime tests, the live replica, and separate ABI checks |
 | `zig build test-http` | Intake, Query, and PASETO authentication through application-owned HTTP types and the shared AWS payload 2.0 adapter, with persistence and publication mocked |
-| `zig build test-agent-tools` | Offline validation-gate and AWS privacy scanner tests using temporary repositories and mocked compiler commands |
 | `zig build test-runtime` | Eleven host integration cases through the real Lambda event loop and all six handlers; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
-| `zig build test-deploy` | Mocked regression tests for cleanup lifecycle, gateway discovery and interfaces, and processor interfaces; requires Bash and `jq`, with no AWS credentials or network access |
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
 | `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli` | Host counter build and deterministic global allocation/tooling tests |
 | `zig build build-seat-processors` | Compile host seat invocation adapters without live services or Lambda packaging |
@@ -114,6 +117,30 @@ deployment checks below have additional prerequisites and distinct evidence scop
 For shell changes, run `bash -n` on each affected script. The
 [complete offline checks](#complete-offline-checks) cover all root entry points
 and recursive shell scripts under `tests/` and `scripts/`.
+
+### Shell regression checks
+
+When changing an existing shell script, select and run the applicable checks
+below directly from the repository root. Update the checks when behavior changes.
+Select every row whose behavior is affected; shared deployment and gateway changes
+can require several suites. These tests use Bash and `jq`, temporary fixtures, and
+mocked external commands, with no AWS credentials or network access. The privacy
+tests also require Git. Shell regression suites belong outside the Zig build graph
+and run only when selected by an agent; `check.sh` and CI check their syntax only.
+The independent privacy scanner still runs in CI and the optional commit hook.
+
+| Changed script or configuration and affected behavior | Direct check |
+| --- | --- |
+| `deploy.sh`, `wireguard-gateway-setup.sh`, `template.yaml`: cleanup, durable-data guards, SSO, and stack lifecycle | `bash tests/deploy_cleanup_lifecycle_test.sh` |
+| `wireguard-gateway-setup.sh` and shared `deploy.sh` helpers: network discovery, preflight, and key configuration | `bash tests/deploy_wireguard_discovery_test.sh` |
+| `deploy.sh`, `wireguard-gateway-setup.sh`: gateway options, deployment, disablement, and preserved configuration | `bash tests/deploy_gateway_interface_test.sh` |
+| `deploy.sh`: package invocation, caches, compiler validation, and artifact checks | `bash tests/deploy_packaging_test.sh` |
+| `deploy.sh`, `wireguard-gateway-setup.sh`, `lambda_logs.sh`: processor names, options, and selectors | `bash tests/processor_interface_test.sh` |
+| `deploy.sh`, `template.yaml`: Operation API routes, discovery, probes, throttling, and access logs | `bash tests/operations_api_test.sh` |
+| `events.sh`: credentials, HTTP origin selection, Event commands, and polling | `bash tests/events_wrapper_test.sh` |
+| `seat_scenarios.sh`: discovery, HTTP origin selection, scenarios, and evidence | `bash tests/seat_scenarios_test.sh` |
+| `check.sh`: gate phases, arguments, recursive syntax checks, and failure propagation | `bash tests/check_gate_test.sh` |
+| `scripts/check_aws_privacy.sh`, `.githooks/pre-commit`: scanner inputs, candidate detection, and commit rejection | `bash tests/aws_privacy_test.sh` |
 
 ### Interface migrations
 
@@ -223,7 +250,8 @@ validates configuration, the compiler version, Lambda bootstraps, and ZIPs;
 full deployment also validates the SAM template. Run the repository gate
 separately before deployment. The helper requires no loopback test server, and
 ordinary builds and `package` do not depend on tests. Deployment-helper regression
-tests remain part of the offline gate and mock all deployment commands.
+tests are selected [directly](#shell-regression-checks) and mock all deployment
+commands.
 
 `test-runtime` starts a fake Runtime API on `127.0.0.1` with an operating-system-assigned
 port. It exercises named HTTP API and Function URL events, base64 intake, authentication
@@ -256,7 +284,8 @@ sources. The six runtime test variants enable only cases prefixed
 `runtime integration:` and support multiple threads for the fake server.
 Ordinary tests disable these cases, and production threading settings are
 unchanged. Restricted environments need loopback socket permission for this
-target; `zig build test` and `zig build test-deploy` do not start the fake server.
+target; `zig build test` and the direct shell regression checks do not start the
+fake server.
 
 ## Diagnose check-environment failures
 
