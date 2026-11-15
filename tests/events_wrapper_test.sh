@@ -11,6 +11,7 @@ export AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null
 export PATH="$TEST_DIR/bin:$PATH" AWS_CALLS="$TEST_DIR/aws-calls" REQUEST_FILE="$TEST_DIR/request"
 export HTTP_CALLS="$TEST_DIR/http-calls" SLEEP_CALLS="$TEST_DIR/sleep-calls" QUERY_COUNT="$TEST_DIR/query-count"
 export SSO_MARKER="$TEST_DIR/sso-refreshed"
+export EVENTS_EXPECTED_ORIGIN=https://operations.invalid
 export EVENT_ID=00000000-0000-0000-0000-000000000001
 : >"$AWS_CALLS"
 : >"$HTTP_CALLS"
@@ -83,7 +84,7 @@ state=SUBMITTED
 tenant="${RESPONSE_TENANT-fixture-owner}"
 case "$method" in
     POST)
-        [ "$url" = https://operations.invalid/operations ] || exit 92
+        [ "$url" = "$EVENTS_EXPECTED_ORIGIN/operations" ] || exit 92
         printf '%s\n' "$config" | sed -n 's/^data = //p' | jq -r . >"$REQUEST_FILE"
         printf '0\n' >"$QUERY_COUNT"
         if [ "${CURL_FAILURE:-false}" = true ]; then exit 7; fi
@@ -91,7 +92,7 @@ case "$method" in
         status="${HTTP_STATUS:-200}" ;;
     GET)
         operation_id="$(jq -r .id "$REQUEST_FILE")"
-        [ "$url" = "https://operations.invalid/operations/$operation_id" ] || exit 94
+        [ "$url" = "$EVENTS_EXPECTED_ORIGIN/operations/$operation_id" ] || exit 94
         case "$config" in *'data = '*) exit 95 ;; esac
         if [ "${QUERY_CURL_FAILURE:-false}" = true ]; then exit 7; fi
         if [ "${BAD_QUERY_RESPONSE:-false}" = true ]; then printf '{}\n200\n'; exit; fi
@@ -140,6 +141,17 @@ done
 reject create
 reject create --class general=3
 export PASETO_TOKEN=v4.public.fixture
+contains "$(run_events --help)" '--api-url'
+reject --api-url
+reject --api-url= create --class general=3
+reject --api-url https://custom-api.invalid read --tenant fixture-owner --event-id "$EVENT_ID"
+for origin in http://custom-api.invalid https://custom-api.invalid/operations \
+    https://user@custom-api.invalid 'https://custom-api.invalid/?query' \
+    'https://custom-api.invalid/#fragment' 'https://custom api.invalid' \
+    $'https://custom-api.invalid\n' $'\nhttps://custom-api.invalid'; do
+    reject --api-url "$origin" check_seats --event-id "$EVENT_ID"
+    contains "$(cat "$TEST_DIR/output")" '--api-url must be an HTTPS origin'
+done
 for class in general general=0 general=-1 general=1.5 general=4294967296 capacity=1 allocation=1 '=1'; do
     reject create --class "$class"
 done
@@ -255,6 +267,32 @@ calls="$(cat "$AWS_CALLS")"
 contains "$calls" OperationsApiUrl
 contains "$calls" '--stack-name check-stack'
 case "$calls" in *describe-stack-resource*) fail_test 'check read Event metadata' ;; esac
+
+# Every HTTP command uses the explicit origin for submission and all polling.
+for command_name in create check_seats reserve_seat confirm_seats; do
+    command_args=("$command_name" --event-id "$EVENT_ID")
+    api_arguments=(--api-url https://custom-api.invalid)
+    case "$command_name" in
+        create) command_args+=(--class general=3)
+            api_arguments=(--api-url=https://custom-api.invalid/) ;;
+        reserve_seat) command_args+=(--class general --quantity 2) ;;
+        confirm_seats) command_args+=(--reservation-id 123)
+            api_arguments=(--api-url=https://custom-api.invalid/) ;;
+    esac
+    : >"$AWS_CALLS"
+    : >"$HTTP_CALLS"
+    output="$(EVENTS_EXPECTED_ORIGIN=https://custom-api.invalid SUBMITTED_READS=0 \
+        run_events "${api_arguments[@]}" "${command_args[@]}")"
+    contains "$(cat "$HTTP_CALLS")" 'POST https://custom-api.invalid/operations'
+    if [ "$command_name" = create ]; then
+        [ "$(wc -l <"$HTTP_CALLS" | tr -d ' ')" = 1 ] || fail_test 'creation unexpectedly polled'
+    else
+        contains "$(cat "$HTTP_CALLS")" "GET https://custom-api.invalid/operations/$(jq -r .id "$REQUEST_FILE")"
+        [ "$(wc -l <"$HTTP_CALLS" | tr -d ' ')" = 2 ] || fail_test 'custom origin did not complete polling'
+        printf '%s' "$output" | jq -e '.state == "COMPLETED"' >/dev/null
+    fi
+    case "$(cat "$AWS_CALLS")" in *OperationsApiUrl*) fail_test 'custom origin used stack endpoint discovery' ;; esac
+done
 
 # Each invocation observes seats through a new Operation, including terminal failures.
 previous_id="$operation_id"

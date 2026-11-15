@@ -10,6 +10,7 @@ export PATH="$TEST_DIR/bin:$PATH"
 # Never inherit the operator's AWS configuration or bearer tokens into fixtures.
 while IFS= read -r key; do unset "$key"; done < <(compgen -e | sed -n '/^AWS_/p')
 export AWS_CALLS="$TEST_DIR/aws-calls" AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null
+export SCENARIO_HTTP_CALLS="$TEST_DIR/http-calls" SCENARIO_EXPECTED_ORIGIN=https://operations.invalid
 unset PROFILE REGION STACK_NAME OUTPUT_DIR PASETO_PRIVATE_KEY PASETO_TOKEN PASETO_FOREIGN_TOKEN
 : >"$AWS_CALLS"
 fail_test() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -48,8 +49,9 @@ JSON
     curl)
         config="$(cat)"
         url="$(printf '%s\n' "$config" | sed -n 's/^url = //p' | jq -r .)"
-        case "$url" in https://operations.invalid/operations|https://operations.invalid/operations/*) ;; *) exit 97 ;; esac
+        case "$url" in "$SCENARIO_EXPECTED_ORIGIN/operations"|"$SCENARIO_EXPECTED_ORIGIN/operations/"*) ;; *) exit 97 ;; esac
         method="$(printf '%s\n' "$config" | sed -n 's/^request = //p' | jq -r .)"
+        printf '%s %s\n' "$method" "$url" >>"$SCENARIO_HTTP_CALLS"
         header="$(printf '%s\n' "$config" | sed -n '/^header = .*Authorization:/s/^header = //p' | jq -r .)"
         if [ -z "$header" ]; then printf '{}\n401\n'; exit; fi
         case "$header" in
@@ -136,8 +138,9 @@ cd "$TEST_DIR/repo"
 
 output="$(bash ./seat_scenarios.sh --help)"
 contains "$output" 'PASETO_TOKEN'
+contains "$output" '--api-url'
 export PASETO_TOKEN=v4.public.owner
-for arguments in '--unknown' '--profile' '--region --stack-name other' '--poll-attempts 0' '--timeout-seconds -1' '--profile=' '--output-dir='; do
+for arguments in '--unknown' '--profile' '--region --stack-name other' '--poll-attempts 0' '--timeout-seconds -1' '--profile=' '--output-dir=' '--api-url' '--api-url='; do
     exit_code=0
     # These fixed test arguments contain no whitespace-bearing option values.
     bash ./seat_scenarios.sh $arguments >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr" || exit_code=$?
@@ -145,11 +148,22 @@ for arguments in '--unknown' '--profile' '--region --stack-name other' '--poll-a
     contains "$(cat "$TEST_DIR/stderr")" 'Usage:'
     [ ! -s "$TEST_DIR/stdout" ] || fail_test 'argument error wrote to stdout'
 done
+for origin in http://custom-api.invalid https://custom-api.invalid/operations \
+    https://user@custom-api.invalid 'https://custom-api.invalid/?query' \
+    'https://custom-api.invalid/#fragment' 'https://custom api.invalid' \
+    $'https://custom-api.invalid\n' $'\nhttps://custom-api.invalid'; do
+    exit_code=0
+    bash ./seat_scenarios.sh --api-url "$origin" >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr" || exit_code=$?
+    [ "$exit_code" -eq 2 ] || fail_test 'invalid API origin did not exit 2'
+    contains "$(cat "$TEST_DIR/stderr")" '--api-url must be an HTTPS origin'
+    [ ! -s "$TEST_DIR/stdout" ] || fail_test 'invalid API origin created evidence'
+done
 [ ! -s "$AWS_CALLS" ] || fail_test 'help or invalid arguments contacted AWS'
 
 run_scenarios() {
     rm -f "$FIXTURE_DIR"/*
     : >"$AWS_CALLS"
+    : >"$SCENARIO_HTTP_CALLS"
     if ! bash ./seat_scenarios.sh "$@" >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr"; then
         cat "$TEST_DIR/stderr" >&2
         fail_test 'mocked scenarios failed'
@@ -165,6 +179,20 @@ if [[ "$(cat "$AWS_CALLS")" == *--profile* ]]; then fail_test 'default AWS chain
 contains "$(cat "$TEST_DIR/stdout")" '.scratch/seat-scenarios.'
 run_scenarios
 [ "$(find .scratch -name manifest.json | wc -l | tr -d ' ')" = 2 ] || fail_test 'default output was reused'
+
+for form in separate equals; do
+    if [ "$form" = separate ]; then
+        api_arguments=(--api-url https://custom-api.invalid)
+    else
+        api_arguments=(--api-url=https://custom-api.invalid/)
+    fi
+    SCENARIO_EXPECTED_ORIGIN=https://custom-api.invalid run_scenarios \
+        "${api_arguments[@]}" --output-dir "$TEST_DIR/custom-$form-output"
+    contains "$(cat "$SCENARIO_HTTP_CALLS")" 'POST https://custom-api.invalid/operations'
+    contains "$(cat "$SCENARIO_HTTP_CALLS")" 'GET https://custom-api.invalid/operations/'
+    contains "$(cat "$AWS_CALLS")" '--stack-name aws-lambda-zig-demo --region ca-central-1'
+    jq -e '.status == "passed"' "$TEST_DIR/custom-$form-output/manifest.json" >/dev/null
+done
 
 export AWS_PROFILE=environment-profile AWS_REGION=environment-region AWS_DEFAULT_REGION=ignored-region
 export PROFILE=ignored-profile REGION=ignored-region STACK_NAME=environment-stack OUTPUT_DIR="$TEST_DIR/environment-output"

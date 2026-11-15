@@ -27,8 +27,9 @@ Separate deployments use separate stacks.
 These are the only public routes. The default stage does not create a `$default`
 catch-all route. Unsupported public methods and paths, including the API root,
 receive a native gateway `404` without a handler invocation. CORS is disabled;
-the API targets non-browser clients. Custom domains, DNS/certificate management,
-and gateway response caching are outside the current integration.
+the API targets non-browser clients. Custom domains and certificates are managed
+separately by [api-domain.sh](../api-domain.sh), with manual Cloudflare DNS.
+Gateway response caching is outside the current integration.
 
 Successful responses use `Content-Type: application/json`. Both routes return
 bodyless Operation views: `id`, `tenant`, `name`, `state`, `last_updated`,
@@ -282,7 +283,77 @@ POST returns the persisted view; poll GET for Completion using a token with the
 same subject. The [authenticated API procedure](DEPLOY_AWS_LAMBDA_WITH_SAM.md#8-test-query-get-and-intake-post)
 covers expected views and failures. [events.sh](../events.sh) and
 [seat_scenarios.sh](../seat_scenarios.sh) discover the same `OperationsApiUrl`
-and construct these routes; there is no separate Query origin.
+by default and construct these routes; there is no separate Query origin.
+
+The deployed scenario runner and [Events wrapper](../events.sh) accept
+`--api-url https://api.example.com` to select an existing custom domain for their
+public HTTP requests. The value must be an HTTPS origin, with an optional trailing
+slash and no credentials, path prefix, query string, or fragment. The custom
+domain must map to the selected stack's API and stage at the root. AWS resource
+discovery still uses the selected stack/profile/Region; the option does not
+configure DNS, certificates, or API mappings. The Events wrapper accepts this
+option before its HTTP command; `read` accesses DynamoDB directly and rejects it.
+Local loopback runtime tests and mocked tests do not use this public origin.
+
+### Standalone custom domain
+
+[api-domain.sh](../api-domain.sh) exposes command-first positional commands:
+
+```sh
+./api-domain.sh setup api.example.com --profile dev --region ca-central-1
+./api-domain.sh verify api.example.com --profile dev --region ca-central-1
+```
+
+Options follow the domain; `--domain` is invalid. Profile and Region options
+override `AWS_PROFILE` and `AWS_REGION`, otherwise AWS CLI defaults apply.
+`--stack-name` defaults to `STACK_NAME` or `aws-lambda-zig-demo`, `--stage` to
+literal `$default`, and `--mapping-key` to the empty root mapping. There is no
+hardcoded AWS profile or Region. `--certificate-arn` selects an ACM certificate
+for a new domain or asserts the certificate already attached to an existing one.
+
+Setup discovers the stack's HTTP API and validates the requested existing stage.
+It reuses a compatible Regional domain and its certificate, or reuses a unique
+matching public ACM certificate; ambiguous matches require explicit selection.
+If none matches, it requests a DNS-validated public RSA-2048 certificate. Pending
+validation returns `3`, prints the full AWS CNAME names and targets for Cloudflare,
+and resumes on a subsequent setup. Existing incompatible domains are rejected.
+Domains use API mappings only, no mutual TLS, and **`TLS_1_2`**: HTTP APIs accept
+TLS 1.2 and TLS 1.3 under this policy. See
+[AWS security policies](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-ciphers.html).
+
+The selected mapping is created or repointed to the requested API/stage; other
+mappings remain intact. For example, `--stage staging --mapping-key staging`
+provides `https://api.example.com/staging/operations`. The gateway strips the
+prefix before forwarding to the API. Stages and their Lambda invocation
+permissions must already work; the helper changes neither stages nor IAM. The
+template's permissions cover `$default` only. The wrappers' `--api-url` option
+continues to require a root mapping.
+
+The helper prints permanent ACM validation records and the traffic CNAME using
+full record names, AWS targets, **DNS only**, and **TTL Auto**. Cloudflare changes
+are manual. Keep ACM's DNS validation records for automatic renewal while the
+certificate is in use; imported/email-validated certificates need their own
+renewal process. Certificates and domains survive application-stack replacement
+or deletion; rerun setup to repoint a mapping after replacement. There is no
+deletion command. SAM and `deploy.sh` continue owning the API, routes, stage,
+Lambda permissions and generated URL output.
+
+Verify uses only AWS reads, validates the domain, certificate, API/stage and
+selected mapping, and rejects competing mappings that shadow probe paths. It
+checks public HTTPS with normal certificate validation, a TLS 1.2 minimum, no
+upper-version cap, no proxy or redirects, and bounded timeouts. Unauthenticated,
+bodyless `POST /operations` and `GET /operations/<uuid>` must return `401` with
+`WWW-Authenticate: Bearer`; unsupported `GET /operations` must return `404`.
+The selected prefix applies to all probes. No token, Operation body, application
+record write or infrastructure change is involved; normal invocation logs and
+metrics can be emitted. Success establishes configuration and unauthenticated
+routing, not processor execution or asynchronous Completion.
+
+Exit codes are `0` for completed AWS setup or successful verification, `1` for
+operational/verification failure, `2` for invalid configuration and `3` for
+pending certificate validation or resource readiness. Setup success does not
+claim working HTTPS. The [domain deployment procedure](DEPLOY_AWS_LAMBDA_WITH_SAM.md#custom-api-domain-and-cloudflare-dns)
+owns operator permissions, manual DNS instructions and stage-switch examples.
 
 Deployment probes in [deploy.sh](../deploy.sh) check unauthenticated `401` on
 both matching routes, authenticated missing-Operation `404`, invalid/bodyless
@@ -338,6 +409,7 @@ Relevant existing checks are:
 | --- | --- |
 | `zig build test-http --system zig-pkg` | Generic handler/authentication behavior plus separate AWS adapter compatibility tests. |
 | `bash tests/operations_api_test.sh` | Declared routes, payload format, permissions, output, throttle defaults/overrides, access-log policy/format/lifecycle, and mocked discovery/probes. |
+| `bash tests/api_domain_test.sh` | Positional parsing, AWS context, certificate/domain reuse, manual DNS instructions, mapping reconciliation and read-only HTTPS probes with AWS/curl mocked. |
 | `bash tests/events_wrapper_test.sh` | Mocked Events integration with common-origin discovery. |
 | `bash tests/seat_scenarios_test.sh` | Mocked seat-tool integration with common-origin discovery. |
 | `zig build test-runtime --system zig-pkg` | Real Lambda event loop with a fake loopback Runtime API and external effects mocked across all six handlers. |

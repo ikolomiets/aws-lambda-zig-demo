@@ -37,6 +37,7 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 - [Full deployment](#6-deploy-with-sam-guided-mode) · [Development code updates](#development-code-updates) · [Rebuild and redeploy](#12-update-the-deployed-lambda-code)
 - [Gateway operation](#7-configure-and-operate-the-wireguard-gateway) · [Gateway diagnostics](#diagnose-failures) · [Key rotation](#rotate-wireguard-keys)
 - [API checks](#8-test-query-get-and-intake-post) · [API access logs](#inspect-api-access-logs) · [Lambda logs](#9-download-lambda-logs)
+- [Custom API domain and Cloudflare DNS](#custom-api-domain-and-cloudflare-dns)
 - [Operation persistence utility](#10-create-read-update-and-delete-persisted-operations) · [Seat Event utility](#seat-event-metadata-utility) · [Ledger counter utility](#global-ledger-counter-utility) · [Queue utility](#11-send-receive-and-check-queued-operations)
 - [Persistence configuration diagnostics](#troubleshoot-persistence-command-configuration) · [Lambda initialization diagnostics](#troubleshoot-lambda-initialization)
 - [Stack deletion](#13-delete-the-sam-stack) · [Security note](#security-note)
@@ -700,7 +701,7 @@ DynamoDB control-plane permission.
 The Operation HTTP API uses Lambda proxy payload format 2.0 and the AWS-generated
 HTTPS hostname. Its `$default` stage adds no stage prefix. Exactly `POST /operations`
 and `GET /operations/{id}` invoke the separate Intake and Query functions. There
-is no catch-all route, custom domain, version prefix, or CORS configuration.
+is no catch-all route, stack-owned custom domain, version prefix, or CORS configuration.
 Unsupported public methods and paths receive native gateway `404` responses without
 invoking a handler; gateway errors keep their own body formats. Direct handler
 invocations retain their existing method checks and `Allow` headers.
@@ -2051,6 +2052,117 @@ the deployment. Once deployed, a queued valid Operation exercises a real
 TigerBeetle account request and transfer request, Completion queue publication,
 and the Completion processor's DynamoDB update.
 
+## Custom API domain and Cloudflare DNS
+
+[api-domain.sh](../api-domain.sh) manages a Regional custom domain independently
+of SAM and `deploy.sh`. It requires Bash 3.2+, AWS CLI v2, `jq` and curl, an
+existing deployed `OperationsApi` HTTP API, and access to the domain's Cloudflare
+DNS zone. It makes no Cloudflare API calls. Run setup only when authorizing AWS
+resource changes:
+
+```sh
+./api-domain.sh setup api.example.com
+./api-domain.sh setup api.example.com --profile dev --region ca-central-1
+```
+
+The interface is `./api-domain.sh <setup|verify> <domain> [options]`: command and
+domain are positional, options follow the domain, and `--domain` is rejected.
+`--profile` and `--region` override `AWS_PROFILE` and `AWS_REGION`; absent these,
+AWS CLI defaults apply. There is no hardcoded profile or Region. The helper
+resolves the account and Region from the selected stack before managing domain
+resources. `--stack-name` defaults to `STACK_NAME` or `aws-lambda-zig-demo`,
+`--stage` defaults to literal `$default`, and `--mapping-key` defaults to the
+empty root mapping. Use `--help` for all options.
+
+Setup validates the API and existing stage before changes. It reuses a compatible
+Regional domain with `TLS_1_2`, API mappings only, and no mutual TLS; incompatible
+domains are rejected rather than replaced. An existing domain keeps its attached
+certificate; `--certificate-arn` must match it. For a new domain, setup reuses a
+unique matching public ACM certificate in the same account and Region, or
+requests a public RSA-2048 certificate with DNS validation. Multiple matches
+require `--certificate-arn`. Issued public imported or email-validated certificates
+can be reused, but their renewal process remains the operator's responsibility.
+
+For a pending certificate, setup prints ACM's exact validation CNAME records and
+exits `3`. In Cloudflare, add each record using the printed full **Name** and
+AWS-generated **Target**, **DNS only** (grey cloud), and **TTL Auto**. Avoid
+appending the zone name twice. If ACM has not yet returned the records, rerun
+shortly. Rerunning reuses the pending certificate; after validation succeeds,
+setup creates the domain and selected mapping. Domain provisioning can also
+return `3`; rerun after AWS reports it ready.
+
+Once AWS setup completes, add the printed traffic CNAME: the full custom hostname
+points to the AWS-generated Regional API Gateway domain, with **DNS only** and
+**TTL Auto**. Keep the separate ACM validation records permanently. DNS-validated
+ACM certificates renew automatically while in use and their validation records
+remain available. See [ACM DNS validation](https://docs.aws.amazon.com/acm/latest/userguide/dns-validation.html).
+Setup prints the resulting API URL and a verification command. Exit `0` from
+setup means AWS configuration completed; HTTPS still needs DNS propagation and
+verification.
+
+The HTTP API domain policy is **`TLS_1_2`**, accepting TLS 1.2 and TLS 1.3.
+Verification uses curl's TLS 1.2 minimum without an upper-version cap. API mappings
+strip the selected prefix before route matching; the named public routes remain
+`POST /operations` and `GET /operations/{id}` within the API. See
+[HTTP API mappings](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-mappings.html).
+
+To change the selected mapping's destination, rerun setup with the desired stack
+and stage. Only that mapping is created or repointed; other mappings stay intact:
+
+```sh
+./api-domain.sh setup api.example.com --profile dev --region ca-central-1 \
+  --stack-name aws-lambda-zig-demo --stage staging --mapping-key staging
+./api-domain.sh verify api.example.com --profile dev --region ca-central-1 \
+  --stack-name aws-lambda-zig-demo --stage staging --mapping-key staging
+```
+
+This produces `https://api.example.com/staging`. The stage must already exist and
+have working Lambda invocation permissions. This template grants invocation only
+for `$default`; another stage requires separately managed deployment and Lambda
+permissions before use. The helper does not create stages or change IAM. The
+Events and scenario wrappers' `--api-url` option accepts a root origin only; use
+a root mapping with those tools.
+
+The certificate and custom domain are outside application-stack ownership. Stack
+replacement or deletion preserves them and their DNS records; rerun setup after
+replacing an API to repoint the selected mapping to the new API. The helper has
+no deletion command and does not alter `OperationsApiUrl` or the stack template.
+
+Setup needs `cloudformation:DescribeStackResource`, `apigateway:GET` for the API,
+stage, domain and mappings, and `acm:DescribeCertificate`. Certificate discovery
+also uses `acm:ListCertificates`, and requesting a certificate requires
+`acm:RequestCertificate`. Resource creation requires `apigateway:POST` for the
+custom domain and mapping; repointing a mapping requires `apigateway:PATCH` on
+the selected mapping. First-time Regional domain creation can require
+`iam:CreateServiceLinkedRole` for API Gateway's service-linked role. These are
+operator permissions; Lambda execution roles receive no additional permissions.
+Verification needs only the read permissions and public HTTPS connectivity.
+
+```sh
+./api-domain.sh verify api.example.com --profile dev --region ca-central-1
+```
+
+Verify checks the attached certificate, HTTP API, stage, selected mapping and
+competing mappings that shadow probe paths. `--certificate-arn` optionally asserts
+the attached certificate. Through public DNS, with certificate validation, no
+proxy, no redirect following and bounded connect/request timeouts, it requires:
+
+- Unauthenticated bodyless `POST /operations`: `401` and `WWW-Authenticate: Bearer`.
+- Unauthenticated `GET /operations/<uuid>`: `401` and the same challenge.
+- Unsupported `GET /operations`: `404`.
+
+The optional mapping prefix applies to all three probes. No bearer token or
+Operation body is sent. Verification performs no AWS mutations and creates no
+Operations; invocations can produce ordinary logs and metrics. It distinguishes
+DNS, TLS, timeout, mapping, redirect and unexpected-response failures. It does
+not verify authenticated submission, processor execution or asynchronous
+Completion. Use the [deployed seat scenarios](#seat-workflow-evidence-and-deployed-scenarios)
+for that separate evidence. All helper exit codes are: `0` completed setup or
+successful verification, `1` operational/verification failure, `2` invalid
+configuration, `3` pending certificate validation or AWS resource readiness.
+`bash tests/api_domain_test.sh` establishes reconciliation and probe behavior
+with external commands mocked, without live AWS or DNS validation.
+
 ## 8. Test query GET and intake POST
 
 Call the matching routes at the common `OperationsApiUrl` returned by SAM.
@@ -2239,7 +2351,7 @@ Events, and actual counter tables. `PASETO_TOKEN` supplies public handler
 authentication; no private key or token-issuance utility is required. Tokens must
 remain valid throughout the run. These operator reads do not certify the Lambda
 roles' permissions.
-Environment endpoint overrides are rejected, and AWS CLI configured endpoint
+AWS endpoint environment overrides are rejected, and AWS CLI configured endpoint
 overrides are disabled for discovery. Read utilities receive empty shared config
 and credentials files (`/dev/null`) with the exported credentials and explicit
 Region; a profile-level SDK endpoint override cannot redirect inspection.
@@ -2253,6 +2365,22 @@ Every counter read passes `--counter-id` explicitly to the direct utility, so an
 inherited `LEDGER_COUNTER_ID` cannot redirect inspection. No native cluster-ID
 discovery participates. Utilities receive the discovered table names, resolved
 credentials and selected Region through their environment.
+
+To exercise an existing custom domain instead of the discovered
+`OperationsApiUrl`, select its HTTPS origin explicitly:
+
+```sh
+./seat_scenarios.sh --profile dev --region ca-central-1 \
+  --stack-name aws-lambda-zig-demo --api-url https://api.example.com
+```
+
+`--api-url` accepts an optional trailing slash, with no credentials, path prefix,
+query string, or fragment. The domain must already map to the selected stack's
+API and stage at the root. All public submission, polling, authentication, and
+tenant-isolation checks use that origin. Stack discovery and direct table/counter
+reads continue using the selected AWS context. Invalid origins fail before AWS
+calls or evidence-directory creation. The runner does not configure the domain
+or change the stack's `OperationsApiUrl` output.
 
 Each invocation generates six unique Operation UUIDs for the owner workflow.
 Creation's UUID is the new Event ID. The owner subject comes from the authenticated
@@ -2656,6 +2784,20 @@ environment credentials; explicit `--profile` selects that profile through the
 AWS CLI. The wrapper exports resolved credentials using
 `aws configure export-credentials --format process`, supports credentials with
 or without a session token, and disables EC2 metadata discovery.
+
+For HTTP commands, `--api-url https://api.example.com` before the command selects
+an existing custom-domain HTTPS origin instead of discovering `OperationsApiUrl`.
+The option applies to creation, availability checks, reservations and confirmations,
+including all Operation polling. The origin accepts an optional trailing slash
+and no credentials, path prefix, query string, or fragment. It must already map
+to the selected stack's API and stage at the root. AWS credential/profile handling
+is unchanged; the wrapper does not configure DNS, certificates, or API mappings.
+The `read` command accesses DynamoDB directly and rejects `--api-url`.
+
+```sh
+./events.sh --profile dev --region ca-central-1 --api-url https://api.example.com \
+  check_seats --event-id 00000000-0000-0000-0000-000000000001
+```
 
 If credential export fails for a profile configured with `sso_session` or legacy
 `sso_start_url`, the wrapper runs

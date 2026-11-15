@@ -19,6 +19,8 @@ Options:
   --region REGION        Override AWS_REGION, AWS_DEFAULT_REGION, REGION
                          (default: ca-central-1)
   --stack-name STACK     Override STACK_NAME (default: aws-lambda-zig-demo)
+  --api-url URL          Use this HTTPS origin for public HTTP requests instead
+                         of the stack's OperationsApiUrl (must map to that stack)
   --output-dir DIRECTORY Override OUTPUT_DIR; must be new with an existing parent
                          (default: a new .scratch/seat-scenarios.XXXXXX directory)
   --poll-attempts N      1-60 reads per Operation (default: 30)
@@ -34,6 +36,7 @@ profile="${AWS_PROFILE:-${AWS_DEFAULT_PROFILE:-${PROFILE:-}}}"
 region="${AWS_REGION:-${AWS_DEFAULT_REGION:-${REGION:-ca-central-1}}}"
 stack_name="${STACK_NAME:-aws-lambda-zig-demo}"
 output_dir="${OUTPUT_DIR:-}"
+operations_api_url=
 explicit_profile=false
 poll_attempts=30 poll_seconds=2 timeout_seconds=300
 while [ "$#" -gt 0 ]; do
@@ -41,11 +44,11 @@ while [ "$#" -gt 0 ]; do
     case "$option" in
         -h|--help) usage; exit 0 ;;
         --authorize-cloud) shift; continue ;;
-        --profile|--region|--stack-name|--output-dir|--poll-attempts|--poll-seconds|--timeout-seconds)
+        --profile|--region|--stack-name|--api-url|--output-dir|--poll-attempts|--poll-seconds|--timeout-seconds)
             [ "$#" -ge 2 ] && [[ "$2" != --* && "$2" != -h ]] ||
                 argument_error 'missing option value'
             value="$2"; shift 2 ;;
-        --profile=*|--region=*|--stack-name=*|--output-dir=*|--poll-attempts=*|--poll-seconds=*|--timeout-seconds=*)
+        --profile=*|--region=*|--stack-name=*|--api-url=*|--output-dir=*|--poll-attempts=*|--poll-seconds=*|--timeout-seconds=*)
             value="${option#*=}"; option="${option%%=*}"; shift ;;
         *) argument_error 'invalid invocation' ;;
     esac
@@ -54,6 +57,7 @@ while [ "$#" -gt 0 ]; do
         --profile) profile="$value"; explicit_profile=true ;;
         --region) region="$value" ;;
         --stack-name) stack_name="$value" ;;
+        --api-url) operations_api_url="$value" ;;
         --output-dir) output_dir="$value" ;;
         --poll-attempts) poll_attempts="$value" ;;
         --poll-seconds) poll_seconds="$value" ;;
@@ -74,6 +78,11 @@ if [ -n "$foreign_token" ]; then
         argument_error 'PASETO_FOREIGN_TOKEN must be a different v4.public token'
 fi
 command -v jq >/dev/null 2>&1 || argument_error 'missing command: jq'
+if [ -n "$operations_api_url" ]; then
+    printf '%s' "$operations_api_url" | jq -Rse \
+        'test("\\Ahttps://(\\[[0-9a-fA-F:.]+\\]|[^/?#@:[:space:]]+)(:[0-9]+)?/?\\z")' \
+        >/dev/null 2>&1 || argument_error '--api-url must be an HTTPS origin without a path, query, credentials, or fragment'
+fi
 [[ "$poll_attempts" =~ ^[0-9]+$ ]] &&
     jq -en --arg n "$poll_attempts" '$n | tonumber | . >= 1 and . <= 60' >/dev/null 2>&1 ||
     argument_error 'poll bounds: attempts 1-60, seconds 0-5'
@@ -262,10 +271,12 @@ check_json '(.Stacks[0].Outputs // []) | type == "array" and
 binding="$(printf '%s' "$JSON" | jq -c '.Stacks[0].Outputs | map({key:.OutputKey,value:.OutputValue}) | from_entries')"
 JSON="$binding"
 for key in OperationsApiUrl; do
-    check_json '.[$key] | type == "string" and test("^https://(\\[[0-9a-fA-F:.]+\\]|[^/?#@:[:space:]]+)(:[0-9]+)?/?$")' \
+    check_json '.[$key] | type == "string" and test("\\Ahttps://(\\[[0-9a-fA-F:.]+\\]|[^/?#@:[:space:]]+)(:[0-9]+)?/?\\z")' \
         "missing or invalid $key output" --arg key "$key"
 done
-operations_api_url="$(printf '%s' "$binding" | jq -r .OperationsApiUrl)"
+if [ -z "$operations_api_url" ]; then
+    operations_api_url="$(printf '%s' "$binding" | jq -r .OperationsApiUrl)"
+fi
 intake_url="${operations_api_url%/}/operations"
 query_url="$intake_url"
 for key in SeatEventsTableName LedgerCounterTableName; do
