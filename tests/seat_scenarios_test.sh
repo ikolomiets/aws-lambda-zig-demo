@@ -53,7 +53,7 @@ JSON
         header="$(printf '%s\n' "$config" | sed -n '/^header = .*Authorization:/s/^header = //p' | jq -r .)"
         if [ -z "$header" ]; then printf '{}\n401\n'; exit; fi
         case "$header" in
-            'Authorization: Bearer v4.public.owner') tenant=fixture-owner ;;
+            'Authorization: Bearer v4.public.owner'|'Authorization: Bearer v4.public.owner-renewed') tenant=fixture-owner ;;
             'Authorization: Bearer v4.public.foreign') tenant=fixture-foreign ;;
             *) exit 94 ;;
         esac
@@ -177,6 +177,19 @@ contains "$(cat "$AWS_CALLS")" '--stack-name environment-stack --region environm
 if [[ "$(cat "$AWS_CALLS")" == *--profile* ]]; then fail_test 'inherited AWS profile forced CLI credential precedence'; fi
 jq -e '.status == "passed" and .tenant_isolation == "passed" and
     .tenants == ["fixture-owner","fixture-foreign"] and (.operations|length) == 9' "$OUTPUT_DIR/manifest.json" >/dev/null
+
+# Different token strings can authenticate the same subject. Diagnose that input
+# before expecting a cross-tenant 404 from an authorized owner query.
+rm -f "$FIXTURE_DIR"/*
+exit_code=0
+PASETO_FOREIGN_TOKEN=v4.public.owner-renewed bash ./seat_scenarios.sh \
+    --output-dir "$TEST_DIR/same-subject-output" --poll-seconds 0 \
+    >"$TEST_DIR/stdout" 2>"$TEST_DIR/stderr" || exit_code=$?
+[ "$exit_code" -eq 1 ] || fail_test 'same-subject tokens did not fail the workflow'
+contains "$(cat "$TEST_DIR/stderr")" 'tenant tokens have the same subject'
+jq -e '.status == "failed" and (.stage|startswith("foreign_check intake")) and
+    .tenant_isolation == "pending" and .tenants == ["fixture-owner"]' \
+    "$TEST_DIR/same-subject-output/manifest.json" >/dev/null
 
 export STATIC_CREDENTIALS=true
 unset PASETO_FOREIGN_TOKEN

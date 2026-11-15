@@ -332,7 +332,8 @@ submit() {
         case "$label" in
             create) owner="$tenant" ;;
             foreign_check)
-                [ "$tenant" != "$owner" ] || fail 'tenant tokens have the same subject'
+                [ "$tenant" != "$owner" ] ||
+                    fail 'tenant tokens have the same subject; issue PASETO_FOREIGN_TOKEN for a different subject'
                 foreign_tenant="$tenant" ;;
         esac
         manifest="$(printf '%s' "$manifest" | jq --arg tenant "$tenant" '.tenants += [$tenant]')"
@@ -425,6 +426,9 @@ confirm_payload="$(jq -cn --arg id "$event_id" --arg pending "$pending_id" \
 submit confirm "$confirm_body" "$owner" "$owner_token" "$confirm_payload"
 submit final_check "$check_body" "$owner" "$owner_token" "$check_payload"
 if [ -n "$foreign_token" ]; then
+    # Establish a different authenticated subject before asserting foreign access
+    # is denied. Token strings alone do not identify distinct tenants.
+    submit foreign_check "$check_body" "$foreign_tenant" "$foreign_token" '{"code":"event_unavailable"}' FAILURE
     stage='tenant isolation through public query and intake'
     http GET "${query_url%/}/$event_id" "$foreign_token" '' 404
     foreign_response="$RESPONSE"
@@ -433,7 +437,6 @@ if [ -n "$foreign_token" ]; then
         fail 'cross-tenant query disclosed Operation data'
     request="$(jq -cn --arg id "$event_id" --argjson body "$check_body" '{id:$id,name:"SeatReservation",body:$body}')"
     http POST "$intake_url" "$foreign_token" "$request" 409
-    submit foreign_check "$check_body" "$foreign_tenant" "$foreign_token" '{"code":"event_unavailable"}' FAILURE
     submit foreign_reserve "$reserve_body" "$foreign_tenant" "$foreign_token" '{"code":"event_unavailable"}' FAILURE
     submit foreign_confirm "$confirm_body" "$foreign_tenant" "$foreign_token" '{"code":"event_unavailable"}' FAILURE
     manifest="$(printf '%s' "$manifest" | jq '.tenant_isolation = "passed"')"

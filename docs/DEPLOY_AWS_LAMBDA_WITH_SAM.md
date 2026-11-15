@@ -2271,8 +2271,12 @@ the allocated ledger; counter reads bracket creation without assuming a gapless
 sequence or exclusive allocator use. Missing authentication must produce 401.
 
 Optionally export `PASETO_FOREIGN_TOKEN`, signed for a different subject, to enable
-cross-tenant checks and three additional Operations. Otherwise, these checks are
-skipped and the manifest records `tenant_isolation: "skipped"`. With the second
+cross-tenant checks and three additional Operations. Issuing another token for the
+owner's subject still authenticates the same tenant, even when the token strings
+differ. The runner obtains the second token's authenticated subject from its
+check-seats intake response and rejects matching subjects before asserting
+cross-tenant access is denied. When `PASETO_FOREIGN_TOKEN` is unset, these checks
+are skipped and the manifest records `tenant_isolation: "skipped"`. With the second
 token, the other tenant sees the owner's Operation as the same static 404 as a missing
 Operation, cannot reuse its UUID at intake (409), and receives exact
 `event_unavailable` Results for foreign check/reserve/confirm requests. The manifest
