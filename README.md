@@ -17,6 +17,11 @@ Operation JSON document, derives required tenant metadata from the verified
 token subject, resolves the exact `<name>Queue` environment mapping, persists
 the Operation idempotently in DynamoDB, submits new work to that SQS queue, and
 returns the current stored output view without the body.
+
+The maintained [Operations API Gateway specification](docs/API_GATEWAY.md) defines
+the public routes, authentication, retry behavior, AWS adapter, throttles, and
+access logs, with usage and validation guidance.
+
 The TigerBeetle processor consumes minimal Processor Messages and validates their complete
 Bodies before executing requested account creations, transfers and account lookups. Each creation
 list is an independent linked chain. Replay safety requires callers to preserve each chain's

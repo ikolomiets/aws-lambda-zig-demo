@@ -90,5 +90,8 @@ must cover routes, permissions, outputs, throttles, and logging configuration;
 runtime tests must exercise the Lambda entry points. The [local-check guide](../agents/local-checks.md)
 owns validation commands and their evidence limits.
 
-The complete design is accepted. Implementation and the required validation are
-pending.
+The [Operations API Gateway specification](../API_GATEWAY.md) describes the
+implemented contract, caller usage, adapter boundary, and regression coverage.
+Local checks establish behavior and declared configuration; effective AWS
+routing, permissions, throttle enforcement, and log delivery require separately
+authorized deployed validation.

@@ -3,6 +3,10 @@
 This guide documents how to deploy the six Zig Lambda packages in this repository
 using AWS SAM and `template.yaml`.
 
+The [Operations API Gateway specification](API_GATEWAY.md) owns the current HTTP
+and integration contract. This guide owns deployment values, infrastructure
+updates, operational commands, and cleanup.
+
 SAM deploys all six Lambda functions as one CloudFormation-managed stack. It creates
 their execution roles, one public HTTP API for intake and query, the DynamoDB
 operations table, the TigerBeetle queue sent by intake and consumed by the TigerBeetle processor,
