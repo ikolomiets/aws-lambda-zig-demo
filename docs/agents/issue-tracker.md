@@ -42,11 +42,15 @@ question body or duplicate them in the map.
 - **Claim first:** set `assignee` to the developer driving the effort before ticket work.
   A delegated agent records its identity in a separate claim comment. Re-read the issue
   before changing it and do not take an already assigned ticket.
+  For interface changes, the claim comment includes the
+  [behavior-to-test map](local-checks.md#interface-migrations) before implementation.
 - **Resolve:** add a dated resolution comment under `comments/<issue-id>/`, with the
   answer or a link to its research asset and relevant evidence. For implementation,
   review every acceptance criterion, check satisfied criteria, and use `complete`
   below. Then append a one-line gist linking the issue title to the map's Decisions
   so far. Research and decision resolutions retain their existing answer convention.
+  For interface changes, record the Spec review's coverage assessment against the
+  claim's behavior-to-test map before the final validation gate.
 - **Release a claim:** set `assignee` back to `null` if work stops before resolution.
 - **Exclude:** label mis-scoped work `wontfix`, record a dated exclusion resolution,
   close it, and link it only from the map's Out of scope section. Exclusion records use

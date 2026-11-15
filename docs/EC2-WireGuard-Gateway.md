@@ -402,7 +402,7 @@ update. CloudFormation creates `TigerBeetleProcessorEgressOnlyInternetGateway`, 
 `TigerBeetleProcessorSqsIpv6Route` and `WireGuardLambdaRoute`, attaches TigerBeetle processor with its
 dual-stack setting, and creates the two security groups. After success, the
 helper prints the conditional network outputs and masked peer configuration,
-then continues with the DynamoDB, SQS, and optional Function URL checks.
+then continues with the DynamoDB, SQS, and optional Operation API route checks.
 
 Routine `deploy.sh` runs preserve both enabled and disabled gateway state.
 Gateway lifecycle changes use these sequences:

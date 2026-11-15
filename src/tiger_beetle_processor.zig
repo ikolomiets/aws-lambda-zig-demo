@@ -4002,6 +4002,12 @@ test "escaped maximum Processor Message survives SQS request and ten-record Lamb
 }
 
 test "executor summaries distinguish publication, native rejection, admission and blocked retries" {
+    const rejection_status: u32 = 19;
+    try std.testing.expectEqualStrings(
+        "exists_with_different_ledger",
+        tigerbeetle.create_account_status_name(rejection_status).?,
+    );
+
     for ([_]bool{ false, true }) |fail_send| {
         var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer storage.deinit();
@@ -4018,7 +4024,7 @@ test "executor summaries distinguish publication, native rejection, admission an
         for (bodies[0..3], 0..) |body, i| messages[i] = try test_body_message(arena, i + 1, body);
         messages[3] = bodies[3];
         var execution: FakeExecution = .{};
-        execution.account_outcomes[0] = .{ .rejected = 9999 };
+        execution.account_outcomes[0] = .{ .rejected = rejection_status };
         var publisher: SerialPublisher = .{ .fail_at = if (fail_send) 1 else null };
         const response = try handle_invocation_observed(arena, try testEvent(arena, &messages), ExecutionAdapter.init(&execution), CompletionPublisher.init(&publisher), observer.logger());
         const parsed = try std.json.parseFromSlice(std.json.Value, arena, response, .{});
@@ -4035,7 +4041,7 @@ test "executor summaries distinguish publication, native rejection, admission an
             }
             if (std.mem.eql(u8, record.outcome, "native_status")) {
                 native_counts += 1;
-                try std.testing.expectEqual(@as(u32, 9999), record.native_status_counts.?[0].code);
+                try std.testing.expectEqual(rejection_status, record.native_status_counts.?[0].code);
                 continue;
             }
             summaries += 1;

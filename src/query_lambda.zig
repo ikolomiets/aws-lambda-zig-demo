@@ -1,6 +1,9 @@
 const std = @import("std");
 const aws = @import("aws");
 const lambda = @import("aws-lambda");
+const http = @import("http");
+const http_test = if (@import("builtin").is_test) @import("http_test_support") else void;
+const aws_http = @import("aws_http");
 const lambda_auth = @import("lambda_auth");
 const operation = @import("operation");
 const operation_persistence = @import("operation_persistence");
@@ -24,9 +27,7 @@ const cache_ttl_ns: i96 = std.time.ns_per_s;
 const content_type_json = "application/json";
 const content_type_text = "text/plain; charset=utf-8";
 const internal_server_error_body = "Internal Server Error\n";
-const internal_server_error_response =
-    "{\"statusCode\":500,\"headers\":{\"Content-Type\":\"" ++ content_type_text ++
-    "\"},\"body\":\"Internal Server Error\\n\"}";
+const internal_server_error_response = aws_http.internal_server_error_response;
 const method_not_allowed_body = "Method Not Allowed\n";
 const not_found_body = "Not Found\n";
 const service_unavailable_body = "Service Unavailable\n";
@@ -76,13 +77,13 @@ const CacheEntry = struct {
     inserted_at_ns: i96,
 };
 
-const OperationCache = struct {
+pub const OperationCache = struct {
     allocator: Allocator,
     entries: std.AutoHashMap(u128, CacheEntry),
 
     const Self = @This();
 
-    fn init(cache: *Self, allocator: Allocator) void {
+    pub fn init(cache: *Self, allocator: Allocator) void {
         cache.* = .{
             .allocator = allocator,
             .entries = std.AutoHashMap(u128, CacheEntry).init(allocator),
@@ -90,7 +91,7 @@ const OperationCache = struct {
         std.debug.assert(cache.entries.count() == 0);
     }
 
-    fn deinit(cache: *Self) void {
+    pub fn deinit(cache: *Self) void {
         var iterator = cache.entries.valueIterator();
         var entry_count: usize = 0;
         while (iterator.next()) |entry| {
@@ -221,7 +222,7 @@ const RuntimeResources = struct {
     }
 };
 
-const QueryAdapter = struct {
+pub const QueryAdapter = struct {
     context: *anyopaque,
     cache: *OperationCache,
     read_fn: *const fn (
@@ -230,7 +231,7 @@ const QueryAdapter = struct {
         u128,
     ) anyerror!operation.Operation,
 
-    fn init(pointer: anytype, cache: *OperationCache) QueryAdapter {
+    pub fn init(pointer: anytype, cache: *OperationCache) QueryAdapter {
         const Pointer = @TypeOf(pointer);
         const pointer_info = @typeInfo(Pointer);
         comptime std.debug.assert(pointer_info == .pointer);
@@ -282,15 +283,40 @@ fn handleInvocation(
     authentication_now: i64,
     monotonic_now_ns: i96,
 ) []const u8 {
-    const outcome = invocationOutcome(
+    var transport = aws_http.Request.parse(allocator, event) catch {
+        const response = response_from_outcome(allocator, .internal_server_error);
+        return aws_http.encode_response(allocator, &response) catch internal_server_error_response;
+    };
+    defer transport.deinit();
+    const request = transport.application_request();
+    var response = handle_http(
         allocator,
-        event,
+        &request,
         environment,
         query,
         authentication_now,
         monotonic_now_ns,
     );
-    return encodeOutcome(allocator, outcome) catch internal_server_error_response;
+    defer response.deinit();
+    return aws_http.encode_response(allocator, &response) catch internal_server_error_response;
+}
+
+pub fn handle_http(
+    allocator: Allocator,
+    request: *const http.HttpRequest,
+    environment: *const std.process.Environ.Map,
+    query: QueryAdapter,
+    authentication_now: i64,
+    monotonic_now_ns: i96,
+) http.HttpResponse {
+    return response_from_outcome(allocator, invocationOutcome(
+        allocator,
+        request,
+        environment,
+        query,
+        authentication_now,
+        monotonic_now_ns,
+    ));
 }
 
 const InvocationOutcome = union(enum) {
@@ -305,19 +331,15 @@ const InvocationOutcome = union(enum) {
 
 fn invocationOutcome(
     allocator: Allocator,
-    event: []const u8,
+    request: *const http.HttpRequest,
     environment: *const std.process.Environ.Map,
     query: QueryAdapter,
     authentication_now: i64,
     monotonic_now_ns: i96,
 ) InvocationOutcome {
-    const request = lambda.url.parseRequest(allocator, event) catch {
-        return .internal_server_error;
-    };
-    defer request.deinit(allocator);
     var identity = lambda_auth.authenticate(
         allocator,
-        &request,
+        request.headers,
         environment,
         authentication_now,
     ) catch |err| {
@@ -328,14 +350,14 @@ fn invocationOutcome(
     };
     defer identity.deinit();
 
-    const method = request.request_context.http.method orelse {
+    const method = request.method orelse {
         return .method_not_allowed;
     };
     if (method != .GET) return .method_not_allowed;
     return queryInvocationOutcome(
         allocator,
         identity.subject,
-        &request,
+        request,
         query,
         monotonic_now_ns,
     );
@@ -344,14 +366,14 @@ fn invocationOutcome(
 fn queryInvocationOutcome(
     allocator: Allocator,
     tenant: []const u8,
-    request: *const lambda.url.Request,
+    request: *const http.HttpRequest,
     query: QueryAdapter,
     monotonic_now_ns: i96,
 ) InvocationOutcome {
     std.debug.assert(tenant.len > 0);
     std.debug.assert(tenant.len <= operation.tenant_size_max);
 
-    const id = operationIDFromRawPath(request.raw_path) catch {
+    const id = operationIDFromRawPath(request.path) catch {
         return .bad_request;
     };
     if (query.cache.getFresh(id, monotonic_now_ns)) |cached| {
@@ -388,10 +410,11 @@ fn queryInvocationOutcome(
 
 fn operationIDFromRawPath(raw_path: ?[]const u8) !u128 {
     const path = raw_path orelse return error.InvalidPath;
-    if (path.len != 37) return error.InvalidPath;
-    if (path[0] != '/') return error.InvalidPath;
-    const id = operation.uuidFromString(path[1..]) catch return error.InvalidPath;
-    std.debug.assert(path[1..].len == 36);
+    const prefix = "/operations/";
+    if (path.len != prefix.len + operation.uuid_string_size) return error.InvalidPath;
+    if (!std.mem.startsWith(u8, path, prefix)) return error.InvalidPath;
+    const id = operation.uuidFromString(path[prefix.len..]) catch return error.InvalidPath;
+    std.debug.assert(path[prefix.len..].len == operation.uuid_string_size);
     return id;
 }
 
@@ -409,50 +432,50 @@ fn operationOutputBody(
     return output.toOwnedSlice();
 }
 
-fn encodeOutcome(
-    allocator: Allocator,
-    outcome: InvocationOutcome,
-) ![]const u8 {
+fn response_from_outcome(allocator: Allocator, outcome: InvocationOutcome) http.HttpResponse {
     return switch (outcome) {
-        .success => |body| success: {
-            defer allocator.free(body);
-            break :success lambda.url.encodeResponse(allocator, .{
-                .content_type = content_type_json,
-                .body = .{ .textual = body },
-            });
+        .success => |success| .{
+            .status = .ok,
+            .headers = &.{.{ .key = "Content-Type", .value = content_type_json }},
+            .body = success,
+            .body_allocator = allocator,
         },
-        .bad_request => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type_text,
-            .status_code = .bad_request,
-            .body = .{ .textual = bad_request_body },
-        }),
-        .method_not_allowed => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type_text,
-            .status_code = .method_not_allowed,
-            .headers = &.{.{ .key = "Allow", .value = "GET" }},
-            .body = .{ .textual = method_not_allowed_body },
-        }),
-        .not_found => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type_text,
-            .status_code = .not_found,
-            .body = .{ .textual = not_found_body },
-        }),
-        .service_unavailable => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type_text,
-            .status_code = .service_unavailable,
-            .body = .{ .textual = service_unavailable_body },
-        }),
-        .unauthorized => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type_text,
-            .status_code = .unauthorized,
-            .headers = &.{.{ .key = "WWW-Authenticate", .value = "Bearer" }},
-            .body = .{ .textual = unauthorized_body },
-        }),
-        .internal_server_error => lambda.url.encodeResponse(allocator, .{
-            .content_type = content_type_text,
-            .status_code = .internal_server_error,
-            .body = .{ .textual = internal_server_error_body },
-        }),
+        .bad_request => .{
+            .status = .bad_request,
+            .headers = &.{.{ .key = "Content-Type", .value = content_type_text }},
+            .body = bad_request_body,
+        },
+        .method_not_allowed => .{
+            .status = .method_not_allowed,
+            .headers = &.{
+                .{ .key = "Content-Type", .value = content_type_text },
+                .{ .key = "Allow", .value = "GET" },
+            },
+            .body = method_not_allowed_body,
+        },
+        .service_unavailable => .{
+            .status = .service_unavailable,
+            .headers = &.{.{ .key = "Content-Type", .value = content_type_text }},
+            .body = service_unavailable_body,
+        },
+        .unauthorized => .{
+            .status = .unauthorized,
+            .headers = &.{
+                .{ .key = "Content-Type", .value = content_type_text },
+                .{ .key = "WWW-Authenticate", .value = "Bearer" },
+            },
+            .body = unauthorized_body,
+        },
+        .internal_server_error => .{
+            .status = .internal_server_error,
+            .headers = &.{.{ .key = "Content-Type", .value = content_type_text }},
+            .body = internal_server_error_body,
+        },
+        .not_found => .{
+            .status = .not_found,
+            .headers = &.{.{ .key = "Content-Type", .value = content_type_text }},
+            .body = not_found_body,
+        },
     };
 }
 
@@ -474,6 +497,19 @@ const FakeQuery = struct {
         return fake.response orelse error.OperationNotFound;
     }
 };
+
+fn handle_http_for_test(
+    allocator: Allocator,
+    request: *const http.HttpRequest,
+    environment: *const std.process.Environ.Map,
+    fake: *FakeQuery,
+    now: i64,
+) http.HttpResponse {
+    var cache: OperationCache = undefined;
+    OperationCache.init(&cache, std.testing.allocator);
+    defer cache.deinit();
+    return handle_http(allocator, request, environment, QueryAdapter.init(fake, &cache), now, 0);
+}
 
 fn handleInvocationForTest(
     allocator: Allocator,
@@ -565,6 +601,56 @@ test "AWS SDK debug logging is enabled" {
     try std.testing.expect(std.log.logEnabled(.debug, .aws_sdk));
 }
 
+test "generic HTTP querying ignores bodies and authorizes warm cached Operations" {
+    const Body = struct {
+        fn read(_: *anyopaque, _: Allocator) anyerror!?[]const u8 {
+            return error.BodyMustNotBeRead;
+        }
+    };
+    var marker: u8 = 0;
+    var request: http.HttpRequest = .{
+        .method = .GET,
+        .path = "/operations/00112233-4455-6677-8899-AABBCCDDEEFF",
+        .body = .{ .deferred = .{ .context = &marker, .read_fn = Body.read } },
+    };
+    var environment = try testEnvironment(0x71);
+    defer environment.deinit();
+    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .submitted) };
+    var cache: OperationCache = undefined;
+    OperationCache.init(&cache, std.testing.allocator);
+    defer cache.deinit();
+    const query = QueryAdapter.init(&fake, &cache);
+    var unauthorized = handle_http(std.testing.allocator, &request, &environment, query, 1000, 0);
+    defer unauthorized.deinit();
+    try std.testing.expectEqual(.unauthorized, unauthorized.status);
+    for ([_][]const u8{ "lambda-test-user", "foreign-tenant", "lambda-test-user" }) |subject| {
+        const token = try testTokenForSubject(0x71, subject);
+        defer std.testing.allocator.free(token);
+        const bearer = try std.fmt.allocPrint(std.testing.allocator, "Bearer {s}", .{token});
+        defer std.testing.allocator.free(bearer);
+        request.headers = &.{.{ .key = "Authorization", .value = bearer }};
+        var response = handle_http(std.testing.allocator, &request, &environment, query, 1000, 0);
+        defer response.deinit();
+        if (std.mem.eql(u8, subject, "foreign-tenant")) {
+            try std.testing.expectEqual(.not_found, response.status);
+            try std.testing.expectEqualStrings(not_found_body, response.body);
+        } else {
+            try std.testing.expectEqual(.ok, response.status);
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                response.body,
+                "\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"",
+            ) != null);
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                response.body,
+                "\"tenant\":\"lambda-test-user\"",
+            ) != null);
+        }
+    }
+    try std.testing.expectEqual(@as(u8, 1), fake.read_count);
+}
+
 test "authenticated GET returns exact SUBMITTED operation JSON and canonicalizes UUID" {
     const token = try testToken(0x71);
     defer std.testing.allocator.free(token);
@@ -573,7 +659,7 @@ test "authenticated GET returns exact SUBMITTED operation JSON and canonicalizes
     const event = try testRequestEvent(.{
         .method = .GET,
         .token = token,
-        .raw_path = "/00112233-4455-6677-8899-AABBCCDDEEFF",
+        .raw_path = "/operations/00112233-4455-6677-8899-AABBCCDDEEFF",
         .raw_query = "id=ffffffff-ffff-ffff-ffff-ffffffffffff",
         .body = "ffffffff-ffff-ffff-ffff-ffffffffffff",
     });
@@ -609,53 +695,57 @@ test "authenticated GET returns exact completed success and failure envelopes" {
     defer std.testing.allocator.free(token);
     var environment = try testEnvironment(0x72);
     defer environment.deinit();
-    const event = try testRequestEvent(.{
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
         .method = .GET,
         .token = token,
-        .raw_path = "/00112233-4455-6677-8899-aabbccddeeff",
+        .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
     });
-    defer std.testing.allocator.free(event);
+    defer fixture.deinit(std.testing.allocator);
     var fake = FakeQuery{ .response = testOperation("lambda-test-user", .completed) };
 
-    const response = handleInvocationForTest(
+    var response = handle_http_for_test(
         std.testing.allocator,
-        event,
+        &fixture.request,
         &environment,
         &fake,
         1000,
     );
-    defer std.testing.allocator.free(response);
+    defer response.deinit();
 
-    const expected =
-        "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
-        "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
-        "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
-        "\\\"state\\\":\\\"COMPLETED\\\",\\\"last_updated\\\":1700000123," ++
-        "\\\"expires_at\\\":1700086523,\\\"result\\\":{" ++
-        "\\\"type\\\":\\\"SUCCESS\\\",\\\"payload\\\":\\\"done\\\"}," ++
-        "\\\"hash\\\":\\\"" ++ (std.mem.asBytes(&@as([32][2]u8, @splat("ab".*)))) ++ "\\\"}\"}";
-    try std.testing.expectEqualStrings(expected, response);
+    const expected = http.HttpResponse{
+        .status = .ok,
+        .headers = &.{.{ .key = "Content-Type", .value = "application/json" }},
+        .body = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"" ++
+            "lambda-test-user\",\"name\":\"echo\",\"state\":\"COMPLETED\",\"la" ++
+            "st_updated\":1700000123,\"expires_at\":1700086523,\"result\"" ++
+            ":{\"type\":\"SUCCESS\",\"payload\":\"done\"},\"hash\":\"ababababab" ++
+            "ababababababababababababababababababababababababababab\"" ++
+            "}",
+    };
+    try http_test.expect_response(&expected, &response);
 
     var failure = testOperation("lambda-test-user", .completed);
     failure.state = .{ .completed = .{ .failure = .{ .string = "done" } } };
     fake.response = failure;
-    const failure_response = handleInvocationForTest(
+    var failure_response = handle_http_for_test(
         std.testing.allocator,
-        event,
+        &fixture.request,
         &environment,
         &fake,
         1000,
     );
-    defer std.testing.allocator.free(failure_response);
-    const expected_failure =
-        "{\"statusCode\":200,\"headers\":{\"Content-Type\":\"application/json\"}," ++
-        "\"body\":\"{\\\"id\\\":\\\"00112233-4455-6677-8899-aabbccddeeff\\\"," ++
-        "\\\"tenant\\\":\\\"lambda-test-user\\\",\\\"name\\\":\\\"echo\\\"," ++
-        "\\\"state\\\":\\\"COMPLETED\\\",\\\"last_updated\\\":1700000123," ++
-        "\\\"expires_at\\\":1700086523,\\\"result\\\":{" ++
-        "\\\"type\\\":\\\"FAILURE\\\",\\\"payload\\\":\\\"done\\\"}," ++
-        "\\\"hash\\\":\\\"" ++ (std.mem.asBytes(&@as([32][2]u8, @splat("ab".*)))) ++ "\\\"}\"}";
-    try std.testing.expectEqualStrings(expected_failure, failure_response);
+    defer failure_response.deinit();
+    const expected_failure = http.HttpResponse{
+        .status = .ok,
+        .headers = &.{.{ .key = "Content-Type", .value = "application/json" }},
+        .body = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\",\"tenant\":\"" ++
+            "lambda-test-user\",\"name\":\"echo\",\"state\":\"COMPLETED\",\"la" ++
+            "st_updated\":1700000123,\"expires_at\":1700086523,\"result\"" ++
+            ":{\"type\":\"FAILURE\",\"payload\":\"done\"},\"hash\":\"ababababab" ++
+            "ababababababababababababababababababababababababababab\"" ++
+            "}",
+    };
+    try http_test.expect_response(&expected_failure, &failure_response);
 }
 
 test "second lookup before one second uses cached response" {
@@ -663,37 +753,39 @@ test "second lookup before one second uses cached response" {
     defer std.testing.allocator.free(token);
     var environment = try testEnvironment(0x77);
     defer environment.deinit();
-    const event = try testQueryRequestEvent(token);
-    defer std.testing.allocator.free(event);
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .GET,
+        .token = token,
+        .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
+    });
+    defer fixture.deinit(std.testing.allocator);
     var fake = FakeQuery{ .response = testOperation("lambda-test-user", .submitted) };
     var cache: OperationCache = undefined;
     OperationCache.init(&cache, std.testing.allocator);
     defer cache.deinit();
 
-    const first = handleInvocationWithCacheForTest(
+    var first = handle_http(
         std.testing.allocator,
-        event,
+        &fixture.request,
         &environment,
-        &fake,
-        &cache,
+        QueryAdapter.init(&fake, &cache),
         1000,
         10,
     );
-    defer std.testing.allocator.free(first);
+    defer first.deinit();
     fake.response = testOperation("lambda-test-user", .completed);
-    const second = handleInvocationWithCacheForTest(
+    var second = handle_http(
         std.testing.allocator,
-        event,
+        &fixture.request,
         &environment,
-        &fake,
-        &cache,
+        QueryAdapter.init(&fake, &cache),
         1000,
         10 + cache_ttl_ns - 1,
     );
-    defer std.testing.allocator.free(second);
+    defer second.deinit();
 
-    try std.testing.expectEqualStrings(first, second);
-    try std.testing.expect(std.mem.indexOf(u8, second, "SUBMITTED") != null);
+    try http_test.expect_response(&first, &second);
+    try std.testing.expect(std.mem.indexOf(u8, second.body, "SUBMITTED") != null);
     try std.testing.expectEqual(@as(u8, 1), fake.read_count);
     try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
 }
@@ -703,37 +795,39 @@ test "cache entry expires and is replaced at exactly one second" {
     defer std.testing.allocator.free(token);
     var environment = try testEnvironment(0x78);
     defer environment.deinit();
-    const event = try testQueryRequestEvent(token);
-    defer std.testing.allocator.free(event);
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .GET,
+        .token = token,
+        .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
+    });
+    defer fixture.deinit(std.testing.allocator);
     var fake = FakeQuery{ .response = testOperation("lambda-test-user", .submitted) };
     var cache: OperationCache = undefined;
     OperationCache.init(&cache, std.testing.allocator);
     defer cache.deinit();
 
-    const first = handleInvocationWithCacheForTest(
+    var first = handle_http(
         std.testing.allocator,
-        event,
+        &fixture.request,
         &environment,
-        &fake,
-        &cache,
+        QueryAdapter.init(&fake, &cache),
         1000,
         0,
     );
-    defer std.testing.allocator.free(first);
+    defer first.deinit();
     fake.response = testOperation("lambda-test-user", .completed);
-    const second = handleInvocationWithCacheForTest(
+    var second = handle_http(
         std.testing.allocator,
-        event,
+        &fixture.request,
         &environment,
-        &fake,
-        &cache,
+        QueryAdapter.init(&fake, &cache),
         1000,
         cache_ttl_ns,
     );
-    defer std.testing.allocator.free(second);
+    defer second.deinit();
 
-    try std.testing.expect(std.mem.indexOf(u8, first, "SUBMITTED") != null);
-    try std.testing.expect(std.mem.indexOf(u8, second, "COMPLETED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first.body, "SUBMITTED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second.body, "COMPLETED") != null);
     try std.testing.expectEqual(@as(u8, 2), fake.read_count);
     try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
 }
@@ -745,41 +839,47 @@ test "foreign request populates ID-only cache for owning tenant" {
     defer std.testing.allocator.free(owner_token);
     var environment = try testEnvironment(0x79);
     defer environment.deinit();
-    const foreign_event = try testQueryRequestEvent(foreign_token);
-    defer std.testing.allocator.free(foreign_event);
-    const owner_event = try testQueryRequestEvent(owner_token);
-    defer std.testing.allocator.free(owner_event);
+    var foreign_fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .GET,
+        .token = foreign_token,
+        .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
+    });
+    defer foreign_fixture.deinit(std.testing.allocator);
+    var owner_fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .GET,
+        .token = owner_token,
+        .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
+    });
+    defer owner_fixture.deinit(std.testing.allocator);
     var fake = FakeQuery{ .response = testOperation("owning-tenant", .submitted) };
     var cache: OperationCache = undefined;
     OperationCache.init(&cache, std.testing.allocator);
     defer cache.deinit();
 
-    const foreign_response = handleInvocationWithCacheForTest(
+    var foreign_response = handle_http(
         std.testing.allocator,
-        foreign_event,
+        &foreign_fixture.request,
         &environment,
-        &fake,
-        &cache,
+        QueryAdapter.init(&fake, &cache),
         1000,
         0,
     );
-    defer std.testing.allocator.free(foreign_response);
+    defer foreign_response.deinit();
     fake.read_error = error.AWSFailure;
-    const owner_response = handleInvocationWithCacheForTest(
+    var owner_response = handle_http(
         std.testing.allocator,
-        owner_event,
+        &owner_fixture.request,
         &environment,
-        &fake,
-        &cache,
+        QueryAdapter.init(&fake, &cache),
         1000,
         cache_ttl_ns - 1,
     );
-    defer std.testing.allocator.free(owner_response);
+    defer owner_response.deinit();
 
-    try std.testing.expect(std.mem.indexOf(u8, foreign_response, "statusCode\":404") != null);
-    try expectNotContains(foreign_response, "owning-tenant");
-    try std.testing.expect(std.mem.indexOf(u8, owner_response, "statusCode\":200") != null);
-    try std.testing.expect(std.mem.indexOf(u8, owner_response, "owning-tenant") != null);
+    try std.testing.expectEqual(std.http.Status.not_found, foreign_response.status);
+    try expectNotContains(foreign_response.body, "owning-tenant");
+    try std.testing.expectEqual(std.http.Status.ok, owner_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, owner_response.body, "owning-tenant") != null);
     try std.testing.expectEqual(@as(u8, 1), fake.read_count);
     try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
 }
@@ -789,25 +889,28 @@ test "missing operations are fetched on every request" {
     defer std.testing.allocator.free(token);
     var environment = try testEnvironment(0x7a);
     defer environment.deinit();
-    const event = try testQueryRequestEvent(token);
-    defer std.testing.allocator.free(event);
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .GET,
+        .token = token,
+        .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
+    });
+    defer fixture.deinit(std.testing.allocator);
     var fake = FakeQuery{ .read_error = error.OperationNotFound };
     var cache: OperationCache = undefined;
     OperationCache.init(&cache, std.testing.allocator);
     defer cache.deinit();
 
     for (0..2) |monotonic_now_ns| {
-        const response = handleInvocationWithCacheForTest(
+        var response = handle_http(
             std.testing.allocator,
-            event,
+            &fixture.request,
             &environment,
-            &fake,
-            &cache,
+            QueryAdapter.init(&fake, &cache),
             1000,
             @intCast(monotonic_now_ns),
         );
-        defer std.testing.allocator.free(response);
-        try std.testing.expect(std.mem.indexOf(u8, response, "statusCode\":404") != null);
+        defer response.deinit();
+        try std.testing.expectEqual(std.http.Status.not_found, response.status);
     }
     try std.testing.expectEqual(@as(u8, 2), fake.read_count);
     try std.testing.expectEqual(@as(u32, 0), cache.entries.count());
@@ -818,8 +921,12 @@ test "full fresh cache serves fetched record without caching it" {
     defer std.testing.allocator.free(token);
     var environment = try testEnvironment(0x7b);
     defer environment.deinit();
-    const event = try testQueryRequestEvent(token);
-    defer std.testing.allocator.free(event);
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .GET,
+        .token = token,
+        .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
+    });
+    defer fixture.deinit(std.testing.allocator);
     var fake = FakeQuery{ .response = testOperation("lambda-test-user", .submitted) };
     var cache: OperationCache = undefined;
     OperationCache.init(&cache, std.testing.allocator);
@@ -829,17 +936,16 @@ test "full fresh cache serves fetched record without caching it" {
     std.debug.assert(target_id >= cache_entry_count_max);
 
     for (0..2) |_| {
-        const response = handleInvocationWithCacheForTest(
+        var response = handle_http(
             std.testing.allocator,
-            event,
+            &fixture.request,
             &environment,
-            &fake,
-            &cache,
+            QueryAdapter.init(&fake, &cache),
             1000,
             cache_ttl_ns - 1,
         );
-        defer std.testing.allocator.free(response);
-        try std.testing.expect(std.mem.indexOf(u8, response, "statusCode\":200") != null);
+        defer response.deinit();
+        try std.testing.expectEqual(std.http.Status.ok, response.status);
         try std.testing.expectEqual(
             @as(u32, cache_entry_count_max),
             cache.entries.count(),
@@ -854,8 +960,12 @@ test "full cache removes all expired entries before admitting fetched record" {
     defer std.testing.allocator.free(token);
     var environment = try testEnvironment(0x7c);
     defer environment.deinit();
-    const event = try testQueryRequestEvent(token);
-    defer std.testing.allocator.free(event);
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .GET,
+        .token = token,
+        .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
+    });
+    defer fixture.deinit(std.testing.allocator);
     var fake = FakeQuery{ .response = testOperation("lambda-test-user", .submitted) };
     var cache: OperationCache = undefined;
     OperationCache.init(&cache, std.testing.allocator);
@@ -864,28 +974,26 @@ test "full cache removes all expired entries before admitting fetched record" {
     const target_id = testOperation("lambda-test-user", .submitted).id;
     std.debug.assert(target_id >= cache_entry_count_max);
 
-    const first = handleInvocationWithCacheForTest(
+    var first = handle_http(
         std.testing.allocator,
-        event,
+        &fixture.request,
         &environment,
-        &fake,
-        &cache,
+        QueryAdapter.init(&fake, &cache),
         1000,
         cache_ttl_ns,
     );
-    defer std.testing.allocator.free(first);
-    const second = handleInvocationWithCacheForTest(
+    defer first.deinit();
+    var second = handle_http(
         std.testing.allocator,
-        event,
+        &fixture.request,
         &environment,
-        &fake,
-        &cache,
+        QueryAdapter.init(&fake, &cache),
         1000,
         cache_ttl_ns,
     );
-    defer std.testing.allocator.free(second);
+    defer second.deinit();
 
-    try std.testing.expectEqualStrings(first, second);
+    try http_test.expect_response(&first, &second);
     try std.testing.expectEqual(@as(u8, 1), fake.read_count);
     try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
     try std.testing.expect(cache.entries.contains(target_id));
@@ -896,8 +1004,12 @@ test "cache allocation failures serve fetched response without caching" {
     defer std.testing.allocator.free(token);
     var environment = try testEnvironment(0x7d);
     defer environment.deinit();
-    const event = try testQueryRequestEvent(token);
-    defer std.testing.allocator.free(event);
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
+        .method = .GET,
+        .token = token,
+        .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
+    });
+    defer fixture.deinit(std.testing.allocator);
 
     for ([_]usize{ 0, 1, 2 }) |fail_index| {
         var failing_allocator = std.testing.FailingAllocator.init(
@@ -909,17 +1021,16 @@ test "cache allocation failures serve fetched response without caching" {
         defer cache.deinit();
         var fake = FakeQuery{ .response = testOperation("lambda-test-user", .submitted) };
 
-        const response = handleInvocationWithCacheForTest(
+        var response = handle_http(
             std.testing.allocator,
-            event,
+            &fixture.request,
             &environment,
-            &fake,
-            &cache,
+            QueryAdapter.init(&fake, &cache),
             1000,
             0,
         );
-        defer std.testing.allocator.free(response);
-        try std.testing.expect(std.mem.indexOf(u8, response, "statusCode\":200") != null);
+        defer response.deinit();
+        try std.testing.expectEqual(std.http.Status.ok, response.status);
         try std.testing.expectEqual(@as(u8, 1), fake.read_count);
         try std.testing.expectEqual(@as(u32, 0), cache.entries.count());
     }
@@ -935,33 +1046,37 @@ test "missing malformed nested and trailing paths do not read persistence" {
         "",
         "/",
         "00112233-4455-6677-8899-aabbccddeeff",
-        "/00112233-4455-6677-8899-aabbccddeefg",
-        "/nested/00112233-4455-6677-8899-aabbccddeeff",
-        "/00112233-4455-6677-8899-aabbccddeeff/",
+        "/00112233-4455-6677-8899-aabbccddeeff",
+        "/operations",
+        "/operations/00112233-4455-6677-8899-aabbccddeefg",
+        "/operations/nested/00112233-4455-6677-8899-aabbccddeeff",
+        "/operations/00112233-4455-6677-8899-aabbccddeeff/",
+        "/operations/00112233-4455-6677-8899-aabbccddeeff/extra",
+        "/operations/00112233-4455-6677-8899-aabbccddee%66f",
     };
 
     for (paths) |path| {
-        const event = try testRequestEvent(.{
+        var fixture = try http_test.Request.init(std.testing.allocator, .{
             .method = .GET,
             .token = token,
-            .raw_path = path,
+            .path = path,
         });
-        defer std.testing.allocator.free(event);
+        defer fixture.deinit(std.testing.allocator);
         var fake: FakeQuery = .{};
-        const response = handleInvocationForTest(
+        var response = handle_http_for_test(
             std.testing.allocator,
-            event,
+            &fixture.request,
             &environment,
             &fake,
             1000,
         );
-        defer std.testing.allocator.free(response);
+        defer response.deinit();
 
-        try std.testing.expectEqualStrings(
-            "{\"statusCode\":400,\"headers\":{\"Content-Type\":\"" ++
-                content_type_text ++ "\"},\"body\":\"Bad Request\\n\"}",
-            response,
-        );
+        try http_test.expect_response(&http.HttpResponse{
+            .status = .bad_request,
+            .headers = &.{.{ .key = "Content-Type", .value = "text/plain; charset=utf-8" }},
+            .body = "Bad Request\n",
+        }, &response);
         try std.testing.expectEqual(@as(u8, 0), fake.read_count);
     }
 }
@@ -971,38 +1086,41 @@ test "missing and cross-tenant operations return identical static not found resp
     defer std.testing.allocator.free(token);
     var environment = try testEnvironment(0x74);
     defer environment.deinit();
-    const event = try testRequestEvent(.{
+    var fixture = try http_test.Request.init(std.testing.allocator, .{
         .method = .GET,
         .token = token,
-        .raw_path = "/00112233-4455-6677-8899-aabbccddeeff",
+        .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
     });
-    defer std.testing.allocator.free(event);
+    defer fixture.deinit(std.testing.allocator);
     var missing = FakeQuery{ .read_error = error.OperationNotFound };
     var foreign = FakeQuery{ .response = testOperation("another-tenant", .submitted) };
 
-    const missing_response = handleInvocationForTest(
+    var missing_response = handle_http_for_test(
         std.testing.allocator,
-        event,
+        &fixture.request,
         &environment,
         &missing,
         1000,
     );
-    defer std.testing.allocator.free(missing_response);
-    const foreign_response = handleInvocationForTest(
+    defer missing_response.deinit();
+    var foreign_response = handle_http_for_test(
         std.testing.allocator,
-        event,
+        &fixture.request,
         &environment,
         &foreign,
         1000,
     );
-    defer std.testing.allocator.free(foreign_response);
+    defer foreign_response.deinit();
 
-    const expected = "{\"statusCode\":404,\"headers\":{\"Content-Type\":\"" ++
-        content_type_text ++ "\"},\"body\":\"Not Found\\n\"}";
-    try std.testing.expectEqualStrings(expected, missing_response);
-    try std.testing.expectEqualStrings(expected, foreign_response);
-    try expectNotContains(foreign_response, "another-tenant");
-    try expectNotContains(foreign_response, "echo");
+    const expected = http.HttpResponse{
+        .status = .not_found,
+        .headers = &.{.{ .key = "Content-Type", .value = "text/plain; charset=utf-8" }},
+        .body = "Not Found\n",
+    };
+    try http_test.expect_response(&expected, &missing_response);
+    try http_test.expect_response(&expected, &foreign_response);
+    try expectNotContains(foreign_response.body, "another-tenant");
+    try expectNotContains(foreign_response.body, "echo");
     try std.testing.expectEqual(@as(u8, 1), missing.read_count);
     try std.testing.expectEqual(@as(u8, 1), foreign.read_count);
 }
@@ -1015,7 +1133,7 @@ test "AWS read failure returns service unavailable and other failures are saniti
     const event = try testRequestEvent(.{
         .method = .GET,
         .token = token,
-        .raw_path = "/00112233-4455-6677-8899-aabbccddeeff",
+        .raw_path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
     });
     defer std.testing.allocator.free(event);
     const failures = [_]anyerror{
@@ -1053,7 +1171,7 @@ test "authentication and method checks happen before persistence" {
     var fake: FakeQuery = .{};
     const unauthorized_event = try testRequestEvent(.{
         .method = .GET,
-        .raw_path = "/00112233-4455-6677-8899-aabbccddeeff",
+        .raw_path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
     });
     defer std.testing.allocator.free(unauthorized_event);
     const unauthorized_response = handleInvocationForTest(
@@ -1074,7 +1192,7 @@ test "authentication and method checks happen before persistence" {
     const post_event = try testRequestEvent(.{
         .method = .POST,
         .token = token,
-        .raw_path = "/00112233-4455-6677-8899-aabbccddeeff",
+        .raw_path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
     });
     defer std.testing.allocator.free(post_event);
     const post_response = handleInvocationForTest(
@@ -1166,7 +1284,7 @@ fn testQueryRequestEvent(token: []const u8) ![]u8 {
     return testRequestEvent(.{
         .method = .GET,
         .token = token,
-        .raw_path = "/00112233-4455-6677-8899-aabbccddeeff",
+        .raw_path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
     });
 }
 
@@ -1202,7 +1320,7 @@ test "authenticated query preserves full 96 KiB Result inside HTTP metadata fram
     const event = try testRequestEvent(.{
         .method = .GET,
         .token = token,
-        .raw_path = "/00112233-4455-6677-8899-aabbccddeeff",
+        .raw_path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
     });
     defer std.testing.allocator.free(event);
     var stored = testOperation("lambda-test-user", .completed);
@@ -1235,7 +1353,11 @@ pub const test_support = if (@import("builtin").is_test) struct {
         var environment = try testEnvironment(0x72);
         defer environment.deinit();
         var uuid: [operation.uuid_string_size]u8 = undefined;
-        const path = try std.fmt.allocPrint(allocator, "/{s}", .{operation.uuidToString(id, &uuid)});
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "/operations/{s}",
+            .{operation.uuidToString(id, &uuid)},
+        );
         defer allocator.free(path);
         const event = try testRequestEvent(.{ .method = .GET, .token = token, .raw_path = path });
         defer std.testing.allocator.free(event);
@@ -1251,7 +1373,11 @@ pub const test_support = if (@import("builtin").is_test) struct {
         var environment = try testEnvironment(0x72);
         defer environment.deinit();
         var uuid: [operation.uuid_string_size]u8 = undefined;
-        const path = try std.fmt.allocPrint(allocator, "/{s}", .{operation.uuidToString(stored.id, &uuid)});
+        const path = try std.fmt.allocPrint(
+            allocator,
+            "/operations/{s}",
+            .{operation.uuidToString(stored.id, &uuid)},
+        );
         defer allocator.free(path);
         const event = try testRequestEvent(.{ .method = .GET, .token = token, .raw_path = path });
         defer std.testing.allocator.free(event);
@@ -1271,8 +1397,33 @@ test "runtime integration: warm query preserves cache and refreshes invocation m
         .now = std.Io.Clock.real.now(std.testing.io).toSeconds(),
         .ttl_seconds = 300,
     });
-    const event = try testQueryRequestEvent(token);
-    defer std.testing.allocator.free(event);
+    const event = try http_test.aws_event(allocator, .{
+        .method = .GET,
+        .route = "GET /operations/{id}",
+        .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
+        .token = token,
+        .body = "!",
+        .base64 = true,
+    });
+    const function_url_event = try testQueryRequestEvent(token);
+    defer std.testing.allocator.free(function_url_event);
+    const foreign_token = try lambda_auth.testing.issue_token(allocator, .{
+        .seed_byte = 0x71,
+        .subject = "foreign-tenant",
+        .now = std.Io.Clock.real.now(std.testing.io).toSeconds(),
+        .ttl_seconds = 300,
+    });
+    const foreign = try http_test.aws_event(allocator, .{
+        .method = .GET,
+        .route = "GET /operations/{id}",
+        .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
+        .token = foreign_token,
+    });
+    const unauthorized = try http_test.aws_event(allocator, .{
+        .method = .GET,
+        .route = "GET /operations/{id}",
+        .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
+    });
     try fixture.init(&.{
         .{
             .request_id = "query-1",
@@ -1284,7 +1435,7 @@ test "runtime integration: warm query preserves cache and refreshes invocation m
         },
         .{
             .request_id = "query-2",
-            .payload = event,
+            .payload = function_url_event,
             .invocation_id = "",
             .xray_trace = "trace-2",
             .invoked_arn = "function-2",
@@ -1298,6 +1449,10 @@ test "runtime integration: warm query preserves cache and refreshes invocation m
             .invoked_arn = "function-3",
             .deadline_ms = 1003,
         },
+        .{ .request_id = "query-unauthorized", .payload = unauthorized },
+        .{ .request_id = "query-foreign", .payload = foreign },
+        .{ .request_id = "query-malformed", .payload = "{" },
+        .{ .request_id = "query-recovered", .payload = event },
     });
     try lambda_auth.testing.put_public_key(&fixture.tester.env_map, 0x71);
     var cache: OperationCache = undefined;
@@ -1328,5 +1483,52 @@ test "runtime integration: warm query preserves cache and refreshes invocation m
             output.object.get("id").?.string,
         );
         try fixture.tester.expectBody(index, (try fixture.tester.post(0)).body);
+    }
+    for ([_]u16{ 401, 404, 500, 200 }, 3..) |status, index| {
+        const envelope = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            (try fixture.tester.post(index)).body,
+            .{},
+        );
+        defer envelope.deinit();
+        try std.testing.expectEqual(
+            @as(i64, status),
+            envelope.value.object.get("statusCode").?.integer,
+        );
+    }
+}
+
+test "named HTTP API and Function URL queries ignore encoded bodies and metadata ID fallbacks" {
+    const allocator = std.testing.allocator;
+    const token = try testToken(0x72);
+    defer allocator.free(token);
+    var environment = try testEnvironment(0x72);
+    defer environment.deinit();
+    for ([_]?[]const u8{ "GET /operations/{id}", null }) |route| {
+        for ([_][]const u8{
+            "/operations/00112233-4455-6677-8899-AABBCCDDEEFF", "/operations/missing",
+        }) |path| {
+            const event = try http_test.aws_event(allocator, .{
+                .method = .GET,
+                .route = route,
+                .path = path,
+                .token = token,
+                .body = "!malformed-base64",
+                .base64 = true,
+            });
+            defer allocator.free(event);
+            var fake: FakeQuery = .{ .response = testOperation("lambda-test-user", .submitted) };
+            const response = handleInvocationForTest(allocator, event, &environment, &fake, 1000);
+            defer allocator.free(response);
+            const outer = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+            defer outer.deinit();
+            const valid = std.mem.endsWith(u8, path, "AABBCCDDEEFF");
+            try std.testing.expectEqual(
+                @as(i64, if (valid) 200 else 400),
+                outer.value.object.get("statusCode").?.integer,
+            );
+            try std.testing.expectEqual(@as(u8, if (valid) 1 else 0), fake.read_count);
+        }
     }
 }

@@ -141,12 +141,24 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zig-paseto", .module = lambda_paseto_implementation },
         },
     });
+    const lambda_http = b.createModule(.{
+        .target = lambda_target,
+        .root_source_file = b.path("src/http.zig"),
+    });
+    const lambda_aws_http = b.createModule(.{
+        .target = lambda_target,
+        .root_source_file = b.path("src/aws_http.zig"),
+        .imports = &.{
+            .{ .name = "http", .module = lambda_http },
+            .{ .name = "aws-lambda", .module = lambda_runtime },
+        },
+    });
     const lambda_auth = b.createModule(.{
         .target = lambda_target,
         .optimize = optimize,
         .root_source_file = b.path("src/lambda_auth.zig"),
         .imports = &.{
-            .{ .name = "aws-lambda", .module = lambda_runtime },
+            .{ .name = "http", .module = lambda_http },
             .{ .name = "paseto", .module = lambda_paseto },
         },
     });
@@ -233,6 +245,8 @@ pub fn build(b: *std.Build) void {
         .strip = true,
         .single_threaded = true,
         .imports = &.{
+            .{ .name = "http", .module = lambda_http },
+            .{ .name = "aws_http", .module = lambda_aws_http },
             .{ .name = "aws", .module = lambda_aws },
             .{ .name = "aws-lambda", .module = lambda_runtime },
             .{ .name = "lambda_auth", .module = lambda_auth },
@@ -260,6 +274,8 @@ pub fn build(b: *std.Build) void {
         .strip = true,
         .single_threaded = true,
         .imports = &.{
+            .{ .name = "http", .module = lambda_http },
+            .{ .name = "aws_http", .module = lambda_aws_http },
             .{ .name = "aws", .module = lambda_aws },
             .{ .name = "aws-lambda", .module = lambda_runtime },
             .{ .name = "lambda_auth", .module = lambda_auth },
@@ -602,12 +618,24 @@ pub fn build(b: *std.Build) void {
     while (runtime_imports.next()) |entry| {
         test_runtime.addImport(entry.key_ptr.*, entry.value_ptr.*);
     }
+    const host_http = b.createModule(.{
+        .target = b.graph.host,
+        .root_source_file = b.path("src/http.zig"),
+    });
+    const host_aws_http = b.createModule(.{
+        .target = b.graph.host,
+        .root_source_file = b.path("src/aws_http.zig"),
+        .imports = &.{
+            .{ .name = "http", .module = host_http },
+            .{ .name = "aws-lambda", .module = test_runtime },
+        },
+    });
     const host_lambda_auth = b.createModule(.{
         .target = b.graph.host,
         .optimize = .debug,
         .root_source_file = b.path("src/lambda_auth.zig"),
         .imports = &.{
-            .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "http", .module = host_http },
             .{ .name = "paseto", .module = host_paseto },
         },
     });
@@ -661,11 +689,19 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(queue_cli_exe);
 
+    const http_test_support = b.createModule(.{
+        .target = b.graph.host,
+        .root_source_file = b.path("src/http_test_support.zig"),
+        .imports = &.{.{ .name = "http", .module = host_http }},
+    });
     const lambda_test_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .debug,
         .root_source_file = b.path("src/intake_lambda.zig"),
         .imports = &.{
+            .{ .name = "http_test_support", .module = http_test_support },
+            .{ .name = "http", .module = host_http },
+            .{ .name = "aws_http", .module = host_aws_http },
             .{ .name = "aws", .module = host_aws },
             .{ .name = "aws-lambda", .module = test_runtime },
             .{ .name = "lambda_auth", .module = host_lambda_auth },
@@ -686,6 +722,9 @@ pub fn build(b: *std.Build) void {
         .optimize = .debug,
         .root_source_file = b.path("src/query_lambda.zig"),
         .imports = &.{
+            .{ .name = "http_test_support", .module = http_test_support },
+            .{ .name = "http", .module = host_http },
+            .{ .name = "aws_http", .module = host_aws_http },
             .{ .name = "aws", .module = host_aws },
             .{ .name = "aws-lambda", .module = test_runtime },
             .{ .name = "lambda_auth", .module = host_lambda_auth },
@@ -970,43 +1009,6 @@ pub fn build(b: *std.Build) void {
     );
     tigerbeetle_linux_step.dependOn(&tigerbeetle_linux_output.step);
 
-    const wireguard_discovery_test = b.addSystemCommand(&.{"bash"});
-    wireguard_discovery_test.addFileArg(
-        b.path("tests/deploy_wireguard_discovery_test.sh"),
-    );
-
-    const cleanup_lifecycle_test = b.addSystemCommand(&.{"bash"});
-    cleanup_lifecycle_test.addFileArg(
-        b.path("tests/deploy_cleanup_lifecycle_test.sh"),
-    );
-    const gateway_interface_test = b.addSystemCommand(&.{"bash"});
-    gateway_interface_test.addFileArg(
-        b.path("tests/deploy_gateway_interface_test.sh"),
-    );
-    const packaging_test = b.addSystemCommand(&.{"bash"});
-    packaging_test.addFileArg(b.path("tests/deploy_packaging_test.sh"));
-
-    const processor_interface_test = b.addSystemCommand(&.{"bash"});
-    processor_interface_test.addFileArg(b.path("tests/processor_interface_test.sh"));
-
-    const seat_scenarios_test = b.addSystemCommand(&.{"bash"});
-    seat_scenarios_test.addFileArg(b.path("tests/seat_scenarios_test.sh"));
-
-    const events_wrapper_test = b.addSystemCommand(&.{"bash"});
-    events_wrapper_test.addFileArg(b.path("tests/events_wrapper_test.sh"));
-
-    const deploy_test_step = b.step(
-        "test-deploy",
-        "Run deployment helper regression tests",
-    );
-    deploy_test_step.dependOn(&wireguard_discovery_test.step);
-    deploy_test_step.dependOn(&cleanup_lifecycle_test.step);
-    deploy_test_step.dependOn(&gateway_interface_test.step);
-    deploy_test_step.dependOn(&packaging_test.step);
-    deploy_test_step.dependOn(&processor_interface_test.step);
-    deploy_test_step.dependOn(&seat_scenarios_test.step);
-    deploy_test_step.dependOn(&events_wrapper_test.step);
-
     const lambda_outcome_log = b.createModule(.{
         .target = lambda_target,
         .optimize = optimize,
@@ -1118,7 +1120,14 @@ pub fn build(b: *std.Build) void {
 
     const log_tests = b.addTest(.{ .root_module = host_outcome_log });
     const run_log_tests = b.addRunArtifact(log_tests);
-    const test_step = b.step("test", "Run unit and integration tests");
+    const http_test_step = b.step(
+        "test-http",
+        "Run HTTP handler, adapter, and authentication tests",
+    );
+    http_test_step.dependOn(&run_lambda_tests.step);
+    http_test_step.dependOn(&run_query_tests.step);
+    http_test_step.dependOn(&run_lambda_auth_tests.step);
+    const test_step = b.step("test", "Run offline Zig unit and integration tests");
     test_step.dependOn(&run_log_tests.step);
     test_step.dependOn(&run_seat_reservation_tests.step);
     test_step.dependOn(&run_seat_processor_tests.step);
@@ -1140,9 +1149,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_persistence_cli_tests.step);
     test_step.dependOn(&run_queue_cli_tests.step);
     test_step.dependOn(&run_tigerbeetle_tests.step);
-    test_step.dependOn(deploy_test_step);
-
-    const check_step = b.step("check", "Run offline and loopback runtime tests");
+    const check_step = b.step("check", "Run offline and loopback runtime Zig tests");
     check_step.dependOn(test_step);
     check_step.dependOn(runtime_test_step);
 }

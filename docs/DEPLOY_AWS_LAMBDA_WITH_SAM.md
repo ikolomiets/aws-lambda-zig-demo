@@ -3,8 +3,12 @@
 This guide documents how to deploy the six Zig Lambda packages in this repository
 using AWS SAM and `template.yaml`.
 
+The [Operations API Gateway specification](API_GATEWAY.md) owns the current HTTP
+and integration contract. This guide owns deployment values, infrastructure
+updates, operational commands, and cleanup.
+
 SAM deploys all six Lambda functions as one CloudFormation-managed stack. It creates
-their execution roles, public Function URLs for intake and query, the DynamoDB
+their execution roles, one public HTTP API for intake and query, the DynamoDB
 operations table, the TigerBeetle queue sent by intake and consumed by the TigerBeetle processor,
 and the Completion queue sent by the TigerBeetle processor and consumed by the Completion processor.
 It also creates seat submission/completion queues, durable Events and an owned or
@@ -32,7 +36,8 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 - [Stack resources](#4-understand-what-the-template-creates) · [Deployment values](#5-preserve-the-intake-function-name-and-choose-deployment-values)
 - [Full deployment](#6-deploy-with-sam-guided-mode) · [Development code updates](#development-code-updates) · [Rebuild and redeploy](#12-update-the-deployed-lambda-code)
 - [Gateway operation](#7-configure-and-operate-the-wireguard-gateway) · [Gateway diagnostics](#diagnose-failures) · [Key rotation](#rotate-wireguard-keys)
-- [API checks](#8-test-query-get-and-intake-post) · [Lambda logs](#9-download-lambda-logs)
+- [API checks](#8-test-query-get-and-intake-post) · [API access logs](#inspect-api-access-logs) · [Lambda logs](#9-download-lambda-logs)
+- [Custom API domain and Cloudflare DNS](#custom-api-domain-and-cloudflare-dns)
 - [Operation persistence utility](#10-create-read-update-and-delete-persisted-operations) · [Seat Event utility](#seat-event-metadata-utility) · [Ledger counter utility](#global-ledger-counter-utility) · [Queue utility](#11-send-receive-and-check-queued-operations)
 - [Persistence configuration diagnostics](#troubleshoot-persistence-command-configuration) · [Lambda initialization diagnostics](#troubleshoot-lambda-initialization)
 - [Stack deletion](#13-delete-the-sam-stack) · [Security note](#security-note)
@@ -43,13 +48,15 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 - `unzip` and `file` are installed for package validation. Zig creates the ZIPs.
 - `jq` 1.6 or newer is installed for deployment guards, `lambda_logs.sh`, deployed seat scenarios, and shell regression tests.
 - Bash 3.2 or newer and curl are installed when running deployed seat scenarios.
+- Git is installed for AWS privacy checks and their regression tests.
+  Shell regression tests use Bash and `jq`.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
 - The six archives under `zig-out/packages/` listed in
   [the packaging procedure](#2-build-and-package-the-zig-lambdas) each contain
   one Linux ARM64 executable named `bootstrap`.
-- Both Lambda Function URLs are intentionally public for authenticated demo testing.
+- The Operation HTTP API is intentionally public for authenticated demo testing.
 - The fixed physical name `TigerBeetleQueue` permits only one such queue per AWS
   account and region; deploy only one stack using this template in that scope.
 - `LAMBDA_PRINCIPAL` defaults to `'*'` unless you override the
@@ -137,38 +144,27 @@ The build resolves the Zig 0.17-compatible Lambda runtime pinned in
 [hostname scheduling reproducer](ZIG_0_16_HOSTNAME_CONNECT_STALL.md#standalone-deterministic-reproducer)
 documents the low-worker scheduling defect, the patch, and current checks.
 
-Check Zig and shell formatting/syntax before the test graph:
+After [provisioning the pinned packages](agents/local-checks.md#host-and-package-prerequisites),
+run the repository check gate separately before deployment. It checks Zig
+formatting and shell syntax, then runs the offline Zig tests and all eleven
+Lambda runtime integration tests:
 
 ```sh
-zig build fmt-check
-for script in deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh; do
-  bash -n "$script" || exit
-done
+./check.sh
 ```
 
-Run the shared check gate before packaging. It includes the offline Zig and
-mocked deployment-helper tests plus all eleven Lambda runtime integration cases:
+To run the complete socket-free offline gate, use:
 
 ```sh
-zig build check --summary all
+./check.sh --offline
 ```
 
-To run only the socket-free offline suite, use:
-
-```sh
-zig build test
-```
-
-To run only the deployment-helper regression tests, use:
-
-```sh
-zig build test-deploy
-```
-
+When changing existing shell scripts, select and run the applicable direct Bash
+commands from the [shell regression table](agents/local-checks.md#shell-regression-checks).
 The deployment-helper tests mock AWS commands, so they require Bash and `jq`,
-with no AWS credentials or network access. The `check` target depends on `test`
-and `test-runtime`, reusing their runners and including the deployment-helper
-tests exactly once.
+with no AWS credentials or network access. Shell regression suites execute only
+when selected, outside the Zig build graph, `check.sh`, and CI. The Zig `check`
+target depends on the offline `test` and loopback `test-runtime` aggregates.
 
 To run only the Lambda runtime integration suite, use:
 
@@ -178,10 +174,11 @@ zig build test-runtime --summary all
 
 The suite exercises all six handlers through a fake Runtime API on `127.0.0.1`
 with external effects mocked. It requires loopback socket access, with no AWS
-credentials or live TigerBeetle replica. The combined `check` target therefore
-requires loopback access too. Both full and development deployments, including
-dry runs, run `check` before packaging and stop if it fails. Formatting remains
-separate; ordinary builds and `package` do not run tests automatically.
+credentials or live TigerBeetle replica. The combined `check` target and default
+`./check.sh` gate therefore require loopback access too. Both full and development
+deployments, including dry runs, build and validate packages without running the
+repository gate. Run `./check.sh` explicitly or rely on the CI gate before deploying.
+Ordinary builds and `package` do not run tests automatically.
 
 Build and package the stripped Lambda executables in `safe` mode for AWS Lambda
 ARM64. ARM64 is also the project build default; `-Darch=arm` keeps the deployment
@@ -317,15 +314,16 @@ Both commands should report that `template.yaml` is valid.
 - `TigerBeetleQueue`: `AWS::SQS::Queue`
 - `CompletionQueue`: `AWS::SQS::Queue`
 - `IntakeFunction`: `AWS::Serverless::Function`
-- `IntakeFunctionUrl`: `AWS::Lambda::Url`
-- `FunctionUrlInvokeFunctionUrlPermission`: allows `lambda:InvokeFunctionUrl`
-- `FunctionUrlInvokeFunctionPermission`: allows `lambda:InvokeFunction` only
-  through the Function URL
 - `QueryFunction`: `AWS::Serverless::Function`
-- `QueryFunctionUrl`: `AWS::Lambda::Url`
-- `QueryFunctionUrlInvokeFunctionUrlPermission`: allows `lambda:InvokeFunctionUrl`
-- `QueryFunctionUrlInvokeFunctionPermission`: allows `lambda:InvokeFunction` only
-  through the query Function URL
+- `OperationsApi`: `AWS::Serverless::HttpApi` and its generated `$default` stage
+- `OperationsApiAccessLogGroup`: `AWS::Logs::LogGroup` with seven-day retention,
+  deleted on stack deletion or replacement
+- `OperationsApiAccessLogPolicy`: stack-owned `AWS::Logs::ResourcePolicy` allowing
+  `delivery.logs.amazonaws.com` to create streams and write events only in that
+  access-log group, conditioned on the stack's account and Region
+- `IntakeApiPermission` and `QueryApiPermission`: `lambda:InvokeFunction` grants
+  to `apigateway.amazonaws.com`, restricted to this API's default stage and the
+  intended POST or GET route, within the stack's account
 - `TigerBeetleProcessor`: `AWS::Serverless::Function`
 - `TigerBeetleProcessorRole`: `AWS::IAM::Role`
 - `TigerBeetleProcessorQueueMapping`: `AWS::Lambda::EventSourceMapping`
@@ -700,21 +698,35 @@ at `expires_at` but may remain readable until DynamoDB removes it.
 CloudFormation configures TTL, so the Lambda role does not need an additional
 DynamoDB control-plane permission.
 
-The Function URLs use `AuthType: NONE` and buffered invocation. CORS is not
-configured because the service targets non-browser HTTP clients. The handlers
-enforce the supported methods: intake allows only POST and query allows only
-`GET /<uuid>`. Their public permissions use the existing intake logical IDs and new
-query-specific logical IDs.
+The Operation HTTP API uses Lambda proxy payload format 2.0 and the AWS-generated
+HTTPS hostname. Its `$default` stage adds no stage prefix. Exactly `POST /operations`
+and `GET /operations/{id}` invoke the separate Intake and Query functions. There
+is no catch-all route, stack-owned custom domain, version prefix, or CORS configuration.
+Unsupported public methods and paths receive native gateway `404` responses without
+invoking a handler; gateway errors keep their own body formats. Direct handler
+invocations retain their existing method checks and `Allow` headers.
 
-```yaml
-AuthType: NONE
-InvokeMode: BUFFERED
-```
-
-`AuthType: NONE` and `Principal: "*"` make the Function URL public.
-
-`LambdaPrincipal` configures only the `LAMBDA_PRINCIPAL` environment variable
-inside the function. It does not change the Function URL resource permissions.
+`OperationsApiUrl` is the common HTTPS origin. No public Function URL resources,
+public URL grants, or former endpoint output aliases are declared. The API and its
+invocation grants are stack-owned and are deleted through normal stack cleanup.
+The default stage applies separate configurable rate and burst targets to each
+named route; polling initially has a larger allowance than submission. All callers
+share each route's allowance. These are best-effort targets subject to account/Region
+constraints, not tenant quotas, a hard cost limit, or a guarantee of downstream
+processor capacity. No separate aggregate API-wide quota is configured. See
+[route throttle configuration](#route-throttle-configuration) for defaults and overrides.
+The stage writes structured JSON access logs to `OperationsApiAccessLogGroup`.
+The delivery policy exists before the API and stage are created and is deleted
+with the stack. It uses one CloudWatch Logs resource-policy slot in the account
+and Region. The deployment identity needs log-group/retention and resource-policy
+lifecycle permissions, plus the
+[HTTP API log-delivery setup permissions](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-logging.html#http-api-logging-permissions).
+The service delivery grant covers only this group's streams; Lambda execution
+roles receive no additional permissions. See [API access logs](#inspect-api-access-logs)
+for discovery and the selected fields. Existing function
+names, memory, timeouts, runtime, execution policies, and thread settings are preserved.
+`LambdaPrincipal` configures only the `LAMBDA_PRINCIPAL` environment variable; it
+does not change gateway invocation permissions or authenticate HTTP callers.
 
 `PasetoPublicKey` is a required parameter that configures the
 `PASETO_PUBLIC_KEY` used by the handler to verify PASETO v4.public bearer
@@ -801,6 +813,47 @@ The optional gateway parameters are:
 | `WireGuardWorkstationPublicKey` | Padded Base64 public key matching the workstation private key. |
 | `WireGuardAmiId` | Concrete pinned ARM64 AMI ID; required when enabled, otherwise defaults to empty. |
 | `WireGuardInstanceType` | ARM64 gateway instance type; defaults to `t4g.nano`. |
+
+### Route throttle configuration
+
+Full deployment configures the following settings on the `$default` stage:
+
+| Route | SAM rate parameter (requests/second) | Default | SAM burst parameter | Default |
+| --- | --- | ---: | --- | ---: |
+| `POST /operations` | `SubmissionThrottlingRateLimit` | 10 | `SubmissionThrottlingBurstLimit` | 20 |
+| `GET /operations/{id}` | `QueryThrottlingRateLimit` | 50 | `QueryThrottlingBurstLimit` | 100 |
+
+`deploy.sh` accepts `SUBMISSION_THROTTLING_RATE_LIMIT`,
+`SUBMISSION_THROTTLING_BURST_LIMIT`, `QUERY_THROTTLING_RATE_LIMIT`, and
+`QUERY_THROTTLING_BURST_LIMIT` environment overrides. Explicit command-line options
+take precedence over those values. Rates accept nonnegative decimal numbers;
+burst capacities require nonnegative integers. An explicitly empty value is rejected.
+The helper passes all four settings on every full deployment, using the table's
+defaults when unset; it does not inherit throttle values saved in `samconfig.toml`
+or read previous stack throttle values. Repeat custom values in the environment or
+options on later full deployments to retain them.
+
+For example, with deployment credentials and PASETO keys configured as above:
+
+```sh
+./deploy.sh --profile dev --region ca-central-1 --stack-name aws-lambda-zig-demo \
+  --submission-throttling-rate-limit 12.5 --submission-throttling-burst-limit 25 \
+  --query-throttling-rate-limit 60 --query-throttling-burst-limit 120
+```
+
+For direct SAM deployment, supply these same four SAM parameter names through
+`sam deploy --guided` or add them to the existing `--parameter-overrides` list;
+SAM can save them in local `samconfig.toml` for later direct SAM deployments.
+Keep all other required parameters when supplying that list. Throttle changes
+require a full stack update. `--dev` syncs function code only, ignores throttle
+environment values, and rejects explicit throttle options. `--cleanup` also
+rejects those options. Changing throttles does not change processor concurrency.
+
+[AWS documents route throttles](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-throttling.html)
+as best-effort targets with account/Region constraints. Local template and mocked
+helper tests establish the declared settings and parameter propagation, not
+deployed enforcement. Traffic validation requires separate authorization and a
+bounded experiment; the configured rate is not an exact rejection threshold.
 
 ### Pin the gateway image
 
@@ -1125,6 +1178,10 @@ Stack Name: aws-lambda-zig-demo
 AWS Region: ca-central-1
 Parameter IntakeFunctionName: <existing-physical-name-or-intake-lambda>
 Parameter QueryFunctionName: query-lambda
+Parameter SubmissionThrottlingRateLimit: 10
+Parameter SubmissionThrottlingBurstLimit: 20
+Parameter QueryThrottlingRateLimit: 50
+Parameter QueryThrottlingBurstLimit: 100
 Parameter TigerBeetleProcessorName: tiger-beetle-processor
 Parameter TigerBeetleCompletionProcessorName: tiger-beetle-completion-processor
 Parameter LambdaPrincipal: *
@@ -1419,13 +1476,14 @@ preflight is deferred.
 `deploy.sh` reads the required `PASETO_PUBLIC_KEY` from the host environment and
 passes it as the `PasetoPublicKey` SAM parameter. When post-deploy checks are
 enabled, it also requires the corresponding `PASETO_PRIVATE_KEY` to issue a
-short-lived test token. It verifies unauthenticated HTTP 401 for both URLs,
-an authenticated query of a valid UUID with a unique test subject returns a
-tenant-safe 404, authenticated wrong methods return 405, and an authenticated
-bodyless intake POST returns 400. The private key and test token are not printed
-or passed to the Lambda environment. Use
+short-lived test token. It probes matching submission and query routes for
+unauthenticated HTTP 401, an authenticated query of a valid UUID with a unique
+subject for tenant-safe 404, and authenticated bodyless or invalid submissions
+for 400. Wrong methods, the API root, and unmatched paths must return native
+gateway 404. The root is not an authentication probe. The private key and test
+token are not printed or passed to the Lambda environment. Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run` to run the
-local checks, rebuild all six Lambda zip archives, and validate `template.yaml` without
+deployment-input checks, rebuild all six Lambda zip archives, and validate `template.yaml` without
 deploying to AWS.
 
 For non-dry-run deployments, the helper clears inherited static AWS credential
@@ -1479,20 +1537,20 @@ resolve its physical URL when needed instead of recording it.
 After a successful enablement, the setup script resolves and validates the
 gateway endpoint, gateway public key, workstation address, and deployed Lambda
 subnet CIDR. It then prints the conditional network outputs and a delimited,
-copy-ready peer configuration before the intake and query Function URL checks.
+copy-ready peer configuration before the Operation API route checks.
 
 Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run --use-local-libs`
 to build with Zig 0.17-compatible local dependency checkouts. The `aws_lambda` checkout defaults
 to `../aws-lambda-zig`; override it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
 
-Both deployment modes run `zig build fmt-check` with their selected local and
-global caches and any `--use-local-libs` package forks. This target checks build
-files, Zig sources, and tests before the remaining test/build steps.
-They then run `zig build check --summary all` once with the same cache and fork
-settings, followed by `package`. The combined gate includes both offline and
-loopback runtime tests. These checks also run during dry runs, and any check
-failure stops the script before packaging, validation, deployment, or sync.
+Both deployment modes run `zig build package` with their selected local and
+global caches and any `--use-local-libs` package forks. They validate deployment
+configuration, the compiler version, Linux ARM64 bootstraps, and all six ZIPs;
+full deployment also runs both SAM template validation passes. These checks also
+run during dry runs, and a failure stops deployment or sync. Formatting, shell
+syntax, offline Zig tests, and loopback runtime tests belong to the
+separate `./check.sh` gate and CI.
 
 ### Durable-data guards and first-time counter setup
 
@@ -1560,10 +1618,20 @@ connectivity, or delivery evidence.
 ### Development code updates
 
 Use `./deploy.sh --dev` for compatible code changes on an existing development
-stack. Establish the six-function baseline with a full deployment first; a
+stack. Introducing the Operation HTTP API requires a full stack update; code-only
+sync does not create routes or replace public invocation infrastructure. The full
+update removes the former public Function URLs and grants and creates the API,
+route-scoped grants, and `OperationsApiUrl` together. There is no manual URL teardown
+or compatibility period. Use separate stacks for separate deployments; the default
+API stage is unrelated to development code-update mode.
+Changing route rate or burst parameters also requires full deployment; a code-only
+sync does not apply gateway configuration.
+Adding or changing access-log resources, delivery permissions, retention, or the
+stage log format also requires a full stack update.
+Establish the six-function baseline with a full deployment first; a
 four-function stack cannot use seat development sync. The helper requires both
-seat function-name outputs before building or syncing. Both modes run the same
-offline and runtime test gate. Plain `./deploy.sh` also runs both SAM validation
+seat function-name outputs before building or syncing. Run `./check.sh` separately
+before deployment for the repository test gate. Plain `./deploy.sh` also runs both SAM validation
 passes, controller/WireGuard flow, outputs, smoke checks, and deletion of `.zig-cache-deploy` and
 `.zig-global-cache-deploy` on exit.
 
@@ -1580,14 +1648,13 @@ successful and failed runs; ordinary deployment does not delete these caches.
 Both deployment modes select the local cache with `--cache-dir` and the global
 cache with `ZIG_GLOBAL_CACHE_DIR` for every Zig build command. Zig 0.17 does not
 accept `--global-cache-dir` for `zig build`.
-Development mode checks for Zig 0.17.x, runs `fmt-check` followed by `check`
-(offline tests and the loopback runtime suite), and incrementally builds the same
+Development mode checks for Zig 0.17.x and incrementally builds the same
 ARM64 targets in `safe` mode and host tools through `zig build package`, using the
 selected caches and any Zig 0.17-compatible package forks. It refreshes all six
 prebuilt ZIPs under `zig-out/packages/` and verifies stripped ARM64
-bootstraps and root-level archive contents. Development mode now runs offline tests
-too, while still skipping both SAM validation passes. Check, build, package, and
-sync failures fail the run.
+bootstraps and root-level archive contents. Both SAM validation passes are skipped.
+Build, package-validation, and sync failures fail the run. Repository tests run
+separately through `./check.sh`.
 
 After SSO login and the active-stack guard, the helper runs one-shot
 `sam sync --code --no-watch --no-dependency-layer` against `template.yaml`, using
@@ -1598,11 +1665,10 @@ prebuilt ZIPs, unchanged-code detection, upload, and update waiting. SAM may ask
 for its development-stack opt-in on first use; selecting `--dev` automatically
 answers that confirmation with a single `Y`. The warning remains visible, and
 any further prompt receives EOF. The helper then retains the
-existing read-only table/queue summaries, Function URL outputs, and HTTP probes;
+existing read-only table/queue summaries, `OperationsApiUrl`, and HTTP probes;
 `--no-url-check` skips those HTTP probes and the private-key requirement.
 The public key is not required in development mode because the deployed
-configuration supplies it. Run `zig build test` separately for the full local
-release gates. The mode has no measured speed guarantee.
+configuration supplies it. The mode has no measured speed guarantee.
 
 Development sync never invokes the separately authorized
 [deployed seat scenarios](#seat-workflow-evidence-and-deployed-scenarios).
@@ -1631,10 +1697,9 @@ After deployment, SAM prints stack outputs. Look for:
 ```text
 IntakeFunctionName
 IntakeFunctionArn
-IntakeFunctionUrl
+OperationsApiUrl
 QueryFunctionName
 QueryFunctionArn
-QueryFunctionUrl
 TigerBeetleProcessorName
 TigerBeetleProcessorArn
 TigerBeetleCompletionProcessorName
@@ -1658,7 +1723,7 @@ You can also query it later with CloudFormation:
 ```sh
 aws cloudformation describe-stacks \
   --stack-name aws-lambda-zig-demo \
-  --query "Stacks[0].Outputs[?OutputKey=='QueryFunctionUrl'].OutputValue" \
+  --query "Stacks[0].Outputs[?OutputKey=='OperationsApiUrl'].OutputValue" \
   --output text \
   --profile dev \
   --region ca-central-1
@@ -1987,13 +2052,124 @@ the deployment. Once deployed, a queued valid Operation exercises a real
 TigerBeetle account request and transfer request, Completion queue publication,
 and the Completion processor's DynamoDB update.
 
-## 8. Test query GET and intake POST
+## Custom API domain and Cloudflare DNS
 
-Call both Function URLs returned by SAM.
+[api-domain.sh](../api-domain.sh) manages a Regional custom domain independently
+of SAM and `deploy.sh`. It requires Bash 3.2+, AWS CLI v2, `jq` and curl, an
+existing deployed `OperationsApi` HTTP API, and access to the domain's Cloudflare
+DNS zone. It makes no Cloudflare API calls. Run setup only when authorizing AWS
+resource changes:
 
 ```sh
-curl -i -L <IntakeFunctionUrl>
-curl -i -L <QueryFunctionUrl>
+./api-domain.sh setup api.example.com
+./api-domain.sh setup api.example.com --profile dev --region ca-central-1
+```
+
+The interface is `./api-domain.sh <setup|verify> <domain> [options]`: command and
+domain are positional, options follow the domain, and `--domain` is rejected.
+`--profile` and `--region` override `AWS_PROFILE` and `AWS_REGION`; absent these,
+AWS CLI defaults apply. There is no hardcoded profile or Region. The helper
+resolves the account and Region from the selected stack before managing domain
+resources. `--stack-name` defaults to `STACK_NAME` or `aws-lambda-zig-demo`,
+`--stage` defaults to literal `$default`, and `--mapping-key` defaults to the
+empty root mapping. Use `--help` for all options.
+
+Setup validates the API and existing stage before changes. It reuses a compatible
+Regional domain with `TLS_1_2`, API mappings only, and no mutual TLS; incompatible
+domains are rejected rather than replaced. An existing domain keeps its attached
+certificate; `--certificate-arn` must match it. For a new domain, setup reuses a
+unique matching public ACM certificate in the same account and Region, or
+requests a public RSA-2048 certificate with DNS validation. Multiple matches
+require `--certificate-arn`. Issued public imported or email-validated certificates
+can be reused, but their renewal process remains the operator's responsibility.
+
+For a pending certificate, setup prints ACM's exact validation CNAME records and
+exits `3`. In Cloudflare, add each record using the printed full **Name** and
+AWS-generated **Target**, **DNS only** (grey cloud), and **TTL Auto**. Avoid
+appending the zone name twice. If ACM has not yet returned the records, rerun
+shortly. Rerunning reuses the pending certificate; after validation succeeds,
+setup creates the domain and selected mapping. Domain provisioning can also
+return `3`; rerun after AWS reports it ready.
+
+Once AWS setup completes, add the printed traffic CNAME: the full custom hostname
+points to the AWS-generated Regional API Gateway domain, with **DNS only** and
+**TTL Auto**. Keep the separate ACM validation records permanently. DNS-validated
+ACM certificates renew automatically while in use and their validation records
+remain available. See [ACM DNS validation](https://docs.aws.amazon.com/acm/latest/userguide/dns-validation.html).
+Setup prints the resulting API URL and a verification command. Exit `0` from
+setup means AWS configuration completed; HTTPS still needs DNS propagation and
+verification.
+
+The HTTP API domain policy is **`TLS_1_2`**, accepting TLS 1.2 and TLS 1.3.
+Verification uses curl's TLS 1.2 minimum without an upper-version cap. API mappings
+strip the selected prefix before route matching; the named public routes remain
+`POST /operations` and `GET /operations/{id}` within the API. See
+[HTTP API mappings](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-mappings.html).
+
+To change the selected mapping's destination, rerun setup with the desired stack
+and stage. Only that mapping is created or repointed; other mappings stay intact:
+
+```sh
+./api-domain.sh setup api.example.com --profile dev --region ca-central-1 \
+  --stack-name aws-lambda-zig-demo --stage staging --mapping-key staging
+./api-domain.sh verify api.example.com --profile dev --region ca-central-1 \
+  --stack-name aws-lambda-zig-demo --stage staging --mapping-key staging
+```
+
+This produces `https://api.example.com/staging`. The stage must already exist and
+have working Lambda invocation permissions. This template grants invocation only
+for `$default`; another stage requires separately managed deployment and Lambda
+permissions before use. The helper does not create stages or change IAM. The
+Events and scenario wrappers' `--api-url` option accepts a root origin only; use
+a root mapping with those tools.
+
+The certificate and custom domain are outside application-stack ownership. Stack
+replacement or deletion preserves them and their DNS records; rerun setup after
+replacing an API to repoint the selected mapping to the new API. The helper has
+no deletion command and does not alter `OperationsApiUrl` or the stack template.
+
+Setup needs `cloudformation:DescribeStackResource`, `apigateway:GET` for the API,
+stage, domain and mappings, and `acm:DescribeCertificate`. Certificate discovery
+also uses `acm:ListCertificates`, and requesting a certificate requires
+`acm:RequestCertificate`. Resource creation requires `apigateway:POST` for the
+custom domain and mapping; repointing a mapping requires `apigateway:PATCH` on
+the selected mapping. First-time Regional domain creation can require
+`iam:CreateServiceLinkedRole` for API Gateway's service-linked role. These are
+operator permissions; Lambda execution roles receive no additional permissions.
+Verification needs only the read permissions and public HTTPS connectivity.
+
+```sh
+./api-domain.sh verify api.example.com --profile dev --region ca-central-1
+```
+
+Verify checks the attached certificate, HTTP API, stage, selected mapping and
+competing mappings that shadow probe paths. `--certificate-arn` optionally asserts
+the attached certificate. Through public DNS, with certificate validation, no
+proxy, no redirect following and bounded connect/request timeouts, it requires:
+
+- Unauthenticated bodyless `POST /operations`: `401` and `WWW-Authenticate: Bearer`.
+- Unauthenticated `GET /operations/<uuid>`: `401` and the same challenge.
+- Unsupported `GET /operations`: `404`.
+
+The optional mapping prefix applies to all three probes. No bearer token or
+Operation body is sent. Verification performs no AWS mutations and creates no
+Operations; invocations can produce ordinary logs and metrics. It distinguishes
+DNS, TLS, timeout, mapping, redirect and unexpected-response failures. It does
+not verify authenticated submission, processor execution or asynchronous
+Completion. Use the [deployed seat scenarios](#seat-workflow-evidence-and-deployed-scenarios)
+for that separate evidence. All helper exit codes are: `0` completed setup or
+successful verification, `1` operational/verification failure, `2` invalid
+configuration, `3` pending certificate validation or AWS resource readiness.
+`bash tests/api_domain_test.sh` establishes reconciliation and probe behavior
+with external commands mocked, without live AWS or DNS validation.
+
+## 8. Test query GET and intake POST
+
+Call the matching routes at the common `OperationsApiUrl` returned by SAM.
+
+```sh
+curl -i -L -X POST <OperationsApiUrl>/operations
+curl -i -L <OperationsApiUrl>/operations/00112233-4455-6677-8899-aabbccddeeff
 ```
 
 An unauthenticated request is rejected by the handler:
@@ -2022,7 +2198,7 @@ curl -L \
   --data \
     '{"id":"00112233-4455-6677-8899-aabbccddeeff",'\
 '"name":"TigerBeetle","body":{"message":"hello","count":2}}' \
-  <IntakeFunctionUrl>
+  <OperationsApiUrl>/operations
 ```
 
 For a new ID, the handler persists `SUBMITTED`, attaches the body only to the queued
@@ -2047,19 +2223,46 @@ Read the Operation with the same token subject and UUID:
 ```sh
 curl -L \
   -H "Authorization: Bearer $token" \
-  <QueryFunctionUrl>/00112233-4455-6677-8899-aabbccddeeff
+  <OperationsApiUrl>/operations/00112233-4455-6677-8899-aabbccddeeff
 ```
 
 The query performs a strongly consistent read and returns the same compact
 bodyless Operation JSON shown above with `Content-Type: application/json`.
 `COMPLETED` Operations also include the complete tagged `result`; `SUBMITTED`
 Operations do not. The path
-must contain exactly one UUID segment. Query strings and GET bodies cannot
-supply or alter the ID. Missing and cross-tenant Operations both return the
+must be exactly `/operations/{id}` with one UUID after `/operations/`. Uppercase
+hexadecimal is accepted and normalized in output; extra path content is rejected.
+Query strings, GET bodies, and gateway metadata cannot supply or alter the ID.
+Missing and cross-tenant Operations both return the
 same static `404 Not Found` response. DynamoDB request or service failures
 return static HTTP 503; malformed items and other unexpected failures remain
 sanitized HTTP 500 responses. DynamoDB TTL remains asynchronous, so an item is
 readable while it is still stored even after `expires_at`.
+
+The shared AWS adapter accepts named HTTP API and Function URL payload 2.0 event
+shapes through the unchanged pinned Lambda runtime. Supporting Function URL events
+does not retain public Function URLs. Authentication and method checks precede
+body materialization and standard base64 decoding; Query never decodes a body.
+Malformed base64 returns `400` only after those checks, and missing bodies retain
+`400`. Allocation and internal errors remain sanitized `500` responses. JSON bytes
+are passed unchanged to Operation validation. Missing or differing Content-Type is
+accepted. The 4,096-byte bound applies to the serialized Operation Body fragment,
+including escaping and internal whitespace; the full envelope can be larger.
+Successful submissions and queries retain `200`, their existing JSON views, and
+matching retry, conflict, tenant authorization, and warm Query cache behavior.
+
+API Gateway can return native `429 Too Many Requests` responses before Lambda
+invocation. Their body format is independent of handler errors; callers must not
+require the application's error schema. After `429`, back off before retrying
+submission or polling, increasing the delay and adding jitter to avoid synchronized
+retry bursts. The repository adds no automatic retry policy or new SDK.
+
+After a submission times out, loses its response, or otherwise has an uncertain
+outcome, retry with the same Operation UUID, verified tenant, name, and original
+Body. Keep that input available and use the same UUID when polling; do not generate
+a new UUID for the retry. A matching submitted retry can republish work, so this
+does not provide exactly-once execution. Existing Events and seat tooling retain
+their current explicit UUID and retry behavior.
 
 The SQS message is compact `{operation_id,tenant,context,body}` JSON with no trailing newline.
 Intake supplies the verified PASETO subject as tenant, null Context, and the submitted Body, and
@@ -2148,12 +2351,12 @@ Events, and actual counter tables. `PASETO_TOKEN` supplies public handler
 authentication; no private key or token-issuance utility is required. Tokens must
 remain valid throughout the run. These operator reads do not certify the Lambda
 roles' permissions.
-Environment endpoint overrides are rejected, and AWS CLI configured endpoint
+AWS endpoint environment overrides are rejected, and AWS CLI configured endpoint
 overrides are disabled for discovery. Read utilities receive empty shared config
 and credentials files (`/dev/null`) with the exported credentials and explicit
 Region; a profile-level SDK endpoint override cannot redirect inspection.
 
-The runner discovers `IntakeFunctionUrl`, `QueryFunctionUrl`, `SeatEventsTableName`,
+The runner discovers `OperationsApiUrl`, `SeatEventsTableName`,
 `LedgerCounterTableName`, and `LedgerCounterId` from the selected stack's outputs.
 It discovers `OperationsTable` through its physical resource, since there is no
 Operations table-name output. The counter table output works for owned and
@@ -2162,6 +2365,22 @@ Every counter read passes `--counter-id` explicitly to the direct utility, so an
 inherited `LEDGER_COUNTER_ID` cannot redirect inspection. No native cluster-ID
 discovery participates. Utilities receive the discovered table names, resolved
 credentials and selected Region through their environment.
+
+To exercise an existing custom domain instead of the discovered
+`OperationsApiUrl`, select its HTTPS origin explicitly:
+
+```sh
+./seat_scenarios.sh --profile dev --region ca-central-1 \
+  --stack-name aws-lambda-zig-demo --api-url https://api.example.com
+```
+
+`--api-url` accepts an optional trailing slash, with no credentials, path prefix,
+query string, or fragment. The domain must already map to the selected stack's
+API and stage at the root. All public submission, polling, authentication, and
+tenant-isolation checks use that origin. Stack discovery and direct table/counter
+reads continue using the selected AWS context. Invalid origins fail before AWS
+calls or evidence-directory creation. The runner does not configure the domain
+or change the stack's `OperationsApiUrl` output.
 
 Each invocation generates six unique Operation UUIDs for the owner workflow.
 Creation's UUID is the new Event ID. The owner subject comes from the authenticated
@@ -2174,8 +2393,12 @@ the allocated ledger; counter reads bracket creation without assuming a gapless
 sequence or exclusive allocator use. Missing authentication must produce 401.
 
 Optionally export `PASETO_FOREIGN_TOKEN`, signed for a different subject, to enable
-cross-tenant checks and three additional Operations. Otherwise, these checks are
-skipped and the manifest records `tenant_isolation: "skipped"`. With the second
+cross-tenant checks and three additional Operations. Issuing another token for the
+owner's subject still authenticates the same tenant, even when the token strings
+differ. The runner obtains the second token's authenticated subject from its
+check-seats intake response and rejects matching subjects before asserting
+cross-tenant access is denied. When `PASETO_FOREIGN_TOKEN` is unset, these checks
+are skipped and the manifest records `tenant_isolation: "skipped"`. With the second
 token, the other tenant sees the owner's Operation as the same static 404 as a missing
 Operation, cannot reuse its UUID at intake (409), and receives exact
 `event_unavailable` Results for foreign check/reserve/confirm requests. The manifest
@@ -2196,7 +2419,7 @@ manifest records authenticated tenants, generated Operation IDs, tenant-isolatio
 coverage and `running`, `failed`, or `passed`; failures include stage, Operation
 UUID where applicable, and a sanitized
 reason. A stopped invocation may retain `running`. Raw service errors, stack outputs,
-table names, Function URLs, credentials, signing keys and bearer tokens are not
+table names, API origins, credentials, signing keys and bearer tokens are not
 captured. Do not redirect AWS discovery/debug output into fixtures or publish local
 deployment output. An unrun runner, mocked pass, or incomplete/failed manifest is
 **not a passing cloud result**. Record executed revision, time and covered paths
@@ -2316,6 +2539,71 @@ private operational data, so do not publish or commit copied log files. Logs
 created by earlier versions of the helper with `[event-id=...]` headers are
 unsupported; remove or rename the existing log before running the updated
 helper.
+
+### Inspect API access logs
+
+The API stage sends six fields to a separate stack-owned CloudWatch log group.
+All values are JSON strings, including status and millisecond timings, so absent
+integration data does not leave an unquoted value in the JSON format.
+
+| Field | Meaning |
+| --- | --- |
+| `request_id` | Gateway request ID (`$context.requestId`) |
+| `integration_request_id` | Integration endpoint request ID, when available (`$context.integration.requestId`) |
+| `route_key` | Configured method and route template (`$context.routeKey`), such as `GET /operations/{id}` |
+| `status` | HTTP response status (`$context.status`) |
+| `response_latency_ms` | Total gateway response latency (`$context.responseLatency`) |
+| `integration_latency_ms` | Integration latency, when available (`$context.integration.latency`) |
+
+These are the [HTTP API access-log variables](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-logging-variables.html).
+The format excludes credentials, request/response bodies, query strings, client
+IPs, raw caller paths, and additional identity or business fields. The configured
+route template does not expose the caller's Operation UUID. For unmatched routes,
+route metadata can be unavailable; the format does not fall back to the raw path.
+
+Discover the generated group name from the selected stack, using the existing
+profile and Region context. Run these read-only commands when inspecting a
+deployed stack:
+
+```sh
+STACK_NAME="${STACK_NAME:-aws-lambda-zig-demo}"
+ACCESS_LOG_GROUP="$(aws cloudformation describe-stack-resource \
+  --stack-name "$STACK_NAME" \
+  --logical-resource-id OperationsApiAccessLogGroup \
+  --query 'StackResourceDetail.PhysicalResourceId' --output text \
+  --profile "${AWS_PROFILE:-dev}" --region "${AWS_REGION:-ca-central-1}")"
+
+aws logs tail "$ACCESS_LOG_GROUP" --since 1h --format short \
+  --profile "${AWS_PROFILE:-dev}" --region "${AWS_REGION:-ca-central-1}"
+```
+
+The caller needs `cloudformation:DescribeStackResource` and log-reading permissions
+(`logs:DescribeLogStreams` and `logs:FilterLogEvents` for this example).
+Select that group and a time window in CloudWatch Logs Insights to inspect fields:
+
+```text
+fields @timestamp, request_id, integration_request_id, route_key, status,
+       response_latency_ms, integration_latency_ms
+| sort @timestamp desc
+| limit 100
+```
+
+When `integration_request_id` is available for a Lambda invocation, use it to
+look for the corresponding request in the routed Intake or Query function's
+logs. Runtime START/END/REPORT lines contain the Lambda request ID; structured
+Intake diagnostics also expose `lambda_request_id`. The gateway `request_id` is
+a separate identifier. Pre-integration rejections such as throttling or unmatched
+routes may have no integration ID or timing and no Lambda invocation. Treat
+unavailable values as missing; no exact placeholder representation is guaranteed.
+Service request IDs aid diagnosis and are not authorization evidence. These
+diagnostics do not promise universal correlation or a complete audit ledger.
+
+Records have seven-day retention. Normal stack cleanup deletes the access-log
+group and delivery policy, including the group's remaining records. Existing
+Lambda application-log configuration and retention are unchanged.
+Local configuration and rendered-format tests establish declared behavior and
+representative JSON validity. Actual AWS log delivery and retention behavior
+require separately authorized cloud validation; local checks do not prove receipt.
 
 ### Investigate structured outcomes
 
@@ -2442,7 +2730,7 @@ credentials, profile, Region and endpoint configuration. Authenticate the
 selected identity before table commands; it needs table-scoped `dynamodb:PutItem`
 and `dynamodb:GetItem`. Wrapper execution needs AWS CLI credential export;
 creation, reservations, confirmations and availability checks additionally need
-`cloudformation:DescribeStacks` to discover the Function URLs and a valid
+`cloudformation:DescribeStacks` to discover `OperationsApiUrl` and a valid
 `PASETO_TOKEN`. Wrapper reads need
 `cloudformation:DescribeStackResource` and `dynamodb:GetItem`. These are operator
 permissions; this utility adds no Lambda IAM or SAM resources.
@@ -2497,6 +2785,20 @@ AWS CLI. The wrapper exports resolved credentials using
 `aws configure export-credentials --format process`, supports credentials with
 or without a session token, and disables EC2 metadata discovery.
 
+For HTTP commands, `--api-url https://api.example.com` before the command selects
+an existing custom-domain HTTPS origin instead of discovering `OperationsApiUrl`.
+The option applies to creation, availability checks, reservations and confirmations,
+including all Operation polling. The origin accepts an optional trailing slash
+and no credentials, path prefix, query string, or fragment. It must already map
+to the selected stack's API and stage at the root. AWS credential/profile handling
+is unchanged; the wrapper does not configure DNS, certificates, or API mappings.
+The `read` command accesses DynamoDB directly and rejects `--api-url`.
+
+```sh
+./events.sh --profile dev --region ca-central-1 --api-url https://api.example.com \
+  check_seats --event-id 00000000-0000-0000-0000-000000000001
+```
+
 If credential export fails for a profile configured with `sso_session` or legacy
 `sso_start_url`, the wrapper runs
 [`aws sso login`](https://docs.aws.amazon.com/cli/latest/reference/sso/login.html)
@@ -2513,8 +2815,8 @@ distinct classes with positive u32 counts; tags follow the
 [public command contract](SEAT_RESERVATION.md#commands). `--timeout-seconds`
 defaults to 300 and accepts a positive u32 reservation timeout. `PASETO_TOKEN`
 authenticates a `SeatReservation` Operation containing `create_event` at the
-stack's `IntakeFunctionUrl`; the handler verifies the tenant, and processors
-allocate the ledger and native IDs. No host binary is required for creation.
+stack's `OperationsApiUrl` at `POST /operations`; the handler verifies the tenant,
+and processors allocate the ledger and native IDs. No host binary is required for creation.
 
 With AWS credentials and `PASETO_TOKEN` already exported:
 
@@ -2611,8 +2913,8 @@ independently of the Event UUID. The handler derives the tenant from the verifie
 token. The wrapper takes that tenant from the authenticated intake response and
 verifies it on subsequent query responses, without decoding token
 claims or sending a tenant override in the public Body. No host binary is
-required. Both `IntakeFunctionUrl` and `QueryFunctionUrl` are resolved before
-submission.
+required. `OperationsApiUrl` is resolved and validated as an HTTPS origin before
+submission; the wrapper constructs both routes from it.
 
 After submission, the wrapper immediately queries the new Operation and waits
 one second between subsequent reads while its state is `SUBMITTED`. It has no
@@ -2895,7 +3197,7 @@ returns a sanitized HTTP 503, leaving the row available for a matching retry.
 The query Lambda requires only `OPERATIONS_TABLE_NAME`; it has no queue
 configuration. A missing or invalid table-name setting exits during query INIT.
 A nonexistent table, missing `GetItem` permission, or DynamoDB service failure
-is discovered by the first authenticated `GET /<uuid>` and returns a sanitized
+is discovered by the first authenticated `GET /operations/{id}` and returns a sanitized
 HTTP 503. A malformed stored item returns a sanitized HTTP 500.
 
 The TigerBeetle processor requires `COMPLETION_QUEUE_URL`,
@@ -3019,8 +3321,9 @@ Explicit owned-resource teardown is a separate mode:
 
 **This permanently deletes owned data.** Cleanup removes all six SAM-managed
 functions and roles, Operations and Events, every counter in an owned counter
-table, all four queues and queued messages, Function URLs, permissions, and the
-remaining stack resources. It preserves a referenced counter table and every
+table, all four queues and queued messages, the HTTP API and stage, invocation
+permissions, the API access-log group and its remaining records, its delivery
+policy, and the remaining stack resources. It preserves a referenced counter table and every
 counter in that table, regardless of the selected counter ID.
 
 Cleanup accepts only stack/profile/Region selection. It rejects `--dev`,
@@ -3118,12 +3421,10 @@ rmdir '<private-key-directory>'
 
 ## Security note
 
-This demo intentionally creates two publicly reachable Lambda Function URLs,
-and both Function URL handlers require a valid PASETO bearer token. The
-TigerBeetle processor has no Function URL and is invoked from SQS. For production,
-consider combining application authentication with stricter infrastructure
-authorization, narrower IAM policies, or an API Gateway/CloudFront layer. The
-Completion processor also has no Function URL and is invoked from its SQS mapping.
+This demo exposes one public HTTP API with two routes whose handlers require a
+valid PASETO bearer token. Public Function URLs are removed, and invocation grants
+are scoped to the API and routes. Processors are invoked from SQS. Production
+configurations can further restrict infrastructure authorization and IAM policies.
 
 When the gateway is enabled, IPv4 UDP/51820 is deliberately open from
 `0.0.0.0/0` because the NAT public address of the development workstation is

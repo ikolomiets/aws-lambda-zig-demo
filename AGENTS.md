@@ -47,6 +47,10 @@ record lasting cross-cutting decisions in ADRs.
 
 ## Coding Style and Scope
 
+Project-maintained executable code uses only Zig or shell scripts, including
+tools, tests, and CI command blocks. Configuration and documentation retain
+their standard formats.
+
 For Zig changes, follow [Tiger Style for agents](docs/TIGER_STYLE_AGENT.md),
 which owns the project-specific defaults, compatibility exceptions, and triggers
 for consulting the extended guide. Keep assertions central: encode programmer
@@ -99,7 +103,8 @@ safety or migration decisions.
 
 Before committing or publishing, check added lines in modified files and full
 contents of new files for private AWS details. Reuse prior checks of unchanged
-content. Do not check in:
+content. Run the [versioned AWS privacy scanner](docs/agents/local-checks.md#aws-privacy-check)
+and review its candidates alongside the contextual checks below. Do not check in:
 
 - AWS access keys, secret access keys, session tokens, SSO cache data, or CLI
   credential/config files.
@@ -124,6 +129,11 @@ Use its targeted checks during implementation and its complete offline checks
 after final fixes. Before running socket-based runtime or live-replica tests in
 a restricted agent sandbox, follow its
 [socket-access instructions](docs/agents/local-checks.md#socket-access-in-agent-sandboxes).
+
+When changing an existing shell script, select and run the applicable `tests/*.sh`
+checks directly using the [shell regression table](docs/agents/local-checks.md#shell-regression-checks).
+Update those checks when behavior changes. Shell regression tests belong outside
+the Zig build graph; `build.zig` owns Zig builds, formatting, packaging, and tests.
 
 Use Zig 0.17.x (minimum 0.17.0). The TigerBeetle processor executable requires a
 compatible patched standard library at `../zig/lib` through its `build.zig`

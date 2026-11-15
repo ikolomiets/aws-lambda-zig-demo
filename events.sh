@@ -5,6 +5,7 @@ profile="${AWS_PROFILE:-${AWS_DEFAULT_PROFILE:-${PROFILE:-}}}"
 region="${AWS_REGION:-${AWS_DEFAULT_REGION:-${REGION:-ca-central-1}}}"
 stack_name="${STACK_NAME:-aws-lambda-zig-demo}"
 explicit_profile=false
+operations_api_url=
 
 fail() { printf 'events: %s\n' "$1" >&2; exit 2; }
 new_uuid() {
@@ -17,7 +18,7 @@ new_uuid() {
 usage() {
     cat <<'USAGE'
 Usage:
-  events.sh [--profile PROFILE] [--region REGION] [--stack-name STACK]
+  events.sh [--profile PROFILE] [--region REGION] [--stack-name STACK] [--api-url URL]
             <command>
   events.sh create --class TAG=COUNT [--class TAG=COUNT ...]
                    [--timeout-seconds SECONDS] [--event-id UUID]
@@ -29,7 +30,7 @@ Usage:
 Commands:
   create
     Requires explicit seat classes and counts and PASETO_TOKEN; no stdin JSON.
-    Submits a SeatReservation create_event Operation to IntakeFunctionUrl.
+    Submits a SeatReservation create_event Operation to POST /operations at OperationsApiUrl.
     The verified token supplies the tenant; processors allocate the ledger
     and native IDs. Output is the submitted Operation, not readiness evidence.
 
@@ -69,6 +70,12 @@ Operation output:
   Uncertain requests are not automatically resubmitted. HTTP/configuration
   errors exit 2 and report the Operation UUID when available.
 
+HTTP endpoint:
+  --api-url URL selects an existing HTTPS origin instead of OperationsApiUrl
+  for create, check_seats, reserve_seat and confirm_seats. Supply it before
+  the command. The origin must map to the selected stack's API and stage at
+  the root. The read command uses DynamoDB directly and rejects this option.
+
 AWS configuration:
   Options override the environment. Selection order:
     Profile: AWS_PROFILE, AWS_DEFAULT_PROFILE, PROFILE, AWS CLI default chain.
@@ -86,11 +93,11 @@ while [ "$#" -gt 0 ]; do
     option="$1"
     case "$option" in
         --help|-h|help) usage; exit 0 ;;
-        --profile|--region|--stack-name)
+        --profile|--region|--stack-name|--api-url)
             [ "$#" -ge 2 ] && [[ "$2" != --* && "$2" != -h ]] ||
                 fail 'missing wrapper option value'
             value="$2"; shift 2 ;;
-        --profile=*|--region=*|--stack-name=*)
+        --profile=*|--region=*|--stack-name=*|--api-url=*)
             value="${option#*=}"; option="${option%%=*}"; shift ;;
         create|read|check_seats|reserve_seat|confirm_seats) break ;;
         *) fail 'invalid invocation; use --help' ;;
@@ -100,6 +107,7 @@ while [ "$#" -gt 0 ]; do
         --profile) profile="$value"; explicit_profile=true ;;
         --region) region="$value" ;;
         --stack-name) stack_name="$value" ;;
+        --api-url) operations_api_url="$value" ;;
     esac
 done
 [ "$#" -gt 0 ] || fail 'missing command; use --help'
@@ -111,6 +119,12 @@ fi
     [[ "$region" =~ [^[:space:]] && "$stack_name" =~ [^[:space:]] ]] ||
     fail 'invalid wrapper configuration'
 command -v jq >/dev/null 2>&1 || fail 'missing required command: jq'
+if [ -n "$operations_api_url" ]; then
+    [ "$command_name" != read ] || fail '--api-url is only supported for HTTP commands'
+    printf '%s' "$operations_api_url" | jq -Rse \
+        'test("\\Ahttps://(\\[[0-9a-fA-F:.]+\\]|[^/?#@:[:space:]]+)(:[0-9]+)?/?\\z")' \
+        >/dev/null 2>&1 || fail '--api-url must be an HTTPS origin without a path, query, credentials, or fragment'
+fi
 
 event_id= tenant= timeout_seconds=300 classes='{}' class_count=0 seat_class= quantity= reservation_id=
 while [ "$#" -gt 0 ]; do
@@ -342,14 +356,17 @@ http_operation() {
     ' 2>/dev/null || fail "invalid $method Operation response for $operation_id"
 }
 
-intake_url="$(stack_url IntakeFunctionUrl)"
+if [ -z "$operations_api_url" ]; then
+    operations_api_url="$(stack_url OperationsApiUrl)"
+fi
+intake_url="${operations_api_url%/}/operations"
 if [ "$command_name" = create ]; then
     http_operation POST "$intake_url" "$request"
     exit 0
 fi
 
-# Resolve both endpoints before submitting work, so discovery failures create no Operation.
-query_url="$(stack_url QueryFunctionUrl)"
+# Both routes use the validated origin resolved before submitting work.
+query_url="$intake_url"
 operation="$(http_operation POST "$intake_url" "$request")"
 # The authenticated handler supplies the tenant; preserve its exact JSON string.
 expected_tenant="$(printf '%s' "$operation" | jq -c .tenant)"

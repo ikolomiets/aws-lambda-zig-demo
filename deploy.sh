@@ -6,6 +6,10 @@ REGION="${REGION:-ca-central-1}"
 STACK_NAME="${STACK_NAME:-aws-lambda-zig-demo}"
 INTAKE_FUNCTION_NAME="${INTAKE_FUNCTION_NAME:-intake-lambda}"
 QUERY_FUNCTION_NAME="${QUERY_FUNCTION_NAME:-query-lambda}"
+SUBMISSION_THROTTLING_RATE_LIMIT="${SUBMISSION_THROTTLING_RATE_LIMIT-10}"
+SUBMISSION_THROTTLING_BURST_LIMIT="${SUBMISSION_THROTTLING_BURST_LIMIT-20}"
+QUERY_THROTTLING_RATE_LIMIT="${QUERY_THROTTLING_RATE_LIMIT-50}"
+QUERY_THROTTLING_BURST_LIMIT="${QUERY_THROTTLING_BURST_LIMIT-100}"
 TIGER_BEETLE_PROCESSOR_NAME="${TIGER_BEETLE_PROCESSOR_NAME:-tiger-beetle-processor}"
 TIGER_BEETLE_COMPLETION_PROCESSOR_NAME="${TIGER_BEETLE_COMPLETION_PROCESSOR_NAME:-tiger-beetle-completion-processor}"
 SEAT_RESERVATION_PROCESSOR_NAME="${SEAT_RESERVATION_PROCESSOR_NAME-seat-reservation-processor}"
@@ -47,6 +51,15 @@ Options:
                          Intake Lambda name. Defaults to intake-lambda.
   --query-function-name NAME
                          Query Lambda name. Defaults to query-lambda.
+  --submission-throttling-rate-limit NUMBER
+                         POST /operations requests/second target. Defaults to 10.
+  --submission-throttling-burst-limit INTEGER
+                         POST /operations burst capacity. Defaults to 20.
+  --query-throttling-rate-limit NUMBER
+                         GET /operations/{id} requests/second target. Defaults to 50.
+  --query-throttling-burst-limit INTEGER
+                         GET /operations/{id} burst capacity. Defaults to 100.
+                         Throttle settings require full deployment; --dev syncs code only.
   --tiger-beetle-processor-name NAME
                          TigerBeetle processor name. Defaults to tiger-beetle-processor.
   --tiger-beetle-completion-processor-name NAME
@@ -68,19 +81,20 @@ Options:
   --use-local-libs       Use local dependency checkouts with zig build --fork.
                          aws_lambda defaults to ../aws-lambda-zig.
   --dev                  Build/package with persistent caches and sync only code
-                         to an existing development stack. Runs offline and runtime
-                         tests; skips SAM validation. Configuration changes require
-                         full deployment.
+                         to an existing development stack. Skips SAM validation.
+                         Configuration changes require full deployment.
                          Automatically accepts SAM's development-stack confirmation.
   --cleanup              Tear down the selected stack only. Permanently deletes
                          owned tables (all counters) and queued messages. Completes
                          guarded WireGuard disable first; preserves external resources.
-  --dry-run              Run local checks, build, package, and validation only.
-  --no-url-check         Skip the post-deploy Function URL HTTP status check.
+  --dry-run              Build, package, and validate deployment inputs only.
+  --no-url-check         Skip the post-deploy Operations API HTTP status checks.
   -h, --help             Show this help.
 
 Environment overrides:
   PROFILE, REGION, STACK_NAME, INTAKE_FUNCTION_NAME, QUERY_FUNCTION_NAME,
+  SUBMISSION_THROTTLING_RATE_LIMIT, SUBMISSION_THROTTLING_BURST_LIMIT,
+  QUERY_THROTTLING_RATE_LIMIT, QUERY_THROTTLING_BURST_LIMIT,
   TIGER_BEETLE_PROCESSOR_NAME, TIGER_BEETLE_COMPLETION_PROCESSOR_NAME, TIGERBEETLE_CLUSTER_ID,
   TIGERBEETLE_ADDRESSES, LAMBDA_PRINCIPAL, PASETO_PRIVATE_KEY,
   SEAT_RESERVATION_PROCESSOR_NAME, SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME,
@@ -94,9 +108,9 @@ Authentication:
   local build work. Dry runs make no AWS authentication calls.
 
 Local checks:
-  Both deployment modes, including dry runs, run zig build check before packaging.
-  It includes offline and runtime tests on 127.0.0.1. External effects are mocked;
-  loopback access is required.
+  Run ./check.sh separately for repository and loopback runtime checks; use
+  --offline to omit runtime tests. Deployment builds and validates the packages;
+  full deployment also validates the SAM template.
 EOF
 }
 
@@ -131,6 +145,18 @@ reject_retired_processor_overrides() {
         fail "EXECUTION_FUNCTION_NAME is retired; unset it and use TIGER_BEETLE_PROCESSOR_NAME"
     [ "${COMPLETION_FUNCTION_NAME+x}" != x ] ||
         fail "COMPLETION_FUNCTION_NAME is retired; unset it and use TIGER_BEETLE_COMPLETION_PROCESSOR_NAME"
+}
+
+validate_route_throttles() {
+    local variable
+    for variable in SUBMISSION_THROTTLING_RATE_LIMIT QUERY_THROTTLING_RATE_LIMIT; do
+        [[ "${!variable}" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+            fail "$variable must be a nonnegative decimal number"
+    done
+    for variable in SUBMISSION_THROTTLING_BURST_LIMIT QUERY_THROTTLING_BURST_LIMIT; do
+        [[ "${!variable}" =~ ^[0-9]+$ ]] ||
+            fail "$variable must be a nonnegative integer"
+    done
 }
 
 validate_tiger_beetle_completion_processor_name() {
@@ -403,6 +429,10 @@ build_sam_parameter_overrides() {
     SAM_PARAMETER_OVERRIDES=(
         "IntakeFunctionName=$INTAKE_FUNCTION_NAME"
         "QueryFunctionName=$QUERY_FUNCTION_NAME"
+        "SubmissionThrottlingRateLimit=$SUBMISSION_THROTTLING_RATE_LIMIT"
+        "SubmissionThrottlingBurstLimit=$SUBMISSION_THROTTLING_BURST_LIMIT"
+        "QueryThrottlingRateLimit=$QUERY_THROTTLING_RATE_LIMIT"
+        "QueryThrottlingBurstLimit=$QUERY_THROTTLING_BURST_LIMIT"
         "TigerBeetleProcessorName=$TIGER_BEETLE_PROCESSOR_NAME"
         "TigerBeetleCompletionProcessorName=$TIGER_BEETLE_COMPLETION_PROCESSOR_NAME"
         "SeatReservationProcessorName=$SEAT_RESERVATION_PROCESSOR_NAME"
@@ -897,6 +927,8 @@ parse_deployment_options() {
     while [ "$#" -gt 0 ]; do
         case "${1%%=*}" in
             --intake-function-name | --query-function-name | \
+                --submission-throttling-rate-limit | --submission-throttling-burst-limit | \
+                --query-throttling-rate-limit | --query-throttling-burst-limit | \
                 --tiger-beetle-processor-name | --tiger-beetle-completion-processor-name | \
                 --seat-reservation-processor-name | --seat-reservation-completion-processor-name | \
                 --existing-ledger-counter-table-name | --ledger-counter-id | \
@@ -965,6 +997,27 @@ parse_deployment_options() {
                 [ -n "$QUERY_FUNCTION_NAME" ] ||
                     fail "empty value for --query-function-name"
                 shift
+                ;;
+            --submission-throttling-rate-limit | --submission-throttling-rate-limit=* | \
+                --submission-throttling-burst-limit | --submission-throttling-burst-limit=* | \
+                --query-throttling-rate-limit | --query-throttling-rate-limit=* | \
+                --query-throttling-burst-limit | --query-throttling-burst-limit=*)
+                local throttle_option="${1%%=*}" throttle_value
+                if [[ "$1" = *=* ]]; then
+                    throttle_value="${1#*=}"
+                    [ -n "$throttle_value" ] || fail "empty value for $throttle_option"
+                    shift
+                else
+                    need_value "$1" "${2:-}"
+                    throttle_value="$2"
+                    shift 2
+                fi
+                case "$throttle_option" in
+                    --submission-throttling-rate-limit) SUBMISSION_THROTTLING_RATE_LIMIT="$throttle_value" ;;
+                    --submission-throttling-burst-limit) SUBMISSION_THROTTLING_BURST_LIMIT="$throttle_value" ;;
+                    --query-throttling-rate-limit) QUERY_THROTTLING_RATE_LIMIT="$throttle_value" ;;
+                    --query-throttling-burst-limit) QUERY_THROTTLING_BURST_LIMIT="$throttle_value" ;;
+                esac
                 ;;
             --tiger-beetle-processor-name)
                 need_value "$1" "${2:-}"
@@ -1146,6 +1199,46 @@ validate_lambda_archives() {
     done
 }
 
+resolve_operations_api_url() {
+    OPERATIONS_API_URL="$(aws cloudformation describe-stacks \
+        --stack-name "$STACK_NAME" \
+        --query "Stacks[0].Outputs[?OutputKey=='OperationsApiUrl'].OutputValue | [0]" \
+        --output text --region "$REGION")"
+    printf '%s' "$OPERATIONS_API_URL" | jq -Rse \
+        'test("^https://(\\[[0-9a-fA-F:.]+\\]|[^/?#@:[:space:]]+)(:[0-9]+)?/?$")' \
+        >/dev/null || fail "stack output OperationsApiUrl is missing or invalid"
+}
+
+probe_operations_api() {
+    local expected="$1" method="$2" path="$3" token="${4:-}" body="${5:-}"
+    local status
+    local arguments=(-L -sS -o /dev/null -w '%{http_code}' -X "$method")
+    if [ -n "$token" ]; then arguments+=(-H "Authorization: Bearer $token"); fi
+    if [ -n "$body" ]; then arguments+=(--data-binary "$body"); fi
+    status="$(curl "${arguments[@]}" "${OPERATIONS_API_URL%/}$path")"
+    [ "$status" = "$expected" ] ||
+        fail "$method $path returned HTTP $status; expected $expected"
+    printf '%s %s: HTTP %s (expected %s)\n' "$method" "$path" "$status" "$expected"
+}
+
+check_operations_api() {
+    local id=00000000-0000-4000-8000-000000000000 token
+    printf '==> Checking matching-route authentication\n'
+    probe_operations_api 401 POST /operations
+    probe_operations_api 401 GET "/operations/$id"
+    token="$(./zig-out/bin/paseto issue \
+        --subject "deploy-query-test-${RANDOM}-${RANDOM}" --ttl-seconds 60)"
+    printf '==> Checking authenticated missing Operation and invalid submissions\n'
+    probe_operations_api 404 GET "/operations/$id" "$token"
+    probe_operations_api 400 POST /operations "$token"
+    probe_operations_api 400 POST /operations "$token" '{}'
+    printf '==> Checking native gateway unmatched routes and methods\n'
+    probe_operations_api 404 GET /operations "$token"
+    probe_operations_api 404 POST "/operations/$id" "$token"
+    probe_operations_api 404 GET / "$token"
+    probe_operations_api 404 GET /unsupported "$token"
+}
+
 run_deployment() {
     parse_deployment_options "$@"
     if [ "$CLEANUP" -eq 1 ]; then
@@ -1155,6 +1248,7 @@ run_deployment() {
         return
     fi
     if [ "$DEV" -eq 0 ]; then
+        validate_route_throttles
         validate_tiger_beetle_completion_processor_name
         validate_seat_configuration
     fi
@@ -1190,7 +1284,7 @@ run_deployment() {
     fi
     if [ "$DRY_RUN" -eq 0 ] && [ "$CHECK_URL" -eq 1 ]; then
         [ -n "${PASETO_PRIVATE_KEY:-}" ] ||
-            fail "PASETO_PRIVATE_KEY is required for the authenticated Function URL check"
+            fail "PASETO_PRIVATE_KEY is required for the authenticated Operations API checks"
     fi
     if [ "$DEV" -eq 0 ]; then
         invoke_deployment_controller plan
@@ -1224,12 +1318,6 @@ run_deployment() {
             ZIG_BUILD_ARGS+=(--fork="$path")
         done
     fi
-
-    printf '==> Checking Zig formatting\n'
-    ZIG_GLOBAL_CACHE_DIR="$GLOBAL_CACHE_DIR" zig build fmt-check "${ZIG_BUILD_ARGS[@]}"
-
-    printf '==> Running offline and Lambda runtime tests\n'
-    ZIG_GLOBAL_CACHE_DIR="$GLOBAL_CACHE_DIR" zig build check "${ZIG_BUILD_ARGS[@]}" --summary all
 
     printf '==> Removing obsolete root Lambda bootstrap\n'
     rm -f zig-out/bin/bootstrap
@@ -1366,70 +1454,10 @@ run_deployment() {
         --output json \
         --region "$REGION"
 
-    INTAKE_FUNCTION_URL="$(aws cloudformation describe-stacks \
-        --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='IntakeFunctionUrl'].OutputValue | [0]" \
-        --output text \
-        --region "$REGION")"
-    QUERY_FUNCTION_URL="$(aws cloudformation describe-stacks \
-        --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='QueryFunctionUrl'].OutputValue | [0]" \
-        --output text \
-        --region "$REGION")"
-    case "$INTAKE_FUNCTION_URL" in
-        "" | None) fail "stack output IntakeFunctionUrl is missing or empty" ;;
-    esac
-    case "$QUERY_FUNCTION_URL" in
-        "" | None) fail "stack output QueryFunctionUrl is missing or empty" ;;
-    esac
-
-    printf 'IntakeFunctionUrl: %s\n' "$INTAKE_FUNCTION_URL"
-    printf 'QueryFunctionUrl: %s\n' "$QUERY_FUNCTION_URL"
-
+    resolve_operations_api_url
+    printf 'OperationsApiUrl: %s\n' "$OPERATIONS_API_URL"
     if [ "$CHECK_URL" -eq 1 ]; then
-        printf '==> Checking unauthenticated intake and query statuses\n'
-        for function_url in "$INTAKE_FUNCTION_URL" "$QUERY_FUNCTION_URL"; do
-            HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' "$function_url")"
-            [ "$HTTP_STATUS" = 401 ] ||
-                fail "unauthenticated Function URL returned HTTP $HTTP_STATUS; expected 401"
-            printf 'HTTP %s (expected 401)\n' "$HTTP_STATUS"
-        done
-
-        printf '==> Checking authenticated tenant-scoped query GET status\n'
-        PASETO_SUBJECT="deploy-query-test-${RANDOM}-${RANDOM}"
-        PASETO_TOKEN="$(
-            ./zig-out/bin/paseto issue --subject "$PASETO_SUBJECT" --ttl-seconds 60
-        )"
-        HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${PASETO_TOKEN}" \
-            "${QUERY_FUNCTION_URL%/}/00000000-0000-4000-8000-000000000000")"
-        [ "$HTTP_STATUS" = 404 ] ||
-            fail "authenticated query GET returned HTTP $HTTP_STATUS; expected 404"
-        printf 'HTTP %s (expected tenant-safe 404)\n' "$HTTP_STATUS"
-
-        printf '==> Checking authenticated wrong-method statuses\n'
-        HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${PASETO_TOKEN}" \
-            "$INTAKE_FUNCTION_URL")"
-        [ "$HTTP_STATUS" = 405 ] ||
-            fail "authenticated intake GET returned HTTP $HTTP_STATUS; expected 405"
-        printf 'Intake GET: HTTP %s (expected 405)\n' "$HTTP_STATUS"
-        HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
-            -X POST \
-            -H "Authorization: Bearer ${PASETO_TOKEN}" \
-            "$QUERY_FUNCTION_URL")"
-        [ "$HTTP_STATUS" = 405 ] ||
-            fail "authenticated query POST returned HTTP $HTTP_STATUS; expected 405"
-        printf 'Query POST: HTTP %s (expected 405)\n' "$HTTP_STATUS"
-
-        printf '==> Checking authenticated bodyless intake POST status\n'
-        HTTP_STATUS="$(curl -L -sS -o /dev/null -w '%{http_code}' \
-            -X POST \
-            -H "Authorization: Bearer ${PASETO_TOKEN}" \
-            "$INTAKE_FUNCTION_URL")"
-        [ "$HTTP_STATUS" = 400 ] ||
-            fail "authenticated bodyless intake POST returned HTTP $HTTP_STATUS; expected 400"
-        printf 'HTTP %s (expected 400)\n' "$HTTP_STATUS"
+        check_operations_api
     fi
 
     trap - ERR
