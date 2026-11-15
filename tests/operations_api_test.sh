@@ -4,16 +4,55 @@ REPOSITORY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fail_test() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 contains() { case "$1" in *"$2"*) ;; *) fail_test "missing: $2" ;; esac; }
 absent() { case "$1" in *"$2"*) fail_test "unexpected: $2" ;; esac; }
+contains_line() { grep -Fxq "$2" <<<"$1" || fail_test "missing line: $2"; }
+
+route_definition() {
+    awk -v route="          $2:" '
+        $0 == route { found = 1; next }
+        found && $0 !~ /^           / && $0 !~ /^ *$/ { exit }
+        found { print }
+    ' <<<"$1"
+}
+
+assert_route_integrations() {
+    local definition route method function
+    for definition in '/operations post IntakeFunction' '/operations/{id} get QueryFunction'; do
+        read -r route method function <<<"$definition"
+        definition="$(route_definition "$1" "$route")"
+        contains_line "$definition" "            $method:"
+        [ "$(grep -Ec '^            [a-z-]+:' <<<"$definition")" -eq 1 ] ||
+            fail_test "expected one method for $route"
+        contains_line "$definition" '              x-amazon-apigateway-integration:'
+        contains_line "$definition" '                type: aws_proxy'
+        contains_line "$definition" '                payloadFormatVersion: "2.0"'
+        contains_line "$definition" "                uri: !Sub arn:\${AWS::Partition}:apigateway:\${AWS::Region}:lambda:path/2015-03-31/functions/\${$function.Arn}/invocations"
+        [ "$(grep -c 'payloadFormatVersion:' <<<"$definition")" -eq 1 ] ||
+            fail_test "expected one payload format for $route"
+        [ "$(grep -c '^[[:space:]]*uri:' <<<"$definition")" -eq 1 ] ||
+            fail_test "expected one integration URI for $route"
+    done
+}
+
 api="$(sed -n '/^  OperationsApi:/,/^  [A-Za-z]/p' "$REPOSITORY_ROOT/template.yaml" | sed '$d')"
 contains "$api" 'Type: AWS::Serverless::HttpApi'
 contains "$api" 'StageName: $default'
 contains "$api" 'DisableExecuteApiEndpoint: false'
-contains "$api" '/operations:'
-contains "$api" '/operations/{id}:'
-contains "$api" 'post:'
-contains "$api" 'get:'
-contains "$api" '${IntakeFunction.Arn}/invocations'
-contains "$api" '${QueryFunction.Arn}/invocations'
+assert_route_integrations "$api"
+# Negative fixtures must fail the same assertions used for the real template.
+swapped="${api//IntakeFunction.Arn/TemporaryFunction.Arn}"
+swapped="${swapped//QueryFunction.Arn/IntakeFunction.Arn}"
+swapped="${swapped//TemporaryFunction.Arn/QueryFunction.Arn}"
+if (assert_route_integrations "$swapped") >/dev/null 2>&1; then
+    fail_test 'swapped Lambda integrations passed route checks'
+fi
+wrong_version="${api/payloadFormatVersion: \"2.0\"/payloadFormatVersion: \"1.0\"}"
+if (assert_route_integrations "$wrong_version") >/dev/null 2>&1; then
+    fail_test 'incorrect route payload version passed route checks'
+fi
+wrong_method="${api/            post:/            put:}"
+if (assert_route_integrations "$wrong_method") >/dev/null 2>&1; then
+    fail_test 'incorrect route method passed route checks'
+fi
 [ "$(printf '%s\n' "$api" | grep -c 'payloadFormatVersion: "2.0"')" -eq 2 ] || fail_test 'expected two payload 2.0 integrations'
 [ "$(printf '%s\n' "$api" | grep -c '^          /')" -eq 2 ] || fail_test 'expected exactly two route paths'
 [ "$(printf '%s\n' "$api" | grep -c 'type: aws_proxy')" -eq 2 ] || fail_test 'expected two proxy integrations'

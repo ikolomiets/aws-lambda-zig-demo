@@ -43,6 +43,8 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 - `unzip` and `file` are installed for package validation. Zig creates the ZIPs.
 - `jq` 1.6 or newer is installed for deployment guards, `lambda_logs.sh`, deployed seat scenarios, and shell regression tests.
 - Bash 3.2 or newer and curl are installed when running deployed seat scenarios.
+- Git is installed for the offline validation-tooling tests included in the
+  deployment check gate. These shell tests use Bash and `jq`.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
@@ -146,8 +148,9 @@ for script in deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh; do
 done
 ```
 
-Run the shared check gate before packaging. It includes the offline Zig and
-mocked deployment-helper tests plus all eleven Lambda runtime integration cases:
+Run the shared check gate before packaging. It includes offline Zig,
+validation-tooling, and mocked deployment-helper tests plus all eleven Lambda
+runtime integration cases:
 
 ```sh
 zig build check --summary all

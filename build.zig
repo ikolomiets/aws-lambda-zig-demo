@@ -1169,6 +1169,13 @@ pub fn build(b: *std.Build) void {
     http_test_step.dependOn(&run_query_tests.step);
     http_test_step.dependOn(&run_lambda_auth_tests.step);
     const test_step = b.step("test", "Run unit and integration tests");
+    const agent_tools_test_step = b.step("test-agent-tools", "Run validation and privacy tool tests");
+    for ([_][]const u8{ "tests/check_gate_test.sh", "tests/aws_privacy_test.sh" }) |script| {
+        const agent_tools_tests = b.addSystemCommand(&.{"bash"});
+        agent_tools_tests.addFileArg(b.path(script));
+        agent_tools_test_step.dependOn(&agent_tools_tests.step);
+    }
+    test_step.dependOn(agent_tools_test_step);
     test_step.dependOn(&run_log_tests.step);
     test_step.dependOn(&run_seat_reservation_tests.step);
     test_step.dependOn(&run_seat_processor_tests.step);

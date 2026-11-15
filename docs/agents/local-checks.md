@@ -5,22 +5,19 @@ including uncommitted development files.
 
 ## Complete offline checks
 
-Use Bash for the shell-syntax loops:
+Run the executable gate against the current working tree:
 
-```bash
-zig build fmt-check --system zig-pkg
-for script in ./*.sh; do
-  bash -n "$script" || exit
-done
-while IFS= read -r -d '' script; do
-  bash -n "$script" || exit
-done < <(find tests -type f -name '*.sh' -print0)
-zig build test --system zig-pkg
+```sh
+./check.sh
 ```
 
-Run each command successfully before continuing. The sequence checks formatting,
-root shell entry points and recursive shell harnesses under `tests/`, and the
-existing aggregate offline test graph.
+The [gate](../../check.sh) checks the compiler version, formatting, root shell
+entry points, recursive shell scripts under `tests/` and `scripts/`, the optional
+commit hook, and the existing aggregate offline test graph. Each failure stops the gate and
+preserves its exit status, including when output is redirected to a log.
+`ZIG_PACKAGE_DIR` selects an already provisioned package directory (default:
+`zig-pkg`); build-cache environment settings also apply. The gate performs no
+dependency fetching, packaging, or deployment.
 Review documentation changes using the [documentation review guide](documentation-checks.md).
 
 Use focused checks during implementation and normally run this complete sequence
@@ -28,10 +25,34 @@ once after final fixes. Repeat or broaden validation when subsequent changes,
 failures or unresolved concerns warrant it, and record the reason for another
 complete run.
 
+### Automatic checks
+
+The [Checks workflow](../../.github/workflows/checks.yml) runs on pushes and pull
+requests using `ubuntu-24.04-arm`. It provisions the pinned Zig 0.17.1 compiler
+with SHA-256 verification and the packages pinned by `build.zig.zon`, then runs
+`./check.sh --runtime`. Provisioning requires network access; the checks use the
+provisioned packages and mock external effects. The runtime suite uses loopback.
+This workflow needs no AWS credentials or deployment permissions.
+
+After publishing the workflow, configure the GitHub branch rules to require
+**Offline and runtime checks** before merging. A workflow file alone does not
+make its result a required merge check.
+
+For a lightweight local commit check, opt into the repository-managed hook:
+
+```sh
+git config --local core.hooksPath .githooks
+```
+
+The [hook](../../.githooks/pre-commit) checks staged whitespace and runs the
+[AWS privacy check](#aws-privacy-check). It does not run the full suite or change
+staged content. Hooks are optional and bypassable; CI runs the full gate.
+
 ## Host and package prerequisites
 
 Use an ARM64 macOS or ARM64 glibc Linux host, Zig **0.17.x** (minimum **0.17.0**;
-validated with **0.17.1**), Bash (tested with **3.2 and 5.3**), `jq`, and `find`.
+validated with **0.17.1**), Bash (tested with **3.2 and 5.3**), `jq`, `find`,
+and Git. Validation tooling and the privacy scanner use shell scripts.
 The native TigerBeetle archive in the pinned packages targets glibc 2.27 or newer.
 
 Provision every pinned dependency from [build.zig.zon](../../build.zig.zon),
@@ -69,6 +90,7 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | `zig build check` | Combined offline and eleven-case runtime suite through the existing `test` and `test-runtime` runners; requires loopback socket permission, with no AWS credentials or live replica. Formatting remains separate. |
 | `zig build test` | Full offline Zig and mocked deployment-helper suite; excludes socket-based runtime tests, the live replica, and separate ABI checks |
 | `zig build test-http` | Intake, Query, and PASETO authentication through application-owned HTTP types and the shared AWS payload 2.0 adapter, with persistence and publication mocked |
+| `zig build test-agent-tools` | Offline validation-gate and AWS privacy scanner tests using temporary repositories and mocked compiler commands |
 | `zig build test-runtime` | Eleven host integration cases through the real Lambda event loop and all six handlers; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
 | `zig build test-deploy` | Mocked regression tests for cleanup lifecycle, gateway discovery and interfaces, and processor interfaces; requires Bash and `jq`, with no AWS credentials or network access |
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
@@ -87,7 +109,61 @@ deployment checks below have additional prerequisites and distinct evidence scop
 
 For shell changes, run `bash -n` on each affected script. The
 [complete offline checks](#complete-offline-checks) cover all root entry points
-and recursive shell harnesses under `tests/`.
+and recursive shell scripts under `tests/` and `scripts/`.
+
+### Interface migrations
+
+Before changing an interface, record a brief behavior-to-test map in the ticket's
+claim comment (or work notes for work without a ticket). Identify the agreed
+behavioral interface, the existing behavior cases that move to it, the cases that
+remain adapter compatibility or composition tests, and the focused checks for
+each group. Account for the relevant existing cases and required failure paths;
+test counts alone do not establish coverage. Resolve coverage questions against
+the specification before migrating the cases.
+
+Migrate one representative case and run its focused check before using it as an
+example for small batches. For HTTP changes, use
+`zig build test-http --system zig-pkg`. Compile and test between batches so type
+and ownership errors remain local. Spec review assesses behavioral coverage against the map before the final
+complete gate; update the map when the agreed scope changes.
+
+## AWS privacy check
+
+Before committing, run the versioned scanner against staged content:
+
+```sh
+bash scripts/check_aws_privacy.sh --staged
+```
+
+For publishing a committed change, set `BASE_REF` to the reviewed baseline and run:
+
+```sh
+bash scripts/check_aws_privacy.sh --base "$BASE_REF" --head HEAD
+```
+
+The [scanner](../../scripts/check_aws_privacy.sh) requires Bash, Git, and `jq`.
+It examines added lines in modified files and full contents of new files.
+Staged mode reads the index, independently
+of unstaged edits. Range mode resolves both refs to immutable trees. Renames are
+treated as deletion/addition; changed binary files are scanned in full. Deleted
+content is excluded. CI compares a pull request's base with its tested merge
+commit, or a push's previous tip with its new tip. A new branch uses its merge
+base with the default branch; an initial default-branch push scans the tree.
+
+Candidates include AWS access keys, labelled secret keys and session tokens,
+12-digit account IDs (including account-specific ARNs), IAM principal IDs,
+recognized deployment endpoints, S3 bucket references, and AWS credential/config
+or SSO cache paths. UUIDs, CloudFormation substitutions, environment references,
+and angle-bracket placeholders are safe representations. The scanner reports
+escaped paths, line numbers, and categories without printing matched values.
+Exit status is 0 for no candidates, 1 for candidates requiring review, and 2 when
+Git inputs cannot be read or arguments are invalid.
+
+Review remains necessary for context-dependent identifiers, intended public
+values, unrecognized endpoint formats, and unlabelled secrets. Replace private
+values with placeholders; publication exceptions require the explicit user
+authorization described in [repository guidance](../../AGENTS.md#security-and-private-aws-details).
+The scanner supplies candidate evidence, not a guarantee that content is safe.
 
 ## Socket access in agent sandboxes
 

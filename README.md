@@ -62,6 +62,7 @@ to `global`; consumers requiring one sequence share both binding components. See
   `../zig/lib` for the TigerBeetle processor executable. Other targets use the bundled library.
 - AWS CLI v2 and AWS SAM CLI for the SAM deployment flow and stack queries.
 - `jq` for the Lambda log helper, deployed scenario runner, and shell regression tests.
+- Git for offline validation tooling; AWS privacy checks use Git, Bash, and `jq`.
 - Bash 3.2 or newer and curl for the deployed scenario runner.
 - An AWS profile with permission to create Lambda, IAM, and CloudFormation
   resources.
@@ -822,6 +823,10 @@ Run checks directly during development. See [local checks](docs/agents/local-che
 for the complete offline sequence, supported hosts, prerequisites, and pinned-package
 provisioning.
 
+After provisioning packages, run the complete offline gate with `./check.sh`.
+CI runs `./check.sh --runtime` on ARM64 Linux. The local-check guide also covers
+the optional staged-content commit hook and required GitHub merge-check setup.
+
 Review documentation links, anchors, command names, and prerequisites using the
 [documentation review guide](docs/agents/documentation-checks.md).
 
@@ -839,7 +844,8 @@ zig build test-deploy
 ```
 
 The shell tests mock AWS commands, so they require no AWS credentials or
-network access. Run all Zig tests and deployment-helper regression tests with:
+network access. Run the aggregate offline suite, including Zig, validation tooling,
+and deployment-helper tests, with:
 
 ```sh
 zig build test
