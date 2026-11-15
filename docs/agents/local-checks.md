@@ -8,7 +8,7 @@ including uncommitted development files.
 Run the executable gate against the current working tree:
 
 ```sh
-./check.sh
+./check.sh --offline
 ```
 
 The [gate](../../check.sh) checks the compiler version, formatting, root shell
@@ -20,6 +20,10 @@ preserves its exit status, including when output is redirected to a log.
 dependency fetching, packaging, or deployment.
 Review documentation changes using the [documentation review guide](documentation-checks.md).
 
+Run `./check.sh` for the complete gate, including loopback runtime tests after
+the offline checks. `--runtime` remains a compatibility alias for this default.
+Use `--offline` when loopback access is unavailable.
+
 Use focused checks during implementation and normally run this complete sequence
 once after final fixes. Repeat or broaden validation when subsequent changes,
 failures or unresolved concerns warrant it, and record the reason for another
@@ -30,7 +34,7 @@ complete run.
 The [Checks workflow](../../.github/workflows/checks.yml) runs on pushes and pull
 requests using `ubuntu-24.04-arm`. It provisions the pinned Zig 0.17.1 compiler
 with SHA-256 verification and the packages pinned by `build.zig.zon`, then runs
-`./check.sh --runtime`. Provisioning requires network access; the checks use the
+`./check.sh`. Provisioning requires network access; the checks use the
 provisioned packages and mock external effects. The runtime suite uses loopback.
 This workflow needs no AWS credentials or deployment permissions.
 
@@ -174,6 +178,7 @@ When the active agent sandbox restricts network access, request elevated
 execution on the first attempt for each of these socket-based commands:
 
 ```sh
+./check.sh
 zig build check --system zig-pkg --summary all
 zig build test-runtime --system zig-pkg
 TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle --system zig-pkg
@@ -181,11 +186,12 @@ TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle --system zig-pkg
 
 Run each command in a separate tool call with
 `sandbox_permissions = "require_escalated"`. Explain the required access in
-the request: `check` includes the offline suite and `test-runtime`, which binds
-a fake Runtime API to `127.0.0.1` on an operating-system-assigned port, with
+the request: `./check.sh` and `zig build check` include the offline suite and
+`test-runtime`, which binds a fake Runtime API to `127.0.0.1` on an
+operating-system-assigned port, with
 external effects mocked; `test-tigerbeetle` connects to and writes test data in the separately authorized
 local replica at `127.0.0.1:3000`. Keep that address explicit in the live command.
-Where supported, scope reusable approval prefixes to `zig build check`,
+Where supported, scope reusable approval prefixes to `./check.sh`, `zig build check`,
 `zig build test-runtime`, and `zig build test-tigerbeetle`, respectively.
 
 If socket access is denied or elevated execution is unavailable, report the
@@ -206,11 +212,18 @@ To run both the offline and runtime suites through the shared gate, use:
 zig build check --system zig-pkg --summary all
 ```
 
-`deploy.sh` runs `fmt-check`, then `check`, then `package` in both full and
-development modes, including dry runs, using the selected caches and dependency
-forks. A check failure stops packaging and deployment. Running the helper therefore
-requires loopback socket access too; the complete offline checks continue to mock
-deployment commands. Ordinary builds and `package` do not depend on tests.
+`./check.sh` runs formatting, shell syntax, the offline suite, and `test-runtime`
+in order. Each failure stops the gate and preserves its exit status. `--offline`
+omits only `test-runtime`; the existing `--runtime` option selects the default
+complete gate.
+
+`deploy.sh` builds through `package` in both full and development modes,
+including dry runs, using the selected caches and dependency forks. Deployment
+validates configuration, the compiler version, Lambda bootstraps, and ZIPs;
+full deployment also validates the SAM template. Run the repository gate
+separately before deployment. The helper requires no loopback test server, and
+ordinary builds and `package` do not depend on tests. Deployment-helper regression
+tests remain part of the offline gate and mock all deployment commands.
 
 `test-runtime` starts a fake Runtime API on `127.0.0.1` with an operating-system-assigned
 port. It exercises named HTTP API and Function URL events, base64 intake, authentication

@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-runtime=0
+runtime=1
 case "${1:-}" in
     '') [ "$#" -eq 0 ] || exit 2 ;;
+    --offline) [ "$#" -eq 1 ] || exit 2; runtime=0 ;;
     --runtime) [ "$#" -eq 1 ] || exit 2; runtime=1 ;;
     -h|--help)
-        printf 'Usage: ./check.sh [--runtime]\nUses provisioned ZIG_PACKAGE_DIR (default: zig-pkg).\n'
+        printf '%s\n' \
+            'Usage: ./check.sh [--offline|--runtime]' \
+            'Runs offline and loopback runtime checks by default.' \
+            'Use --offline to omit runtime tests; --runtime remains an alias for the default.' \
+            'Uses provisioned ZIG_PACKAGE_DIR (default: zig-pkg).'
         exit 0
         ;;
-    *) printf 'Usage: ./check.sh [--runtime]\n' >&2; exit 2 ;;
+    *) printf 'Usage: ./check.sh [--offline|--runtime]\n' >&2; exit 2 ;;
 esac
 
 cd "$(dirname "${BASH_SOURCE[0]}")"

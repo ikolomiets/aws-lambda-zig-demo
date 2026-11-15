@@ -828,8 +828,9 @@ Run checks directly during development. See [local checks](docs/agents/local-che
 for the complete offline sequence, supported hosts, prerequisites, and pinned-package
 provisioning.
 
-After provisioning packages, run the complete offline gate with `./check.sh`.
-CI runs `./check.sh --runtime` on ARM64 Linux. The local-check guide also covers
+After provisioning packages, run the complete gate with `./check.sh`, including
+the loopback runtime tests. Use `./check.sh --offline` for offline checks only.
+CI runs `./check.sh` on ARM64 Linux. The local-check guide also covers
 the optional staged-content commit hook and required GitHub merge-check setup.
 
 Review documentation links, anchors, command names, and prerequisites using the
@@ -865,8 +866,9 @@ zig build check --summary all
 `check` requires loopback socket access for the fake Runtime API on `127.0.0.1`.
 External effects are mocked; no AWS credentials or live TigerBeetle replica are
 required. Run only the runtime cases with `zig build test-runtime --summary all`.
-Formatting remains a separate check. Both deployment modes, including dry runs,
-run `fmt-check`, `check`, then `package`; development mode skips SAM validation.
+Formatting remains separate from the Zig `check` target; `./check.sh` includes it.
+Run the gate separately before deployment. Both deployment modes, including dry
+runs, build and validate packages; full deployment also validates the SAM template.
 
 When developing against a Zig 0.17-compatible sibling checkout of `aws-lambda-zig`, keep
 `build.zig.zon` pinned and override the dependency at build time:

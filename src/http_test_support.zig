@@ -91,7 +91,7 @@ pub fn aws_event(allocator: std.mem.Allocator, options: struct {
         .requestContext = .{
             .stage = "$default",
             .requestId = "request-id",
-            .domainName = "example.execute-api.ca-central-1.amazonaws.com",
+            .domainName = "example.invalid",
             .http = .{ .method = @tagName(options.method), .path = options.path },
         },
         .body = options.body,

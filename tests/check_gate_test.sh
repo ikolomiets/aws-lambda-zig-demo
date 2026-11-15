@@ -54,16 +54,34 @@ assert_arguments() {
 new_fixture
 export ZIG_PACKAGE_DIR='packages with spaces'
 run_gate
-[ "$gate_status" -eq 0 ] || fail_test 'offline gate failed'
-assert_calls $'fmt-check\ntest'
+[ "$gate_status" -eq 0 ] || fail_test 'complete gate failed'
+assert_calls $'fmt-check\ntest\ntest-runtime'
 assert_arguments "$TEST_ZIG_ARGS_DIR/fmt-check" build fmt-check --system 'packages with spaces'
 assert_arguments "$TEST_ZIG_ARGS_DIR/test" build test --system 'packages with spaces' --summary all
+assert_arguments "$TEST_ZIG_ARGS_DIR/test-runtime" build test-runtime --system 'packages with spaces' --summary all
+
+new_fixture
+run_gate --offline
+[ "$gate_status" -eq 0 ] || fail_test 'offline gate failed'
+assert_calls $'fmt-check\ntest'
 
 new_fixture
 export TEST_FAIL_STEP=fmt-check
-run_gate --runtime
+run_gate
 [ "$gate_status" -eq 42 ] || fail_test 'gate lost the compiler exit status during output capture'
 assert_calls fmt-check
+
+for failure_step in test test-runtime; do
+    new_fixture
+    export TEST_FAIL_STEP="$failure_step"
+    run_gate
+    [ "$gate_status" -eq 42 ] || fail_test "$failure_step failure lost its exit status"
+    if [ "$failure_step" = test ]; then
+        assert_calls $'fmt-check\ntest'
+    else
+        assert_calls $'fmt-check\ntest\ntest-runtime'
+    fi
+done
 
 new_fixture
 mkdir "$project/tests/nested"
@@ -80,7 +98,7 @@ assert_calls fmt-check
 
 new_fixture
 run_gate --runtime
-[ "$gate_status" -eq 0 ] || fail_test 'runtime gate failed'
+[ "$gate_status" -eq 0 ] || fail_test 'legacy --runtime alias failed'
 assert_calls $'fmt-check\ntest\ntest-runtime'
 assert_arguments "$TEST_ZIG_ARGS_DIR/test-runtime" build test-runtime --system zig-pkg --summary all
 
@@ -94,5 +112,10 @@ new_fixture
 export TEST_ZIG_VERSION=0.16.0
 run_gate
 [ "$gate_status" -ne 0 ] || fail_test 'gate accepted an unsupported compiler'
+assert_calls ''
+
+new_fixture
+run_gate --offline --runtime
+[ "$gate_status" -eq 2 ] || fail_test 'gate accepted conflicting arguments'
 assert_calls ''
 printf 'Validation gate tests passed (%s checks).\n' "$checks"

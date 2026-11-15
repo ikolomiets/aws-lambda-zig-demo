@@ -81,14 +81,13 @@ Options:
   --use-local-libs       Use local dependency checkouts with zig build --fork.
                          aws_lambda defaults to ../aws-lambda-zig.
   --dev                  Build/package with persistent caches and sync only code
-                         to an existing development stack. Runs offline and runtime
-                         tests; skips SAM validation. Configuration changes require
-                         full deployment.
+                         to an existing development stack. Skips SAM validation.
+                         Configuration changes require full deployment.
                          Automatically accepts SAM's development-stack confirmation.
   --cleanup              Tear down the selected stack only. Permanently deletes
                          owned tables (all counters) and queued messages. Completes
                          guarded WireGuard disable first; preserves external resources.
-  --dry-run              Run local checks, build, package, and validation only.
+  --dry-run              Build, package, and validate deployment inputs only.
   --no-url-check         Skip the post-deploy Operations API HTTP status checks.
   -h, --help             Show this help.
 
@@ -109,9 +108,9 @@ Authentication:
   local build work. Dry runs make no AWS authentication calls.
 
 Local checks:
-  Both deployment modes, including dry runs, run zig build check before packaging.
-  It includes offline and runtime tests on 127.0.0.1. External effects are mocked;
-  loopback access is required.
+  Run ./check.sh separately for repository and loopback runtime checks; use
+  --offline to omit runtime tests. Deployment builds and validates the packages;
+  full deployment also validates the SAM template.
 EOF
 }
 
@@ -1319,12 +1318,6 @@ run_deployment() {
             ZIG_BUILD_ARGS+=(--fork="$path")
         done
     fi
-
-    printf '==> Checking Zig formatting\n'
-    ZIG_GLOBAL_CACHE_DIR="$GLOBAL_CACHE_DIR" zig build fmt-check "${ZIG_BUILD_ARGS[@]}"
-
-    printf '==> Running offline and Lambda runtime tests\n'
-    ZIG_GLOBAL_CACHE_DIR="$GLOBAL_CACHE_DIR" zig build check "${ZIG_BUILD_ARGS[@]}" --summary all
 
     printf '==> Removing obsolete root Lambda bootstrap\n'
     rm -f zig-out/bin/bootstrap

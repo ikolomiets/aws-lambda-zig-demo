@@ -64,4 +64,4 @@ jobs:
           zig build --fetch
 
       - name: Run offline and loopback runtime checks
-        run: ./check.sh --runtime
+        run: ./check.sh

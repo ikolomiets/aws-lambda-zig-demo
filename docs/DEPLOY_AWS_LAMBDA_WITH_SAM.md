@@ -47,8 +47,8 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 - `unzip` and `file` are installed for package validation. Zig creates the ZIPs.
 - `jq` 1.6 or newer is installed for deployment guards, `lambda_logs.sh`, deployed seat scenarios, and shell regression tests.
 - Bash 3.2 or newer and curl are installed when running deployed seat scenarios.
-- Git is installed for the offline validation-tooling tests included in the
-  deployment check gate. These shell tests use Bash and `jq`.
+- Git is installed when running `./check.sh` for the validation-tooling tests.
+  These shell tests use Bash and `jq`.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
@@ -143,27 +143,19 @@ The build resolves the Zig 0.17-compatible Lambda runtime pinned in
 [hostname scheduling reproducer](ZIG_0_16_HOSTNAME_CONNECT_STALL.md#standalone-deterministic-reproducer)
 documents the low-worker scheduling defect, the patch, and current checks.
 
-Check Zig and shell formatting/syntax before the test graph:
+After [provisioning the pinned packages](agents/local-checks.md#host-and-package-prerequisites),
+run the repository check gate separately before deployment. It checks Zig
+formatting and shell syntax, then runs the offline Zig, validation-tooling,
+mocked deployment-helper, and all eleven Lambda runtime integration tests:
 
 ```sh
-zig build fmt-check
-for script in deploy.sh wireguard-gateway-setup.sh lambda_logs.sh tests/*.sh; do
-  bash -n "$script" || exit
-done
+./check.sh
 ```
 
-Run the shared check gate before packaging. It includes offline Zig,
-validation-tooling, and mocked deployment-helper tests plus all eleven Lambda
-runtime integration cases:
+To run the complete socket-free offline gate, use:
 
 ```sh
-zig build check --summary all
-```
-
-To run only the socket-free offline suite, use:
-
-```sh
-zig build test
+./check.sh --offline
 ```
 
 To run only the deployment-helper regression tests, use:
@@ -185,10 +177,11 @@ zig build test-runtime --summary all
 
 The suite exercises all six handlers through a fake Runtime API on `127.0.0.1`
 with external effects mocked. It requires loopback socket access, with no AWS
-credentials or live TigerBeetle replica. The combined `check` target therefore
-requires loopback access too. Both full and development deployments, including
-dry runs, run `check` before packaging and stop if it fails. Formatting remains
-separate; ordinary builds and `package` do not run tests automatically.
+credentials or live TigerBeetle replica. The combined `check` target and default
+`./check.sh` gate therefore require loopback access too. Both full and development
+deployments, including dry runs, build and validate packages without running the
+repository gate. Run `./check.sh` explicitly or rely on the CI gate before deploying.
+Ordinary builds and `package` do not run tests automatically.
 
 Build and package the stripped Lambda executables in `safe` mode for AWS Lambda
 ARM64. ARM64 is also the project build default; `-Darch=arm` keeps the deployment
@@ -1493,7 +1486,7 @@ for 400. Wrong methods, the API root, and unmatched paths must return native
 gateway 404. The root is not an authentication probe. The private key and test
 token are not printed or passed to the Lambda environment. Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run` to run the
-local checks, rebuild all six Lambda zip archives, and validate `template.yaml` without
+deployment-input checks, rebuild all six Lambda zip archives, and validate `template.yaml` without
 deploying to AWS.
 
 For non-dry-run deployments, the helper clears inherited static AWS credential
@@ -1554,13 +1547,13 @@ Use
 to build with Zig 0.17-compatible local dependency checkouts. The `aws_lambda` checkout defaults
 to `../aws-lambda-zig`; override it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
 
-Both deployment modes run `zig build fmt-check` with their selected local and
-global caches and any `--use-local-libs` package forks. This target checks build
-files, Zig sources, and tests before the remaining test/build steps.
-They then run `zig build check --summary all` once with the same cache and fork
-settings, followed by `package`. The combined gate includes both offline and
-loopback runtime tests. These checks also run during dry runs, and any check
-failure stops the script before packaging, validation, deployment, or sync.
+Both deployment modes run `zig build package` with their selected local and
+global caches and any `--use-local-libs` package forks. They validate deployment
+configuration, the compiler version, Linux ARM64 bootstraps, and all six ZIPs;
+full deployment also runs both SAM template validation passes. These checks also
+run during dry runs, and a failure stops deployment or sync. Formatting, shell
+syntax, offline regression tests, and loopback runtime tests belong to the
+separate `./check.sh` gate and CI.
 
 ### Durable-data guards and first-time counter setup
 
@@ -1640,8 +1633,8 @@ Adding or changing access-log resources, delivery permissions, retention, or the
 stage log format also requires a full stack update.
 Establish the six-function baseline with a full deployment first; a
 four-function stack cannot use seat development sync. The helper requires both
-seat function-name outputs before building or syncing. Both modes run the same
-offline and runtime test gate. Plain `./deploy.sh` also runs both SAM validation
+seat function-name outputs before building or syncing. Run `./check.sh` separately
+before deployment for the repository test gate. Plain `./deploy.sh` also runs both SAM validation
 passes, controller/WireGuard flow, outputs, smoke checks, and deletion of `.zig-cache-deploy` and
 `.zig-global-cache-deploy` on exit.
 
@@ -1658,14 +1651,13 @@ successful and failed runs; ordinary deployment does not delete these caches.
 Both deployment modes select the local cache with `--cache-dir` and the global
 cache with `ZIG_GLOBAL_CACHE_DIR` for every Zig build command. Zig 0.17 does not
 accept `--global-cache-dir` for `zig build`.
-Development mode checks for Zig 0.17.x, runs `fmt-check` followed by `check`
-(offline tests and the loopback runtime suite), and incrementally builds the same
+Development mode checks for Zig 0.17.x and incrementally builds the same
 ARM64 targets in `safe` mode and host tools through `zig build package`, using the
 selected caches and any Zig 0.17-compatible package forks. It refreshes all six
 prebuilt ZIPs under `zig-out/packages/` and verifies stripped ARM64
-bootstraps and root-level archive contents. Development mode now runs offline tests
-too, while still skipping both SAM validation passes. Check, build, package, and
-sync failures fail the run.
+bootstraps and root-level archive contents. Both SAM validation passes are skipped.
+Build, package-validation, and sync failures fail the run. Repository tests run
+separately through `./check.sh`.
 
 After SSO login and the active-stack guard, the helper runs one-shot
 `sam sync --code --no-watch --no-dependency-layer` against `template.yaml`, using
@@ -1679,8 +1671,7 @@ any further prompt receives EOF. The helper then retains the
 existing read-only table/queue summaries, `OperationsApiUrl`, and HTTP probes;
 `--no-url-check` skips those HTTP probes and the private-key requirement.
 The public key is not required in development mode because the deployed
-configuration supplies it. Run `zig build test` separately for the full local
-release gates. The mode has no measured speed guarantee.
+configuration supplies it. The mode has no measured speed guarantee.
 
 Development sync never invokes the separately authorized
 [deployed seat scenarios](#seat-workflow-evidence-and-deployed-scenarios).
