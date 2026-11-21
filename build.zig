@@ -694,6 +694,23 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/http_test_support.zig"),
         .imports = &.{.{ .name = "http", .module = host_http }},
     });
+    host_aws_http.addImport("http_test_support", http_test_support);
+    const aws_http_tests = b.addTest(.{ .root_module = host_aws_http });
+    const run_aws_http_tests = b.addRunArtifact(aws_http_tests);
+
+    const authentication_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .root_source_file = b.path("src/authentication_lambda.zig"),
+            .imports = &.{
+                .{ .name = "http", .module = host_http },
+                .{ .name = "lambda_auth", .module = host_lambda_auth },
+                .{ .name = "paseto", .module = host_paseto },
+            },
+        }),
+    });
+    const run_authentication_tests = b.addRunArtifact(authentication_tests);
     const lambda_test_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .debug,
@@ -1126,7 +1143,9 @@ pub fn build(b: *std.Build) void {
     );
     http_test_step.dependOn(&run_lambda_tests.step);
     http_test_step.dependOn(&run_query_tests.step);
+    http_test_step.dependOn(&run_aws_http_tests.step);
     http_test_step.dependOn(&run_lambda_auth_tests.step);
+    http_test_step.dependOn(&run_authentication_tests.step);
     const test_step = b.step("test", "Run offline Zig unit and integration tests");
     test_step.dependOn(&run_log_tests.step);
     test_step.dependOn(&run_seat_reservation_tests.step);
@@ -1135,7 +1154,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_events_cli_tests.step);
     test_step.dependOn(&run_ledger_counter_tests.step);
     test_step.dependOn(&run_ledger_counter_cli_tests.step);
+    test_step.dependOn(&run_aws_http_tests.step);
     test_step.dependOn(&run_lambda_auth_tests.step);
+    test_step.dependOn(&run_authentication_tests.step);
     test_step.dependOn(&run_query_tests.step);
     test_step.dependOn(&run_tiger_beetle_processor_tests.step);
     test_step.dependOn(&run_tiger_beetle_completion_processor_tests.step);

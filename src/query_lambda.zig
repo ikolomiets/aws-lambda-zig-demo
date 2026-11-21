@@ -601,21 +601,22 @@ test "AWS SDK debug logging is enabled" {
     try std.testing.expect(std.log.logEnabled(.debug, .aws_sdk));
 }
 
-test "generic HTTP querying ignores bodies and authorizes warm cached Operations" {
+test "HTTP querying ignores bodies and checks tenant and expiry on warm cache reads" {
     const Body = struct {
         fn read(_: *anyopaque, _: Allocator) anyerror!?[]const u8 {
             return error.BodyMustNotBeRead;
         }
     };
+    const tenant = "github:42";
     var marker: u8 = 0;
     var request: http.HttpRequest = .{
         .method = .GET,
         .path = "/operations/00112233-4455-6677-8899-AABBCCDDEEFF",
-        .body = .{ .deferred = .{ .context = &marker, .read_fn = Body.read } },
+        .body = .{ .deferred = .{ .context = &marker, .is_empty = false, .read_fn = Body.read } },
     };
     var environment = try testEnvironment(0x71);
     defer environment.deinit();
-    var fake = FakeQuery{ .response = testOperation("lambda-test-user", .submitted) };
+    var fake = FakeQuery{ .response = testOperation(tenant, .submitted) };
     var cache: OperationCache = undefined;
     OperationCache.init(&cache, std.testing.allocator);
     defer cache.deinit();
@@ -623,29 +624,46 @@ test "generic HTTP querying ignores bodies and authorizes warm cached Operations
     var unauthorized = handle_http(std.testing.allocator, &request, &environment, query, 1000, 0);
     defer unauthorized.deinit();
     try std.testing.expectEqual(.unauthorized, unauthorized.status);
-    for ([_][]const u8{ "lambda-test-user", "foreign-tenant", "lambda-test-user" }) |subject| {
-        const token = try testTokenForSubject(0x71, subject);
+    const cases = [_]struct { subject: []const u8, now: i64, status: std.http.Status }{
+        .{ .subject = tenant, .now = 1000, .status = .ok },
+        // The foreign subjects exercise full equality by sharing a prefix or suffix.
+        .{ .subject = "github:43", .now = 1000, .status = .not_found },
+        .{ .subject = "other:42", .now = 1000, .status = .not_found },
+        .{ .subject = tenant, .now = 1059, .status = .ok },
+        .{ .subject = tenant, .now = 1060, .status = .unauthorized },
+    };
+    for (cases) |case| {
+        const token = try testTokenForSubject(0x71, case.subject);
         defer std.testing.allocator.free(token);
         const bearer = try std.fmt.allocPrint(std.testing.allocator, "Bearer {s}", .{token});
         defer std.testing.allocator.free(bearer);
         request.headers = &.{.{ .key = "Authorization", .value = bearer }};
-        var response = handle_http(std.testing.allocator, &request, &environment, query, 1000, 0);
+        var response = handle_http(
+            std.testing.allocator,
+            &request,
+            &environment,
+            query,
+            case.now,
+            0,
+        );
         defer response.deinit();
-        if (std.mem.eql(u8, subject, "foreign-tenant")) {
-            try std.testing.expectEqual(.not_found, response.status);
-            try std.testing.expectEqualStrings(not_found_body, response.body);
-        } else {
-            try std.testing.expectEqual(.ok, response.status);
-            try std.testing.expect(std.mem.indexOf(
-                u8,
-                response.body,
-                "\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"",
-            ) != null);
-            try std.testing.expect(std.mem.indexOf(
-                u8,
-                response.body,
-                "\"tenant\":\"lambda-test-user\"",
-            ) != null);
+        try std.testing.expectEqual(case.status, response.status);
+        switch (case.status) {
+            .not_found => try std.testing.expectEqualStrings(not_found_body, response.body),
+            .unauthorized => try std.testing.expectEqualStrings(unauthorized_body, response.body),
+            .ok => {
+                try std.testing.expect(std.mem.indexOf(
+                    u8,
+                    response.body,
+                    "\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"",
+                ) != null);
+                try std.testing.expect(std.mem.indexOf(
+                    u8,
+                    response.body,
+                    "\"tenant\":\"" ++ tenant ++ "\"",
+                ) != null);
+            },
+            else => unreachable,
         }
     }
     try std.testing.expectEqual(@as(u8, 1), fake.read_count);

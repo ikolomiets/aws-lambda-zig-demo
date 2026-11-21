@@ -17,11 +17,22 @@ pub const HttpRequest = struct {
         bytes: []const u8,
         deferred: struct {
             context: *anyopaque,
+            // The transport can identify a zero-byte body without decoding it.
+            // A malformed body encoding counts as nonempty.
+            is_empty: bool,
             // Bytes remain valid through the handler call. Storage uses the supplied
             // allocator or the transport request owner; original bytes are preserved.
             read_fn: *const fn (*anyopaque, std.mem.Allocator) anyerror!?[]const u8,
         },
     };
+
+    pub fn body_is_empty(request: *const HttpRequest) bool {
+        return switch (request.body) {
+            .empty => true,
+            .bytes => |bytes| bytes.len == 0,
+            .deferred => |reader| reader.is_empty,
+        };
+    }
 
     pub fn read_body(request: *const HttpRequest, arena: std.mem.Allocator) !?[]const u8 {
         return switch (request.body) {

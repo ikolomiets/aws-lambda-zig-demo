@@ -52,16 +52,57 @@ expired, or unverifiable credentials receive `401` with
 different-case spellings, and combined bearer values are rejected. The adapter
 preserves header ambiguity rather than choosing one credential.
 
-The verified `sub` claim is the sole source of Operation Tenant. Public JSON
-cannot supply tenant, lifecycle metadata, hash, Result, Processor Context, or
-internal routing. Query looks up the globally keyed Operation UUID and then
-checks tenant ownership. Missing and foreign Operations return the same static
-`404`, including on warm-cache reads.
+The complete verified `sub` claim is the sole source of Operation Tenant.
+Intake and Query treat it as an opaque identifier. Public JSON cannot supply
+tenant, lifecycle metadata, hash, Result, Processor Context, or internal routing.
+Query looks up the globally keyed Operation UUID and compares the stored tenant
+with the verified subject. Missing and foreign Operations return the same
+static `404`, including on warm-cache reads.
 
 Authentication runs in the matching Lambda, with no gateway authorizer or
 authorization cache. Invalid credentials can therefore invoke the handler.
 `LambdaPrincipal` configures an application environment variable; it does not
 authenticate HTTP callers or control gateway invocation permissions.
+
+### Direct GitHub exchange
+
+The authentication handler accepts `POST /auth/github/exchange` on the same
+HTTPS origin when a deployment exposes the route. The current SAM template
+exposes the two Operation routes above.
+
+```http
+POST /auth/github/exchange HTTP/1.1
+Host: <Operations API host>
+Authorization: Bearer <GitHub OAuth App user access token>
+Content-Length: 0
+```
+
+Send exactly one Bearer credential and an empty body. The GitHub user access
+token must have been issued to the deployment's configured OAuth App. GitHub
+checks the token on every exchange. The handler uses the verified GitHub
+account ID as the Operation Tenant, so account 42 receives `github:42`
+even if its GitHub login changes.
+
+A successful exchange returns `200` with `Cache-Control: no-store`.
+The JSON body has three fields.
+
+```json
+{"access_token":"<PASETO>","token_type":"Bearer","expires_in":28800}
+```
+
+Use that PASETO as the Bearer credential for submitting and querying Operations.
+It expires eight hours after issuance by default. To obtain another PASETO, make
+a fresh exchange with a currently valid GitHub token for the same OAuth App.
+The response contains only the PASETO and its type and lifetime. Revoking a
+GitHub token prevents new exchanges with it, while already issued PASETOs
+continue to work until their signed expiration.
+
+| Status | Direct exchange outcome |
+| --- | --- |
+| `400` | The authenticated request contains a body. |
+| `401` | The credential is missing, ambiguous, malformed, rejected by GitHub, or issued to another OAuth App. The response includes `WWW-Authenticate: Bearer`. |
+| `503` | GitHub is unavailable, rate-limits the token check, or returns unusable identity data, or secret retrieval is temporarily unavailable. Wait and retry with backoff. |
+| `500` | The exchange has a configuration failure, such as rejected OAuth App credentials, a missing secret, or an invalid or mismatched PASETO signing key. |
 
 ### Submission, paths, and request bodies
 

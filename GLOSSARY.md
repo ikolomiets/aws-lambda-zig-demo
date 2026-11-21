@@ -21,6 +21,15 @@ it only as create-command metadata. It is part of idempotency identity and autho
 after the globally keyed DynamoDB lookup, but does not scope the partition key.
 _Avoid_: Customer ID, partition key
 
+**Tenant Resolution**:
+The provider-specific rule by which the Operations framework determines the Operation Tenant
+from verified claims about an external identity.
+_Avoid_: Tenant selection
+
+**Pending Sign-in**:
+A client's attempt to authenticate through Operations, lasting until it completes,
+is denied, or expires.
+
 **Operation Body**:
 The caller-supplied JSON value that contains an operation's input.
 _Avoid_: Payload, parameters

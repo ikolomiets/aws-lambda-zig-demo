@@ -57,11 +57,17 @@ pub const Request = struct {
     }
 
     pub fn application_request(request: *Request) http.HttpRequest {
+        // The scanner retains the raw JSON string. A zero-byte body is represented by "".
+        const is_empty = if (request.body_json) |json| std.mem.eql(u8, json, "\"\"") else true;
         return .{
             .method = request.method,
             .path = request.path,
             .headers = request.headers,
-            .body = .{ .deferred = .{ .context = request, .read_fn = read_body } },
+            .body = .{ .deferred = .{
+                .context = request,
+                .is_empty = is_empty,
+                .read_fn = read_body,
+            } },
         };
     }
 
@@ -163,4 +169,32 @@ pub fn encode_response(
         .headers = headers,
         .body = .{ .textual = response.body },
     });
+}
+
+test "AWS payload adaptation identifies empty bodies without decoding them" {
+    const http_test = @import("http_test_support");
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        body: ?[]const u8,
+        base64: bool = false,
+        is_empty: bool,
+    }{
+        .{ .body = null, .is_empty = true },
+        .{ .body = "", .is_empty = true },
+        .{ .body = "", .base64 = true, .is_empty = true },
+        .{ .body = "\n", .is_empty = false },
+        .{ .body = "Cg==", .base64 = true, .is_empty = false },
+        .{ .body = "!", .base64 = true, .is_empty = false },
+    };
+    for (cases) |case| {
+        const event = try http_test.aws_event(allocator, .{
+            .body = case.body,
+            .base64 = case.base64,
+        });
+        defer allocator.free(event);
+        var adapted = try Request.parse(allocator, event);
+        defer adapted.deinit();
+        const request = adapted.application_request();
+        try std.testing.expectEqual(case.is_empty, request.body_is_empty());
+    }
 }

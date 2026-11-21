@@ -98,7 +98,7 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
 | `zig build check` | Combined offline and eleven-case runtime Zig suite through the existing `test` and `test-runtime` runners; requires loopback socket permission, with no AWS credentials or live replica. Formatting remains separate. |
 | `zig build test` | Full offline Zig suite; excludes socket-based runtime tests, the live replica, and separate ABI checks |
-| `zig build test-http` | Intake, Query, and PASETO authentication through application-owned HTTP types and the shared AWS payload 2.0 adapter, with persistence and publication mocked |
+| `zig build test-http` | Intake and Query through application-owned HTTP types and the shared AWS payload 2.0 adapter with persistence and publication mocked. PASETO authentication and direct exchange with GitHub and secret retrieval simulated. |
 | `zig build test-runtime` | Eleven host integration cases through the real Lambda event loop and all six handlers; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
 | `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli` | Host counter build and deterministic global allocation/tooling tests |
@@ -148,16 +148,24 @@ The independent privacy scanner still runs in CI and the optional commit hook.
 Before changing an interface, record a brief behavior-to-test map in the ticket's
 claim comment (or work notes for work without a ticket). Identify the agreed
 behavioral interface, the existing behavior cases that move to it, the cases that
-remain adapter compatibility or composition tests, and the focused checks for
-each group. Account for the relevant existing cases and required failure paths;
-test counts alone do not establish coverage. Resolve coverage questions against
-the specification before migrating the cases.
+remain adapter compatibility or composition tests, and the focused check for
+each group. For each affected boundary, name the tests and the observable
+assertions that demonstrate the behavior. Cover the relevant existing cases and
+required failure paths. Resolve coverage questions against the specification
+before migrating the cases.
+
+For new behavior, get the focused test running and confirm it fails at the
+intended assertion before implementing the change. Record the command and the
+observed failure alongside the map. Run the focused check again after the change
+and confirm the test passes.
 
 Migrate one representative case and run its focused check before using it as an
-example for small batches. For HTTP changes, use
-`zig build test-http --system zig-pkg`. Compile and test between batches so type
-and ownership errors remain local. Spec review assesses behavioral coverage against the map before the final
-complete gate; update the map when the agreed scope changes.
+example for small batches. For application HTTP and payload adapter checks, use
+`zig build test-http --system zig-pkg`. For full Lambda event-loop coverage, use
+the [runtime integration checks](#runtime-integration-checks). Compile and test
+between batches so type and ownership errors remain local. Update the map when
+the agreed scope changes. Spec review assesses the assertions against the map
+before the final validation gate.
 
 ## AWS privacy check
 

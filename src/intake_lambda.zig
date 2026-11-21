@@ -855,7 +855,7 @@ test "generic HTTP submission authenticates before method and deferred body acce
     var request: http.HttpRequest = .{
         .method = .GET,
         .path = "/",
-        .body = .{ .deferred = .{ .context = &body, .read_fn = Body.read } },
+        .body = .{ .deferred = .{ .context = &body, .is_empty = false, .read_fn = Body.read } },
     };
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
@@ -1078,6 +1078,7 @@ test "POST derives tenant and hash from distinct bounded verified subjects" {
     const subjects = [_][]const u8{
         &@as([lambda_auth.subject_size_max]u8, @splat('a')),
         "tenant-b",
+        "github:42",
     };
     const input =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
@@ -1111,21 +1112,35 @@ test "POST derives tenant and hash from distinct bounded verified subjects" {
         );
         defer response.deinit();
 
-        try expectContains(response.body, subject);
-        try std.testing.expectEqualStrings(subject, fake.lastTenant());
+        try std.testing.expectEqual(.ok, response.status);
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
+        const response_body = try std.json.parseFromSliceLeaky(
+            struct { tenant: []const u8 },
+            arena.allocator(),
+            response.body,
+            .{ .ignore_unknown_fields = true },
+        );
+        try std.testing.expectEqualStrings(subject, response_body.tenant);
+        try std.testing.expectEqualStrings(subject, fake.lastTenant());
         const queued = try processor_message.decode(arena.allocator(), fake.lastMessage());
         try std.testing.expectEqualStrings(subject, queued.tenant);
         try std.testing.expect(queued.context == .null);
         hashes[index] = fake.last_hash.?;
     }
-    try std.testing.expect(!std.mem.eql(u8, &hashes[0], &hashes[1]));
+    for (hashes, 0..) |hash, index| {
+        for (hashes[0..index]) |previous| {
+            try std.testing.expect(!std.mem.eql(u8, &hash, &previous));
+        }
+    }
 }
 
 test "matching SUBMITTED POST requeues and returns the stored snapshot" {
+    const tenant = "github:42";
+    const body = "{\"message\":\"hello\",\"count\":2}";
     const token = try lambda_auth.testing.issue_token(std.testing.allocator, .{
         .seed_byte = 0x52,
+        .subject = tenant,
         .now = 1_700_000_500,
         .ttl_seconds = 60,
     });
@@ -1136,7 +1151,7 @@ test "matching SUBMITTED POST requeues and returns the stored snapshot" {
     try put_test_queue_url(&environment, "echo");
     const input =
         "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
-        "\"name\":\"echo\",\"body\":{\"message\":\"hello\",\"count\":2}}";
+        "\"name\":\"echo\",\"body\":" ++ body ++ "}";
     var fixture = try http_test.Request.init(std.testing.allocator, .{
         .method = .POST,
         .header_name = "Authorization",
@@ -1145,16 +1160,19 @@ test "matching SUBMITTED POST requeues and returns the stored snapshot" {
         .body = input,
     });
     defer fixture.deinit(std.testing.allocator);
-    var expected_hash: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(
-        &expected_hash,
-        "471493bf210a9c6922a2f0870d05a655ba9f859bffecd57972ebfe39863b672c",
+    const parsed_body = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        body,
+        .{},
     );
+    defer parsed_body.deinit();
+    const expected_hash = try operation.operationHash(tenant, "echo", &parsed_body.value);
     var fake = FakeIntake{ .response = .{
         .id = operation.uuidFromString(
             "00112233-4455-6677-8899-aabbccddeeff",
         ) catch unreachable,
-        .tenant = "lambda-test-user",
+        .tenant = tenant,
         .name = "echo",
         .state = .submitted,
         .last_updated = 1_699_999_000,
@@ -1172,6 +1190,9 @@ test "matching SUBMITTED POST requeues and returns the stored snapshot" {
     );
     defer response.deinit();
 
+    try std.testing.expectEqual(.ok, response.status);
+    try std.testing.expectEqualStrings(tenant, fake.lastTenant());
+    try expectContains(response.body, "\"tenant\":\"" ++ tenant ++ "\"");
     try expectContains(response.body, "\"state\":\"SUBMITTED\"");
     try expectContains(response.body, "\"last_updated\":1699999000");
     try expectContains(response.body, "\"expires_at\":1700085400");
@@ -1726,16 +1747,18 @@ test "wrong and expired tokens return a sanitized unauthorized response" {
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
     try lambda_auth.testing.put_public_key(&environment, 0x51);
+    try put_test_queue_url(&environment, "echo");
     var fake: FakeIntake = .{};
 
+    const input = "{\"id\":\"00112233-4455-6677-8899-aabbccddeeff\"," ++
+        "\"name\":\"echo\",\"body\":null}";
     const tokens = [_][]const u8{ wrong_token, expired_token };
     for (tokens) |token| {
-        const event = try testAuthorizationEvent(
-            std.testing.allocator,
-            "Authorization",
-            "Bearer",
-            token,
-        );
+        const event = try http_test.aws_event(std.testing.allocator, .{
+            .method = .POST,
+            .token = token,
+            .body = input,
+        });
         defer std.testing.allocator.free(event);
         const response = handleInvocationForTest(
             std.testing.allocator,
@@ -1751,6 +1774,7 @@ test "wrong and expired tokens return a sanitized unauthorized response" {
         try expectNotContains(response, token);
     }
     try std.testing.expectEqual(@as(u8, 0), fake.create_count);
+    try std.testing.expectEqual(@as(u8, 0), fake.send_count);
 }
 
 test "missing and invalid public key configuration return sanitized errors" {

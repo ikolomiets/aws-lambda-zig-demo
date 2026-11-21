@@ -30,7 +30,7 @@ pub fn authenticate(
     environment: *const std.process.Environ.Map,
     now: i64,
 ) Error!Identity {
-    const token = bearerToken(headers) catch return error.Unauthorized;
+    const token = bearer_token(headers) catch return error.Unauthorized;
     const public_key_encoded = environment.get("PASETO_PUBLIC_KEY") orelse {
         return error.InternalFailure;
     };
@@ -53,7 +53,7 @@ pub fn authenticate(
     };
 }
 
-fn bearerToken(headers: []const http.Header) error{InvalidCredentials}![]const u8 {
+pub fn bearer_token(headers: []const http.Header) error{InvalidCredentials}![]const u8 {
     if (headers.len > authorization_header_count_max) {
         return error.InvalidCredentials;
     }
