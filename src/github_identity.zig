@@ -5,10 +5,14 @@ const Allocator = std.mem.Allocator;
 const access_token_size_max = 16 * 1024;
 const client_id_size_max = 256;
 const client_secret_size_max = 1024;
+pub const device_code_size_max = 1024;
+pub const device_verification_uri = "https://github.com/login/device";
+pub const device_start_url = "https://github.com/login/device/code";
+pub const device_poll_url = "https://github.com/login/oauth/access_token";
 
-pub const token_check_body_size_max = 32 * 1024;
+pub const response_size_max = 32 * 1024;
 
-pub const TokenCheckRequest = struct {
+pub const Request = struct {
     method: std.http.Method,
     url: []const u8,
     headers: []const http.Header,
@@ -18,13 +22,13 @@ pub const TokenCheckRequest = struct {
 /// The transport applies a deadline, disables redirects and caps the response body.
 /// Request fields are borrowed for the call. The response body lives in the provided
 /// invocation arena or in storage borrowed for the duration of the exchange.
-pub const CheckTokenFn = *const fn (
+pub const SendFn = *const fn (
     *anyopaque,
     Allocator,
-    *const TokenCheckRequest,
-) TransportError!TokenCheckResponse;
+    *const Request,
+) TransportError!Response;
 
-pub const TokenCheckResponse = struct {
+pub const Response = struct {
     status: std.http.Status,
     body: []const u8,
 };
@@ -53,6 +57,140 @@ pub const Credentials = struct {
     access_token: AccessToken,
 };
 
+pub const DeviceGrant = struct {
+    device_code: []const u8,
+    user_code: []const u8,
+    verification_uri: []const u8,
+    interval: u32,
+    expires_in: u32,
+};
+
+pub const DevicePoll = union(enum) {
+    pending,
+    slow_down: ?u32,
+    denied,
+    expired,
+    approved: AccessToken,
+};
+
+pub fn start_device(
+    arena: Allocator,
+    client_id: []const u8,
+    context: *anyopaque,
+    send: SendFn,
+) Error!DeviceGrant {
+    try validate_client_id(client_id);
+    const body = std.fmt.allocPrint(arena, "client_id={s}&scope=", .{client_id}) catch {
+        return error.InternalFailure;
+    };
+    const response = try send_device(arena, context, send, device_start_url, body);
+    if (response.status != .ok) return error.Unavailable;
+    const grant = try parse_response(DeviceGrant, arena, response.body);
+    if (grant.device_code.len == 0 or grant.device_code.len > device_code_size_max) {
+        return error.Unavailable;
+    }
+    if (grant.user_code.len == 0 or grant.user_code.len > 32) return error.Unavailable;
+    for (grant.user_code) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-') return error.Unavailable;
+    }
+    if (!std.mem.eql(u8, grant.verification_uri, device_verification_uri)) return error.Unavailable;
+    if (grant.interval == 0 or grant.interval >= grant.expires_in) return error.Unavailable;
+    return grant;
+}
+
+pub fn poll_device(
+    arena: Allocator,
+    client_id: []const u8,
+    device_code: []const u8,
+    context: *anyopaque,
+    send: SendFn,
+) Error!DevicePoll {
+    try validate_client_id(client_id);
+    std.debug.assert(device_code.len > 0);
+    std.debug.assert(device_code.len <= device_code_size_max);
+    var encoded_buffer: [3 * device_code_size_max]u8 = undefined;
+    var encoded: std.Io.Writer = .fixed(&encoded_buffer);
+    std.Uri.Component.percentEncode(&encoded, device_code, form_unreserved) catch unreachable;
+    defer std.crypto.secureZero(u8, encoded.buffered());
+    const body = std.fmt.allocPrint(
+        arena,
+        "client_id={s}&device_code={s}" ++
+            "&grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code",
+        .{ client_id, encoded.buffered() },
+    ) catch return error.InternalFailure;
+    defer std.crypto.secureZero(u8, body);
+
+    const response = try send_device(arena, context, send, device_poll_url, body);
+    switch (response.status) {
+        .ok, .bad_request, .forbidden, .too_many_requests => {},
+        else => return error.Unavailable,
+    }
+    const fields = try parse_response(struct {
+        @"error": ?[]const u8 = null,
+        interval: ?u32 = null,
+        access_token: ?[]const u8 = null,
+        token_type: ?[]const u8 = null,
+    }, arena, response.body);
+    if (fields.@"error") |failure| {
+        if (fields.access_token != null) return error.Unavailable;
+        return switch (std.meta.stringToEnum(enum {
+            authorization_pending,
+            slow_down,
+            access_denied,
+            expired_token,
+            token_expired,
+            incorrect_device_code,
+            incorrect_client_credentials,
+            device_flow_disabled,
+            unsupported_grant_type,
+        }, failure) orelse return error.Unavailable) {
+            .authorization_pending => .pending,
+            .slow_down => .{ .slow_down = fields.interval },
+            .access_denied => .denied,
+            .expired_token, .token_expired => .expired,
+            // Another invocation may already be verifying a token from the same code.
+            .incorrect_device_code => error.Unavailable,
+            .incorrect_client_credentials,
+            .device_flow_disabled,
+            .unsupported_grant_type,
+            => error.InternalFailure,
+        };
+    }
+    if (response.status != .ok) return error.Unavailable;
+    const token_type = fields.token_type orelse return error.Unavailable;
+    if (!std.ascii.eqlIgnoreCase(token_type, "bearer")) return error.Unavailable;
+    const token = AccessToken.parse(fields.access_token orelse return error.Unavailable) catch {
+        return error.Unavailable;
+    };
+    return .{ .approved = token };
+}
+
+fn form_unreserved(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~", byte) != null;
+}
+
+fn send_device(
+    arena: Allocator,
+    context: *anyopaque,
+    send: SendFn,
+    url: []const u8,
+    body: []const u8,
+) Error!Response {
+    return send(context, arena, &.{
+        .method = .POST,
+        .url = url,
+        .headers = &.{
+            .{ .key = "Accept", .value = "application/json" },
+            .{ .key = "Content-Type", .value = "application/x-www-form-urlencoded" },
+            .{ .key = "User-Agent", .value = "operations-api" },
+        },
+        .body = body,
+    }) catch |err| switch (err) {
+        error.Unavailable => return error.Unavailable,
+        error.OutOfMemory => return error.InternalFailure,
+    };
+}
+
 const IdentityResponse = struct {
     app: struct { client_id: []const u8 },
     user: struct { id: AccountId },
@@ -79,7 +217,7 @@ pub fn resolve_tenant(
     arena: Allocator,
     credentials: *const Credentials,
     context: *anyopaque,
-    check_token: CheckTokenFn,
+    check_token: SendFn,
 ) Error![]const u8 {
     const response = try check(arena, credentials, context, check_token);
     switch (response.status) {
@@ -89,14 +227,7 @@ pub fn resolve_tenant(
         // GitHub can use 403 or 429 for rate limiting and 422 for abuse throttling.
         else => return error.Unavailable,
     }
-    if (response.body.len > token_check_body_size_max) return error.Unavailable;
-    const identity = std.json.parseFromSliceLeaky(IdentityResponse, arena, response.body, .{
-        .ignore_unknown_fields = true,
-        .duplicate_field_behavior = .@"error",
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.InternalFailure,
-        else => error.Unavailable,
-    };
+    const identity = try parse_response(IdentityResponse, arena, response.body);
     if (!std.mem.eql(u8, identity.app.client_id, credentials.client_id)) {
         return error.Unauthorized;
     }
@@ -106,15 +237,18 @@ pub fn resolve_tenant(
     };
 }
 
-fn check(
-    arena: Allocator,
-    credentials: *const Credentials,
-    context: *anyopaque,
-    check_token: CheckTokenFn,
-) Error!TokenCheckResponse {
-    std.debug.assert(credentials.access_token.bytes.len > 0);
-    std.debug.assert(credentials.access_token.bytes.len <= access_token_size_max);
-    const client_id = credentials.client_id;
+fn parse_response(comptime Value: type, arena: Allocator, body: []const u8) Error!Value {
+    if (body.len > response_size_max) return error.Unavailable;
+    return std.json.parseFromSliceLeaky(Value, arena, body, .{
+        .ignore_unknown_fields = true,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.InternalFailure,
+        else => error.Unavailable,
+    };
+}
+
+fn validate_client_id(client_id: []const u8) error{InternalFailure}!void {
     if (client_id.len == 0 or client_id.len > client_id_size_max) return error.InternalFailure;
     if (std.mem.eql(u8, client_id, ".") or std.mem.eql(u8, client_id, "..")) {
         return error.InternalFailure;
@@ -123,6 +257,18 @@ fn check(
         if (std.ascii.isAlphanumeric(byte)) continue;
         if (std.mem.indexOfScalar(u8, "-._", byte) == null) return error.InternalFailure;
     }
+}
+
+fn check(
+    arena: Allocator,
+    credentials: *const Credentials,
+    context: *anyopaque,
+    check_token: SendFn,
+) Error!Response {
+    std.debug.assert(credentials.access_token.bytes.len > 0);
+    std.debug.assert(credentials.access_token.bytes.len <= access_token_size_max);
+    const client_id = credentials.client_id;
+    try validate_client_id(client_id);
     const client_secret = credentials.client_secret;
     if (client_secret.len == 0 or client_secret.len > client_secret_size_max) {
         return error.InternalFailure;

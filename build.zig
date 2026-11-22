@@ -293,12 +293,26 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&install_query_lambda.step);
 
+    const lambda_github_identity = b.createModule(.{
+        .target = lambda_target,
+        .root_source_file = b.path("src/github_identity.zig"),
+        .imports = &.{.{ .name = "http", .module = lambda_http }},
+    });
+    const lambda_pending_sign_in = b.createModule(.{
+        .target = lambda_target,
+        .root_source_file = b.path("src/pending_sign_in.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = lambda_aws },
+            .{ .name = "dynamodb", .module = lambda_dynamodb },
+            .{ .name = "github_identity", .module = lambda_github_identity },
+        },
+    });
     const authentication_lambda_mod = b.createModule(.{
         .target = lambda_target,
         .optimize = optimize,
         .root_source_file = b.path("src/authentication_lambda.zig"),
         .strip = true,
-        // A cancellable worker bounds the exchange before the invocation deadline.
+        // A cancellable worker bounds sign-in requests before the invocation deadline.
         .single_threaded = false,
         .imports = &.{
             .{ .name = "http", .module = lambda_http },
@@ -308,6 +322,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "paseto", .module = lambda_paseto },
             .{ .name = "aws", .module = lambda_aws },
             .{ .name = "secretsmanager", .module = lambda_aws_sdk.module("secretsmanager") },
+            .{ .name = "github_identity", .module = lambda_github_identity },
+            .{ .name = "pending_sign_in", .module = lambda_pending_sign_in },
         },
     });
     const authentication_lambda_exe = b.addExecutable(.{
@@ -726,6 +742,20 @@ pub fn build(b: *std.Build) void {
     const aws_http_tests = b.addTest(.{ .root_module = host_aws_http });
     const run_aws_http_tests = b.addRunArtifact(aws_http_tests);
 
+    const host_github_identity = b.createModule(.{
+        .target = b.graph.host,
+        .root_source_file = b.path("src/github_identity.zig"),
+        .imports = &.{.{ .name = "http", .module = host_http }},
+    });
+    const host_pending_sign_in = b.createModule(.{
+        .target = b.graph.host,
+        .root_source_file = b.path("src/pending_sign_in.zig"),
+        .imports = &.{
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "dynamodb", .module = host_dynamodb },
+            .{ .name = "github_identity", .module = host_github_identity },
+        },
+    });
     const authentication_test_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = .debug,
@@ -738,6 +768,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "paseto", .module = host_paseto },
             .{ .name = "aws", .module = host_aws },
             .{ .name = "secretsmanager", .module = host_aws_sdk.module("secretsmanager") },
+            .{ .name = "github_identity", .module = host_github_identity },
+            .{ .name = "pending_sign_in", .module = host_pending_sign_in },
         },
     });
     const authentication_tests = b.addTest(.{ .root_module = authentication_test_mod });
@@ -1105,6 +1137,7 @@ pub fn build(b: *std.Build) void {
         lambda_test_mod,
         query_test_mod,
         authentication_test_mod,
+        host_pending_sign_in,
         tiger_beetle_processor_test_mod,
         tiger_beetle_completion_processor_test_mod,
         seat_submission_mod,

@@ -96,10 +96,10 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | Check | Scope and additional prerequisites |
 | --- | --- |
 | `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
-| `zig build check` | Combined offline and 13-case runtime Zig suite through the existing `test` and `test-runtime` runners; requires loopback socket permission, with no AWS credentials or live replica. Formatting remains separate. |
+| `zig build check` | Combined offline and runtime Zig suites through the existing `test` and `test-runtime` runners; requires loopback socket permission, with no AWS credentials or live replica. Formatting remains separate. |
 | `zig build test` | Full offline Zig suite; excludes socket-based runtime tests, the live replica, and separate ABI checks |
-| `zig build test-http` | Intake and Query through application-owned HTTP types and the shared AWS payload 2.0 adapter with persistence and publication mocked. PASETO authentication and direct exchange with GitHub and secret retrieval simulated. |
-| `zig build test-runtime` | Thirteen host integration cases through the real Lambda event loop and all seven handlers; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
+| `zig build test-http` | Intake and Query through application-owned HTTP types and the shared AWS payload 2.0 adapter with persistence and publication mocked. GitHub authentication covers direct exchange and device sign-in with simulated provider, secrets, and storage. |
+| `zig build test-runtime` | Host integration across all seven handlers and the Pending Sign-in AWS adapter; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
 | `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli` | Host counter build and deterministic global allocation/tooling tests |
 | `zig build build-seat-processors` | Compile host seat invocation adapters without live services or Lambda packaging |
@@ -178,6 +178,13 @@ assertions that demonstrate the behavior. Cover the relevant existing cases and
 required failure paths. Resolve coverage questions against the specification
 before migrating the cases.
 
+For each stateful HTTP case, record the upstream outcome, the caller's response,
+the persisted state, and what the next invocation observes. For example, GitHub
+returns `expired_token`. The handler persists the Pending Sign-in as expired and
+returns HTTP `410` on the first poll. An immediate replay reads that terminal
+state and also returns HTTP `410`. Assert a single GitHub poll across both
+invocations.
+
 For a new outbound HTTP adapter, use the production HTTP client against a
 loopback peer in the first runtime test. Record that boundary in the map.
 Assert the method, path, relevant headers and body received by the peer, then
@@ -189,13 +196,18 @@ intended assertion before implementing the change. Record the command and the
 observed failure alongside the map. Run the focused check again after the change
 and confirm the test passes.
 
+As soon as an SDK-backed adapter is wired, exercise the real SDK with the
+adapter's existing local test. For Pending Sign-ins, run
+`zig build test-runtime --system zig-pkg` using the
+[socket-access instructions](#socket-access-in-agent-sandboxes).
+
 Migrate one representative case and run its focused check before using it as an
 example for small batches. For application HTTP and payload adapter checks, use
 `zig build test-http --system zig-pkg`. For full Lambda event-loop coverage, use
 the [runtime integration checks](#runtime-integration-checks). Compile and test
 between batches so type and ownership errors remain local. Update the map when
 the agreed scope changes. Spec review assesses the assertions against the map
-before the final validation gate.
+before the complete `./check.sh` gate.
 
 ## AWS privacy check
 
@@ -310,14 +322,18 @@ readback, and malformed-SQS error reporting followed by successful processing.
 Captured publications, writes and logs use test-owned memory so assertions remain
 valid after invocation arena resets.
 
-The authentication cases drive the real entry point with simulated secret
-reads. The mismatched OAuth App case sends the token check through the
-production HTTP client to a loopback GitHub peer and verifies the request
-before checking the Lambda's `401` response and Bearer challenge. The
-valid-credential case verifies the returned PASETO.
-[GitHub exchange runtime test](../../src/authentication_lambda.zig#L340)
+The authentication cases drive the real entry point with simulated secrets and
+storage. The loopback GitHub peer checks the direct token check and zero-scope
+device-start requests received through the production HTTP client. The Lambda
+rejects a token issued for another OAuth App, issues a verifiable PASETO on
+successful exchange, and returns public approval instructions plus a private
+Operations code on device start. The malformed-event fallback also returns
+`Cache-Control: no-store`. A separate loopback DynamoDB peer checks the SDK
+requests and models a conditional consumption success and conflict.
+[Authentication tests](../../src/authentication_lambda.zig)
+[Pending Sign-in adapter test](../../src/pending_sign_in.zig#L226)
 
-The summary reports 13 passing cases. Cached compilation still executes them.
+The summary reports 16 passing cases. Cached compilation still executes them.
 
 All external persistence, execution, and publication effects are mocked. Cloud
 resource initialization is bypassed; these tests establish no live AWS or

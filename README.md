@@ -133,7 +133,7 @@ file zig-out/bin/intake/bootstrap \
 ```
 
 Intake, query, native completion and both seat processors are statically linked and single-threaded.
-The statically linked authentication bootstrap uses cancellable I/O tasks to bound the exchange.
+The statically linked authentication bootstrap uses cancellable I/O tasks to bound sign-in requests.
 TigerBeetle processor is
 multithread-capable for the TigerBeetle callback thread and is a dynamically
 linked glibc executable. All seven are stripped.
@@ -808,7 +808,8 @@ and response bodies, query strings, and client IP addresses are excluded. See
 
 - `src/intake_lambda.zig`: authenticated POST intake entrypoint, named-queue routing, and handler.
 - `src/query_lambda.zig`: authenticated tenant-scoped Operation GET entrypoint and handler.
-- `src/authentication_lambda.zig`: direct GitHub token exchange entry point and PASETO issuance.
+- `src/authentication_lambda.zig`: GitHub direct exchange, headless sign-in, and PASETO issuance.
+- `src/pending_sign_in.zig`: DynamoDB Pending Sign-in mapping and conditional transitions.
 - `src/tiger_beetle_processor.zig`: SQS-driven TigerBeetle processor entrypoint and handler.
 - `src/tiger_beetle_completion_processor.zig`: SQS-driven conditional completion entrypoint and handler.
 - `src/processor_message.zig`: bounded individual Processor Message contract and codec.

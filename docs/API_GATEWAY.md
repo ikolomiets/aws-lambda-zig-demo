@@ -1,7 +1,7 @@
 # Operations API Gateway specification
 
 This document specifies the public HTTP boundary for Operation submission,
-querying, and direct GitHub exchange, including its AWS integration.
+querying, and GitHub authentication, including its AWS integration.
 The [ingress ADR](adr/0008-api-gateway-operation-ingress.md) records the design
 trade-offs. The [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md) owns provisioning,
 packaging, infrastructure updates, and cleanup procedures.
@@ -104,6 +104,82 @@ continue to work until their signed expiration.
 | `404` | Exchange is disabled. API Gateway returns its native unmatched-route response. |
 | `503` | GitHub is unavailable, rate-limits the token check, or returns unusable identity data, or secret retrieval is temporarily unavailable. Wait and retry with backoff. |
 | `500` | The exchange has a configuration failure, such as rejected OAuth App credentials, a missing secret, or an invalid or mismatched PASETO signing key. |
+
+### Headless GitHub sign-in
+
+On an HTTPS Operations API origin with device sign-in enabled, a client can sign
+in using only that origin. The authentication Lambda uses the deployment's GitHub
+OAuth App and requests zero scopes. The current SAM template exposes only the
+direct exchange route. See the [device sign-in binding](DEPLOY_AWS_LAMBDA_WITH_SAM.md#device-sign-in-binding).
+
+1. Send an empty request to the Operations origin.
+
+   ```http
+   POST /auth/github/device/start HTTP/1.1
+   Host: <Operations API host>
+   Content-Length: 0
+   ```
+
+   A successful start returns `200` with `Cache-Control: no-store`. The JSON
+   body contains these fields.
+
+   ```json
+   {
+     "device_code": "<private Operations device code>",
+     "user_code": "WDJB-MJHT",
+     "verification_uri": "https://github.com/login/device",
+     "interval": 5,
+     "expires_in": 899
+   }
+   ```
+
+2. Show the person `verification_uri` and `user_code`. Ask them to open the
+   URI in a browser, enter the code, and approve the OAuth App in GitHub.
+   Keep the private `device_code` in memory. Send it only to the same
+   Operations HTTPS origin in the poll body. Keep it out of URLs, logs,
+   and diagnostic output.
+
+3. Wait at least `interval` seconds before the first poll. Stop polling
+   when the returned `expires_in` seconds have elapsed.
+
+   ```http
+   POST /auth/github/device/poll HTTP/1.1
+   Host: <Operations API host>
+   Content-Type: application/json
+   Content-Length: <JSON body length in bytes>
+
+   {"device_code":"<private Operations device code>"}
+   ```
+
+   Poll responses include `Cache-Control: no-store`.
+
+   | Status | Poll outcome and client action |
+   | --- | --- |
+   | `202` | `{"error":"authorization_pending","interval":5}` means approval is pending. Wait at least the returned interval before polling again. |
+   | `429` | `{"error":"slow_down"}` with `Retry-After` in seconds means the next poll must wait at least that long. This applies both to an early poll and to a GitHub slowdown. For a gateway throttle without this header, back off. |
+   | `403` | `{"error":"access_denied"}`. Stop and report that approval was denied. Start again if the person wants to retry. |
+   | `410` | `{"error":"expired_or_consumed"}`. Discard the code. Start a new sign-in if credentials are still needed. |
+   | `400` | The poll body is invalid. Send a JSON object containing only the private Operations device code. |
+   | `503` | An upstream service or storage operation is temporarily unavailable. Retry with backoff within the grant lifetime. |
+   | `500` | The server cannot complete sign-in. Report the status without including credentials. |
+
+4. On approval, the first successful poll returns `200` with the PASETO response.
+
+   ```json
+   {"access_token":"<PASETO>","token_type":"Bearer","expires_in":28800}
+   ```
+
+   Discard the device code and use the PASETO as the Bearer credential for
+   [Operation requests](#authentication-and-tenant-authorization). The PASETO
+   expires eight hours after issuance by default. When it expires, discard it
+   and begin a new sign-in at step 1.
+
+Operations verifies the approved GitHub token against the configured OAuth App,
+uses the numeric GitHub account ID to resolve the Operation Tenant, and discards
+the GitHub token. Pending Sign-ins survive separate Lambda invocations. The
+server enforces the GitHub grant deadline even while the DynamoDB row still
+exists. A successful conditional write consumes the grant before PASETO
+issuance. [GitHub device flow](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow)
 
 ### Submission, paths, and request bodies
 
@@ -456,7 +532,7 @@ Relevant existing checks are:
 | `bash tests/api_domain_test.sh` | Positional parsing, AWS context, certificate/domain reuse, manual DNS instructions, mapping reconciliation and read-only HTTPS probes with AWS/curl mocked. |
 | `bash tests/events_wrapper_test.sh` | Mocked Events integration with common-origin discovery. |
 | `bash tests/seat_scenarios_test.sh` | Mocked seat-tool integration with common-origin discovery. |
-| `zig build test-runtime --system zig-pkg` | Real Lambda event loop with a fake loopback Runtime API across all seven handlers, including rejection of another OAuth App's token and successful issuance. |
+| `zig build test-runtime --system zig-pkg` | Real Lambda event loop with a fake loopback Runtime API across all seven handlers. The authentication cases include GitHub device start over loopback and DynamoDB conditional updates through the SDK to a loopback peer. |
 | SAM validation described in the [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md#3-validate-the-sam-template) | Template validity; no cloud enforcement evidence. |
 
 Required regression coverage includes generic HTTP behavior without AWS metadata;

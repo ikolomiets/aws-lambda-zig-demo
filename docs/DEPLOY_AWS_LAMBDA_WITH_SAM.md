@@ -245,7 +245,7 @@ ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
 ```
 
 The authentication bootstrap is statically linked and uses cancellable I/O
-tasks to bound the external exchange before the Lambda deadline.
+tasks to bound sign-in requests before the Lambda deadline.
 
 TigerBeetle processor is multithread-capable because the TigerBeetle C client completes
 requests on a native callback thread. It is a stripped ARM64 glibc executable
@@ -1724,6 +1724,25 @@ separate lifecycle management. API Gateway returns `404` for further exchanges.
 PASETOs already issued remain valid through their signed expiration. Subsequent
 invocations of `deploy.sh` without either exchange flag preserve the stack's
 configured setting.
+
+#### Device sign-in binding
+
+The authentication bootstrap handles the
+[headless HTTP flow](API_GATEWAY.md#headless-github-sign-in). The current SAM
+template exposes direct exchange. Device sign-in requires an OAuth App with
+device flow enabled, both device POST routes bound to the authentication
+function, and a DynamoDB table bound as `PENDING_SIGN_IN_TABLE_NAME`. The
+function's execution role needs `dynamodb:PutItem`, `dynamodb:GetItem`, and
+`dynamodb:UpdateItem` scoped to that table. The function reads consistently
+and writes conditionally.
+
+The table uses the string partition key `id`, which stores a SHA-256 digest of
+the Operations device code, and the numeric TTL attribute `expires_at` in epoch
+seconds. Rows hold the GitHub device code while pending. The function checks
+`expires_at_ms` on access and removes the GitHub code at denial, provider
+expiry, or consumption.
+TTL handles background cleanup. GitHub access tokens and PASETOs remain in the
+invocation that resolves or issues them.
 
 ### Development code updates
 

@@ -15,6 +15,7 @@ pub const Request = struct {
     headers: []const http.Header = &.{},
     body_json: ?[]const u8 = null,
     base64: bool = false,
+    body_size_max: ?usize = null,
 
     pub fn parse(allocator: std.mem.Allocator, event: []const u8) !Request {
         var request: Request = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
@@ -76,15 +77,52 @@ pub const Request = struct {
         const json = request.body_json orelse return null;
         // Transport storage has the same request lifetime, including on error paths.
         const arena = request.arena.allocator();
-        const bytes = try parse_value([]const u8, arena, json);
+        const decoded_size_max = request.body_size_max orelse json.len;
+        const encoded_size_max = if (request.base64)
+            @divFloor(decoded_size_max +| 2, 3) *| 4
+        else
+            decoded_size_max;
+        const bytes = try std.json.parseFromSliceLeaky([]const u8, arena, json, .{
+            .allocate = .alloc_always,
+            .max_value_len = @min(encoded_size_max, json.len),
+        });
         if (!request.base64) return bytes;
         const decoder = std.base64.standard.Decoder;
         const size = decoder.calcSizeForSlice(bytes) catch return error.InvalidBodyEncoding;
+        if (size > decoded_size_max) return error.ValueTooLong;
         const decoded = try arena.alloc(u8, size);
         decoder.decode(decoded, bytes) catch return error.InvalidBodyEncoding;
         return decoded;
     }
 };
+
+test "AWS payload adaptation bounds plain and base64 body allocation" {
+    const http_test = @import("http_test_support");
+    const allocator = std.testing.allocator;
+    for ([_]struct { body: []const u8, base64: bool, allowed: bool }{
+        .{ .body = "xx", .base64 = false, .allowed = true },
+        .{ .body = "xxx", .base64 = false, .allowed = false },
+        .{ .body = "eHg=", .base64 = true, .allowed = true },
+        .{ .body = "eHh4", .base64 = true, .allowed = false },
+        .{ .body = "eHh4eA==", .base64 = true, .allowed = false },
+    }) |case| {
+        const event = try http_test.aws_event(allocator, .{
+            .body = case.body,
+            .base64 = case.base64,
+        });
+        defer allocator.free(event);
+        var adapted = try Request.parse(allocator, event);
+        defer adapted.deinit();
+        adapted.body_size_max = 2;
+        const request = adapted.application_request();
+        const body = request.read_body(allocator);
+        if (case.allowed) {
+            try std.testing.expectEqualStrings("xx", (try body).?);
+        } else {
+            try std.testing.expectError(error.ValueTooLong, body);
+        }
+    }
+}
 
 fn parse_value(comptime T: type, arena: std.mem.Allocator, json: []const u8) !T {
     return std.json.parseFromSliceLeaky(T, arena, json, .{

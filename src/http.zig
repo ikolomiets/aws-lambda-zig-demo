@@ -43,15 +43,18 @@ pub const HttpRequest = struct {
     }
 };
 
-/// Headers are borrowed. An allocated body remains owned until deinit, after encoding.
+/// Headers are borrowed unless backed by headers_arena. An allocated body remains
+/// owned until deinit, after encoding.
 pub const HttpResponse = struct {
     status: std.http.Status,
     headers: []const Header,
     body: []const u8,
     body_allocator: ?std.mem.Allocator = null,
+    headers_arena: ?std.heap.ArenaAllocator = null,
 
     pub fn deinit(response: *HttpResponse) void {
         if (response.body_allocator) |allocator| allocator.free(response.body);
+        if (response.headers_arena) |*arena| arena.deinit();
         response.* = undefined;
     }
 };
