@@ -10,6 +10,8 @@ const lambda_auth = @import("lambda_auth");
 const github = @import("github_identity");
 const pending_sign_in = @import("pending_sign_in");
 const token_issuer = @import("token_issuer.zig");
+const authentication = @import("authentication_support.zig");
+const browser = @import("browser_sign_in.zig");
 
 const Allocator = std.mem.Allocator;
 const runtime_tests_enabled = if (builtin.is_test)
@@ -20,18 +22,21 @@ const authentication_duration_ms_max = 10_000;
 const response_margin_ms = 1_000;
 const secret_response_size_max = 64 * 1024;
 const poll_body_size_max = 1024;
-const device_entropy_size = 32;
 const runtime_error_response =
     "{\"statusCode\":500,\"headers\":{\"Content-Type\":\"application/json\"," ++
     "\"Cache-Control\":\"no-store\"},\"body\":\"{\\\"error\\\":\\\"internal_error\\\"}\"}";
 
-var runtime_test_services: ?*TestServices = null;
+var runtime_test_dependencies: ?*const Dependencies = null;
 var test_diagnostics: ?*TestDiagnostics = null;
 
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{.{ .scope = .aws_sdk, .level = .warn }},
     .logFn = if (builtin.is_test) capture_test_log else std.log.defaultLog,
 };
+
+comptime {
+    if (builtin.is_test) _ = @import("authentication_browser_tests.zig");
+}
 
 pub fn main(init: std.process.Init) void {
     lambda.handle(init, handler, .{});
@@ -41,13 +46,25 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
     const config: Config = .{
         .github_client_id = ctx.env("GITHUB_CLIENT_ID") orelse "",
         .paseto_public_key = ctx.env("PASETO_PUBLIC_KEY") orelse "",
+        .github_oauth_callback_url = ctx.env("GITHUB_OAUTH_CALLBACK_URL") orelse "",
+        .browser_redirect_uris = ctx.env("GITHUB_BROWSER_REDIRECT_URIS") orelse "",
     };
     var input = aws_http.Request.parse(ctx.arena, event) catch {
         return runtime_error_response;
     };
     defer input.deinit();
-    input.body_size_max = poll_body_size_max;
-    const request = input.application_request();
+    const route = browser.match_route(input.method, input.path orelse "");
+    input.body_size_max = if (route == .redeem)
+        browser.redeem_body_size_max
+    else
+        poll_body_size_max;
+    const request = if (route != null) input.navigation_request() catch |err| {
+        const response = authentication_error(if (err == error.OutOfMemory)
+            error.InternalFailure
+        else
+            error.BadRequest);
+        return aws_http.encode_response(ctx.arena, &response) catch runtime_error_response;
+    } else input.application_request();
     var services: RuntimeServices = .{
         .allocator = ctx.arena,
         .io = ctx.io,
@@ -62,14 +79,14 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
     };
     defer sign_in_store.deinit();
     var random_source: std.Random.IoSource = .{ .io = ctx.io };
-    const dependencies: Dependencies = if (builtin.is_test and runtime_test_services != null)
-        runtime_test_services.?.dependencies()
+    const dependencies: Dependencies = if (builtin.is_test and runtime_test_dependencies != null)
+        runtime_test_dependencies.?.*
     else
         .{
             .context = &services,
             .random = random_source.interface(),
             .now_ms = RuntimeServices.now,
-            .device_entropy_fn = RuntimeServices.device_entropy,
+            .sign_in_entropy_fn = RuntimeServices.sign_in_entropy,
             .read_secret_fn = RuntimeServices.read_secret,
             .send_github_fn = RuntimeServices.send_github,
             .store = sign_in_store.interface(),
@@ -121,9 +138,9 @@ const RuntimeServices = struct {
         return @intCast(std.Io.Clock.real.now(services.io).toMilliseconds());
     }
 
-    fn device_entropy(
+    fn sign_in_entropy(
         context: *anyopaque,
-        bytes: *[device_entropy_size]u8,
+        bytes: *[authentication.sign_in_entropy_size]u8,
     ) error{Unavailable}!void {
         const services: *RuntimeServices = @ptrCast(@alignCast(context));
         services.io.randomSecure(bytes) catch return error.Unavailable;
@@ -233,38 +250,13 @@ fn classify_unknown_secret_error(status: u16, code: []const u8) SecretError {
     return error.Unavailable;
 }
 
-pub const Config = struct {
-    github_client_id: []const u8,
-    paseto_public_key: []const u8,
-};
+pub const Config = authentication.Config;
+pub const Secret = authentication.Secret;
+pub const SecretError = authentication.SecretError;
+pub const Dependencies = authentication.Dependencies;
+const AuthenticationError = authentication.AuthenticationError;
 
-pub const Secret = enum { github_client_secret, paseto_signing_key };
-pub const SecretError = error{ MissingSecret, InvalidSecret, Unavailable, OutOfMemory };
-
-pub const Dependencies = struct {
-    context: *anyopaque,
-    random: std.Random,
-    now_ms: *const fn (*anyopaque) i64,
-    device_entropy_fn: *const fn (*anyopaque, *[device_entropy_size]u8) error{Unavailable}!void,
-    // The secret reader gives the invocation ownership of mutable secret bytes.
-    read_secret_fn: *const fn (*anyopaque, Allocator, Secret) SecretError![]u8,
-    send_github_fn: github.SendFn,
-    store: pending_sign_in.Store,
-};
-
-const AuthenticationError = error{
-    BadRequest,
-    Unauthorized,
-    InternalFailure,
-    Unavailable,
-    Denied,
-    Gone,
-};
-const json_headers: []const http.Header = &.{
-    .{ .key = "Content-Type", .value = "application/json" },
-    .{ .key = "Cache-Control", .value = "no-store" },
-};
-const unauthorized_headers = json_headers ++ [_]http.Header{
+const unauthorized_headers = authentication.json_headers ++ [_]http.Header{
     .{ .key = "WWW-Authenticate", .value = "Bearer" },
 };
 
@@ -274,17 +266,21 @@ pub fn handle_http(
     config: *const Config,
     dependencies: *const Dependencies,
 ) http.HttpResponse {
-    if (request.method != .POST) return error_response(.not_found, "not_found");
     const path = request.path orelse return error_response(.not_found, "not_found");
+    if (browser.match_route(request.method, path)) |route| {
+        return browser.handle(allocator, route, request, config, dependencies) catch |err|
+            authentication_error(err);
+    }
+    if (request.method != .POST) return error_response(.not_found, "not_found");
     if (std.mem.eql(u8, path, "/auth/github/exchange")) {
         const body = exchange_github(allocator, request, config, dependencies) catch |err|
             return authentication_error(err);
-        return json_response(allocator, .ok, body);
+        return authentication.json_response(allocator, .ok, body);
     }
     if (std.mem.eql(u8, path, "/auth/github/device/start")) {
         const body = start_github_device(allocator, request, config, dependencies) catch |err|
             return authentication_error(err);
-        return json_response(allocator, .ok, body);
+        return authentication.json_response(allocator, .ok, body);
     }
     if (std.mem.eql(u8, path, "/auth/github/device/poll")) {
         return poll_github_device(allocator, request, config, dependencies) catch |err|
@@ -304,15 +300,6 @@ fn authentication_error(err: AuthenticationError) http.HttpResponse {
     };
 }
 
-fn json_response(allocator: Allocator, status: std.http.Status, body: []u8) http.HttpResponse {
-    return .{
-        .status = status,
-        .headers = json_headers,
-        .body = body,
-        .body_allocator = allocator,
-    };
-}
-
 fn start_github_device(
     allocator: Allocator,
     request: *const http.HttpRequest,
@@ -323,10 +310,7 @@ fn start_github_device(
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
     const arena = scratch.allocator();
-    var random_bytes: [device_entropy_size]u8 = undefined;
-    defer std.crypto.secureZero(u8, &random_bytes);
-    try dependencies.device_entropy_fn(dependencies.context, &random_bytes);
-    var code: pending_sign_in.Code = .{ .hex = std.fmt.bytesToHex(random_bytes, .lower) };
+    var code = try authentication.sign_in_code(dependencies);
     defer std.crypto.secureZero(u8, &code.hex);
     const key = pending_sign_in.key_for(&code);
 
@@ -391,11 +375,23 @@ fn poll_github_device(
     const interval = reservation.polling.interval_seconds;
     switch (try reply) {
         .expired => {
-            _ = try finish_grant(arena, dependencies, &key, reservation.expires_at_ms, .expired);
+            _ = try authentication.finish_grant(
+                arena,
+                dependencies,
+                &key,
+                reservation.expires_at_ms,
+                .{ .finish = .expired },
+            );
             return error.Gone;
         },
         .denied => {
-            _ = try finish_grant(arena, dependencies, &key, reservation.expires_at_ms, .denied);
+            _ = try authentication.finish_grant(
+                arena,
+                dependencies,
+                &key,
+                reservation.expires_at_ms,
+                .{ .finish = .denied },
+            );
             return error.Denied;
         },
         .pending => {
@@ -404,7 +400,7 @@ fn poll_github_device(
                 .@"error" = "authorization_pending",
                 .interval = interval,
             }, .{}) catch return error.InternalFailure;
-            return json_response(allocator, .accepted, body);
+            return authentication.json_response(allocator, .accepted, body);
         },
         .slow_down => |provider_interval| {
             const delay = @max(interval +| 5, provider_interval orelse 0);
@@ -465,13 +461,7 @@ fn poll_key(
         error.OutOfMemory => return error.InternalFailure,
         else => return error.BadRequest,
     };
-    var code: pending_sign_in.Code = undefined;
-    if (fields.device_code.len != code.hex.len) return error.BadRequest;
-    for (fields.device_code) |byte| {
-        if (std.ascii.isDigit(byte)) continue;
-        if (byte < 'a' or byte > 'f') return error.BadRequest;
-    }
-    @memcpy(&code.hex, fields.device_code);
+    var code = pending_sign_in.parse_code(fields.device_code) catch return error.BadRequest;
     defer std.crypto.secureZero(u8, &code.hex);
     return pending_sign_in.key_for(&code);
 }
@@ -488,7 +478,7 @@ fn reserve_poll(
         const now_ms = dependencies.now_ms(dependencies.context);
         if (now_ms >= grant.expires_at_ms) return error.Gone;
         const polling = switch (grant.state) {
-            .consumed, .expired => return error.Gone,
+            .consumed, .expired, .browser_pending, .browser_approved => return error.Gone,
             .denied => return error.Denied,
             .pending => |polling| polling,
         };
@@ -531,35 +521,18 @@ fn finish_approved_poll(
         error.Unauthorized => return error.Unavailable,
         else => |failure| return failure,
     };
-    const signing_key = try read_secret(arena, dependencies, .paseto_signing_key);
+    const signing_key = try authentication.read_secret(arena, dependencies, .paseto_signing_key);
     defer std.crypto.secureZero(u8, signing_key);
-    const issued_at_ms = try finish_grant(arena, dependencies, key, expires_at_ms, .consumed);
+    const issued_at_ms = try authentication.finish_grant(arena, dependencies, key, expires_at_ms, .{
+        .finish = .consumed,
+    });
     const body = try token_issuer.issue(allocator, dependencies.random, &.{
         .subject = tenant,
         .now_seconds = @divFloor(issued_at_ms, 1000),
         .signing_key_base64 = signing_key,
         .public_key_base64 = config.paseto_public_key,
     });
-    return json_response(allocator, .ok, body);
-}
-
-fn finish_grant(
-    arena: Allocator,
-    dependencies: *const Dependencies,
-    key: *const pending_sign_in.Key,
-    expires_at_ms: i64,
-    state: pending_sign_in.TerminalState,
-) AuthenticationError!i64 {
-    const store = &dependencies.store;
-    const now_ms = dependencies.now_ms(dependencies.context);
-    if (now_ms >= expires_at_ms) return error.Gone;
-    if (!try store.change(store.context, arena, key, &.{
-        .now_ms = now_ms,
-        .transition = .{ .finish = state },
-    })) return error.Gone;
-    const issued_at_ms = dependencies.now_ms(dependencies.context);
-    if (issued_at_ms >= expires_at_ms) return error.Gone;
-    return issued_at_ms;
+    return authentication.json_response(allocator, .ok, body);
 }
 
 fn retry_response(allocator: Allocator, seconds: i64) AuthenticationError!http.HttpResponse {
@@ -568,9 +541,10 @@ fn retry_response(allocator: Allocator, seconds: i64) AuthenticationError!http.H
     errdefer arena.deinit();
     const value = std.fmt.allocPrint(arena.allocator(), "{d}", .{seconds}) catch
         return error.InternalFailure;
-    const headers = arena.allocator().dupe(http.Header, json_headers ++ [_]http.Header{
-        .{ .key = "Retry-After", .value = value },
-    }) catch return error.InternalFailure;
+    const headers = arena.allocator().dupe(
+        http.Header,
+        authentication.json_headers ++ [_]http.Header{.{ .key = "Retry-After", .value = value }},
+    ) catch return error.InternalFailure;
     return .{
         .status = .too_many_requests,
         .headers = headers,
@@ -593,7 +567,7 @@ fn exchange_github(
     const tenant = try verify_github_token(arena, config, dependencies, &token);
     if (!request.body_is_empty()) return error.BadRequest;
 
-    const signing_key = try read_secret(arena, dependencies, .paseto_signing_key);
+    const signing_key = try authentication.read_secret(arena, dependencies, .paseto_signing_key);
     defer std.crypto.secureZero(u8, signing_key);
     return token_issuer.issue(allocator, dependencies.random, &.{
         .subject = tenant,
@@ -612,7 +586,11 @@ fn verify_github_token(
     // An Operations credential must stay with the Operations API.
     if (std.mem.startsWith(u8, token.bytes, "v4.public.")) return error.Unauthorized;
 
-    const client_secret = try read_secret(arena, dependencies, .github_client_secret);
+    const client_secret = try authentication.read_secret(
+        arena,
+        dependencies,
+        .github_client_secret,
+    );
     defer std.crypto.secureZero(u8, client_secret);
     return github.resolve_tenant(arena, &.{
         .client_id = config.github_client_id,
@@ -621,22 +599,13 @@ fn verify_github_token(
     }, dependencies.context, dependencies.send_github_fn);
 }
 
-fn read_secret(
-    arena: Allocator,
-    dependencies: *const Dependencies,
-    secret: Secret,
-) error{ Unavailable, InternalFailure }![]u8 {
-    const bytes = dependencies.read_secret_fn(dependencies.context, arena, secret);
-    return bytes catch |err| switch (err) {
-        error.Unavailable => error.Unavailable,
-        error.MissingSecret, error.InvalidSecret, error.OutOfMemory => error.InternalFailure,
-    };
-}
-
 fn error_response(status: std.http.Status, comptime code: []const u8) http.HttpResponse {
     return .{
         .status = status,
-        .headers = if (status == .unauthorized) unauthorized_headers else json_headers,
+        .headers = if (status == .unauthorized)
+            unauthorized_headers
+        else
+            authentication.json_headers,
         .body = "{\"error\":\"" ++ code ++ "\"}",
     };
 }
@@ -648,6 +617,31 @@ const test_client_secret = "fixture-app-secret";
 const test_github_identity =
     \\{"id":7,"app":{"client_id":"configured-client"},"user":{"id":42,"login":"octocat"}}
 ;
+
+pub const testing = if (builtin.is_test) struct {
+    pub const Services = TestServices;
+    pub const Diagnostics = TestDiagnostics;
+    pub const GrantFinishGate = FinishGate;
+    pub const TokenResponse = IssuedToken;
+
+    pub const now_seconds = test_now_seconds;
+    pub const client_id = test_client_id;
+    pub const client_secret = test_client_secret;
+    pub const provider_token = test_provider_token;
+    pub const github_identity = test_github_identity;
+
+    pub const header = test_header;
+    pub const expect_response_header = expect_header;
+    pub const issued_token = read_issued_token;
+    pub const run_runtime = run_runtime_with_dependencies;
+    pub const fetch_github_http = fetch_github;
+} else void;
+fn test_header(headers: []const http.Header, name: []const u8) error{MissingHeader}![]const u8 {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.key, name)) return header.value;
+    }
+    return error.MissingHeader;
+}
 const test_exchange: http.HttpRequest = .{
     .method = .POST,
     .path = "/auth/github/exchange",
@@ -898,18 +892,36 @@ fn run_runtime_authentication(
     services: *TestServices,
     event: []const u8,
 ) !std.json.Value {
+    return run_runtime_with_dependencies(fixture, &services.dependencies(), .{
+        .event = event,
+        .public_key = &services.public_key,
+    });
+}
+
+fn run_runtime_with_dependencies(
+    fixture: *@import("runtime_test_support").Fixture,
+    dependencies: *const Dependencies,
+    options: struct {
+        event: []const u8,
+        public_key: []const u8,
+        environment: []const struct { name: []const u8, value: []const u8 } = &.{},
+    },
+) !std.json.Value {
     const now_ms: u64 = @intCast(std.Io.Clock.real.now(std.testing.io).toMilliseconds());
     const script = [_]@import("runtime_test_support").Tester.Event{.{
         .request_id = "exchange",
         .deadline_ms = now_ms + 30_000,
-        .payload = event,
+        .payload = options.event,
     }};
     try fixture.init(&script);
     try fixture.tester.env_map.put("GITHUB_CLIENT_ID", test_client_id);
-    try fixture.tester.env_map.put("PASETO_PUBLIC_KEY", &services.public_key);
-    std.debug.assert(runtime_test_services == null);
-    runtime_test_services = services;
-    defer runtime_test_services = null;
+    try fixture.tester.env_map.put("PASETO_PUBLIC_KEY", options.public_key);
+    for (options.environment) |variable| {
+        try fixture.tester.env_map.put(variable.name, variable.value);
+    }
+    std.debug.assert(runtime_test_dependencies == null);
+    runtime_test_dependencies = dependencies;
+    defer runtime_test_dependencies = null;
 
     main(fixture.tester.processInit());
     try fixture.tester.expectPostCount(1);
@@ -1027,9 +1039,8 @@ test "only one of two approved GitHub polls consumes the grant and issues creden
     defer flow.store.finish_gate = null;
 
     var capture: TestDiagnostics = .{};
-    std.debug.assert(test_diagnostics == null);
-    test_diagnostics = &capture;
-    defer test_diagnostics = null;
+    capture.start();
+    defer capture.stop();
 
     flow.poll.now_seconds += 5;
     flow.poll.device_poll_result = test_approved_device_poll;
@@ -1113,9 +1124,8 @@ test "GitHub and caller credentials stay out of device failure diagnostics" {
     try flow.init();
     defer flow.deinit();
     var capture: TestDiagnostics = .{};
-    std.debug.assert(test_diagnostics == null);
-    test_diagnostics = &capture;
-    defer test_diagnostics = null;
+    capture.start();
+    defer capture.stop();
 
     flow.poll.now_seconds += 5;
     flow.poll.device_poll_result = test_approved_device_poll;
@@ -1219,7 +1229,7 @@ const DeviceTest = struct {
 };
 
 const FinishGate = struct {
-    const timeout: std.Io.Timeout = .{ .duration = .{
+    pub const timeout: std.Io.Timeout = .{ .duration = .{
         .clock = .awake,
         .raw = .fromSeconds(5),
     } };
@@ -1227,7 +1237,7 @@ const FinishGate = struct {
     first_arrived: std.Io.Event = .unset,
     both_arrived: std.Io.Event = .unset,
 
-    fn arrive(gate: *FinishGate, io: std.Io) pending_sign_in.Error!void {
+    pub fn arrive(gate: *FinishGate, io: std.Io) pending_sign_in.Error!void {
         const previous = gate.arrivals.fetchAdd(1, .monotonic);
         std.debug.assert(previous < 2);
         if (previous == 0) {
@@ -1245,7 +1255,17 @@ const TestDiagnostics = struct {
     len: usize = 0,
     overflow: bool = false,
 
-    fn expect_no_credentials(
+    pub fn start(capture: *TestDiagnostics) void {
+        std.debug.assert(test_diagnostics == null);
+        test_diagnostics = capture;
+    }
+
+    pub fn stop(capture: *TestDiagnostics) void {
+        std.debug.assert(test_diagnostics == capture);
+        test_diagnostics = null;
+    }
+
+    pub fn expect_no_credentials(
         capture: *const TestDiagnostics,
         credentials: []const []const u8,
     ) !void {
@@ -1629,7 +1649,7 @@ const TestServices = struct {
     device_polls: u8,
     advance_after_poll_seconds: i64,
 
-    fn init(fixture: *TestServices) !void {
+    pub fn init(fixture: *TestServices) !void {
         fixture.key_pair = try paseto.Ed25519.KeyPair.generateDeterministic(@splat(0x42));
         _ = paseto.encodePrivateKey(&fixture.key_pair.secret_key, &fixture.private_key);
         _ = paseto.encodePublicKey(fixture.key_pair.public_key, &fixture.public_key);
@@ -1654,24 +1674,33 @@ const TestServices = struct {
         fixture.advance_after_poll_seconds = 0;
     }
 
-    fn deinit(fixture: *TestServices) void {
+    pub fn deinit(fixture: *TestServices) void {
         paseto.wipeSecretKey(&fixture.key_pair.secret_key);
         std.crypto.secureZero(u8, &fixture.private_key);
     }
 
-    fn invoke(fixture: *TestServices, request: *const http.HttpRequest) http.HttpResponse {
-        return handle_http(std.testing.allocator, request, &.{
+    pub fn config(fixture: *const TestServices) Config {
+        return .{
             .github_client_id = test_client_id,
             .paseto_public_key = &fixture.public_key,
-        }, &fixture.dependencies());
+        };
     }
 
-    fn dependencies(fixture: *TestServices) Dependencies {
+    fn invoke(fixture: *TestServices, request: *const http.HttpRequest) http.HttpResponse {
+        return handle_http(
+            std.testing.allocator,
+            request,
+            &fixture.config(),
+            &fixture.dependencies(),
+        );
+    }
+
+    pub fn dependencies(fixture: *TestServices) Dependencies {
         return .{
             .context = fixture,
             .random = fixture.random.random(),
             .now_ms = now,
-            .device_entropy_fn = device_entropy,
+            .sign_in_entropy_fn = sign_in_entropy,
             .read_secret_fn = TestServices.read_secret,
             .send_github_fn = send_github,
             .store = .{
@@ -1688,9 +1717,9 @@ const TestServices = struct {
         return fixture.now_seconds * 1000;
     }
 
-    fn device_entropy(
+    fn sign_in_entropy(
         context: *anyopaque,
-        bytes: *[device_entropy_size]u8,
+        bytes: *[authentication.sign_in_entropy_size]u8,
     ) error{Unavailable}!void {
         const fixture: *TestServices = @ptrCast(@alignCast(context));
         fixture.random.random().bytes(bytes);
@@ -1760,6 +1789,7 @@ const TestServices = struct {
                     .consumed => .consumed,
                 };
             },
+            .browser_finish => return false,
         }
         return true;
     }
@@ -1782,7 +1812,7 @@ const TestServices = struct {
         });
     }
 
-    fn send_github(
+    pub fn send_github(
         context: *anyopaque,
         allocator: Allocator,
         request: *const github.Request,
@@ -1797,7 +1827,7 @@ const TestServices = struct {
             }
             return .{ .status = .ok, .body = test_device_grant };
         }
-        if (std.mem.eql(u8, request.url, github.device_poll_url)) {
+        if (std.mem.eql(u8, request.url, github.oauth_token_url)) {
             expect_device_poll_request(request) catch unreachable;
             fixture.device_polls += 1;
             fixture.now_seconds += fixture.advance_after_poll_seconds;
@@ -1915,10 +1945,6 @@ fn expect_exchange_error(
 }
 
 fn expect_header(headers: []const http.Header, name: []const u8, value: []const u8) !void {
-    for (headers) |header| {
-        if (std.ascii.eqlIgnoreCase(header.key, name)) {
-            return std.testing.expectEqualStrings(value, header.value);
-        }
-    }
-    return error.TestExpectedHeader;
+    const actual = test_header(headers, name) catch return error.TestExpectedHeader;
+    return std.testing.expectEqualStrings(value, actual);
 }

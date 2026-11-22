@@ -8,7 +8,9 @@ const Attribute = aws.map.MapEntry(dynamodb.types.AttributeValue);
 
 pub const Code = struct { hex: [64]u8 };
 pub const Key = struct { digest: [64]u8 };
+pub const pkce_challenge_size = 43;
 pub const TerminalState = enum { denied, expired, consumed };
+pub const BrowserFinish = enum { claim, deny, redeem };
 pub const Error = error{ InternalFailure, Unavailable };
 
 pub const Polling = struct {
@@ -17,10 +19,26 @@ pub const Polling = struct {
     interval_seconds: u32,
 };
 
+pub const BrowserPending = struct {
+    redirect_uri: []const u8,
+    app_state: []const u8,
+    app_challenge: []const u8,
+    upstream_verifier: []const u8,
+    browser_binding: []const u8,
+};
+
+pub const BrowserApproved = struct {
+    redirect_uri: []const u8,
+    app_challenge: []const u8,
+    tenant: []const u8,
+};
+
 pub const Grant = struct {
     expires_at_ms: i64,
     state: union(enum) {
         pending: Polling,
+        browser_pending: BrowserPending,
+        browser_approved: BrowserApproved,
         denied,
         expired,
         consumed,
@@ -90,6 +108,7 @@ pub const Change = struct {
             interval_seconds: u32,
         },
         finish: TerminalState,
+        browser_finish: BrowserFinish,
     },
 };
 
@@ -99,37 +118,82 @@ pub fn key_for(code: *const Code) Key {
     return .{ .digest = std.fmt.bytesToHex(hash, .lower) };
 }
 
+pub fn parse_code(text: []const u8) error{InvalidCode}!Code {
+    var code: Code = undefined;
+    if (text.len != code.hex.len) return error.InvalidCode;
+    for (text) |byte| {
+        if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return error.InvalidCode;
+    }
+    @memcpy(&code.hex, text);
+    return code;
+}
+
 fn create_dynamo(
     context: *anyopaque,
     allocator: Allocator,
     key: *const Key,
     grant: *const Grant,
 ) Error!void {
-    std.debug.assert(grant.state == .pending);
-    const polling = &grant.state.pending;
-    std.debug.assert(polling.interval_seconds > 0);
-    std.debug.assert(polling.github_device_code.len > 0);
-    std.debug.assert(polling.github_device_code.len <= github.device_code_size_max);
-    std.debug.assert(grant.expires_at_ms > polling.next_poll_at_ms);
+    std.debug.assert(grant.expires_at_ms > 0);
     const runtime: *RuntimeStore = @ptrCast(@alignCast(context));
     const connection = try runtime.connect();
     const expires_at = try number(allocator, grant.expires_at_ms);
-    const next_poll_at = try number(allocator, polling.next_poll_at_ms);
-    const interval = try number(allocator, polling.interval_seconds);
     const ttl = try number(allocator, std.math.divCeil(i64, grant.expires_at_ms, 1000) catch
         unreachable);
+    var fields: [9]Attribute = undefined;
+    fields[0..4].* = .{
+        .{ .key = "id", .value = .{ .s = &key.digest } },
+        .{ .key = "expires_at_ms", .value = expires_at },
+        .{ .key = "expires_at", .value = ttl },
+        .{ .key = "state", .value = .{ .s = @tagName(grant.state) } },
+    };
+    const field_count: usize = switch (grant.state) {
+        .pending => |polling| count: {
+            std.debug.assert(polling.interval_seconds > 0);
+            std.debug.assert(polling.github_device_code.len > 0);
+            std.debug.assert(polling.github_device_code.len <= github.device_code_size_max);
+            std.debug.assert(grant.expires_at_ms > polling.next_poll_at_ms);
+            const next_poll_at = try number(allocator, polling.next_poll_at_ms);
+            const interval = try number(allocator, polling.interval_seconds);
+            fields[4..7].* = .{
+                .{ .key = "github_device_code", .value = .{ .s = polling.github_device_code } },
+                .{ .key = "next_poll_at_ms", .value = next_poll_at },
+                .{ .key = "interval_seconds", .value = interval },
+            };
+            break :count 7;
+        },
+        .browser_pending => |browser| count: {
+            std.debug.assert(browser.redirect_uri.len > 0);
+            std.debug.assert(browser.app_state.len > 0);
+            std.debug.assert(browser.app_challenge.len == pkce_challenge_size);
+            std.debug.assert(browser.upstream_verifier.len == @sizeOf(Code));
+            std.debug.assert(browser.browser_binding.len == @sizeOf(Key));
+            fields[4..9].* = .{
+                .{ .key = "redirect_uri", .value = .{ .s = browser.redirect_uri } },
+                .{ .key = "app_state", .value = .{ .s = browser.app_state } },
+                .{ .key = "app_challenge", .value = .{ .s = browser.app_challenge } },
+                .{ .key = "upstream_verifier", .value = .{ .s = browser.upstream_verifier } },
+                .{ .key = "browser_binding", .value = .{ .s = browser.browser_binding } },
+            };
+            break :count 9;
+        },
+        .browser_approved => |browser| count: {
+            std.debug.assert(browser.redirect_uri.len > 0);
+            std.debug.assert(browser.app_challenge.len == pkce_challenge_size);
+            std.debug.assert(browser.tenant.len > 0);
+            fields[4..7].* = .{
+                .{ .key = "redirect_uri", .value = .{ .s = browser.redirect_uri } },
+                .{ .key = "app_challenge", .value = .{ .s = browser.app_challenge } },
+                .{ .key = "tenant", .value = .{ .s = browser.tenant } },
+            };
+            break :count 7;
+        },
+        .denied, .expired, .consumed => unreachable,
+    };
     _ = connection.client.putItem(allocator, .{
         .table_name = connection.table_name,
         .condition_expression = "attribute_not_exists(id)",
-        .item = &.{
-            .{ .key = "id", .value = .{ .s = &key.digest } },
-            .{ .key = "github_device_code", .value = .{ .s = polling.github_device_code } },
-            .{ .key = "expires_at_ms", .value = expires_at },
-            .{ .key = "next_poll_at_ms", .value = next_poll_at },
-            .{ .key = "interval_seconds", .value = interval },
-            .{ .key = "expires_at", .value = ttl },
-            .{ .key = "state", .value = .{ .s = "pending" } },
-        },
+        .item = fields[0..field_count],
     }, .{}) catch return error.Unavailable;
 }
 
@@ -150,6 +214,18 @@ fn read_dynamo(context: *anyopaque, arena: Allocator, key: *const Key) Error!?Gr
     return .{
         .state = switch (state) {
             .pending => .{ .pending = try read_polling(item) },
+            .browser_pending => .{ .browser_pending = .{
+                .redirect_uri = try get_string(item, "redirect_uri"),
+                .app_state = try get_string(item, "app_state"),
+                .app_challenge = try get_fixed_string(item, "app_challenge", pkce_challenge_size),
+                .upstream_verifier = try get_fixed_string(item, "upstream_verifier", @sizeOf(Code)),
+                .browser_binding = try get_fixed_string(item, "browser_binding", @sizeOf(Key)),
+            } },
+            .browser_approved => .{ .browser_approved = .{
+                .redirect_uri = try get_string(item, "redirect_uri"),
+                .app_challenge = try get_fixed_string(item, "app_challenge", pkce_challenge_size),
+                .tenant = try get_string(item, "tenant"),
+            } },
             .denied => .denied,
             .expired => .expired,
             .consumed => .consumed,
@@ -213,6 +289,21 @@ fn change_dynamo(
             request.condition_expression = pending_and_live;
             request.update_expression = "SET #state = :terminal REMOVE github_device_code";
         },
+        .browser_finish => |transition| {
+            const expected = if (transition == .redeem) "browser_approved" else "browser_pending";
+            values[0].value = .{ .s = expected };
+            values[2] = .{
+                .key = ":terminal",
+                .value = .{ .s = if (transition == .deny) "denied" else "consumed" },
+            };
+            request.expression_attribute_values = values[0..3];
+            request.condition_expression = pending_and_live;
+            request.update_expression = if (transition == .redeem)
+                "SET #state = :terminal REMOVE redirect_uri, app_challenge, tenant"
+            else
+                "SET #state = :terminal REMOVE redirect_uri, app_state, app_challenge, " ++
+                    "upstream_verifier, browser_binding";
+        },
     }
     var diagnostic: dynamodb.ServiceError = undefined;
     _ = connection.client.updateItem(arena, request, .{ .diagnostic = &diagnostic }) catch |err| {
@@ -231,6 +322,12 @@ fn get_string(item: []const Attribute, key: []const u8) Error![]const u8 {
         .s => |value| value orelse error.InternalFailure,
         else => error.InternalFailure,
     };
+}
+
+fn get_fixed_string(item: []const Attribute, key: []const u8, length: usize) Error![]const u8 {
+    const value = try get_string(item, key);
+    if (value.len != length) return error.InternalFailure;
+    return value;
 }
 
 fn get_number(comptime T: type, item: []const Attribute, key: []const u8) Error!T {
@@ -314,15 +411,71 @@ test "runtime integration: DynamoDB guards the Pending Sign-in schedule and cons
     const finish: Change = .{ .now_ms = 1005001, .transition = .{ .finish = .consumed } };
     try std.testing.expect(try store.change(store.context, arena, &test_key, &finish));
     try std.testing.expect(!try store.change(store.context, arena, &test_key, &finish));
+    try exercise_browser_dynamo(arena, &store);
     try peer.await(io);
 }
 
 const test_key: Key = .{ .digest = @splat('a') };
 
-const AwsStep = enum { create, read, schedule, consume, conflict };
+fn exercise_browser_dynamo(arena: Allocator, store: *const Store) !void {
+    const pending: Grant = .{
+        .expires_at_ms = 1900001,
+        .state = .{ .browser_pending = .{
+            .redirect_uri = "https://app.example.test/callback",
+            .app_state = "fixture-app-state",
+            .app_challenge = test_challenge,
+            .upstream_verifier = &test_verifier,
+            .browser_binding = &test_binding,
+        } },
+    };
+    const approved: Grant = .{
+        .expires_at_ms = 1065001,
+        .state = .{ .browser_approved = .{
+            .redirect_uri = "https://app.example.test/callback",
+            .app_challenge = test_challenge,
+            .tenant = "github:42",
+        } },
+    };
+    try store.create(store.context, arena, &test_browser_key, &pending);
+    const loaded_pending = (try store.read(store.context, arena, &test_browser_key)).?;
+    try std.testing.expectEqualDeep(pending, loaded_pending);
+    const claim: Change = .{ .now_ms = 1005001, .transition = .{ .browser_finish = .claim } };
+    try std.testing.expect(try store.change(store.context, arena, &test_browser_key, &claim));
+    const deny: Change = .{ .now_ms = 1005001, .transition = .{ .browser_finish = .deny } };
+    try std.testing.expect(try store.change(store.context, arena, &test_denial_key, &deny));
+    try store.create(store.context, arena, &test_redeem_key, &approved);
+    const loaded_approved = (try store.read(store.context, arena, &test_redeem_key)).?;
+    try std.testing.expectEqualDeep(approved, loaded_approved);
+    const redeem: Change = .{ .now_ms = 1005001, .transition = .{ .browser_finish = .redeem } };
+    try std.testing.expect(try store.change(store.context, arena, &test_redeem_key, &redeem));
+    try std.testing.expect(!try store.change(store.context, arena, &test_redeem_key, &redeem));
+}
+
+const test_browser_key: Key = .{ .digest = @splat('b') };
+const test_denial_key: Key = .{ .digest = @splat('c') };
+const test_redeem_key: Key = .{ .digest = @splat('d') };
+const test_challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+const test_verifier: [64]u8 = @splat('e');
+const test_binding: [64]u8 = @splat('f');
+
+const AwsStep = enum {
+    create,
+    read,
+    schedule,
+    consume,
+    conflict,
+    browser_create,
+    browser_read,
+    browser_claim,
+    browser_deny,
+    redeem_create,
+    redeem_read,
+    redeem_consume,
+    redeem_conflict,
+};
 
 fn mock_dynamodb(listener: *std.Io.net.Server, io: std.Io) !void {
-    for ([_]AwsStep{ .create, .read, .schedule, .consume, .conflict }) |step| {
+    for (std.enums.values(AwsStep)) |step| {
         const connection = try listener.accept(io);
         defer connection.close(io);
         try mock_aws_command(connection, io, step);
@@ -344,9 +497,9 @@ fn mock_aws_command(connection: std.Io.net.Stream, io: std.Io, step: AwsStep) !v
         if (std.ascii.eqlIgnoreCase(header.name, "x-amz-target")) operation = header.value;
     }
     try std.testing.expectEqualStrings(switch (step) {
-        .create => "DynamoDB_20120810.PutItem",
-        .read => "DynamoDB_20120810.GetItem",
-        .schedule, .consume, .conflict => "DynamoDB_20120810.UpdateItem",
+        .create, .browser_create, .redeem_create => "DynamoDB_20120810.PutItem",
+        .read, .browser_read, .redeem_read => "DynamoDB_20120810.GetItem",
+        else => "DynamoDB_20120810.UpdateItem",
     }, operation orelse return error.MissingOperation);
     var body_buffer: [4096]u8 = undefined;
     const length = request.head.content_length orelse return error.MissingRequestBody;
@@ -363,12 +516,14 @@ fn mock_aws_command(connection: std.Io.net.Stream, io: std.Io, step: AwsStep) !v
 
     const body = switch (step) {
         .read => "{\"Item\":" ++ test_item ++ "}",
-        .conflict => "{\"__type\":\"ConditionalCheckFailedException\"," ++
+        .browser_read => "{\"Item\":" ++ test_browser_item ++ "}",
+        .redeem_read => "{\"Item\":" ++ test_approved_item ++ "}",
+        .conflict, .redeem_conflict => "{\"__type\":\"ConditionalCheckFailedException\"," ++
             "\"message\":\"fixture-upstream-code\"}",
         else => "{}",
     };
     try request.respond(body, .{
-        .status = if (step == .conflict) .bad_request else .ok,
+        .status = if (step == .conflict or step == .redeem_conflict) .bad_request else .ok,
         .keep_alive = false,
         .extra_headers = &.{.{ .name = "Content-Type", .value = "application/x-amz-json-1.0" }},
     });
@@ -380,6 +535,23 @@ const test_item =
     "\"expires_at_ms\":{\"N\":\"1900001\"},\"expires_at\":{\"N\":\"1901\"}," ++
     "\"next_poll_at_ms\":{\"N\":\"1005000\"},\"interval_seconds\":{\"N\":\"5\"}}";
 
+const test_browser_item =
+    "{\"id\":{\"S\":\"" ++ test_browser_key.digest ++ "\"}," ++
+    "\"state\":{\"S\":\"browser_pending\"}," ++
+    "\"expires_at_ms\":{\"N\":\"1900001\"},\"expires_at\":{\"N\":\"1901\"}," ++
+    "\"redirect_uri\":{\"S\":\"https://app.example.test/callback\"}," ++
+    "\"app_state\":{\"S\":\"fixture-app-state\"}," ++
+    "\"app_challenge\":{\"S\":\"" ++ test_challenge ++ "\"}," ++
+    "\"upstream_verifier\":{\"S\":\"" ++ test_verifier ++ "\"}," ++
+    "\"browser_binding\":{\"S\":\"" ++ test_binding ++ "\"}}";
+
+const test_approved_item =
+    "{\"id\":{\"S\":\"" ++ test_redeem_key.digest ++ "\"}," ++
+    "\"state\":{\"S\":\"browser_approved\"}," ++
+    "\"expires_at_ms\":{\"N\":\"1065001\"},\"expires_at\":{\"N\":\"1066\"}," ++
+    "\"redirect_uri\":{\"S\":\"https://app.example.test/callback\"}," ++
+    "\"app_challenge\":{\"S\":\"" ++ test_challenge ++ "\"},\"tenant\":{\"S\":\"github:42\"}}";
+
 fn required(value: *const std.json.Value, key: []const u8) !std.json.Value {
     if (value.* != .object) return error.ExpectedObject;
     return value.object.get(key) orelse error.MissingField;
@@ -388,15 +560,27 @@ fn required(value: *const std.json.Value, key: []const u8) !std.json.Value {
 fn expect_aws_body(command: *const std.json.Value, step: AwsStep) !void {
     const table = try required(command, "TableName");
     try std.testing.expectEqualStrings("fixture-sign-ins", table.string);
-    const key = try required(command, if (step == .create) "Item" else "Key");
+    const expected_item: ?[]const u8 = switch (step) {
+        .create => test_item,
+        .browser_create => test_browser_item,
+        .redeem_create => test_approved_item,
+        else => null,
+    };
+    const key = try required(command, if (expected_item != null) "Item" else "Key");
     const row_id = try required(&key, "id");
-    try std.testing.expectEqualStrings(&test_key.digest, (try required(&row_id, "S")).string);
+    const digest = switch (step) {
+        .browser_create, .browser_read, .browser_claim => &test_browser_key.digest,
+        .browser_deny => &test_denial_key.digest,
+        .redeem_create, .redeem_read, .redeem_consume, .redeem_conflict => &test_redeem_key.digest,
+        else => &test_key.digest,
+    };
+    try std.testing.expectEqualStrings(digest, (try required(&row_id, "S")).string);
     switch (step) {
-        .create => {
+        .create, .browser_create, .redeem_create => {
             const parsed = try std.json.parseFromSlice(
                 std.json.Value,
                 std.testing.allocator,
-                test_item,
+                expected_item.?,
                 .{},
             );
             defer parsed.deinit();
@@ -414,9 +598,42 @@ fn expect_aws_body(command: *const std.json.Value, step: AwsStep) !void {
                 (try required(command, "ConditionExpression")).string,
             );
         },
-        .read => try std.testing.expect((try required(command, "ConsistentRead")).bool),
+        .read, .browser_read, .redeem_read => {
+            try std.testing.expect((try required(command, "ConsistentRead")).bool);
+        },
         .schedule, .consume, .conflict => try expect_aws_transition(command, step),
+        .browser_claim, .browser_deny, .redeem_consume, .redeem_conflict => {
+            try expect_browser_aws_transition(command, step);
+        },
     }
+}
+
+fn expect_browser_aws_transition(command: *const std.json.Value, step: AwsStep) !void {
+    const redeem = step == .redeem_consume or step == .redeem_conflict;
+    const names = try required(command, "ExpressionAttributeNames");
+    const values = try required(command, "ExpressionAttributeValues");
+    const pending = try required(&values, ":pending");
+    const now = try required(&values, ":now");
+    const terminal = try required(&values, ":terminal");
+    try std.testing.expectEqualStrings("state", (try required(&names, "#state")).string);
+    try std.testing.expectEqualStrings(
+        if (redeem) "browser_approved" else "browser_pending",
+        (try required(&pending, "S")).string,
+    );
+    try std.testing.expectEqualStrings("1005001", (try required(&now, "N")).string);
+    try std.testing.expectEqualStrings(
+        if (step == .browser_deny) "denied" else "consumed",
+        (try required(&terminal, "S")).string,
+    );
+    try std.testing.expectEqualStrings(
+        "#state = :pending AND expires_at_ms > :now",
+        (try required(command, "ConditionExpression")).string,
+    );
+    const clear_approved = "SET #state = :terminal REMOVE redirect_uri, app_challenge, tenant";
+    const clear_pending = "SET #state = :terminal REMOVE redirect_uri, app_state, " ++
+        "app_challenge, upstream_verifier, browser_binding";
+    const update = if (redeem) clear_approved else clear_pending;
+    try std.testing.expectEqualStrings(update, (try required(command, "UpdateExpression")).string);
 }
 
 fn expect_aws_transition(command: *const std.json.Value, step: AwsStep) !void {

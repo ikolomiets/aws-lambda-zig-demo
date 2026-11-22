@@ -6,9 +6,11 @@ const access_token_size_max = 16 * 1024;
 const client_id_size_max = 256;
 const client_secret_size_max = 1024;
 pub const device_code_size_max = 1024;
+pub const authorization_code_size_max = 1024;
 pub const device_verification_uri = "https://github.com/login/device";
 pub const device_start_url = "https://github.com/login/device/code";
-pub const device_poll_url = "https://github.com/login/oauth/access_token";
+pub const oauth_token_url = "https://github.com/login/oauth/access_token";
+pub const authorize_url = "https://github.com/login/oauth/authorize";
 
 pub const response_size_max = 32 * 1024;
 
@@ -57,6 +59,28 @@ pub const Credentials = struct {
     access_token: AccessToken,
 };
 
+pub const Authorization = struct {
+    client_id: []const u8,
+    redirect_uri: []const u8,
+    state: []const u8,
+    challenge: []const u8,
+};
+
+pub fn authorize(arena: Allocator, request: *const Authorization) Error![]const u8 {
+    try validate_client_id(request.client_id);
+    var buffer = std.Io.Writer.Allocating.init(arena);
+    errdefer buffer.deinit();
+    const writer = &buffer.writer;
+    writer.print(authorize_url ++ "?client_id={s}&redirect_uri=", .{request.client_id}) catch
+        return error.InternalFailure;
+    std.Uri.Component.percentEncode(writer, request.redirect_uri, form_unreserved) catch
+        return error.InternalFailure;
+    writer.print("&scope=&state={s}&code_challenge={s}&code_challenge_method=S256", .{
+        request.state, request.challenge,
+    }) catch return error.InternalFailure;
+    return buffer.written();
+}
+
 pub const DeviceGrant = struct {
     device_code: []const u8,
     user_code: []const u8,
@@ -83,7 +107,7 @@ pub fn start_device(
     const body = std.fmt.allocPrint(arena, "client_id={s}&scope=", .{client_id}) catch {
         return error.InternalFailure;
     };
-    const response = try send_device(arena, context, send, device_start_url, body);
+    const response = try send_form(arena, context, send, device_start_url, body);
     if (response.status != .ok) return error.Unavailable;
     const grant = try parse_response(DeviceGrant, arena, response.body);
     if (grant.device_code.len == 0 or grant.device_code.len > device_code_size_max) {
@@ -120,7 +144,7 @@ pub fn poll_device(
     ) catch return error.InternalFailure;
     defer std.crypto.secureZero(u8, body);
 
-    const response = try send_device(arena, context, send, device_poll_url, body);
+    const response = try send_form(arena, context, send, oauth_token_url, body);
     switch (response.status) {
         .ok, .bad_request, .forbidden, .too_many_requests => {},
         else => return error.Unavailable,
@@ -169,7 +193,7 @@ fn form_unreserved(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~", byte) != null;
 }
 
-fn send_device(
+fn send_form(
     arena: Allocator,
     context: *anyopaque,
     send: SendFn,
@@ -189,6 +213,70 @@ fn send_device(
         error.Unavailable => return error.Unavailable,
         error.OutOfMemory => return error.InternalFailure,
     };
+}
+
+pub const CodeExchange = struct {
+    client_id: []const u8,
+    client_secret: []const u8,
+    code: []const u8,
+    redirect_uri: []const u8,
+    verifier: []const u8,
+};
+
+pub fn exchange_code(
+    arena: Allocator,
+    exchange: *const CodeExchange,
+    context: *anyopaque,
+    send: SendFn,
+) Error!AccessToken {
+    try validate_client_id(exchange.client_id);
+    if (exchange.client_secret.len == 0 or exchange.client_secret.len > client_secret_size_max) {
+        return error.InternalFailure;
+    }
+    std.debug.assert(exchange.code.len > 0);
+    std.debug.assert(exchange.code.len <= authorization_code_size_max);
+    var buffer = std.Io.Writer.Allocating.init(arena);
+    defer buffer.deinit();
+    defer std.crypto.secureZero(u8, buffer.written());
+    const writer = &buffer.writer;
+    writer.print("client_id={s}", .{exchange.client_id}) catch return error.InternalFailure;
+    for ([_]http.Header{
+        .{ .key = "client_secret", .value = exchange.client_secret },
+        .{ .key = "code", .value = exchange.code },
+        .{ .key = "redirect_uri", .value = exchange.redirect_uri },
+        .{ .key = "code_verifier", .value = exchange.verifier },
+    }) |field| {
+        writer.print("&{s}=", .{field.key}) catch return error.InternalFailure;
+        std.Uri.Component.percentEncode(writer, field.value, form_unreserved) catch
+            return error.InternalFailure;
+    }
+    const response = try send_form(arena, context, send, oauth_token_url, buffer.written());
+    switch (response.status) {
+        .ok, .bad_request => {},
+        .unauthorized => return error.InternalFailure,
+        else => return error.Unavailable,
+    }
+    const fields = try parse_response(struct {
+        @"error": ?[]const u8 = null,
+        access_token: ?[]const u8 = null,
+        token_type: ?[]const u8 = null,
+    }, arena, response.body);
+    if (fields.@"error") |failure| {
+        if (fields.access_token != null) return error.Unavailable;
+        if (std.mem.eql(u8, failure, "bad_verification_code")) return error.Unauthorized;
+        if (std.mem.eql(u8, failure, "incorrect_client_credentials") or
+            std.mem.eql(u8, failure, "redirect_uri_mismatch"))
+        {
+            return error.InternalFailure;
+        }
+        return error.Unavailable;
+    }
+    if (response.status != .ok) return error.Unavailable;
+    if (!std.ascii.eqlIgnoreCase(fields.token_type orelse return error.Unavailable, "bearer")) {
+        return error.Unavailable;
+    }
+    return AccessToken.parse(fields.access_token orelse return error.Unavailable) catch
+        error.Unavailable;
 }
 
 const IdentityResponse = struct {

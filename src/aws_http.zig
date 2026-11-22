@@ -12,7 +12,9 @@ pub const Request = struct {
     arena: std.heap.ArenaAllocator,
     method: ?std.http.Method = null,
     path: ?[]const u8 = null,
+    raw_query_json: ?[]const u8 = null,
     headers: []const http.Header = &.{},
+    cookies_json: ?[]const u8 = null,
     body_json: ?[]const u8 = null,
     base64: bool = false,
     body_size_max: ?usize = null,
@@ -32,6 +34,10 @@ pub const Request = struct {
                 if (!std.mem.eql(u8, version, "2.0")) return error.InvalidEvent;
             } else if (std.mem.eql(u8, field.key, "rawPath")) {
                 request.path = try parse_value(?[]const u8, arena, field.value);
+            } else if (std.mem.eql(u8, field.key, "rawQueryString")) {
+                request.raw_query_json = field.value;
+            } else if (std.mem.eql(u8, field.key, "cookies")) {
+                request.cookies_json = field.value;
             } else if (std.mem.eql(u8, field.key, "requestContext")) {
                 const Context = struct { http: struct { method: ?[]const u8 = null } = .{} };
                 const context = try parse_value(Context, arena, field.value);
@@ -70,6 +76,35 @@ pub const Request = struct {
                 .read_fn = read_body,
             } },
         };
+    }
+
+    /// Only handlers that use navigation metadata materialize the raw query and cookies.
+    pub fn navigation_request(request: *Request) !http.HttpRequest {
+        var application = request.application_request();
+        const arena = request.arena.allocator();
+        // A JSON escape can use six bytes per decoded byte. Cookie arrays also have
+        // delimiters and quotes, so leave space for that overhead before decoding.
+        const encoded_size_max = 8 * http.navigation_size_max;
+        if (request.raw_query_json) |json| {
+            if (json.len > encoded_size_max) return error.ValueTooLong;
+            application.raw_query = (try parse_value_bounded(
+                ?[]const u8,
+                arena,
+                json,
+                http.navigation_size_max,
+            )) orelse "";
+            if (application.raw_query.len > http.navigation_size_max) return error.ValueTooLong;
+        }
+        if (request.cookies_json) |json| {
+            if (json.len > encoded_size_max) return error.ValueTooLong;
+            application.cookies = (try parse_value_bounded(
+                ?[]const []const u8,
+                arena,
+                json,
+                http.navigation_size_max,
+            )) orelse &.{};
+        }
+        return application;
     }
 
     fn read_body(context: *anyopaque, _: std.mem.Allocator) anyerror!?[]const u8 {
@@ -125,12 +160,50 @@ test "AWS payload adaptation bounds plain and base64 body allocation" {
 }
 
 fn parse_value(comptime T: type, arena: std.mem.Allocator, json: []const u8) !T {
+    return parse_value_bounded(T, arena, json, json.len);
+}
+
+fn parse_value_bounded(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    json: []const u8,
+    size_max: usize,
+) !T {
     return std.json.parseFromSliceLeaky(T, arena, json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
         .duplicate_field_behavior = .@"error",
-        .max_value_len = json.len,
+        .max_value_len = size_max,
     });
+}
+
+test "AWS payload navigation is decoded only when requested and has a size limit" {
+    const allocator = std.testing.allocator;
+    const prefix = "fixture=";
+    const value: [http.navigation_size_max + 1 - prefix.len]u8 = @splat('x');
+    const oversized = prefix ++ &value;
+    for ([_]struct {
+        raw_query: ?[]const u8 = null,
+        cookies: ?[]const []const u8 = null,
+    }{
+        .{ .raw_query = oversized },
+        .{ .cookies = &.{oversized} },
+    }) |fields| {
+        const event = try std.json.Stringify.valueAlloc(allocator, .{
+            .version = "2.0",
+            .rawPath = "/operations",
+            .rawQueryString = fields.raw_query,
+            .cookies = fields.cookies,
+        }, .{ .emit_null_optional_fields = false });
+        defer allocator.free(event);
+        var request = try Request.parse(allocator, event);
+        defer request.deinit();
+        const application = request.application_request();
+        try std.testing.expectEqualStrings("/operations", application.path.?);
+        try std.testing.expectEqualStrings("", application.raw_query);
+        try std.testing.expectEqual(0, application.cookies.len);
+        try std.testing.expectError(error.ValueTooLong, request.navigation_request());
+    }
 }
 
 fn parse_headers(arena: std.mem.Allocator, json: []const u8) ![]const http.Header {
@@ -205,6 +278,7 @@ pub fn encode_response(
     return lambda.url.encodeResponse(allocator, .{
         .status_code = response.status,
         .headers = headers,
+        .cookies = response.cookies,
         .body = .{ .textual = response.body },
     });
 }

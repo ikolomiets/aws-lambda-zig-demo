@@ -98,7 +98,7 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
 | `zig build check` | Combined offline and runtime Zig suites through the existing `test` and `test-runtime` runners; requires loopback socket permission, with no AWS credentials or live replica. Formatting remains separate. |
 | `zig build test` | Full offline Zig suite; excludes socket-based runtime tests, the live replica, and separate ABI checks |
-| `zig build test-http` | Intake and Query through application-owned HTTP types and the shared AWS payload 2.0 adapter with persistence and publication mocked. GitHub authentication covers direct exchange and device sign-in with simulated provider, secrets, and storage. |
+| `zig build test-http` | Intake and Query through application-owned HTTP types and the shared AWS payload 2.0 adapter with persistence and publication mocked. GitHub authentication covers direct exchange, device sign-in, and browser sign-in with simulated provider, secrets, and storage. |
 | `zig build test-runtime` | Host integration across all seven handlers and the Pending Sign-in AWS adapter; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
 | `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli` | Host counter build and deterministic global allocation/tooling tests |
@@ -191,10 +191,17 @@ Assert the method, path, relevant headers and body received by the peer, then
 assert the caller's observable result after the peer returns its scripted
 response.
 
-For new behavior, get the focused test running and confirm it fails at the
-intended assertion before implementing the change. Record the command and the
-observed failure alongside the map. Run the focused check again after the change
-and confirm the test passes.
+For new behavior, record the focused command and expected failure alongside the
+map. Run the check before implementation and record how it fails at the intended
+assertion. Rerun the same check after implementation and record the passing
+result. For HTTP changes, record this evidence for each route. Keep earlier
+evidence when adding follow-up runs.
+
+```markdown
+| Route and test | Expected failure | Focused command | Observed red | Passing run |
+| --- | --- | --- | --- | --- |
+| `<method> <path>` and test name | Expected and baseline outcome | `command` | Assertion and actual outcome | Result of rerunning the command |
+```
 
 As soon as an SDK-backed adapter is wired, exercise the real SDK with the
 adapter's existing local test. For Pending Sign-ins, run
@@ -311,8 +318,8 @@ failure and recovery, partial SQS acknowledgements, and Completion persistence
 retry. It checks response/error paths and bodies, invocation-ID echoing and
 missing-ID compatibility, and refreshed request and trace metadata. Tests copy
 observations before invocation arenas reset and issue tokens against the current
-clock. The query case freezes only the handler's cache clock so host scheduling
-does not expire its one-second cache between scripted invocations.
+clock. The Query case freezes only the handler's cache clock to keep the
+one-second cache valid between scripted invocations.
 
 Both Seat Reservation handlers use the same
 [test support](../../tests/seat_test_support.zig). Their six cases
@@ -328,12 +335,15 @@ device-start requests received through the production HTTP client. The Lambda
 rejects a token issued for another OAuth App, issues a verifiable PASETO on
 successful exchange, and returns public approval instructions plus a private
 Operations code on device start. The malformed-event fallback also returns
-`Cache-Control: no-store`. A separate loopback DynamoDB peer checks the SDK
-requests and models a conditional consumption success and conflict.
+`Cache-Control: no-store`. The browser callback rejects conflicting payload and
+header cookies before either GitHub call and leaves the Pending Sign-in pending.
+A separate loopback DynamoDB peer checks the SDK requests and models a
+conditional consumption success and conflict.
 [Authentication tests](../../src/authentication_lambda.zig)
-[Pending Sign-in adapter test](../../src/pending_sign_in.zig#L226)
+[Browser sign-in tests](../../src/authentication_browser_tests.zig)
+[Pending Sign-in adapter test](../../src/pending_sign_in.zig#L353)
 
-The summary reports 16 passing cases. Cached compilation still executes them.
+The runtime suite executes even when compilation is cached.
 
 All external persistence, execution, and publication effects are mocked. Cloud
 resource initialization is bypassed; these tests establish no live AWS or

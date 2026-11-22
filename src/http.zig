@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const navigation_size_max = 8192;
+
 pub const Header = struct {
     key: []const u8,
     value: []const u8,
@@ -9,7 +11,9 @@ pub const Header = struct {
 pub const HttpRequest = struct {
     method: ?std.http.Method = null,
     path: ?[]const u8 = null,
+    raw_query: []const u8 = "",
     headers: []const Header = &.{},
+    cookies: []const []const u8 = &.{},
     body: Body = .empty,
 
     pub const Body = union(enum) {
@@ -48,6 +52,7 @@ pub const HttpRequest = struct {
 pub const HttpResponse = struct {
     status: std.http.Status,
     headers: []const Header,
+    cookies: []const []const u8 = &.{},
     body: []const u8,
     body_allocator: ?std.mem.Allocator = null,
     headers_arena: ?std.heap.ArenaAllocator = null,

@@ -181,6 +181,78 @@ server enforces the GitHub grant deadline even while the DynamoDB row still
 exists. A successful conditional write consumes the grant before PASETO
 issuance. [GitHub device flow](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow)
 
+### Browser GitHub sign-in
+
+The authentication Lambda handles these routes on an HTTPS Operations API
+origin with browser sign-in enabled. The current SAM template exposes direct
+exchange. Browser sign-in requires the three browser routes, the Pending Sign-in
+table binding, and the browser app's origin enabled for cross-origin requests.
+See the [table binding](DEPLOY_AWS_LAMBDA_WITH_SAM.md#device-sign-in-binding).
+
+The Lambda reads `GITHUB_OAUTH_CALLBACK_URL` for the HTTPS Operations callback
+registered with GitHub. Use the callback URL without a query or fragment.
+`GITHUB_BROWSER_REDIRECT_URIS` is a JSON array of exact
+HTTPS app callback URLs. The comparison uses the decoded `redirect_uri` value
+byte for byte, including any static query string. A registered app callback
+cannot contain user information, a fragment, or a query parameter named `code`,
+`state` or `error`. Callback registration and cross-origin access are separate
+settings.
+
+1. Generate fresh random app state and an independent PKCE verifier using the
+   browser's cryptographic random source. A base64url encoding of 32 random
+   bytes without padding gives a 43-character verifier. Compute the challenge
+   as base64url without padding of the SHA-256 digest of the verifier's ASCII
+   bytes. Keep only the temporary state and verifier in `sessionStorage` for
+   this tab. Use a top-level navigation to `GET /auth/github/authorize` with
+   `redirect_uri`, `state`, `code_challenge` and `code_challenge_method=S256` as
+   URL-encoded query parameters.
+2. Operations validates the app callback and responds with a `302` to GitHub
+   requesting zero scopes. It uses its own state and S256 challenge with GitHub
+   and binds the Pending Sign-in to a short-lived Secure, HttpOnly, SameSite=Lax
+   cookie on the Operations host. On GitHub's redirect to
+   `GET /auth/github/callback`, the browser sends the cookie as proof that it
+   initiated the Pending Sign-in. Operations checks that proof and its upstream
+   state before exchanging GitHub's code with its own verifier. It resolves the
+   Operation Tenant from the verified GitHub account and discards the GitHub
+   token.
+3. Operations redirects to the app callback with `code` and the app's original
+   `state`, or with `error=access_denied` and the same state on denial. Read the
+   result and require exactly one state matching the app state in
+   `sessionStorage` before acting on either outcome. Remove the returned fields
+   from the address bar with `history.replaceState` before making other
+   requests. For a valid approval, read the app verifier from `sessionStorage`
+   and send `POST /auth/github/redeem` to Operations with this JSON body.
+
+   ```json
+   {
+     "code": "<Operations code>",
+     "redirect_uri": "<original registered HTTPS callback>",
+     "code_verifier": "<app verifier from tab storage>"
+   }
+   ```
+
+4. On first valid redemption, Operations conditionally consumes the grant and
+   returns `200` with only `access_token`, `token_type` (`Bearer`) and
+   `expires_in` (28,800 seconds by default). Clear the state and verifier on
+   completion or denial. Discard any old attempt before beginning a new one.
+   Hold the PASETO in memory and use it for authorized Operation requests. Local
+   sign-out discards that in-memory copy. A reload requires fresh sign-in. Any
+   other copy remains valid up to its signed expiration.
+
+The authentication responses use `Cache-Control: no-store`. A malformed or
+unregistered request or invalid callback binding fails locally. A PASETO or
+GitHub access token never appears in a redirect. Keep codes, state, verifiers,
+cookies and credential-bearing URLs out of application diagnostics. Denial
+ends the attempt. A callback already claimed for GitHub exchange stays spent
+even if the exchange fails. Start a fresh sign-in in that case.
+
+The callback must complete within ten minutes of authorization. The code
+expires 60 seconds after the callback verifies GitHub's identity, capped by
+the original ten-minute deadline. The server checks both cutoffs on access
+even while the rows remain stored. Invalid redemption input or an app binding
+mismatch returns `400`. An expired or consumed code returns `410`.
+[GitHub OAuth web application flow](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#web-application-flow)
+
 ### Submission, paths, and request bodies
 
 Submission accepts the existing Operation input JSON containing `id`, `name`, and
@@ -304,8 +376,8 @@ records. Existing Lambda application-log retention is a separate policy.
 
 | Source | Responsibility |
 | --- | --- |
-| [http.zig](../src/http.zig) | Application-owned `HttpRequest` (method, path, headers, deferred body access) and `HttpResponse` (status, headers, body). |
-| [aws_http.zig](../src/aws_http.zig) | Payload 2.0 envelope parsing, header preservation, deferred body materialization/base64 decoding, and AWS response encoding. |
+| [http.zig](../src/http.zig) | Application-owned requests and responses, including browser queries, cookies, and deferred request bodies. |
+| [aws_http.zig](../src/aws_http.zig) | Payload 2.0 envelope parsing, header preservation, bounded browser query and cookie decoding, deferred body materialization, and AWS response encoding. |
 | [intake_lambda.zig](../src/intake_lambda.zig) and [query_lambda.zig](../src/query_lambda.zig) | Lambda entry points and `handle_http` application behavior, including existing persistence/publication seams and warm resource ownership. |
 | [lambda_auth.zig](../src/lambda_auth.zig) | Authentication from application headers, environment, allocator, and clock. |
 
