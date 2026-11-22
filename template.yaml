@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Deploy six operation and seat Lambdas with an optional WireGuard gateway.
+Description: Deploy the Operations API and processors with optional GitHub exchange and WireGuard.
 
 # Opt-in network parameters intentionally default to empty and are guarded by a Rule.
 Metadata:
@@ -95,6 +95,26 @@ Parameters:
   PasetoPublicKey:
     Type: String
     Description: Padded Base64 Ed25519 public key used to verify PASETO tokens.
+  EnableGitHubExchange:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Whether to expose direct GitHub token exchange on the Operations API.
+  GitHubClientId:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[A-Za-z0-9_-][A-Za-z0-9._-]{0,255}$'
+    Description: Public client ID of the registered GitHub OAuth App.
+  GitHubClientSecretArn:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}$'
+    Description: Complete Secrets Manager ARN of the GitHub OAuth App client secret.
+  PasetoSigningKeySecretArn:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}$'
+    Description: Complete Secrets Manager ARN of the private key matching PasetoPublicKey.
   EnableWireGuardGateway:
     Type: String
     Default: "false"
@@ -173,6 +193,17 @@ Parameters:
     Description: ARM64 EC2 instance type for the WireGuard gateway.
 
 Rules:
+  GitHubExchangeInputsRequired:
+    RuleCondition: !Equals [!Ref EnableGitHubExchange, "true"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref GitHubClientId, ""]]
+        AssertDescription: GitHubClientId is required when GitHub exchange is enabled.
+      - Assert: !Not [!Equals [!Ref GitHubClientSecretArn, ""]]
+        AssertDescription: GitHubClientSecretArn is required when GitHub exchange is enabled.
+      - Assert: !Not [!Equals [!Ref PasetoSigningKeySecretArn, ""]]
+        AssertDescription: PasetoSigningKeySecretArn is required when GitHub exchange is enabled.
+      - Assert: !Not [!Equals [!Ref GitHubClientSecretArn, !Ref PasetoSigningKeySecretArn]]
+        AssertDescription: GitHub exchange requires two distinct secrets.
   WireGuardGatewayInputsRequired:
     RuleCondition: !Equals [!Ref EnableWireGuardGateway, "true"]
     Assertions:
@@ -205,6 +236,7 @@ Rules:
         AssertDescription: LambdaRouteTableId is required while TigerBeetle processor VPC cleanup resources are retained.
 
 Conditions:
+  GitHubExchangeEnabled: !Equals [!Ref EnableGitHubExchange, "true"]
   OwnLedgerCounterTable: !Equals [!Ref ExistingLedgerCounterTableName, ""]
   WireGuardGatewayEnabled: !Equals [!Ref EnableWireGuardGateway, "true"]
   TigerBeetleProcessorVpcCleanupResourcesRetained: !Or
@@ -387,6 +419,16 @@ Resources:
                 httpMethod: POST
                 payloadFormatVersion: "2.0"
                 uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryFunction.Arn}/invocations
+          /auth/github/exchange: !If
+            - GitHubExchangeEnabled
+            - post:
+                responses: {}
+                x-amazon-apigateway-integration:
+                  type: aws_proxy
+                  httpMethod: POST
+                  payloadFormatVersion: "2.0"
+                  uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations
+            - !Ref AWS::NoValue
 
   IntakeApiPermission:
     Type: AWS::Lambda::Permission
@@ -431,6 +473,44 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceAccount: !Ref AWS::AccountId
       SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OperationsApi}/$default/GET/operations/*
+
+  AuthenticationFunction:
+    Type: AWS::Serverless::Function
+    Condition: GitHubExchangeEnabled
+    Properties:
+      Description: Exchanges GitHub OAuth App user credentials for Operations PASETOs.
+      CodeUri: zig-out/packages/authentication-lambda.zip
+      Runtime: provided.al2023
+      Handler: bootstrap
+      Architectures:
+        - arm64
+      MemorySize: 128
+      Timeout: 15
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource:
+                - !Ref GitHubClientSecretArn
+                - !Ref PasetoSigningKeySecretArn
+      Environment:
+        Variables:
+          GITHUB_CLIENT_ID: !Ref GitHubClientId
+          GITHUB_CLIENT_SECRET_ARN: !Ref GitHubClientSecretArn
+          PASETO_SIGNING_KEY_SECRET_ARN: !Ref PasetoSigningKeySecretArn
+          PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
+
+  AuthenticationApiPermission:
+    Type: AWS::Lambda::Permission
+    Condition: GitHubExchangeEnabled
+    Properties:
+      FunctionName: !Ref AuthenticationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OperationsApi}/$default/POST/auth/github/exchange
 
   # Keep this role explicit so the deploy helper can retain ENI cleanup permissions
   # only between the VPC-detach and cleanup phases.
@@ -975,6 +1055,10 @@ Outputs:
   OperationsApiUrl:
     Description: Common HTTPS origin for Operation submission and querying.
     Value: !Sub https://${OperationsApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+  AuthenticationFunctionName:
+    Condition: GitHubExchangeEnabled
+    Description: Physical name of the optional authentication Lambda.
+    Value: !Ref AuthenticationFunction
   QueryFunctionName:
     Description: Deployed operation query Lambda function name.
     Value: !Ref QueryFunction

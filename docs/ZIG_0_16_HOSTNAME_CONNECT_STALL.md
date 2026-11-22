@@ -355,8 +355,8 @@ only `tiger_beetle_processor_exe` selects the compatible patched standard librar
 with `.zig_lib_dir = .{ .cwd_relative = "../zig/lib" }`.
 Keep that sibling checkout and its hostname-connect scheduling patch available
 for Lambda builds and packaging. The checkout is external to this repository
-and its patch is not pinned in `build.zig.zon`. The other five Lambda
-executables, host tools, and ordinary tests use the compiler's bundled library.
+and its patch is not pinned in `build.zig.zon`. All other Lambda executables,
+host tools, and ordinary tests use the compiler's bundled library.
 
 The patched library passes all three standalone scheduling cases. These checks
 establish compiler compatibility and simulated scheduling behavior; they do not

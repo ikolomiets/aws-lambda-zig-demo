@@ -30,10 +30,18 @@ export ZIG_GLOBAL_CACHE_DIR=inherited-global-cache
 need_command() { printf 'need:%s\n' "$1" >>"$MOCK_LOG"; }
 prepare_aws_sso_session() { :; }
 ensure_stack_not_in_progress() { :; }
-require_seat_development_baseline() { :; }
 validate_existing_intake_name() { :; }
 invoke_deployment_controller() { :; }
-aws() { printf 'unexpected AWS call\n' >&2; exit 90; }
+aws() {
+    if [ "$1 $2" = 'cloudformation describe-stacks' ] &&
+        [[ "$*" == *'SeatReservationCompletionProcessorName'*'AuthenticationFunctionName'* ]]; then
+        printf 'inspect-development-functions\n' >>"$MOCK_LOG"
+        printf '2\t%s\n' "${MOCK_AUTHENTICATION_OUTPUT_COUNT:-0}"
+        return
+    fi
+    printf 'unexpected AWS call\n' >&2
+    exit 90
+}
 zip() { printf 'unexpected shell packaging\n' >&2; exit 91; }
 zig() {
     [ "$1" != version ] || { printf '%s\n' "${MOCK_ZIG_VERSION:-0.17.1}"; return; }
@@ -54,7 +62,7 @@ zig() {
     if [ "$2" = package ]; then
         [ "$MOCK_PACKAGE_STATUS" -eq 0 ] || return "$MOCK_PACKAGE_STATUS"
         mkdir -p zig-out/packages
-        for archive in intake-lambda query-lambda tiger-beetle-processor \
+        for archive in intake-lambda query-lambda authentication-lambda tiger-beetle-processor \
             tiger-beetle-completion-processor seat-reservation-processor \
             seat-reservation-completion-processor
         do
@@ -128,8 +136,12 @@ for mode in full dev; do
                 fi
                 continue
             fi
-            [ "$(grep -c '^unzip:-Z1 zig-out/packages/.*\.zip$' "$TEST_TMP_DIR/calls.log")" -eq 6 ] ||
-                fail_test "deployment did not validate six packages"
+            [ "$(grep -c '^unzip:-Z1 zig-out/packages/.*\.zip$' "$TEST_TMP_DIR/calls.log")" -eq 7 ] ||
+                fail_test "deployment did not validate seven packages"
+            grep -Fxq 'file:zig-out/bin/authentication/bootstrap' "$TEST_TMP_DIR/calls.log" ||
+                fail_test "deployment skipped authentication bootstrap validation"
+            grep -Fxq 'unzip:-Z1 zig-out/packages/authentication-lambda.zip' "$TEST_TMP_DIR/calls.log" ||
+                fail_test "deployment skipped authentication archive validation"
             if [ "$mode" = dev ]; then
                 [[ "$calls" != *'sam:validate '* ]] ||
                     fail_test "development mode ran SAM validation"
@@ -147,6 +159,35 @@ for mode in full dev; do
             fi
         done
     done
+done
+
+for authentication_output_count in 0 1 2; do
+    : >"$TEST_TMP_DIR/calls.log"
+    status=0
+    MOCK_AUTHENTICATION_OUTPUT_COUNT="$authentication_output_count" \
+        bash "$TEST_TMP_DIR/driver.sh" "$TEST_TMP_DIR" 0 --dev --no-url-check \
+        >"$TEST_TMP_DIR/output.log" 2>&1 || status=$?
+    calls="$(cat "$TEST_TMP_DIR/calls.log")"
+    [[ "$calls" == *inspect-development-functions* ]] ||
+        fail_test 'code update skipped deployed function discovery'
+    if [ "$authentication_output_count" -eq 2 ]; then
+        [ "$status" -eq 1 ] && [[ "$calls" != *'sam:sync '* ]] ||
+            fail_test 'ambiguous authentication outputs reached code update'
+        continue
+    fi
+    [ "$status" -eq 0 ] || {
+        cat "$TEST_TMP_DIR/output.log" >&2
+        fail_test 'code update failed'
+    }
+    resource_ids="$(sed -n 's/^sam:sync .*--no-dependency-layer //p' "$TEST_TMP_DIR/calls.log")"
+    expected='--resource-id IntakeFunction --resource-id QueryFunction'
+    expected+=' --resource-id TigerBeetleProcessor --resource-id TigerBeetleCompletionProcessor'
+    expected+=' --resource-id SeatReservationProcessor --resource-id SeatReservationCompletionProcessor'
+    if [ "$authentication_output_count" -eq 1 ]; then
+        expected+=' --resource-id AuthenticationFunction'
+    fi
+    [ "$resource_ids" = "$expected" ] ||
+        fail_test "code update selected the wrong function set: $resource_ids"
 done
 
 for zig_version in 0.17.0 0.17.1 0.17.42; do

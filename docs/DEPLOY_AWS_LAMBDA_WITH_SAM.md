@@ -1,13 +1,13 @@
-# Deploy the six operation and Seat Reservation Lambdas with SAM
+# Deploy the Operations API and processors with SAM
 
-This guide documents how to deploy the six Zig Lambda packages in this repository
+This guide documents how to deploy the Zig Lambda packages in this repository
 using AWS SAM and `template.yaml`.
 
 The [Operations API Gateway specification](API_GATEWAY.md) owns the current HTTP
 and integration contract. This guide owns deployment values, infrastructure
 updates, operational commands, and cleanup.
 
-SAM deploys all six Lambda functions as one CloudFormation-managed stack. It creates
+SAM deploys six Lambda functions by default as one CloudFormation-managed stack. It creates
 their execution roles, one public HTTP API for intake and query, the DynamoDB
 operations table, the TigerBeetle queue sent by intake and consumed by the TigerBeetle processor,
 and the Completion queue sent by the TigerBeetle processor and consumed by the Completion processor.
@@ -23,6 +23,9 @@ intake -> SeatReservationQueue -> seat-reservation-processor -> TigerBeetleQueue
 Seat submission sends local rejections directly to seat completion. Events and
 Ledger Counters are retained independently of the Operations TTL.
 
+The stack can also deploy an authentication Lambda on the same API for
+[direct GitHub token exchange](#direct-github-token-exchange).
+
 The template can also provision an optional EC2 WireGuard gateway that routes
 TigerBeetle processor traffic to TigerBeetle on a development workstation. While
 the TigerBeetle processor is VPC-attached, SAM supplies outbound IPv6 access to the regional SQS
@@ -35,6 +38,7 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 - [Build and package](#2-build-and-package-the-zig-lambdas) · [Template validation](#3-validate-the-sam-template)
 - [Stack resources](#4-understand-what-the-template-creates) · [Deployment values](#5-preserve-the-intake-function-name-and-choose-deployment-values)
 - [Full deployment](#6-deploy-with-sam-guided-mode) · [Development code updates](#development-code-updates) · [Rebuild and redeploy](#12-update-the-deployed-lambda-code)
+- [Direct GitHub token exchange](#direct-github-token-exchange)
 - [Gateway operation](#7-configure-and-operate-the-wireguard-gateway) · [Gateway diagnostics](#diagnose-failures) · [Key rotation](#rotate-wireguard-keys)
 - [API checks](#8-test-query-get-and-intake-post) · [API access logs](#inspect-api-access-logs) · [Lambda logs](#9-download-lambda-logs)
 - [Custom API domain and Cloudflare DNS](#custom-api-domain-and-cloudflare-dns)
@@ -53,7 +57,7 @@ The gateway is disabled by default; enabling it adds EC2 and Elastic IP charges.
 - You have an IAM Identity Center / SSO profile named `dev`.
 - The deployment region is `ca-central-1`.
 - `template.yaml` exists in this repository.
-- The six archives under `zig-out/packages/` listed in
+- The seven archives under `zig-out/packages/` listed in
   [the packaging procedure](#2-build-and-package-the-zig-lambdas) each contain
   one Linux ARM64 executable named `bootstrap`.
 - The Operation HTTP API is intentionally public for authenticated demo testing.
@@ -172,7 +176,7 @@ To run only the Lambda runtime integration suite, use:
 zig build test-runtime --summary all
 ```
 
-The suite exercises all six handlers through a fake Runtime API on `127.0.0.1`
+The suite exercises all seven handlers through a fake Runtime API on `127.0.0.1`
 with external effects mocked. It requires loopback socket access, with no AWS
 credentials or live TigerBeetle replica. The combined `check` target and default
 `./check.sh` gate therefore require loopback access too. Both full and development
@@ -195,11 +199,12 @@ implementations invoked by `persistence.sh`, `queue.sh`, `events.sh`, and
 Each Lambda zip
 contains only its handler's root-level `bootstrap`.
 
-Verify that all six built artifacts are Linux ARM64 executables.
+Verify that all seven built artifacts are Linux ARM64 executables.
 
 ```sh
 file zig-out/bin/intake/bootstrap \
   zig-out/bin/query/bootstrap \
+  zig-out/bin/authentication/bootstrap \
   zig-out/bin/tiger_beetle_processor/bootstrap \
   zig-out/bin/tiger_beetle_completion_processor/bootstrap \
   zig-out/bin/seat_reservation_processor/bootstrap \
@@ -239,6 +244,9 @@ executables:
 ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
 ```
 
+The authentication bootstrap is statically linked and uses cancellable I/O
+tasks to bound the external exchange before the Lambda deadline.
+
 TigerBeetle processor is multithread-capable because the TigerBeetle C client completes
 requests on a native callback thread. It is a stripped ARM64 glibc executable
 and `file` reports it as dynamically linked. Amazon Linux 2023 supplies the
@@ -246,11 +254,12 @@ glibc loader and libraries; do not expect the TigerBeetle processor bootstrap to
 static.
 
 The explicit `package` target installs the existing executables and writes these
-six archives relative to the Zig installation prefix (`zig-out` by default):
+seven archives relative to the Zig installation prefix (`zig-out` by default):
 
 ```text
 zig-out/packages/intake-lambda.zip
 zig-out/packages/query-lambda.zip
+zig-out/packages/authentication-lambda.zip
 zig-out/packages/tiger-beetle-processor.zip
 zig-out/packages/tiger-beetle-completion-processor.zip
 zig-out/packages/seat-reservation-processor.zip
@@ -263,6 +272,8 @@ nonempty size, and single root-level entry after inspecting the bootstraps.
 Ordinary `zig build` and the offline test suite do not create or refresh ZIPs.
 
 SAM reads these paths from the matching `CodeUri` properties in `template.yaml`.
+The authentication archive is built with the others. SAM creates its function
+only when direct GitHub exchange is enabled.
 The previous root-level archives with the same filenames are unused. Their
 removal remains manual; neither the build nor the deployment helper deletes them.
 
@@ -330,6 +341,17 @@ Both commands should report that `template.yaml` is valid.
 - `TigerBeetleCompletionProcessor`: `AWS::Serverless::Function`
 - `TigerBeetleCompletionProcessorRole`: `AWS::IAM::Role`
 - `TigerBeetleCompletionProcessorQueueMapping`: `AWS::Lambda::EventSourceMapping`
+
+When `EnableGitHubExchange=true`, the template adds these resources and the
+named `POST /auth/github/exchange` route.
+
+- `AuthenticationFunction` uses ARM64 `provided.al2023`, 128 MB of memory, and a
+  15-second Lambda timeout. It runs outside the optional WireGuard VPC attachment
+  and uses HTTPS to reach GitHub and regional Secrets Manager.
+- Its generated `AuthenticationFunctionRole` has CloudWatch execution logging
+  and `secretsmanager:GetSecretValue` scoped to the two configured secret ARNs.
+- `AuthenticationApiPermission` permits API Gateway invocation from this
+  account and the API's `$default/POST/auth/github/exchange` route.
 
 When `EnableWireGuardGateway=true`, the template also creates:
 
@@ -1483,7 +1505,7 @@ for 400. Wrong methods, the API root, and unmatched paths must return native
 gateway 404. The root is not an authentication probe. The private key and test
 token are not printed or passed to the Lambda environment. Use
 `PASETO_PUBLIC_KEY='<public-key-from-keygen>' ./deploy.sh --dry-run` to run the
-deployment-input checks, rebuild all six Lambda zip archives, and validate `template.yaml` without
+deployment-input checks, rebuild all seven Lambda zip archives, and validate `template.yaml` without
 deploying to AWS.
 
 For non-dry-run deployments, the helper clears inherited static AWS credential
@@ -1546,7 +1568,7 @@ to `../aws-lambda-zig`; override it with `LOCAL_AWS_LAMBDA_ROOT` when needed.
 
 Both deployment modes run `zig build package` with their selected local and
 global caches and any `--use-local-libs` package forks. They validate deployment
-configuration, the compiler version, Linux ARM64 bootstraps, and all six ZIPs;
+configuration, the compiler version, Linux ARM64 bootstraps, and all seven ZIPs;
 full deployment also runs both SAM template validation passes. These checks also
 run during dry runs, and a failure stops deployment or sync. Formatting, shell
 syntax, offline Zig tests, and loopback runtime tests belong to the
@@ -1615,6 +1637,94 @@ retains `GetItem`/`UpdateItem` counter access and cannot initialize a counter.
 The guards have mocked offline coverage; they do not establish live AWS IAM,
 connectivity, or delivery evidence.
 
+### Direct GitHub token exchange
+
+New stacks leave GitHub exchange disabled and need only the existing PASETO
+public-key configuration. Enabling exchange lets **any GitHub account** that
+authorizes the deployment's OAuth App obtain a PASETO and submit configured
+Operations. Operation Tenant controls access to Operation records. Generic
+TigerBeetle commands can look up accounts and submit transfers against known
+cluster-wide Resource IDs, subject to the processor's admission checks and
+TigerBeetle ledger rules. [TigerBeetle processor contract](TIGER_BEETLE_PROCESSOR.md#framework-boundary)
+
+Before enabling, inventory subjects issued by existing token issuers and check
+persisted Operations and tenant-owned Seat Events for `github:<numeric-id>`.
+Each such subject belongs to its corresponding GitHub account. For unrelated
+uses, stop issuing that subject, assign a new subject outside the reserved
+namespace, and rebind or reprovision affected resources under that subject.
+Resolve any outstanding Operations with their original owners and verify that
+unrelated Operation records have been removed before enabling. Allow old
+credentials to expire and verify that no unrelated tenant-owned resources
+remain accessible under the reserved subjects. A GitHub login rename preserves
+the account's numeric ID and tenant.
+
+Register an OAuth App in GitHub's **Settings → Developer settings → OAuth Apps**.
+Use the client application's homepage and its HTTPS authorization callback.
+The client obtains the user access token for this OAuth App and sends it to
+Operations. If the client obtains the token through GitHub's device flow, enable
+that option in the OAuth App registration. The exchange needs only public
+account identity. Record the public Client ID and generate a client secret.
+[GitHub's OAuth App registration guide](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
+
+In Secrets Manager, create two **Other type of secret** entries in the stack's
+account and Region. Use the AWS-managed `aws/secretsmanager` key and enter each
+value in the **Plaintext** editor as a raw `SecretString`. Store the GitHub client
+secret in one entry. In the second, store the padded Base64 value of
+`PASETO_PRIVATE_KEY` from the same `zig-out/bin/paseto keygen` pair as the
+`PASETO_PUBLIC_KEY` used by Intake and Query. Leave out JSON wrapping, variable
+names and trailing newlines. The Lambda reads each current version at exchange
+time and verifies the key pair before issuing a token. Use a coordinated full
+stack update for a signing key change so that the verifier configuration matches.
+Keep values out of deployment arguments, stack outputs and diagnostic logs.
+[Secrets Manager GetSecretValue](https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html)
+
+Set `PASETO_PUBLIC_KEY` to the matching public value and configure the public
+GitHub ID and complete secret ARNs, including their generated six-character
+suffixes. The following reads only secret metadata after SSO login.
+
+```sh
+export GITHUB_CLIENT_ID='<OAuth App client ID>'
+export GITHUB_CLIENT_SECRET_ARN="$(
+  aws secretsmanager describe-secret --secret-id '<GitHub client secret name>' \
+    --profile dev --region ca-central-1 --query ARN --output text
+)"
+export PASETO_SIGNING_KEY_SECRET_ARN="$(
+  aws secretsmanager describe-secret --secret-id '<PASETO signing key secret name>' \
+    --profile dev --region ca-central-1 --query ARN --output text
+)"
+./deploy.sh --profile dev --region ca-central-1 --stack-name aws-lambda-zig-demo \
+  --enable-github-exchange --no-url-check
+```
+
+`--no-url-check` keeps the private key in Secrets Manager for this workflow by
+skipping the existing Intake and Query smoke checks that require a host-side
+private key. `--dry-run` can be added to validate inputs and packages locally.
+With direct SAM deployment, set `EnableGitHubExchange=true`, `GitHubClientId`,
+`GitHubClientSecretArn`, `PasetoSigningKeySecretArn`, and the existing
+`PasetoPublicKey` parameter on the full stack deployment.
+
+Discover the origin from the stack, then use its
+[`POST /auth/github/exchange` contract](API_GATEWAY.md#direct-github-exchange).
+The conditional `AuthenticationFunctionName` output identifies the Lambda for
+CloudWatch diagnostics.
+
+```sh
+OPERATIONS_API_URL="$(
+  aws cloudformation describe-stacks --stack-name aws-lambda-zig-demo \
+    --profile dev --region ca-central-1 --output text \
+    --query "Stacks[0].Outputs[?OutputKey=='OperationsApiUrl'].OutputValue | [0]"
+)"
+```
+
+To disable exchange, run a full deployment with the public key and the existing
+stack settings, using `./deploy.sh --disable-github-exchange --no-url-check` or
+`EnableGitHubExchange=false` with SAM. This removes the route, function, role,
+and invocation permission. The operator-owned secrets remain available for
+separate lifecycle management. API Gateway returns `404` for further exchanges.
+PASETOs already issued remain valid through their signed expiration. Subsequent
+invocations of `deploy.sh` without either exchange flag preserve the stack's
+configured setting.
+
 ### Development code updates
 
 Use `./deploy.sh --dev` for compatible code changes on an existing development
@@ -1650,7 +1760,7 @@ cache with `ZIG_GLOBAL_CACHE_DIR` for every Zig build command. Zig 0.17 does not
 accept `--global-cache-dir` for `zig build`.
 Development mode checks for Zig 0.17.x and incrementally builds the same
 ARM64 targets in `safe` mode and host tools through `zig build package`, using the
-selected caches and any Zig 0.17-compatible package forks. It refreshes all six
+selected caches and any Zig 0.17-compatible package forks. It refreshes all seven
 prebuilt ZIPs under `zig-out/packages/` and verifies stripped ARM64
 bootstraps and root-level archive contents. Both SAM validation passes are skipped.
 Build, package-validation, and sync failures fail the run. Repository tests run
@@ -1660,7 +1770,10 @@ After SSO login and the active-stack guard, the helper runs one-shot
 `sam sync --code --no-watch --no-dependency-layer` against `template.yaml`, using
 the selected stack/profile/Region and exactly `IntakeFunction`, `QueryFunction`,
 `TigerBeetleProcessor`, `TigerBeetleCompletionProcessor`,
-`SeatReservationProcessor`, and `SeatReservationCompletionProcessor`. SAM handles the
+`SeatReservationProcessor`, and `SeatReservationCompletionProcessor`. It also
+selects `AuthenticationFunction` when the stack has the
+`AuthenticationFunctionName` output. Enabling or disabling exchange requires a
+full deployment. SAM handles the
 prebuilt ZIPs, unchanged-code detection, upload, and update waiting. SAM may ask
 for its development-stack opt-in on first use; selecting `--dev` automatically
 answers that confirmation with a single `Y`. The warning remains visible, and
@@ -1677,7 +1790,7 @@ Development mode invokes no deployment controller, WireGuard lifecycle action,
 or counter setup. It rejects explicit function-name, TigerBeetle configuration,
 counter-table/counter-ID, and Lambda-principal flags, lifecycle options including `--cleanup`, and custom
 deployment controllers. Environment configuration overrides such as
-`PASETO_PUBLIC_KEY`, function names, and TigerBeetle settings are not applied by
+`PASETO_PUBLIC_KEY`, function names, GitHub settings, and TigerBeetle settings are not applied by
 code sync. Use full deployment for new resources, IAM, environment/runtime/network
 settings, and coordinated incompatible message-envelope changes; those require
 a new compatible baseline before further code-only iterations.
@@ -2439,13 +2552,13 @@ needed, without treating it as a durable execution journal.
 
 ### Outcome log rollout and manual acceptance
 
-Build, run the complete offline checks, and refresh all six packages using
+Build, run the complete offline checks, and refresh the Lambda packages using
 [the packaging procedure](#2-build-and-package-the-zig-lambdas). Deploy the same
 revision across intake, both seat processors and both TigerBeetle processors.
 Follow the [coordinated processor procedure](#processor-message-rollout) before
 resuming producers; development sync is appropriate only after establishing a
-compatible six-function baseline. The deployment helper is unchanged and does
-not automate these acceptance checks. Run cloud updates and scenarios only after
+compatible six-function baseline. Run the acceptance checks manually.
+Run cloud updates and scenarios only after
 explicit deployment authorization.
 
 Confirmation requests and Context have exactly `command`, `event_id` and
@@ -2989,7 +3102,7 @@ submission and completion with mocked DynamoDB and queue effects, including
 class-free Results, native failure mapping and retired-request rejection. They are
 also part of `zig build test`.
 
-Run the separate runtime suite to exercise all six private handlers, including
+Run the separate runtime suite to exercise all seven handlers, including
 both seat processors, through the real Lambda event loop:
 
 ```sh
@@ -3306,7 +3419,7 @@ Then redeploy the stack:
 sam deploy --profile dev --region ca-central-1
 ```
 
-SAM uploads all six packages and updates their CloudFormation-managed Lambda functions.
+SAM uses the packages to update the CloudFormation-managed Lambda functions.
 
 ## 13. Delete the SAM stack
 
@@ -3319,7 +3432,7 @@ Explicit owned-resource teardown is a separate mode:
   --region ca-central-1
 ```
 
-**This permanently deletes owned data.** Cleanup removes all six SAM-managed
+**This permanently deletes owned data.** Cleanup removes the deployed SAM-managed
 functions and roles, Operations and Events, every counter in an owned counter
 table, all four queues and queued messages, the HTTP API and stage, invocation
 permissions, the API access-log group and its remaining records, its delivery
@@ -3421,10 +3534,11 @@ rmdir '<private-key-directory>'
 
 ## Security note
 
-This demo exposes one public HTTP API with two routes whose handlers require a
-valid PASETO bearer token. Public Function URLs are removed, and invocation grants
-are scoped to the API and routes. Processors are invoked from SQS. Production
-configurations can further restrict infrastructure authorization and IAM policies.
+This demo exposes one public HTTP API. Intake and Query require a valid
+PASETO. Optional direct GitHub exchange requires a valid user access token
+for the deployment's OAuth App and opens enrollment to GitHub accounts.
+Invocation grants are scoped to the API and routes. Processors are invoked
+from SQS. [GitHub exchange deployment and enrollment](#direct-github-token-exchange)
 
 When the gateway is enabled, IPv4 UDP/51820 is deliberately open from
 `0.0.0.0/0` because the NAT public address of the development workstation is

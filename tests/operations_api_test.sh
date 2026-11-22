@@ -8,7 +8,7 @@ contains_line() { grep -Fxq "$2" <<<"$1" || fail_test "missing line: $2"; }
 
 route_definition() {
     awk -v route="          $2:" '
-        $0 == route { found = 1; next }
+        $0 == route || $0 == route " !If" { found = 1; next }
         found && $0 !~ /^           / && $0 !~ /^ *$/ { exit }
         found { print }
     ' <<<"$1"
@@ -53,9 +53,9 @@ wrong_method="${api/            post:/            put:}"
 if (assert_route_integrations "$wrong_method") >/dev/null 2>&1; then
     fail_test 'incorrect route method passed route checks'
 fi
-[ "$(printf '%s\n' "$api" | grep -c 'payloadFormatVersion: "2.0"')" -eq 2 ] || fail_test 'expected two payload 2.0 integrations'
-[ "$(printf '%s\n' "$api" | grep -c '^          /')" -eq 2 ] || fail_test 'expected exactly two route paths'
-[ "$(printf '%s\n' "$api" | grep -c 'type: aws_proxy')" -eq 2 ] || fail_test 'expected two proxy integrations'
+[ "$(printf '%s\n' "$api" | grep -c 'payloadFormatVersion: "2.0"')" -eq 3 ] || fail_test 'expected three payload 2.0 integrations'
+[ "$(printf '%s\n' "$api" | grep -c '^          /')" -eq 3 ] || fail_test 'expected two base paths and one conditional path'
+[ "$(printf '%s\n' "$api" | grep -c 'type: aws_proxy')" -eq 3 ] || fail_test 'expected three proxy integrations'
 [ "$(printf '%s\n' "$api" | grep -Ec '^            [a-z-]+:')" -eq 2 ] || fail_test 'expected exactly two route methods'
 absent "$api" 'Cors'
 absent "$api" 'cors'
@@ -64,6 +64,68 @@ absent "$api" 'x-amazon-apigateway-any-method'
 absent "$api" 'Auth:'
 absent "$api" 'security:'
 absent "$api" 'DefaultRouteSettings:'
+
+template="$REPOSITORY_ROOT/template.yaml"
+template_section() {
+    sed -n "/^  $1:/,/^  [A-Za-z]/p" "$template" | sed '$d'
+}
+contains_line "$(template_section EnableGitHubExchange)" '    Default: "false"'
+contains_line "$(cat "$template")" '  GitHubExchangeEnabled: !Equals [!Ref EnableGitHubExchange, "true"]'
+required="$(template_section GitHubExchangeInputsRequired)"
+contains_line "$required" '    RuleCondition: !Equals [!Ref EnableGitHubExchange, "true"]'
+for parameter in GitHubClientId GitHubClientSecretArn PasetoSigningKeySecretArn; do
+    contains_line "$(template_section "$parameter")" '    Default: ""'
+    contains_line "$required" "      - Assert: !Not [!Equals [!Ref $parameter, \"\"]]"
+done
+contains_line "$api" '          /auth/github/exchange: !If'
+expected_exchange="$(cat <<'YAML'
+            - GitHubExchangeEnabled
+            - post:
+                responses: {}
+                x-amazon-apigateway-integration:
+                  type: aws_proxy
+                  httpMethod: POST
+                  payloadFormatVersion: "2.0"
+                  uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations
+            - !Ref AWS::NoValue
+YAML
+)"
+[ "$(route_definition "$api" /auth/github/exchange | sed '/^$/d')" = "$expected_exchange" ] ||
+    fail_test 'exchange must add only POST when enabled and omit the path when disabled'
+
+auth_function="$(template_section AuthenticationFunction)"
+contains_line "$auth_function" '    Type: AWS::Serverless::Function'
+contains_line "$auth_function" '    Condition: GitHubExchangeEnabled'
+contains_line "$auth_function" '      CodeUri: zig-out/packages/authentication-lambda.zip'
+expected_auth_permissions="$(cat <<'YAML'
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource:
+                - !Ref GitHubClientSecretArn
+                - !Ref PasetoSigningKeySecretArn
+YAML
+)"
+auth_permissions="$(sed -n '/^      Policies:/,/^      Environment:/p' <<<"$auth_function" | sed '1d;$d')"
+[ "$auth_permissions" = "$expected_auth_permissions" ] || fail_test 'authentication role scope differs'
+[ "$(grep -c 'secretsmanager:' "$template")" -eq 3 ] ||
+    fail_test 'expected only the two ARN parameter patterns and the authentication role action'
+expected_auth_environment="$(cat <<'YAML'
+          GITHUB_CLIENT_ID: !Ref GitHubClientId
+          GITHUB_CLIENT_SECRET_ARN: !Ref GitHubClientSecretArn
+          PASETO_SIGNING_KEY_SECRET_ARN: !Ref PasetoSigningKeySecretArn
+          PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
+YAML
+)"
+[ "$(sed -n '/^        Variables:/,$p' <<<"$auth_function" | sed '1d;/^$/d')" = "$expected_auth_environment" ] ||
+    fail_test 'authentication environment must contain only the public configuration and secret references'
+contains_line "$(template_section AuthenticationFunctionName)" '    Condition: GitHubExchangeEnabled'
+contains_line "$(template_section AuthenticationFunctionName)" '    Value: !Ref AuthenticationFunction'
+auth_grant="$(template_section AuthenticationApiPermission)"
+contains_line "$auth_grant" '    Condition: GitHubExchangeEnabled'
+contains_line "$auth_grant" '      SourceAccount: !Ref AWS::AccountId'
 for setting in \
     'SubmissionThrottlingRateLimit 10' 'SubmissionThrottlingBurstLimit 20' \
     'QueryThrottlingRateLimit 50' 'QueryThrottlingBurstLimit 100'
@@ -82,13 +144,17 @@ contains "$submission" 'ThrottlingRateLimit: !Ref SubmissionThrottlingRateLimit'
 contains "$submission" 'ThrottlingBurstLimit: !Ref SubmissionThrottlingBurstLimit'
 contains "$query" 'ThrottlingRateLimit: !Ref QueryThrottlingRateLimit'
 contains "$query" 'ThrottlingBurstLimit: !Ref QueryThrottlingBurstLimit'
-for pair in 'IntakeApiPermission IntakeFunction POST/operations' 'QueryApiPermission QueryFunction GET/operations/*'; do
+for pair in 'IntakeApiPermission IntakeFunction POST/operations' \
+    'QueryApiPermission QueryFunction GET/operations/*' \
+    'AuthenticationApiPermission AuthenticationFunction POST/auth/github/exchange'
+do
     read -r permission function route <<<"$pair"
     grant="$(sed -n "/^  $permission:/,/^  [A-Za-z]/p" "$REPOSITORY_ROOT/template.yaml" | sed '$d')"
     contains "$grant" 'Action: lambda:InvokeFunction'
     contains "$grant" 'Principal: apigateway.amazonaws.com'
     contains "$grant" "FunctionName: !Ref $function"
-    contains "$grant" "\${OperationsApi}/\$default/$route"
+    source_arn='arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OperationsApi}/$default'
+    contains_line "$grant" "      SourceArn: !Sub $source_arn/$route"
 done
 output="$(sed -n '/^Outputs:/,$p' "$REPOSITORY_ROOT/template.yaml")"
 contains "$output" 'OperationsApiUrl:'
@@ -183,6 +249,7 @@ deployment_parameters() (
     parse_deployment_options --stack-name throttle-fixture --profile throttle-profile \
         --region us-west-2 "$@"
     validate_route_throttles
+    validate_github_exchange_configuration
     DEPLOYMENT_PARAMETER_OVERRIDES=("EnableWireGuardGateway=true" "VpcId=vpc-00000001")
     build_sam_parameter_overrides
     printf '%s\n' "${SAM_PARAMETER_OVERRIDES[@]}"
@@ -247,6 +314,36 @@ overrides="$(deployment_parameters --submission-throttling-rate-limit 0 --submis
     --query-throttling-rate-limit 0 --query-throttling-burst-limit 0)"
 contains "$overrides" 'SubmissionThrottlingRateLimit=0'
 contains "$overrides" 'QueryThrottlingBurstLimit=0'
+
+printf -v fixture_account '%012d' 0
+fixture_secret_prefix="arn:aws:secretsmanager:us-west-2:$fixture_account:secret"
+app_secret_arn="$fixture_secret_prefix:fixture-app-AbCd12"
+signing_key_arn="$fixture_secret_prefix:fixture-key-DeFg34"
+absent "$defaults" 'EnableGitHubExchange='
+absent "$defaults" 'GitHubClientId='
+overrides="$(GITHUB_CLIENT_ID=FixtureClient GITHUB_CLIENT_SECRET_ARN="$app_secret_arn" \
+    PASETO_SIGNING_KEY_SECRET_ARN="$signing_key_arn" deployment_parameters --enable-github-exchange)"
+contains_line "$overrides" 'EnableGitHubExchange=true'
+contains_line "$overrides" 'GitHubClientId=FixtureClient'
+contains_line "$overrides" "GitHubClientSecretArn=$app_secret_arn"
+contains_line "$overrides" "PasetoSigningKeySecretArn=$signing_key_arn"
+overrides="$(deployment_parameters --disable-github-exchange)"
+contains_line "$overrides" 'EnableGitHubExchange=false'
+absent "$overrides" 'GitHubClientId='
+absent "$overrides" 'SecretArn='
+if output="$(GITHUB_CLIENT_ID=FixtureClient GITHUB_CLIENT_SECRET_ARN="$app_secret_arn" \
+    PASETO_SIGNING_KEY_SECRET_ARN='fixture-invalid-reference' \
+    deployment_parameters --enable-github-exchange 2>&1)"; then
+    fail_test 'enabled GitHub exchange accepted an invalid signing-key reference'
+fi
+contains "$output" 'PASETO_SIGNING_KEY_SECRET_ARN must be a complete Secrets Manager ARN'
+absent "$output" 'fixture-invalid-reference'
+for option in --enable-github-exchange --disable-github-exchange; do
+    if output="$(deployment_parameters --dev "$option" 2>&1)"; then
+        fail_test "accepted $option during code-only sync"
+    fi
+    contains "$output" 'requires a full deployment'
+done
 printf 'Operations API deployment parameter tests passed.\n'
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/operations-api-test.XXXXXX")"
 trap 'rm -rf -- "$TEST_DIR"' EXIT

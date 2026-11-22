@@ -293,6 +293,33 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&install_query_lambda.step);
 
+    const authentication_lambda_mod = b.createModule(.{
+        .target = lambda_target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/authentication_lambda.zig"),
+        .strip = true,
+        // A cancellable worker bounds the exchange before the invocation deadline.
+        .single_threaded = false,
+        .imports = &.{
+            .{ .name = "http", .module = lambda_http },
+            .{ .name = "aws_http", .module = lambda_aws_http },
+            .{ .name = "aws-lambda", .module = lambda_runtime },
+            .{ .name = "lambda_auth", .module = lambda_auth },
+            .{ .name = "paseto", .module = lambda_paseto },
+            .{ .name = "aws", .module = lambda_aws },
+            .{ .name = "secretsmanager", .module = lambda_aws_sdk.module("secretsmanager") },
+        },
+    });
+    const authentication_lambda_exe = b.addExecutable(.{
+        .name = "authentication-bootstrap",
+        .root_module = authentication_lambda_mod,
+    });
+    const install_authentication_lambda = b.addInstallArtifact(authentication_lambda_exe, .{
+        .dest_dir = .{ .override = .{ .custom = "bin/authentication" } },
+        .dest_sub_path = "bootstrap",
+    });
+    b.getInstallStep().dependOn(&install_authentication_lambda.step);
+
     const tiger_beetle_completion_processor_mod = b.createModule(.{
         .target = lambda_target,
         .optimize = optimize,
@@ -430,11 +457,12 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&install_tiger_beetle_processor.step);
 
-    const package = b.step("package", "Install executables and package all six Lambda archives");
+    const package = b.step("package", "Install executables and package all seven Lambda archives");
     package.dependOn(b.getInstallStep());
     const lambda_packages = .{
         .{ intake_lambda_exe, "intake-lambda.zip" },
         .{ query_lambda_exe, "query-lambda.zip" },
+        .{ authentication_lambda_exe, "authentication-lambda.zip" },
         .{ tiger_beetle_processor_exe, "tiger-beetle-processor.zip" },
         .{ tiger_beetle_completion_processor_exe, "tiger-beetle-completion-processor.zip" },
         .{ seat_submission_lambda, "seat-reservation-processor.zip" },
@@ -698,18 +726,21 @@ pub fn build(b: *std.Build) void {
     const aws_http_tests = b.addTest(.{ .root_module = host_aws_http });
     const run_aws_http_tests = b.addRunArtifact(aws_http_tests);
 
-    const authentication_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = b.graph.host,
-            .optimize = .debug,
-            .root_source_file = b.path("src/authentication_lambda.zig"),
-            .imports = &.{
-                .{ .name = "http", .module = host_http },
-                .{ .name = "lambda_auth", .module = host_lambda_auth },
-                .{ .name = "paseto", .module = host_paseto },
-            },
-        }),
+    const authentication_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .debug,
+        .root_source_file = b.path("src/authentication_lambda.zig"),
+        .imports = &.{
+            .{ .name = "http", .module = host_http },
+            .{ .name = "aws_http", .module = host_aws_http },
+            .{ .name = "aws-lambda", .module = test_runtime },
+            .{ .name = "lambda_auth", .module = host_lambda_auth },
+            .{ .name = "paseto", .module = host_paseto },
+            .{ .name = "aws", .module = host_aws },
+            .{ .name = "secretsmanager", .module = host_aws_sdk.module("secretsmanager") },
+        },
     });
+    const authentication_tests = b.addTest(.{ .root_module = authentication_test_mod });
     const run_authentication_tests = b.addRunArtifact(authentication_tests);
     const lambda_test_mod = b.createModule(.{
         .target = b.graph.host,
@@ -1073,6 +1104,7 @@ pub fn build(b: *std.Build) void {
     const runtime_test_modules = [_]*std.Build.Module{
         lambda_test_mod,
         query_test_mod,
+        authentication_test_mod,
         tiger_beetle_processor_test_mod,
         tiger_beetle_completion_processor_test_mod,
         seat_submission_mod,

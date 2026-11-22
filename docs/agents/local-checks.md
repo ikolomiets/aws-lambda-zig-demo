@@ -96,10 +96,10 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | Check | Scope and additional prerequisites |
 | --- | --- |
 | `zig build fmt-check` | Formatting of build files and all Zig files under `src/` and `tests/` |
-| `zig build check` | Combined offline and eleven-case runtime Zig suite through the existing `test` and `test-runtime` runners; requires loopback socket permission, with no AWS credentials or live replica. Formatting remains separate. |
+| `zig build check` | Combined offline and 13-case runtime Zig suite through the existing `test` and `test-runtime` runners; requires loopback socket permission, with no AWS credentials or live replica. Formatting remains separate. |
 | `zig build test` | Full offline Zig suite; excludes socket-based runtime tests, the live replica, and separate ABI checks |
 | `zig build test-http` | Intake and Query through application-owned HTTP types and the shared AWS payload 2.0 adapter with persistence and publication mocked. PASETO authentication and direct exchange with GitHub and secret retrieval simulated. |
-| `zig build test-runtime` | Eleven host integration cases through the real Lambda event loop and all six handlers; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
+| `zig build test-runtime` | Thirteen host integration cases through the real Lambda event loop and all seven handlers; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
 | `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli` | Host counter build and deterministic global allocation/tooling tests |
 | `zig build build-seat-processors` | Compile host seat invocation adapters without live services or Lambda packaging |
@@ -110,13 +110,37 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | `zig build test-tigerbeetle-c-abi-linux test-tigerbeetle-wrapper-linux` | Compile ARM64 glibc Linux ABI and wrapper tests; does not execute them |
 | `TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle` | Live native integration tests against the separately authorized local development replica; establishes no AWS behavior |
 | `zig build --release -Darch=arm` | Stripped ARM64 Lambda bootstraps in `safe` mode and host CLI tools; uses a compatible patched library at `../zig/lib` for the TigerBeetle processor and the bundled library for other targets. Building does not refresh zip packages; use the [packaging procedure](../DEPLOY_AWS_LAMBDA_WITH_SAM.md#2-build-and-package-the-zig-lambdas) when deployable packages are requested. |
-| `zig build package --release -Darch=arm` | Install the existing executables and create the six Lambda ZIPs under `zig-out/packages/`; uses the same per-target libraries as the ordinary build. |
+| `zig build package --release -Darch=arm` | Install the existing executables and create the seven Lambda ZIPs under `zig-out/packages/`; uses the same per-target libraries as the ordinary build. |
 | `sam validate --template-file template.yaml --region ca-central-1` | SAM template validation when the template changes; requires SAM CLI |
 | `sam validate --lint --template-file template.yaml --region ca-central-1` | Stricter SAM template validation; requires SAM CLI with lint support |
 
 For shell changes, run `bash -n` on each affected script. The
 [complete offline checks](#complete-offline-checks) cover all root entry points
 and recursive shell scripts under `tests/` and `scripts/`.
+
+### Local SAM validation with a fixture profile
+
+Run this block from the repository root to validate the template with an
+isolated AWS profile. The subshell supplies fixture credentials and removes
+its temporary configuration on exit.
+
+```sh
+(
+    set -eu
+    sam_validation_config="$(mktemp "${TMPDIR:-/tmp}/sam-validation.XXXXXX")"
+    trap 'rm -f "$sam_validation_config"' EXIT
+    printf '[profile fixture]\nregion = ca-central-1\n' >"$sam_validation_config"
+
+    unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
+    export AWS_CONFIG_FILE="$sam_validation_config"
+    export AWS_SHARED_CREDENTIALS_FILE=/dev/null
+    export AWS_ACCESS_KEY_ID=fixture AWS_SECRET_ACCESS_KEY=fixture
+    export AWS_EC2_METADATA_DISABLED=true SAM_CLI_TELEMETRY=0
+
+    sam validate --profile fixture --template-file template.yaml --region ca-central-1
+    sam validate --profile fixture --lint --template-file template.yaml --region ca-central-1
+)
+```
 
 ### Shell regression checks
 
@@ -134,9 +158,9 @@ The independent privacy scanner still runs in CI and the optional commit hook.
 | `deploy.sh`, `wireguard-gateway-setup.sh`, `template.yaml`: cleanup, durable-data guards, SSO, and stack lifecycle | `bash tests/deploy_cleanup_lifecycle_test.sh` |
 | `wireguard-gateway-setup.sh` and shared `deploy.sh` helpers: network discovery, preflight, and key configuration | `bash tests/deploy_wireguard_discovery_test.sh` |
 | `deploy.sh`, `wireguard-gateway-setup.sh`: gateway options, deployment, disablement, and preserved configuration | `bash tests/deploy_gateway_interface_test.sh` |
-| `deploy.sh`: package invocation, caches, compiler validation, and artifact checks | `bash tests/deploy_packaging_test.sh` |
+| `deploy.sh`: package invocation, caches, compiler validation, artifact checks, and deployed function selection for code sync | `bash tests/deploy_packaging_test.sh` |
 | `deploy.sh`, `wireguard-gateway-setup.sh`, `lambda_logs.sh`: processor names, options, and selectors | `bash tests/processor_interface_test.sh` |
-| `deploy.sh`, `template.yaml`: Operation API routes, discovery, probes, throttling, and access logs | `bash tests/operations_api_test.sh` |
+| `deploy.sh`, `template.yaml`: Operations API routes, discovery, probes, throttling, access logs, and optional GitHub exchange routing and permissions | `bash tests/operations_api_test.sh` |
 | `api-domain.sh`: custom-domain parsing, certificate/domain reuse, DNS instructions, mappings, and HTTPS probes | `bash tests/api_domain_test.sh` |
 | `events.sh`: credentials, HTTP origin selection, Event commands, and polling | `bash tests/events_wrapper_test.sh` |
 | `seat_scenarios.sh`: discovery, HTTP origin selection, scenarios, and evidence | `bash tests/seat_scenarios_test.sh` |
@@ -153,6 +177,12 @@ each group. For each affected boundary, name the tests and the observable
 assertions that demonstrate the behavior. Cover the relevant existing cases and
 required failure paths. Resolve coverage questions against the specification
 before migrating the cases.
+
+For a new outbound HTTP adapter, use the production HTTP client against a
+loopback peer in the first runtime test. Record that boundary in the map.
+Assert the method, path, relevant headers and body received by the peer, then
+assert the caller's observable result after the peer returns its scripted
+response.
 
 For new behavior, get the focused test running and confirm it fails at the
 intended assertion before implementing the change. Record the command and the
@@ -278,8 +308,16 @@ exercise ready-Event cache reuse across warm invocations, submission publication
 retry, Completion retry after an uncertain write with authoritative submitted-state
 readback, and malformed-SQS error reporting followed by successful processing.
 Captured publications, writes and logs use test-owned memory so assertions remain
-valid after invocation arena resets. The summary reports eleven passing cases;
-cached compilation still executes all runtime tests.
+valid after invocation arena resets.
+
+The authentication cases drive the real entry point with simulated secret
+reads. The mismatched OAuth App case sends the token check through the
+production HTTP client to a loopback GitHub peer and verifies the request
+before checking the Lambda's `401` response and Bearer challenge. The
+valid-credential case verifies the returned PASETO.
+[GitHub exchange runtime test](../../src/authentication_lambda.zig#L340)
+
+The summary reports 13 passing cases. Cached compilation still executes them.
 
 All external persistence, execution, and publication effects are mocked. Cloud
 resource initialization is bypassed; these tests establish no live AWS or
@@ -289,7 +327,7 @@ coverage under `test-seat-processors` and the ordinary `test` target.
 Host test wiring uses `sh`, `ln`, and `cp` to place a test facade beside a symlink
 to the active `aws_lambda` source directory. It uses the same
 resolved dependency, including `--fork` overrides, without copying upstream
-sources. The six runtime test variants enable only cases prefixed
+sources. The seven runtime test variants enable only cases prefixed
 `runtime integration:` and support multiple threads for the fake server.
 Ordinary tests disable these cases, and production threading settings are
 unchanged. Restricted environments need loopback socket permission for this

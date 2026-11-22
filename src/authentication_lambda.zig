@@ -1,11 +1,207 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const aws = @import("aws");
+const lambda = @import("aws-lambda");
+const aws_http = @import("aws_http");
 const http = @import("http");
 const paseto = @import("paseto");
+const secretsmanager = @import("secretsmanager");
 const lambda_auth = @import("lambda_auth");
 const github = @import("github_identity.zig");
 const token_issuer = @import("token_issuer.zig");
 
 const Allocator = std.mem.Allocator;
+const runtime_tests_enabled = if (builtin.is_test)
+    @import("runtime_test_options").enabled
+else
+    false;
+const exchange_duration_ms_max = 10_000;
+const response_margin_ms = 1_000;
+const secret_response_size_max = 64 * 1024;
+
+var runtime_test_services: ?*TestServices = null;
+
+pub const std_options: std.Options = .{
+    .log_scope_levels = &.{.{ .scope = .aws_sdk, .level = .warn }},
+};
+
+pub fn main(init: std.process.Init) void {
+    lambda.handle(init, handler, .{});
+}
+
+fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
+    const config: Config = .{
+        .github_client_id = ctx.env("GITHUB_CLIENT_ID") orelse "",
+        .paseto_public_key = ctx.env("PASETO_PUBLIC_KEY") orelse "",
+    };
+    var input = aws_http.Request.parse(ctx.arena, event) catch {
+        return aws_http.internal_server_error_response;
+    };
+    defer input.deinit();
+    const request = input.application_request();
+    var services: RuntimeServices = .{
+        .allocator = ctx.arena,
+        .io = ctx.io,
+        .environment = @field(ctx, "_").kv,
+    };
+    defer services.deinit();
+    var random_source: std.Random.IoSource = .{ .io = ctx.io };
+    const dependencies: Dependencies = if (builtin.is_test and runtime_test_services != null)
+        runtime_test_services.?.dependencies()
+    else
+        .{
+            .context = &services,
+            .random = random_source.interface(),
+            .now_seconds_fn = RuntimeServices.now,
+            .read_secret_fn = RuntimeServices.read_secret,
+            .check_token_fn = RuntimeServices.check_token,
+        };
+    var response = invoke_with_deadline(&ctx, &request, &config, &dependencies) catch
+        error_response(.service_unavailable, "service_unavailable");
+    defer response.deinit();
+    return aws_http.encode_response(ctx.arena, &response) catch
+        aws_http.internal_server_error_response;
+}
+
+fn invoke_with_deadline(
+    ctx: *const lambda.Context,
+    request: *const http.HttpRequest,
+    config: *const Config,
+    dependencies: *const Dependencies,
+) !http.HttpResponse {
+    const now_ms = std.Io.Clock.real.now(ctx.io).toMilliseconds();
+    const remaining_ms = @as(i96, ctx.request.deadline_ms) - now_ms - response_margin_ms;
+    if (remaining_ms <= 0) return error.ExchangeDeadline;
+    const duration_ms: i64 = @intCast(@min(remaining_ms, exchange_duration_ms_max));
+    const Result = union(enum) { response: http.HttpResponse, deadline: std.Io.Cancelable!void };
+    var results: [2]Result = undefined;
+    var select: std.Io.Select(Result) = .init(ctx.io, &results);
+    // The worker uses only invocation-owned memory. Join before the arena resets.
+    defer select.cancelDiscard();
+    try select.concurrent(.deadline, std.Io.sleep, .{
+        ctx.io, .fromMilliseconds(duration_ms), .awake,
+    });
+    try select.concurrent(.response, handle_http, .{ ctx.arena, request, config, dependencies });
+    return switch (try select.await()) {
+        .response => |response| response,
+        .deadline => error.ExchangeDeadline,
+    };
+}
+
+const RuntimeServices = struct {
+    allocator: Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    aws_config: ?aws.Config = null,
+
+    fn deinit(services: *RuntimeServices) void {
+        if (services.aws_config) |*config| config.deinit();
+    }
+
+    fn now(context: *anyopaque) i64 {
+        const services: *RuntimeServices = @ptrCast(@alignCast(context));
+        return std.Io.Clock.real.now(services.io).toSeconds();
+    }
+
+    fn read_secret(context: *anyopaque, allocator: Allocator, secret: Secret) SecretError![]u8 {
+        const services: *RuntimeServices = @ptrCast(@alignCast(context));
+        const arn = services.environment.get(switch (secret) {
+            .github_client_secret => "GITHUB_CLIENT_SECRET_ARN",
+            .paseto_signing_key => "PASETO_SIGNING_KEY_SECRET_ARN",
+        }) orelse return error.MissingSecret;
+        if (arn.len == 0) return error.MissingSecret;
+        if (services.aws_config == null) {
+            services.aws_config = aws.Config.load(
+                services.allocator,
+                services.io,
+                services.environment,
+                .{
+                    .max_attempts = 1,
+                },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidSecret,
+            };
+        }
+        var client = secretsmanager.Client.initWithOptions(allocator, &services.aws_config.?, .{
+            .max_attempts = 1,
+            .max_response_size = secret_response_size_max,
+        });
+        defer client.deinit();
+        var diagnostic: secretsmanager.ServiceError = undefined;
+        const result = client.getSecretValue(allocator, .{ .secret_id = arn }, .{
+            .diagnostic = &diagnostic,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ServiceError => {
+                defer diagnostic.deinit();
+                return secret_service_error(diagnostic.kind);
+            },
+            else => return error.Unavailable,
+        };
+        const value = result.secret_string orelse return error.InvalidSecret;
+        // The pinned SDK allocates parsed strings in the supplied arena.
+        return @constCast(value);
+    }
+
+    fn check_token(
+        context: *anyopaque,
+        allocator: Allocator,
+        request: *const github.TokenCheckRequest,
+    ) github.TransportError!github.TokenCheckResponse {
+        const services: *RuntimeServices = @ptrCast(@alignCast(context));
+        return fetch_token_check(services.io, allocator, request);
+    }
+};
+
+fn fetch_token_check(
+    io: std.Io,
+    allocator: Allocator,
+    request: *const github.TokenCheckRequest,
+) github.TransportError!github.TokenCheckResponse {
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+    const headers = try allocator.alloc(std.http.Header, request.headers.len);
+    defer allocator.free(headers);
+    for (request.headers, headers) |source, *target| {
+        target.* = .{ .name = source.key, .value = source.value };
+    }
+    const buffer = try allocator.alloc(u8, github.token_check_body_size_max);
+    var response: std.Io.Writer = .fixed(buffer);
+    const result = client.fetch(.{
+        .location = .{ .url = request.url },
+        .method = request.method,
+        .payload = request.body,
+        // Zig 0.17 writes extra_headers. Disable redirects for this credential-bearing request.
+        .extra_headers = headers,
+        .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .headers = .{ .accept_encoding = .{ .override = "identity" }, .user_agent = .omit },
+        .response_writer = &response,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Unavailable,
+    };
+    return .{ .status = result.status, .body = response.buffered() };
+}
+
+fn secret_service_error(kind: secretsmanager.ServiceError.Kind) SecretError {
+    return switch (kind) {
+        .resource_not_found_exception => error.MissingSecret,
+        .decryption_failure,
+        .invalid_parameter_exception,
+        .invalid_request_exception,
+        => error.InvalidSecret,
+        .unknown => |failure| classify_unknown_secret_error(failure.http_status, failure.code),
+        else => error.Unavailable,
+    };
+}
+
+fn classify_unknown_secret_error(status: u16, code: []const u8) SecretError {
+    if (status == 401 or status == 403) return error.InvalidSecret;
+    if (std.mem.eql(u8, code, "AccessDeniedException")) return error.InvalidSecret;
+    return error.Unavailable;
+}
 
 pub const Config = struct {
     github_client_id: []const u8,
@@ -134,6 +330,145 @@ const test_exchange: http.HttpRequest = .{
     .path = "/auth/github/exchange",
     .headers = &.{.{ .key = "Authorization", .value = "Bearer " ++ test_provider_token }},
 };
+
+const test_exchange_event =
+    \\{"version":"2.0","routeKey":"POST /auth/github/exchange","rawPath":"/auth/github/exchange",
+    \\"requestContext":{"http":{"method":"POST"}},"isBase64Encoded":false,
+    \\"headers":{"authorization":"Bearer
+++ " " ++ test_provider_token ++ "\"}}";
+
+test "runtime integration: GitHub exchange rejects a token for another OAuth App" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    const runtime = @import("runtime_test_support");
+    var fixture: runtime.Fixture = .{};
+    defer fixture.deinit();
+    var services: TestServices = undefined;
+    try services.init();
+    defer services.deinit();
+    const io = std.testing.io;
+    const loopback: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var github_server = try loopback.listen(io, .{ .mode = .stream });
+    defer github_server.deinit(io);
+    services.token_check_url = try std.fmt.allocPrint(
+        fixture.allocator(),
+        "http://{f}/applications/configured-client/token",
+        .{github_server.socket.address},
+    );
+    var github_reply = try io.concurrent(reply_with_other_app, .{ &github_server, io });
+    defer github_reply.cancel(io) catch {};
+    const response = try run_runtime_exchange(&fixture, &services);
+    try std.testing.expectEqual(401, response.object.get("statusCode").?.integer);
+    try std.testing.expectEqualStrings(
+        "Bearer",
+        response.object.get("headers").?.object.get("WWW-Authenticate").?.string,
+    );
+    try std.testing.expectEqual(1, services.github_checks);
+    try std.testing.expectEqual(0, services.signing_key_reads);
+    try github_reply.await(io);
+}
+
+fn reply_with_other_app(listener: *std.Io.net.Server, io: std.Io) !void {
+    const connection = try listener.accept(io);
+    defer connection.close(io);
+    var input_buffer: [4096]u8 = undefined;
+    var output_buffer: [1024]u8 = undefined;
+    var reader = connection.reader(io, &input_buffer);
+    var writer = connection.writer(io, &output_buffer);
+    var server: std.http.Server = .init(&reader.interface, &writer.interface);
+    var request = try server.receiveHead();
+    try std.testing.expectEqual(.POST, request.head.method);
+    try std.testing.expectEqualStrings("/applications/configured-client/token", request.head.target);
+    try std.testing.expectEqualStrings("application/json", request.head.content_type.?);
+    var headers = request.iterateHeaders();
+    var user_agents: u8 = 0;
+    var has_api_version = false;
+    var has_basic_authorization = false;
+    while (headers.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "User-Agent")) {
+            try std.testing.expectEqualStrings("operations-api", header.value);
+            user_agents += 1;
+        }
+        if (std.ascii.eqlIgnoreCase(header.name, "X-GitHub-Api-Version")) {
+            has_api_version = header.value.len > 0;
+        }
+        if (std.ascii.eqlIgnoreCase(header.name, "Authorization")) {
+            has_basic_authorization = std.mem.startsWith(u8, header.value, "Basic ");
+        }
+    }
+    try std.testing.expectEqual(1, user_agents);
+    try std.testing.expect(has_api_version);
+    try std.testing.expect(has_basic_authorization);
+    const expected_body = "{\"access_token\":\"" ++ test_provider_token ++ "\"}";
+    try std.testing.expectEqual(expected_body.len, request.head.content_length.?);
+    var body_buffer: [expected_body.len]u8 = undefined;
+    const body_reader = try request.readerExpectContinue(&body_buffer);
+    try std.testing.expectEqualStrings(expected_body, try body_reader.take(expected_body.len));
+    try request.respond(
+        \\{"app":{"client_id":"other-client"},"user":{"id":42}}
+    ,
+        .{ .status = .ok, .keep_alive = false },
+    );
+}
+
+test "runtime integration: GitHub exchange posts a verifiable tenant PASETO" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    const runtime = @import("runtime_test_support");
+    var fixture: runtime.Fixture = .{};
+    defer fixture.deinit();
+    var services: TestServices = undefined;
+    try services.init();
+    defer services.deinit();
+
+    const response = try run_runtime_exchange(&fixture, &services);
+    try std.testing.expectEqual(200, response.object.get("statusCode").?.integer);
+    try std.testing.expectEqualStrings(
+        "no-store",
+        response.object.get("headers").?.object.get("Cache-Control").?.string,
+    );
+    const fields = try std.json.parseFromSliceLeaky(
+        IssuedToken,
+        fixture.allocator(),
+        response.object.get("body").?.string,
+        .{},
+    );
+    var claims = try paseto.verify(
+        std.testing.allocator,
+        fields.access_token,
+        services.key_pair.public_key,
+        test_now_seconds,
+    );
+    defer claims.deinit();
+    try std.testing.expectEqualStrings("github:42", claims.sub);
+    try std.testing.expectEqual(test_now_seconds + 28800, claims.exp);
+}
+
+fn run_runtime_exchange(
+    fixture: *@import("runtime_test_support").Fixture,
+    services: *TestServices,
+) !std.json.Value {
+    const now_ms: u64 = @intCast(std.Io.Clock.real.now(std.testing.io).toMilliseconds());
+    const script = [_]@import("runtime_test_support").Tester.Event{.{
+        .request_id = "exchange",
+        .deadline_ms = now_ms + 30_000,
+        .payload = test_exchange_event,
+    }};
+    try fixture.init(&script);
+    try fixture.tester.env_map.put("GITHUB_CLIENT_ID", test_client_id);
+    try fixture.tester.env_map.put("PASETO_PUBLIC_KEY", &services.public_key);
+    std.debug.assert(runtime_test_services == null);
+    runtime_test_services = services;
+    defer runtime_test_services = null;
+
+    main(fixture.tester.processInit());
+    try fixture.tester.expectPostCount(1);
+    try fixture.tester.expectPath(0, "/2018-06-01/runtime/invocation/exchange/response");
+    return std.json.parseFromSliceLeaky(
+        std.json.Value,
+        fixture.allocator(),
+        (try fixture.tester.post(0)).body,
+        .{},
+    );
+}
 
 test "direct GitHub exchange issues exactly eight hours of access for github:42" {
     var fixture: TestServices = undefined;
@@ -469,6 +804,7 @@ const TestServices = struct {
     app_secret_reads: u8,
     signing_key_reads: u8,
     github_checks: u8,
+    token_check_url: ?[]const u8,
 
     fn init(fixture: *TestServices) !void {
         fixture.key_pair = try paseto.Ed25519.KeyPair.generateDeterministic(@splat(0x42));
@@ -483,6 +819,7 @@ const TestServices = struct {
         fixture.app_secret_reads = 0;
         fixture.signing_key_reads = 0;
         fixture.github_checks = 0;
+        fixture.token_check_url = null;
     }
 
     fn deinit(fixture: *TestServices) void {
@@ -494,13 +831,17 @@ const TestServices = struct {
         return handle_http(std.testing.allocator, request, &.{
             .github_client_id = test_client_id,
             .paseto_public_key = &fixture.public_key,
-        }, &.{
+        }, &fixture.dependencies());
+    }
+
+    fn dependencies(fixture: *TestServices) Dependencies {
+        return .{
             .context = fixture,
             .random = fixture.random.random(),
             .now_seconds_fn = now,
             .read_secret_fn = TestServices.read_secret,
             .check_token_fn = check_token,
-        });
+        };
     }
 
     fn now(context: *anyopaque) i64 {
@@ -539,6 +880,11 @@ const TestServices = struct {
         ) catch unreachable;
         try expect_token_check_request(allocator, request, fixture.expected_provider_token);
         fixture.github_checks += 1;
+        if (fixture.token_check_url) |url| {
+            var local_request = request.*;
+            local_request.url = url;
+            return fetch_token_check(std.testing.io, allocator, &local_request);
+        }
         return fixture.github_result;
     }
 };

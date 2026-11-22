@@ -20,6 +20,10 @@ TIGERBEETLE_CLUSTER_ID="${TIGERBEETLE_CLUSTER_ID:-0}"
 TIGERBEETLE_ADDRESSES="${TIGERBEETLE_ADDRESSES:-10.200.0.2:3000}"
 LAMBDA_PRINCIPAL="${LAMBDA_PRINCIPAL:-*}"
 PASETO_PUBLIC_KEY="${PASETO_PUBLIC_KEY:-}"
+GITHUB_EXCHANGE_SETTING=
+GITHUB_CLIENT_ID="${GITHUB_CLIENT_ID:-}"
+GITHUB_CLIENT_SECRET_ARN="${GITHUB_CLIENT_SECRET_ARN:-}"
+PASETO_SIGNING_KEY_SECRET_ARN="${PASETO_SIGNING_KEY_SECRET_ARN:-}"
 LOCAL_AWS_LAMBDA_ROOT="${LOCAL_AWS_LAMBDA_ROOT:-../aws-lambda-zig}"
 DRY_RUN=0
 DEV=0
@@ -51,6 +55,11 @@ Options:
                          Intake Lambda name. Defaults to intake-lambda.
   --query-function-name NAME
                          Query Lambda name. Defaults to query-lambda.
+  --enable-github-exchange
+                         Enable direct GitHub token exchange by full deployment.
+  --disable-github-exchange
+                         Remove direct GitHub token exchange by full deployment.
+                         Without either flag, preserve the deployed setting.
   --submission-throttling-rate-limit NUMBER
                          POST /operations requests/second target. Defaults to 10.
   --submission-throttling-burst-limit INTEGER
@@ -99,7 +108,8 @@ Environment overrides:
   TIGERBEETLE_ADDRESSES, LAMBDA_PRINCIPAL, PASETO_PRIVATE_KEY,
   SEAT_RESERVATION_PROCESSOR_NAME, SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME,
   EXISTING_LEDGER_COUNTER_TABLE_NAME, LEDGER_COUNTER_ID,
-  PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT
+  PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT,
+  GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET_ARN, PASETO_SIGNING_KEY_SECRET_ARN
 
 Authentication:
   Non-dry-run deployments and cleanup require an SSO-backed AWS CLI profile. The script
@@ -214,15 +224,45 @@ validate_seat_configuration() {
     fi
 }
 
-require_seat_development_baseline() {
-    local seat_output_count
-    seat_output_count="$(aws cloudformation describe-stacks \
+validate_github_exchange_configuration() {
+    [ "$GITHUB_EXCHANGE_SETTING" = true ] || return 0
+    local variable arn
+    local client_id_pattern='^[A-Za-z0-9_-][A-Za-z0-9._-]{0,255}$'
+    local secret_arn_pattern='^arn:[a-z0-9-]+:secretsmanager:([a-z0-9-]+):[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}$'
+    [[ "$GITHUB_CLIENT_ID" =~ $client_id_pattern ]] ||
+        fail "GITHUB_CLIENT_ID must be the public OAuth App client ID"
+    for variable in GITHUB_CLIENT_SECRET_ARN PASETO_SIGNING_KEY_SECRET_ARN; do
+        arn="${!variable}"
+        [[ "$arn" =~ $secret_arn_pattern && "${BASH_REMATCH[1]}" = "$REGION" ]] ||
+            fail "$variable must be a complete Secrets Manager ARN in the deployment Region"
+    done
+    [ "$GITHUB_CLIENT_SECRET_ARN" != "$PASETO_SIGNING_KEY_SECRET_ARN" ] ||
+        fail "GitHub exchange requires two distinct secrets"
+}
+
+load_development_function_ids() {
+    local output_counts seat_output_count authentication_output_count
+    output_counts="$(aws cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
-        --query "length(Stacks[0].Outputs[?OutputKey=='SeatReservationProcessorName' || OutputKey=='SeatReservationCompletionProcessorName'])" \
+        --query "Stacks[0].Outputs.[length([?OutputKey=='SeatReservationProcessorName' || OutputKey=='SeatReservationCompletionProcessorName']), length([?OutputKey=='AuthenticationFunctionName'])]" \
         --output text --profile "$PROFILE" --region "$REGION")" ||
-        fail "could not verify the six-function baseline; use full deployment before seat development sync"
+        fail "could not resolve stack outputs for development sync"
+    read -r seat_output_count authentication_output_count <<<"$output_counts"
     [ "$seat_output_count" = 2 ] ||
         fail "seat development sync requires a full deployment of the six-function baseline first"
+    DEVELOPMENT_RESOURCE_ARGS=(
+        --resource-id IntakeFunction
+        --resource-id QueryFunction
+        --resource-id TigerBeetleProcessor
+        --resource-id TigerBeetleCompletionProcessor
+        --resource-id SeatReservationProcessor
+        --resource-id SeatReservationCompletionProcessor
+    )
+    case "$authentication_output_count" in
+        0) ;;
+        1) DEVELOPMENT_RESOURCE_ARGS+=(--resource-id AuthenticationFunction) ;;
+        *) fail "could not determine whether the deployed stack includes the authentication Lambda" ;;
+    esac
 }
 
 clear_aws_credentials() {
@@ -442,6 +482,16 @@ build_sam_parameter_overrides() {
         "LambdaPrincipal=$LAMBDA_PRINCIPAL"
         "PasetoPublicKey=$PASETO_PUBLIC_KEY"
     )
+    if [ -n "$GITHUB_EXCHANGE_SETTING" ]; then
+        SAM_PARAMETER_OVERRIDES+=("EnableGitHubExchange=$GITHUB_EXCHANGE_SETTING")
+    fi
+    if [ "$GITHUB_EXCHANGE_SETTING" = true ]; then
+        SAM_PARAMETER_OVERRIDES+=(
+            "GitHubClientId=$GITHUB_CLIENT_ID"
+            "GitHubClientSecretArn=$GITHUB_CLIENT_SECRET_ARN"
+            "PasetoSigningKeySecretArn=$PASETO_SIGNING_KEY_SECRET_ARN"
+        )
+    fi
     if [ -n "$EXISTING_LEDGER_COUNTER_TABLE_NAME" ]; then
         SAM_PARAMETER_OVERRIDES+=("ExistingLedgerCounterTableName=$EXISTING_LEDGER_COUNTER_TABLE_NAME")
     fi
@@ -758,10 +808,11 @@ validate_deployed_function_names() {
     local deployed_intake_name="" deployed_query_name=""
     local deployed_tiger_beetle_processor_name="" deployed_tiger_beetle_completion_processor_name=""
     local deployed_seat_processor_name="" deployed_seat_completion_processor_name=""
+    local deployed_authentication_name=""
 
     stack_outputs="$(aws cloudformation describe-stacks \
         --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='IntakeFunctionName' || OutputKey=='QueryFunctionName' || OutputKey=='TigerBeetleProcessorName' || OutputKey=='TigerBeetleCompletionProcessorName' || OutputKey=='SeatReservationProcessorName' || OutputKey=='SeatReservationCompletionProcessorName'].join('|', [OutputKey,OutputValue])" \
+        --query "Stacks[0].Outputs[?OutputKey=='IntakeFunctionName' || OutputKey=='QueryFunctionName' || OutputKey=='TigerBeetleProcessorName' || OutputKey=='TigerBeetleCompletionProcessorName' || OutputKey=='SeatReservationProcessorName' || OutputKey=='SeatReservationCompletionProcessorName' || OutputKey=='AuthenticationFunctionName'].join('|', [OutputKey,OutputValue])" \
         --output text \
         --profile "$PROFILE" \
         --region "$REGION")" ||
@@ -778,6 +829,7 @@ validate_deployed_function_names() {
             TigerBeetleCompletionProcessorName) deployed_tiger_beetle_completion_processor_name="$output_value" ;;
             SeatReservationProcessorName) deployed_seat_processor_name="$output_value" ;;
             SeatReservationCompletionProcessorName) deployed_seat_completion_processor_name="$output_value" ;;
+            AuthenticationFunctionName) deployed_authentication_name="$output_value" ;;
             *) fail "stack returned an unexpected Lambda function-name output" ;;
         esac
     done <<<"${stack_outputs//$'\t'/$'\n'}"
@@ -794,6 +846,12 @@ validate_deployed_function_names() {
         fail "stack output SeatReservationProcessorName does not match the requested name"
     [ "$deployed_seat_completion_processor_name" = "$SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME" ] ||
         fail "stack output SeatReservationCompletionProcessorName does not match the requested name"
+    case "$GITHUB_EXCHANGE_SETTING" in
+        true) [ -n "$deployed_authentication_name" ] ||
+            fail "enabled stack is missing AuthenticationFunctionName" ;;
+        false) [ -z "$deployed_authentication_name" ] ||
+            fail "disabled stack still exposes AuthenticationFunctionName" ;;
+    esac
     printf '==> Deployed Lambda function names match requested values\n'
 }
 
@@ -927,6 +985,7 @@ parse_deployment_options() {
     while [ "$#" -gt 0 ]; do
         case "${1%%=*}" in
             --intake-function-name | --query-function-name | \
+                --enable-github-exchange | --disable-github-exchange | \
                 --submission-throttling-rate-limit | --submission-throttling-burst-limit | \
                 --query-throttling-rate-limit | --query-throttling-burst-limit | \
                 --tiger-beetle-processor-name | --tiger-beetle-completion-processor-name | \
@@ -937,6 +996,15 @@ parse_deployment_options() {
                 ;;
         esac
         case "$1" in
+            --enable-github-exchange | --disable-github-exchange)
+                [ -z "$GITHUB_EXCHANGE_SETTING" ] ||
+                    fail "choose one GitHub exchange setting"
+                case "$1" in
+                    --enable-github-exchange) GITHUB_EXCHANGE_SETTING=true ;;
+                    --disable-github-exchange) GITHUB_EXCHANGE_SETTING=false ;;
+                esac
+                shift
+                ;;
             --execution-function-name | --execution-function-name=*)
                 fail "--execution-function-name is retired; use --tiger-beetle-processor-name"
                 ;;
@@ -1161,6 +1229,7 @@ validate_lambda_bootstraps() {
     for bootstrap in \
         zig-out/bin/intake/bootstrap \
         zig-out/bin/query/bootstrap \
+        zig-out/bin/authentication/bootstrap \
         zig-out/bin/tiger_beetle_completion_processor/bootstrap \
         zig-out/bin/seat_reservation_processor/bootstrap \
         zig-out/bin/seat_reservation_completion_processor/bootstrap
@@ -1187,6 +1256,7 @@ validate_lambda_archives() {
     for archive in \
         zig-out/packages/intake-lambda.zip \
         zig-out/packages/query-lambda.zip \
+        zig-out/packages/authentication-lambda.zip \
         zig-out/packages/tiger-beetle-processor.zip \
         zig-out/packages/tiger-beetle-completion-processor.zip \
         zig-out/packages/seat-reservation-processor.zip \
@@ -1249,6 +1319,7 @@ run_deployment() {
     fi
     if [ "$DEV" -eq 0 ]; then
         validate_route_throttles
+        validate_github_exchange_configuration
         validate_tiger_beetle_completion_processor_name
         validate_seat_configuration
     fi
@@ -1271,7 +1342,7 @@ run_deployment() {
         prepare_aws_sso_session "$PROFILE"
         ensure_stack_not_in_progress
         if [ "$DEV" -eq 1 ]; then
-            require_seat_development_baseline
+            load_development_function_ids
         fi
         if [ "$DEV" -eq 0 ]; then
             validate_existing_intake_name "$INTAKE_FUNCTION_NAME"
@@ -1357,12 +1428,7 @@ run_deployment() {
             --code \
             --no-watch \
             --no-dependency-layer \
-            --resource-id IntakeFunction \
-            --resource-id QueryFunction \
-            --resource-id TigerBeetleProcessor \
-            --resource-id TigerBeetleCompletionProcessor \
-            --resource-id SeatReservationProcessor \
-            --resource-id SeatReservationCompletionProcessor <<< 'Y' ||
+            "${DEVELOPMENT_RESOURCE_ARGS[@]}" <<< 'Y' ||
             fail "development code sync failed; some functions may already have updated"
     else
         deploy_stack_and_resolve_controller_outputs

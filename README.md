@@ -125,22 +125,25 @@ Verify the ARM64 Linux executables:
 ```sh
 file zig-out/bin/intake/bootstrap \
   zig-out/bin/query/bootstrap \
+  zig-out/bin/authentication/bootstrap \
   zig-out/bin/tiger_beetle_processor/bootstrap \
   zig-out/bin/tiger_beetle_completion_processor/bootstrap \
   zig-out/bin/seat_reservation_processor/bootstrap \
   zig-out/bin/seat_reservation_completion_processor/bootstrap
 ```
 
-Intake, query, native completion and both seat processors are statically linked and single-threaded. TigerBeetle processor is
+Intake, query, native completion and both seat processors are statically linked and single-threaded.
+The statically linked authentication bootstrap uses cancellable I/O tasks to bound the exchange.
+TigerBeetle processor is
 multithread-capable for the TigerBeetle callback thread and is a dynamically
-linked glibc executable. All six are stripped.
+linked glibc executable. All seven are stripped.
 
 ```text
-intake/query/tiger-beetle-completion-processor: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
+intake/query/authentication and completion/seat processors: ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped
 tiger-beetle-processor:           ELF 64-bit LSB executable, ARM aarch64, dynamically linked, stripped
 ```
 
-Build and package all six Lambdas explicitly when preparing deployment artifacts
+Build and package all seven Lambdas explicitly when preparing deployment artifacts
 (`deploy.sh` runs this target automatically):
 
 ```sh
@@ -152,6 +155,7 @@ This target installs the existing executables and creates:
 ```text
 zig-out/packages/intake-lambda.zip
 zig-out/packages/query-lambda.zip
+zig-out/packages/authentication-lambda.zip
 zig-out/packages/tiger-beetle-processor.zip
 zig-out/packages/tiger-beetle-completion-processor.zip
 zig-out/packages/seat-reservation-processor.zip
@@ -160,7 +164,7 @@ zig-out/packages/seat-reservation-completion-processor.zip
 
 Each archive contains only its handler's executable root-level `bootstrap`.
 Ordinary builds and the offline test suite do not create or refresh ZIPs.
-All six archives are ignored by Git as generated deployment artifacts.
+Git ignores all seven archives as generated deployment artifacts.
 
 ## PASETO Authentication
 
@@ -603,7 +607,7 @@ different value when the function should see a narrower principal string.
 configuration. It is public key material; keep the corresponding private key
 only in the signing environment.
 
-`deploy.sh` builds and packages all six bootstraps, preserves any existing WireGuard state,
+`deploy.sh` builds and packages all seven bootstraps, preserves any existing WireGuard state,
 and defaults the TigerBeetle processor and Completion processor names to `tiger-beetle-processor` and `tiger-beetle-completion-processor`.
 Override them with `TIGER_BEETLE_PROCESSOR_NAME`, `TIGER_BEETLE_COMPLETION_PROCESSOR_NAME`, or the matching
 `--tiger-beetle-processor-name` and `--tiger-beetle-completion-processor-name` options. Both deployment helpers accept these options.
@@ -621,6 +625,9 @@ aws cloudformation describe-stacks \
   --profile dev \
   --region ca-central-1
 ```
+
+Deployments can enable direct GitHub token exchange on the same API origin.
+New stacks leave it disabled. [GitHub OAuth and deployment setup](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#direct-github-token-exchange)
 
 ### Connect to External TigerBeetle with an EC2 WireGuard Gateway
 
@@ -776,14 +783,14 @@ unfinished Operation, including those sharing the failed request. Completion pub
 retries the failed message's source record and every later unpublished record; earlier successful
 sends remain acknowledgement-eligible. DynamoDB uncertainty replays the single Completion message.
 
-The template exposes one public HTTP API with the two authenticated Operation
-routes, the AWS-generated hostname, and a prefix-free `$default` stage. CORS is
-disabled. API Gateway can invoke only the intended Intake and Query routes;
-processors remain SQS-driven. Introducing this API requires a full stack update;
-code-only development updates do not create routes or replace public invocation
-infrastructure. Stack deletion removes the API and its invocation grants.
-Each route has configurable shared, best-effort throttle targets: submission
-defaults to 10 requests/second with burst 20, and querying to 50 with burst 100.
+The template exposes one public HTTP API with an AWS-generated hostname, a
+prefix-free `$default` stage, and CORS disabled. API Gateway invokes Intake and
+Query through named routes and can also invoke the optional GitHub exchange.
+Processors remain SQS-driven. Use a full stack update to change routes and
+public invocation permissions. Stack deletion removes the API and its grants.
+Submission and query have configurable shared, best-effort throttle targets.
+Submission defaults to 10 requests/second with burst 20, and querying to 50
+with burst 100.
 Account/Region constraints also apply; these are not tenant quotas, a hard cost
 limit, or downstream capacity guarantees. Use a full deployment to change them;
 see [throttle parameters and overrides](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#route-throttle-configuration).
@@ -801,6 +808,7 @@ and response bodies, query strings, and client IP addresses are excluded. See
 
 - `src/intake_lambda.zig`: authenticated POST intake entrypoint, named-queue routing, and handler.
 - `src/query_lambda.zig`: authenticated tenant-scoped Operation GET entrypoint and handler.
+- `src/authentication_lambda.zig`: direct GitHub token exchange entry point and PASETO issuance.
 - `src/tiger_beetle_processor.zig`: SQS-driven TigerBeetle processor entrypoint and handler.
 - `src/tiger_beetle_completion_processor.zig`: SQS-driven conditional completion entrypoint and handler.
 - `src/processor_message.zig`: bounded individual Processor Message contract and codec.
@@ -815,9 +823,9 @@ and response bodies, query strings, and client IP addresses are excluded. See
 - `persistence.sh`: stack-aware persistence command and credential setup.
 - `queue.sh`: stack-aware queue command and credential setup.
 - `lambda_logs.sh`: explicit six-handler CloudWatch log download helper.
-- `build.zig`: Zig build graph for all six bootstraps, local commands, and tests.
+- `build.zig`: Zig build graph for the seven bootstraps, local commands, and tests.
 - `build.zig.zon`: package metadata and pinned dependencies.
-- `template.yaml`: SAM template for all six Lambdas, one Operation HTTP API, four queue mappings, permissions, and the optional EC2 WireGuard gateway.
+- `template.yaml`: SAM template for the Operations API, six base Lambdas, four queue mappings, optional authentication Lambda, and optional EC2 WireGuard gateway.
 - `docs/EC2-WireGuard-Gateway.md`: implemented gateway architecture, lifecycle, security, and ownership reference.
 - `docs/`: the SAM deployment guide, ADRs, and the Zig style reference.
 - `AGENTS.md`: repository guidance for coding agents.
@@ -855,7 +863,7 @@ Run the aggregate offline Zig test suite with:
 zig build test
 ```
 
-Run the offline Zig suite and all eleven Lambda runtime integration cases together with:
+Run the offline Zig suite and all Lambda runtime integration cases together:
 
 ```sh
 zig build check --summary all

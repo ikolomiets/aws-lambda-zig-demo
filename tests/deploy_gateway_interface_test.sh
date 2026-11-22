@@ -151,7 +151,7 @@ test_deployed_function_name_outputs() (
     assert_contains "$output" "TigerBeetleCompletionProcessorName does not match"
 )
 
-test_six_lambda_artifacts() (
+test_lambda_artifacts() (
     local artifact_tmp artifact_output expected_file_calls expected_archive_calls
 
     artifact_tmp="$(mktemp -d "${TMPDIR:-/tmp}/deploy-artifact-test.XXXXXX")"
@@ -165,6 +165,7 @@ test_six_lambda_artifacts() (
     for archive in \
         intake-lambda.zip \
         query-lambda.zip \
+        authentication-lambda.zip \
         tiger-beetle-processor.zip \
         tiger-beetle-completion-processor.zip \
         seat-reservation-processor.zip \
@@ -182,6 +183,7 @@ test_six_lambda_artifacts() (
                 ;;
             zig-out/bin/intake/bootstrap | \
                 zig-out/bin/query/bootstrap | \
+                zig-out/bin/authentication/bootstrap | \
                 zig-out/bin/tiger_beetle_completion_processor/bootstrap | \
                 zig-out/bin/seat_reservation_processor/bootstrap | \
                 zig-out/bin/seat_reservation_completion_processor/bootstrap)
@@ -201,26 +203,28 @@ test_six_lambda_artifacts() (
     }
 
     artifact_output="$(validate_lambda_bootstraps)" ||
-        fail_test "six-bootstrap artifact validation failed"
+        fail_test "Lambda bootstrap validation failed"
     assert_contains "$artifact_output" "zig-out/bin/tiger_beetle_completion_processor/bootstrap"
     validate_lambda_archives
 
     expected_file_calls='zig-out/bin/intake/bootstrap
 zig-out/bin/query/bootstrap
+zig-out/bin/authentication/bootstrap
 zig-out/bin/tiger_beetle_completion_processor/bootstrap
 zig-out/bin/seat_reservation_processor/bootstrap
 zig-out/bin/seat_reservation_completion_processor/bootstrap
 zig-out/bin/tiger_beetle_processor/bootstrap'
     [ "$(<"$MOCK_FILE_CALLS")" = "$expected_file_calls" ] ||
-        fail_test "bootstrap validation did not retain the six expected paths"
+        fail_test "bootstrap validation did not retain the expected paths"
     expected_archive_calls='zig-out/packages/intake-lambda.zip
 zig-out/packages/query-lambda.zip
+zig-out/packages/authentication-lambda.zip
 zig-out/packages/tiger-beetle-processor.zip
 zig-out/packages/tiger-beetle-completion-processor.zip
 zig-out/packages/seat-reservation-processor.zip
 zig-out/packages/seat-reservation-completion-processor.zip'
     [ "$(<"$MOCK_ARCHIVE_CALLS")" = "$expected_archive_calls" ] ||
-        fail_test "validation did not retain the six expected archive paths"
+        fail_test "validation did not retain the expected archive paths"
 
     for archive in zig-out/packages/*.zip; do
         rm "$archive"
@@ -649,7 +653,7 @@ test_source_guards
 test_tiger_beetle_completion_processor_name_options
 test_completion_parameter_preserves_stack_state
 test_deployed_function_name_outputs
-test_six_lambda_artifacts
+test_lambda_artifacts
 test_setup_action_parsing
 test_enabled_stack_fills_only_unspecified_values
 test_ipv6_egress_ownership_state

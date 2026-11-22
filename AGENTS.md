@@ -2,7 +2,8 @@
 
 ## Repository and Sources of Truth
 
-This is a Zig 0.17.x AWS Lambda example with six handlers and host-native
+This is a Zig 0.17.x AWS Lambda example with six base handlers, an optional
+authentication handler, and host-native
 `paseto`, `dynamodb`, `sqs`, `events`, and `ledger-counter` CLI tools. `build.zig` and `build.zig.zon` own
 supported targets, optimization, executables, and pinned dependencies, including
 `aws_lambda`.
@@ -12,6 +13,7 @@ Read sources relevant to the task:
 | Task | Sources |
 | --- | --- |
 | HTTP intake or operation query | `src/intake_lambda.zig`, `src/query_lambda.zig`, `src/lambda_auth.zig` |
+| Direct GitHub exchange | `src/authentication_lambda.zig`, `src/github_identity.zig`, [HTTP contract](docs/API_GATEWAY.md#direct-github-exchange), [operator setup](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#direct-github-token-exchange) |
 | Operation data and persistence | `src/operation.zig`, `src/operation_persistence.zig` |
 | Seat contracts, Event metadata, and host tooling | `src/seat_reservation.zig`, `src/seat_reservation_persistence.zig`, `src/seat_events_cli.zig`, `events.sh`, [seat reference](docs/SEAT_RESERVATION.md), [Event utility setup and discovery](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#seat-event-metadata-utility) |
 | Global ledger allocation and counter tooling | `src/ledger_counter.zig`, `src/ledger_counter_cli.zig`, `ledger-counter.sh`, [seat reference](docs/SEAT_RESERVATION.md#global-ledger-allocator), [counter setup and discovery](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#global-ledger-counter-utility) |
@@ -144,5 +146,6 @@ Lambda runtime's Zig 0.17-compatible source revision.
 For Zig code or build changes, check formatting and build the affected targets,
 then select tests for the changed behavior. Documentation-only changes need link
 and command consistency checks rather than an application rebuild. The
-TigerBeetle processor must remain multithread-capable for its native callback
-thread; the other five Lambda bootstraps are single-threaded.
+TigerBeetle processor needs multiple threads for its native callback. The
+authentication bootstrap uses cancellable I/O tasks to bound the exchange.
+Keep the other five Lambda bootstraps single-threaded.

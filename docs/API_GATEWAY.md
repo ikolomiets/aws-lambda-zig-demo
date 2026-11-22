@@ -1,7 +1,7 @@
 # Operations API Gateway specification
 
-This document specifies the implemented public HTTP boundary for Operation
-submission and querying, its AWS integration, and caller and operator usage.
+This document specifies the public HTTP boundary for Operation submission,
+querying, and direct GitHub exchange, including its AWS integration.
 The [ingress ADR](adr/0008-api-gateway-operation-ingress.md) records the design
 trade-offs. The [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md) owns provisioning,
 packaging, infrastructure updates, and cleanup procedures.
@@ -24,8 +24,8 @@ Separate deployments use separate stacks.
 | `POST /operations` | Intake | `200` with the current persisted Operation output view; execution is asynchronous. |
 | `GET /operations/{id}` | Query | `200` with the authorized Operation output view, including its Result when completed. |
 
-These are the only public routes. The default stage does not create a `$default`
-catch-all route. Unsupported public methods and paths, including the API root,
+Both routes are always available. Deployments can also enable
+`POST /auth/github/exchange`. Unsupported public methods and paths, including the API root,
 receive a native gateway `404` without a handler invocation. CORS is disabled;
 the API targets non-browser clients. Custom domains and certificates are managed
 separately by [api-domain.sh](../api-domain.sh), with manual Cloudflare DNS.
@@ -67,8 +67,8 @@ authenticate HTTP callers or control gateway invocation permissions.
 ### Direct GitHub exchange
 
 The authentication handler accepts `POST /auth/github/exchange` on the same
-HTTPS origin when a deployment exposes the route. The current SAM template
-exposes the two Operation routes above.
+HTTPS origin when `EnableGitHubExchange=true`. Exchange is disabled by default.
+[Operator setup and enablement](DEPLOY_AWS_LAMBDA_WITH_SAM.md#direct-github-token-exchange)
 
 ```http
 POST /auth/github/exchange HTTP/1.1
@@ -101,6 +101,7 @@ continue to work until their signed expiration.
 | --- | --- |
 | `400` | The authenticated request contains a body. |
 | `401` | The credential is missing, ambiguous, malformed, rejected by GitHub, or issued to another OAuth App. The response includes `WWW-Authenticate: Bearer`. |
+| `404` | Exchange is disabled. API Gateway returns its native unmatched-route response. |
 | `503` | GitHub is unavailable, rate-limits the token check, or returns unusable identity data, or secret retrieval is temporarily unavailable. Wait and retry with backoff. |
 | `500` | The exchange has a configuration failure, such as rejected OAuth App credentials, a missing secret, or an invalid or mismatched PASETO signing key. |
 
@@ -191,7 +192,7 @@ republish work. The repository defines no new SDK or automatic retry policy.
 ## AWS integration and ownership
 
 [template.yaml](../template.yaml) owns `OperationsApi`, its generated default
-stage, two separate Lambda proxy integrations, and the common URL output.
+stage, Lambda proxy integrations, and the common URL output.
 The inline OpenAPI definition is the infrastructure routing declaration;
 the application contract is specified above.
 
@@ -199,6 +200,7 @@ the application contract is specified above.
 | --- | --- |
 | `IntakeApiPermission` | `lambda:InvokeFunction` for `apigateway.amazonaws.com`, scoped to the stack account and this API's `$default/POST/operations`. |
 | `QueryApiPermission` | Same service/account scope, restricted to this API's `$default/GET/operations/*`. |
+| `AuthenticationApiPermission` | Present with direct exchange enabled. Same service/account scope, restricted to this API's `$default/POST/auth/github/exchange`. |
 | `OperationsApiAccessLogGroup` | Stack-owned log destination, seven-day retention, deletion on stack deletion or replacement. |
 | `OperationsApiAccessLogPolicy` | Stack-owned service log-delivery permission, created before the API/stage and deleted with the stack or on replacement. |
 
@@ -252,7 +254,8 @@ concrete adapter, with no transport registry or general server framework.
 
 ## Route throttles
 
-The default stage configures each named route independently:
+The default stage configures the two Operation routes independently.
+Direct GitHub exchange uses the gateway's account and Region throttle limits.
 
 | Route | Rate parameter | Default requests/second | Burst parameter | Default |
 | --- | --- | ---: | --- | ---: |
@@ -449,11 +452,11 @@ Relevant existing checks are:
 | Check | Evidence |
 | --- | --- |
 | `zig build test-http --system zig-pkg` | Generic handler/authentication behavior plus separate AWS adapter compatibility tests. |
-| `bash tests/operations_api_test.sh` | Declared routes, payload format, permissions, output, throttle defaults/overrides, access-log policy/format/lifecycle, and mocked discovery/probes. |
+| `bash tests/operations_api_test.sh` | Declared routes, payload format, permissions, exchange configuration in both modes, throttle defaults/overrides, access-log configuration, and mocked discovery/probes. |
 | `bash tests/api_domain_test.sh` | Positional parsing, AWS context, certificate/domain reuse, manual DNS instructions, mapping reconciliation and read-only HTTPS probes with AWS/curl mocked. |
 | `bash tests/events_wrapper_test.sh` | Mocked Events integration with common-origin discovery. |
 | `bash tests/seat_scenarios_test.sh` | Mocked seat-tool integration with common-origin discovery. |
-| `zig build test-runtime --system zig-pkg` | Real Lambda event loop with a fake loopback Runtime API and external effects mocked across all six handlers. |
+| `zig build test-runtime --system zig-pkg` | Real Lambda event loop with a fake loopback Runtime API across all seven handlers, including rejection of another OAuth App's token and successful issuance. |
 | SAM validation described in the [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md#3-validate-the-sam-template) | Template validity; no cloud enforcement evidence. |
 
 Required regression coverage includes generic HTTP behavior without AWS metadata;
