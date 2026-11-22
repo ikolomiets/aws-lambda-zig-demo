@@ -8,6 +8,10 @@ authentication handler, and host-native
 supported targets, optimization, executables, and pinned dependencies, including
 `aws_lambda`.
 
+Start implementation with [Bounded exploration](docs/agents/domain.md#bounded-exploration).
+Use `rg -n '^#{1,4} '` to locate the ticket, validation, and review headings first,
+then read the applicable sections by line range in bounded batches.
+
 Read sources relevant to the task:
 
 | Task | Sources |
