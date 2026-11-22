@@ -99,7 +99,8 @@ deployment checks below have additional prerequisites and distinct evidence scop
 | `zig build check` | Combined offline and runtime Zig suites through the existing `test` and `test-runtime` runners; requires loopback socket permission, with no AWS credentials or live replica. Formatting remains separate. |
 | `zig build test` | Full offline Zig suite; excludes socket-based runtime tests, the live replica, and separate ABI checks |
 | `zig build test-http` | Intake and Query through application-owned HTTP types and the shared AWS payload 2.0 adapter with persistence and publication mocked. GitHub authentication covers direct exchange, device sign-in, and browser sign-in with simulated provider, secrets, and storage. |
-| `zig build test-runtime` | Host integration across all seven handlers and the Pending Sign-in AWS adapter; requires loopback socket permission, with external effects mocked and no AWS credentials or live replica |
+| `zig build test-runtime` | Loopback integration across all seven handlers, the Pending Sign-in AWS adapter, and the PASETO CLI's Operations HTTP client. Uses simulated services and requires loopback socket permission. |
+| `zig build test-paseto-cli` | Compile the host PASETO executable and run deterministic CLI tests, including stdin expiry and GitHub device sign-in with simulated Operations responses. Use `zig build build-paseto` to install the executable. |
 | `zig build build-events test-seat-reservation test-seat-persistence test-events-cli` | Host Events build and deterministic seat/domain/persistence/tooling tests |
 | `zig build build-ledger-counter test-ledger-counter test-ledger-counter-cli` | Host counter build and deterministic global allocation/tooling tests |
 | `zig build build-seat-processors` | Compile host seat invocation adapters without live services or Lambda packaging |
@@ -186,10 +187,14 @@ state and also returns HTTP `410`. Assert a single GitHub poll across both
 invocations.
 
 For a new outbound HTTP adapter, use the production HTTP client against a
-loopback peer in the first runtime test. Record that boundary in the map.
+loopback peer in the first runtime test.
 Assert the method, path, relevant headers and body received by the peer, then
 assert the caller's observable result after the peer returns its scripted
-response.
+response. For each security or timing claim, record the layer under test, the
+peer protocol, and relevant platform limits in the map. For example, the PASETO
+CLI's simulated command tests exercise HTTPS origin enforcement. Its plain HTTP
+loopback peer exercises redirect handling and stalled-response cancellation.
+On macOS, a synchronous system DNS lookup can delay cancellation.
 
 For new behavior, record the focused command and expected failure alongside the
 map. Run the check before implementation and record how it fails at the intended
@@ -272,9 +277,9 @@ TIGERBEETLE_ADDRESSES=127.0.0.1:3000 zig build test-tigerbeetle --system zig-pkg
 Run each command in a separate tool call with
 `sandbox_permissions = "require_escalated"`. Explain the required access in
 the request: `./check.sh` and `zig build check` include the offline suite and
-`test-runtime`, which binds a fake Runtime API to `127.0.0.1` on an
-operating-system-assigned port, with
-external effects mocked; `test-tigerbeetle` connects to and writes test data in the separately authorized
+`test-runtime`, which binds fake Runtime and Operations APIs to `127.0.0.1` on
+operating-system-assigned ports and simulates external effects. The
+`test-tigerbeetle` suite connects to and writes test data in the separately authorized
 local replica at `127.0.0.1:3000`. Keep that address explicit in the live command.
 Where supported, scope reusable approval prefixes to `./check.sh`, `zig build check`,
 `zig build test-runtime`, and `zig build test-tigerbeetle`, respectively.

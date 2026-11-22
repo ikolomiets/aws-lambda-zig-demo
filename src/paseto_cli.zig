@@ -1,5 +1,6 @@
 const std = @import("std");
 const paseto = @import("paseto");
+const device_login = @import("paseto_device_login.zig");
 
 const Allocator = std.mem.Allocator;
 const Ed25519 = paseto.Ed25519;
@@ -17,6 +18,7 @@ const Command = union(enum) {
     keygen,
     issue: IssueOptions,
     verify,
+    login_github,
 };
 
 const IssueOptions = struct {
@@ -24,14 +26,24 @@ const IssueOptions = struct {
     ttl_seconds: i64,
 };
 
+const CommandInput = struct {
+    stdin: []const u8,
+    now: i64,
+};
+
+const InputSource = union(enum) {
+    process: std.Io,
+    provided: CommandInput,
+};
+
 const Context = struct {
     allocator: Allocator,
     environment: *const std.process.Environ.Map,
-    now: i64,
     random: std.Random,
-    stdin: []const u8,
+    input: InputSource,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
+    login_services: ?*const device_login.Services = null,
 };
 
 const CliError = error{
@@ -46,10 +58,12 @@ const usage =
     \\  paseto keygen
     \\  paseto issue --subject <sub> --ttl-seconds <seconds>
     \\  paseto verify
+    \\  paseto login github
     \\
     \\Environment:
     \\  PASETO_PRIVATE_KEY  padded standard Base64 Ed25519 secret key for issue
     \\  PASETO_PUBLIC_KEY   padded standard Base64 Ed25519 public key for verify
+    \\  OPERATIONS_API_URL  HTTPS Operations API origin for login github
     \\
 ;
 
@@ -68,26 +82,20 @@ pub fn main(init: std.process.Init) u8 {
     ) catch {
         return finish(&stdout_file.interface, &stderr_file.interface, 2, .invocation);
     };
-    const command = parseCommand(arguments) catch {
-        return finish(&stdout_file.interface, &stderr_file.interface, 2, .invocation);
-    };
-
-    var stdin_buffer: [stdin_size_max + 1]u8 = undefined;
-    const stdin = readCommandInput(init.io, command, &stdin_buffer) catch |err| {
-        const failure: Failure = if (err == error.InputTooLarge) .token else .internal;
-        return finish(&stdout_file.interface, &stderr_file.interface, failure.code(), failure);
-    };
     var random_source = std.Random.IoSource{ .io = init.io };
+    var login_runtime = device_login.Runtime.init(init.gpa, init.io);
+    defer login_runtime.client.deinit();
+    const login_services = login_runtime.services();
     const context = Context{
         .allocator = init.gpa,
         .environment = init.environ_map,
-        .now = unixSeconds(init.io),
         .random = random_source.interface(),
-        .stdin = stdin,
+        .input = .{ .process = init.io },
         .stdout = &stdout_file.interface,
         .stderr = &stderr_file.interface,
+        .login_services = &login_services,
     };
-    const exit_code = runCommand(command, context);
+    const exit_code = runArguments(arguments, context);
     return finish(&stdout_file.interface, &stderr_file.interface, exit_code, null);
 }
 
@@ -96,11 +104,23 @@ const Failure = enum {
     key_configuration,
     token,
     internal,
+    login_origin,
+    login_denied,
+    login_failed,
+    login_expired,
+    login_redirected,
+    login_exchange,
 
     fn code(failure: Failure) u8 {
         return switch (failure) {
-            .token => 1,
-            .invocation, .key_configuration, .internal => 2,
+            .token,
+            .login_denied,
+            .login_failed,
+            .login_expired,
+            .login_redirected,
+            .login_exchange,
+            => 1,
+            .invocation, .key_configuration, .internal, .login_origin => 2,
         };
     }
 };
@@ -123,6 +143,12 @@ fn writeDiagnostic(stderr: *std.Io.Writer, failure: Failure) void {
         .key_configuration => "paseto: missing or invalid key configuration\n",
         .token => "paseto: token verification failed\n",
         .internal => "paseto: operation failed\n",
+        .login_origin => "paseto: set OPERATIONS_API_URL to an HTTPS Operations API origin\n",
+        .login_denied => "paseto: GitHub sign-in was denied\n",
+        .login_failed => "paseto: Operations GitHub sign-in failed\n",
+        .login_expired => "paseto: GitHub sign-in expired; run paseto login github again\n",
+        .login_redirected => "paseto: Operations redirected the GitHub sign-in request\n",
+        .login_exchange => "paseto: Operations could not complete GitHub sign-in (HTTP 500)\n",
     };
     stderr.writeAll(message) catch {};
 }
@@ -186,6 +212,10 @@ fn parseCommand(arguments: []const []const u8) CliError!Command {
     if (std.mem.eql(u8, name, "keygen")) return parseKeygen(arguments[2..]);
     if (std.mem.eql(u8, name, "issue")) return parseIssue(arguments[2..]);
     if (std.mem.eql(u8, name, "verify")) return parseVerify(arguments[2..]);
+    if (std.mem.eql(u8, name, "login")) {
+        if (arguments.len == 3 and isHelp(arguments[2])) return .help;
+        if (arguments.len == 3 and std.mem.eql(u8, arguments[2], "github")) return .login_github;
+    }
     return error.InvalidInvocation;
 }
 
@@ -250,12 +280,18 @@ fn isHelp(argument: []const u8) bool {
     return std.mem.eql(u8, argument, "help");
 }
 
-fn runCommand(command: Command, context: Context) u8 {
-    executeCommand(command, context) catch |err| {
+fn runCommand(command: Command, context: Context, input: *const CommandInput) u8 {
+    executeCommand(command, context, input) catch |err| {
         const failure: Failure = switch (err) {
             error.InvalidInvocation => .invocation,
             error.InvalidKeyConfiguration => .key_configuration,
             error.InvalidToken => .token,
+            error.InvalidOrigin => .login_origin,
+            error.SignInDenied => .login_denied,
+            error.SignInFailed => .login_failed,
+            error.SignInExpired => .login_expired,
+            error.SignInRedirected => .login_redirected,
+            error.SignInExchange => .login_exchange,
             else => .internal,
         };
         writeDiagnostic(context.stderr, failure);
@@ -269,15 +305,37 @@ fn runArguments(arguments: []const []const u8, context: Context) u8 {
         writeDiagnostic(context.stderr, .invocation);
         return 2;
     };
-    return runCommand(command, context);
+    var stdin_buffer: [stdin_size_max + 1]u8 = undefined;
+    const input = switch (context.input) {
+        .process => |io| process: {
+            const stdin = readCommandInput(io, command, &stdin_buffer) catch |err| {
+                const failure: Failure = if (err == error.InputTooLarge) .token else .internal;
+                writeDiagnostic(context.stderr, failure);
+                return failure.code();
+            };
+            break :process CommandInput{ .stdin = stdin, .now = unixSeconds(io) };
+        },
+        .provided => |input| input,
+    };
+    return runCommand(command, context, &input);
 }
 
-fn executeCommand(command: Command, context: Context) !void {
+fn executeCommand(command: Command, context: Context, input: *const CommandInput) !void {
     switch (command) {
         .help => try context.stdout.writeAll(usage),
         .keygen => try keygen(context),
-        .issue => |options| try issue(options, context),
-        .verify => try verify(context),
+        .issue => |options| try issue(options, context, input.now),
+        .verify => try verify(context, input),
+        .login_github => {
+            const origin = context.environment.get("OPERATIONS_API_URL") orelse {
+                return error.InvalidOrigin;
+            };
+            const services = context.login_services orelse return error.InternalFailure;
+            try device_login.run(context.allocator, services, origin, .{
+                .stdout = context.stdout,
+                .stderr = context.stderr,
+            });
+        },
     }
 }
 
@@ -298,7 +356,7 @@ fn keygen(context: Context) !void {
     try context.stdout.print("PASETO_KEY_ID={s}\n", .{kid});
 }
 
-fn issue(options: IssueOptions, context: Context) !void {
+fn issue(options: IssueOptions, context: Context, now: i64) !void {
     const private_base64 = context.environment.get("PASETO_PRIVATE_KEY") orelse {
         return error.InvalidKeyConfiguration;
     };
@@ -313,7 +371,7 @@ fn issue(options: IssueOptions, context: Context) !void {
         &secret_key,
         .{
             .subject = options.subject,
-            .now = context.now,
+            .now = now,
             .ttl_seconds = options.ttl_seconds,
         },
     ) catch |err| {
@@ -327,20 +385,20 @@ fn issue(options: IssueOptions, context: Context) !void {
     try context.stdout.print("{s}\n", .{token});
 }
 
-fn verify(context: Context) !void {
+fn verify(context: Context, input: *const CommandInput) !void {
     const public_base64 = context.environment.get("PASETO_PUBLIC_KEY") orelse {
         return error.InvalidKeyConfiguration;
     };
     const public_key = paseto.decodePublicKey(public_base64) catch {
         return error.InvalidKeyConfiguration;
     };
-    if (context.stdin.len > stdin_size_max) return error.InvalidToken;
+    if (input.stdin.len > stdin_size_max) return error.InvalidToken;
 
     var claims = paseto.verify(
         context.allocator,
-        context.stdin,
+        input.stdin,
         public_key,
-        context.now,
+        input.now,
     ) catch |err| {
         return switch (err) {
             error.InvalidToken => error.InvalidToken,
@@ -437,6 +495,75 @@ test "issue uses only the private key and verify uses only the public key" {
         private_only_result.stderr(),
     );
 }
+
+test "verify rejects a token that expires before stdin reaches EOF" {
+    var key_pair = testKeyPair(0x22);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try putPrivateKey(&environment, &key_pair.secret_key);
+    try putPublicKey(&environment, key_pair.public_key);
+
+    const started_seconds = 1000;
+    const issue_result = runForTest(
+        &.{ "paseto", "issue", "--subject", "alice", "--ttl-seconds", "1" },
+        "",
+        &environment,
+        started_seconds,
+    );
+    try std.testing.expectEqual(@as(u8, 0), issue_result.exit_code);
+
+    var stdin = ExpiringStdin{
+        .remaining = issue_result.stdout(),
+        .now_seconds = started_seconds,
+        .eof_seconds = 1001,
+    };
+    const result = run_test(&.{ "paseto", "verify" }, &environment, .{ .process = stdin.io() }, .{});
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", result.stdout());
+    try std.testing.expectEqualStrings("paseto: token verification failed\n", result.stderr());
+    try std.testing.expectEqual(@as(i64, 1001), stdin.now_seconds);
+}
+
+const ExpiringStdin = struct {
+    remaining: []const u8,
+    now_seconds: i64,
+    eof_seconds: i64,
+
+    const vtable: std.Io.VTable = fixture: {
+        var table = std.Io.failing.vtable.*;
+        table.operate = operate;
+        table.now = now;
+        break :fixture table;
+    };
+
+    fn io(stdin: *ExpiringStdin) std.Io {
+        return .{ .userdata = stdin, .vtable = &vtable };
+    }
+
+    fn operate(context: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        const stdin: *ExpiringStdin = @ptrCast(@alignCast(context.?));
+        const read = operation.file_read_streaming;
+        std.debug.assert(read.file.handle == std.Io.File.stdin().handle);
+        if (stdin.remaining.len == 0) {
+            // The token is valid before the read begins and expired when stdin closes.
+            stdin.now_seconds = stdin.eof_seconds;
+            return .{ .file_read_streaming = error.EndOfStream };
+        }
+        const destination = read.data[0];
+        std.debug.assert(destination.len > 0);
+        const size = @min(destination.len, stdin.remaining.len);
+        @memcpy(destination[0..size], stdin.remaining[0..size]);
+        stdin.remaining = stdin.remaining[size..];
+        return .{ .file_read_streaming = size };
+    }
+
+    fn now(context: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+        const stdin: *const ExpiringStdin = @ptrCast(@alignCast(context.?));
+        std.debug.assert(clock == .real);
+        return .{ .nanoseconds = @as(i96, stdin.now_seconds) * std.time.ns_per_s };
+    }
+};
 
 test "verify accepts surrounding whitespace and writes canonical claims" {
     var key_pair = testKeyPair(0x23);
@@ -682,11 +809,306 @@ const TestResult = struct {
     }
 };
 
+test "GitHub login presents browser approval and reports denial after the first interval" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("OPERATIONS_API_URL", "https://operations.example:8443/");
+
+    var operations = TestOperations{ .polls = &.{
+        .{
+            .time_seconds = 5,
+            .response = .{ .status = .forbidden, .body = "{\"error\":\"access_denied\"}" },
+        },
+    } };
+    const result = run_login_for_test(&environment, &operations);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", result.stdout());
+    try std.testing.expectEqualStrings(
+        test_approval_prompt ++ "paseto: GitHub sign-in was denied\n",
+        result.stderr(),
+    );
+    try std.testing.expectEqual(@as(usize, 2), operations.requests);
+}
+
+test "GitHub login waits through pending approval and Retry-After and prints one signed token" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("OPERATIONS_API_URL", "https://operations.example:8443");
+
+    var key_pair = testKeyPair(0x71);
+    defer paseto.wipeSecretKey(&key_pair.secret_key);
+    var random = std.Random.DefaultPrng.init(41);
+    const allocator = std.testing.allocator;
+    const token = try paseto.issue(allocator, random.random(), &key_pair.secret_key, .{
+        .subject = "github:42",
+        .now = 1020,
+        .ttl_seconds = 28800,
+    });
+    defer allocator.free(token);
+    const success = try std.json.Stringify.valueAlloc(allocator, .{
+        .access_token = token,
+        .token_type = "Bearer",
+        .expires_in = 28800,
+    }, .{});
+    defer allocator.free(success);
+    var operations = TestOperations{ .polls = &.{
+        .{
+            .time_seconds = 5,
+            .response = .{
+                .status = .accepted,
+                .body = "{\"error\":\"authorization_pending\",\"interval\":7}",
+            },
+        },
+        .{
+            .time_seconds = 12,
+            .response = .{ .status = .too_many_requests, .body = "", .retry_after_seconds = 8 },
+        },
+        .{ .time_seconds = 20, .response = .{ .status = .ok, .body = success } },
+    } };
+    const result = run_login_for_test(&environment, &operations);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings(test_approval_prompt, result.stderr());
+    const expected_stdout = try std.fmt.allocPrint(allocator, "{s}\n", .{token});
+    defer allocator.free(expected_stdout);
+    try std.testing.expectEqualStrings(expected_stdout, result.stdout());
+    try std.testing.expectEqual(@as(usize, 4), operations.requests);
+
+    try putPublicKey(&environment, key_pair.public_key);
+    const verified = runForTest(&.{ "paseto", "verify" }, result.stdout(), &environment, 1020);
+    try std.testing.expectEqual(@as(u8, 0), verified.exit_code);
+    try std.testing.expectEqualStrings(
+        "{\"sub\":\"github:42\",\"exp\":29820}\n",
+        verified.stdout(),
+    );
+    try std.testing.expectEqualStrings("", verified.stderr());
+}
+
+test "GitHub login stops at server expiry or before polling at the local deadline" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("OPERATIONS_API_URL", "https://operations.example:8443");
+    const responses: []const device_login.Response = &.{
+        .{ .status = .gone, .body = "{\"error\":\"expired_or_consumed\"}" },
+        .{ .status = .too_many_requests, .body = "", .retry_after_seconds = 55 },
+    };
+    for (responses, [_]i96{ 5, 60 }) |response, elapsed_seconds| {
+        var operations = TestOperations{ .polls = &.{
+            .{ .time_seconds = 5, .response = response },
+        } };
+        const result = run_login_for_test(&environment, &operations);
+        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+        try std.testing.expectEqualStrings("", result.stdout());
+        try std.testing.expectEqualStrings(
+            test_approval_prompt ++ test_expiry_diagnostic,
+            result.stderr(),
+        );
+        try std.testing.expectEqual(@as(usize, 2), operations.requests);
+        try std.testing.expectEqual(elapsed_seconds * std.time.ns_per_s, operations.elapsed_ns);
+    }
+}
+
+test "GitHub login rejects a poll response arriving at the grant deadline" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("OPERATIONS_API_URL", "https://operations.example:8443");
+    var operations = TestOperations{ .polls = &.{.{
+        .time_seconds = 5,
+        .response_delay_seconds = 55,
+        .response = .{ .status = .ok, .body = "{}" },
+    }} };
+    const result = run_login_for_test(&environment, &operations);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", result.stdout());
+    try std.testing.expectEqualStrings(
+        test_approval_prompt ++ test_expiry_diagnostic,
+        result.stderr(),
+    );
+    try std.testing.expectEqual(@as(usize, 2), operations.requests);
+}
+
+test "GitHub login backs off on gateway throttles and 503 and reports only the exchange status" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("OPERATIONS_API_URL", "https://operations.example:8443");
+    var operations = TestOperations{ .polls = &.{
+        .{ .time_seconds = 5, .response = .{ .status = .too_many_requests, .body = "" } },
+        .{ .time_seconds = 15, .response = .{ .status = .service_unavailable, .body = "" } },
+        .{
+            .time_seconds = 35,
+            .response = .{ .status = .internal_server_error, .body =
+            \\{"error":"internal_error","message":"private-poll-code bearer-token signing-key"}
+            },
+        },
+    } };
+    const result = run_login_for_test(&environment, &operations);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", result.stdout());
+    try std.testing.expectEqualStrings(
+        test_approval_prompt ++ "paseto: Operations could not complete GitHub sign-in (HTTP 500)\n",
+        result.stderr(),
+    );
+    try std.testing.expectEqual(@as(usize, 4), operations.requests);
+}
+
+test "GitHub login keeps a poll redirect and malformed credential out of the output" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("OPERATIONS_API_URL", "https://operations.example:8443");
+    const responses: []const device_login.Response = &.{
+        .{ .status = .temporary_redirect, .body = "https://other.example/private-poll-code" },
+        .{ .status = .ok, .body =
+        \\{"access_token":"v4.public.fake\nBearer secret","token_type":"Bearer","expires_in":28800}
+        },
+        .{
+            .status = .ok,
+            .body = "{\"access_token\":\"v4.public." ++ @as([90]u8, @splat('A')) ++
+                "\",\"token_type\":\"Bearer\",\"expires_in\":28800}",
+        },
+    };
+    const diagnostics = [_][]const u8{
+        "paseto: Operations redirected the GitHub sign-in request\n",
+        "paseto: Operations GitHub sign-in failed\n",
+        "paseto: Operations GitHub sign-in failed\n",
+    };
+    for (responses, diagnostics) |response, diagnostic| {
+        var operations = TestOperations{ .polls = &.{
+            .{ .time_seconds = 5, .response = response },
+        } };
+        const result = run_login_for_test(&environment, &operations);
+        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+        try std.testing.expectEqualStrings("", result.stdout());
+        const expected = try std.mem.concat(std.testing.allocator, u8, &.{
+            test_approval_prompt, diagnostic,
+        });
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, result.stderr());
+        try std.testing.expectEqual(@as(usize, 2), operations.requests);
+    }
+}
+
+test "GitHub login rejects invalid Operations origins before making a request" {
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    const origins: []const ?[]const u8 = &.{
+        null,
+        "",
+        "http://operations.example:8443",
+        "https://user:credential@operations.example",
+        "https://operations.example/route",
+        "https://operations.example?credential",
+        "https://operations.example/#credential",
+        "https:operations.example",
+        "https://operations.example:+8443",
+        "https://operations.example:8_443",
+        "https://operations.example\n",
+    };
+    for (origins) |origin| {
+        if (origin) |value| try environment.put("OPERATIONS_API_URL", value);
+        var operations = TestOperations{ .polls = &.{} };
+        const result = run_login_for_test(&environment, &operations);
+        try std.testing.expectEqual(@as(u8, 2), result.exit_code);
+        try std.testing.expectEqualStrings("", result.stdout());
+        try std.testing.expectEqualStrings(
+            "paseto: set OPERATIONS_API_URL to an HTTPS Operations API origin\n",
+            result.stderr(),
+        );
+        try std.testing.expectEqual(@as(usize, 0), operations.requests);
+    }
+}
+
+fn run_login_for_test(
+    environment: *const std.process.Environ.Map,
+    operations: *TestOperations,
+) TestResult {
+    const services = operations.services();
+    return run_test(
+        &.{ "paseto", "login", "github" },
+        environment,
+        .{ .provided = .{ .stdin = "", .now = 1000 } },
+        .{ .login_services = &services },
+    );
+}
+
+const test_approval_prompt =
+    "Open https://github.com/login/device in your browser and enter code WDJB-MJHT.\n";
+const test_expiry_diagnostic =
+    "paseto: GitHub sign-in expired; run paseto login github again\n";
+
+const TestOperations = struct {
+    const Poll = struct {
+        time_seconds: i96,
+        response: device_login.Response,
+        response_delay_seconds: i96 = 0,
+    };
+
+    polls: []const Poll,
+    requests: usize = 0,
+    elapsed_ns: i96 = 0,
+
+    fn services(operations: *TestOperations) device_login.Services {
+        return .{ .context = operations, .post = post, .now = now, .sleep = sleep };
+    }
+
+    fn post(
+        context: *anyopaque,
+        uri: *const std.Uri,
+        body: []const u8,
+        _: []u8,
+        deadline_ns: i96,
+    ) !device_login.Response {
+        const operations: *TestOperations = @ptrCast(@alignCast(context));
+        try std.testing.expectEqualStrings("https", uri.scheme);
+        try std.testing.expectEqualStrings("operations.example", uri.host.?.percent_encoded);
+        try std.testing.expectEqual(@as(?u16, 8443), uri.port);
+        try std.testing.expect(uri.query == null);
+        try std.testing.expect(uri.fragment == null);
+        const request_index = operations.requests;
+        operations.requests += 1;
+        if (request_index == 0) {
+            try std.testing.expectEqual(30 * std.time.ns_per_s, deadline_ns);
+            try std.testing.expectEqualStrings("/auth/github/device/start", uri.path.raw);
+            try std.testing.expectEqualStrings("", body);
+            return .{ .status = .ok, .body =
+            \\{"device_code":"private-poll-code","user_code":"WDJB-MJHT",
+            \\"verification_uri":"https://github.com/login/device","interval":5,"expires_in":60}
+            };
+        }
+        try std.testing.expectEqualStrings("/auth/github/device/poll", uri.path.raw);
+        try std.testing.expectEqualStrings("{\"device_code\":\"private-poll-code\"}", body);
+        try std.testing.expect(request_index <= operations.polls.len);
+        const poll = operations.polls[request_index - 1];
+        try std.testing.expectEqual(poll.time_seconds * std.time.ns_per_s, operations.elapsed_ns);
+        const deadline_seconds = @min(poll.time_seconds + 30, 60);
+        try std.testing.expectEqual(deadline_seconds * std.time.ns_per_s, deadline_ns);
+        operations.elapsed_ns += poll.response_delay_seconds * std.time.ns_per_s;
+        return poll.response;
+    }
+
+    fn now(context: *anyopaque) i96 {
+        const operations: *TestOperations = @ptrCast(@alignCast(context));
+        return operations.elapsed_ns;
+    }
+
+    fn sleep(context: *anyopaque, duration: std.Io.Duration) !void {
+        const operations: *TestOperations = @ptrCast(@alignCast(context));
+        operations.elapsed_ns += duration.nanoseconds;
+    }
+};
+
 fn runForTest(
     arguments: []const []const u8,
     stdin: []const u8,
     environment: *const std.process.Environ.Map,
     now: i64,
+) TestResult {
+    return run_test(arguments, environment, .{ .provided = .{ .stdin = stdin, .now = now } }, .{});
+}
+
+fn run_test(
+    arguments: []const []const u8,
+    environment: *const std.process.Environ.Map,
+    input: InputSource,
+    options: struct { login_services: ?*const device_login.Services = null },
 ) TestResult {
     var result: TestResult = undefined;
     var stdout: std.Io.Writer = .fixed(&result.stdout_buffer);
@@ -695,11 +1117,11 @@ fn runForTest(
     result.exit_code = runArguments(arguments, .{
         .allocator = std.testing.allocator,
         .environment = environment,
-        .now = now,
         .random = random.random(),
-        .stdin = stdin,
+        .input = input,
         .stdout = &stdout,
         .stderr = &stderr,
+        .login_services = options.login_services,
     });
     result.stdout_size = stdout.buffered().len;
     result.stderr_size = stderr.buffered().len;

@@ -181,6 +181,26 @@ server enforces the GitHub grant deadline even while the DynamoDB row still
 exists. A successful conditional write consumes the grant before PASETO
 issuance. [GitHub device flow](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow)
 
+#### Sign in from a terminal
+
+From the checkout, build the host CLI with `zig build build-paseto`. Set
+`OPERATIONS_API_URL` to the HTTPS origin of a deployment with device sign-in
+enabled. When the CLI prompts on stderr, open the displayed URL, enter the
+displayed user code, and approve the OAuth App in GitHub. The command puts the
+PASETO on stdout so the shell can capture it. Use the UUID of an existing
+Operation owned by that GitHub account. [Endpoint discovery](#calling-the-api-and-discovering-endpoints)
+
+```sh
+export OPERATIONS_API_URL='https://api.example.com'
+operation_id='<operation-uuid>'
+token="$(zig-out/bin/paseto login github)" &&
+  curl --fail-with-body -H "Authorization: Bearer $token" \
+    "${OPERATIONS_API_URL%/}/operations/$operation_id"
+```
+
+The PASETO expires eight hours after issuance by default. Discard the old token
+and run `paseto login github` again to sign in and get a fresh token.
+
 ### Browser GitHub sign-in
 
 The authentication Lambda handles these routes on an HTTPS Operations API
@@ -600,11 +620,12 @@ Relevant existing checks are:
 | Check | Evidence |
 | --- | --- |
 | `zig build test-http --system zig-pkg` | Generic handler/authentication behavior plus separate AWS adapter compatibility tests. |
+| `zig build test-paseto-cli --system zig-pkg` | Terminal sign-in exit status and output, polling with a controlled clock and simulated Operations responses, and verification of the returned PASETO. |
 | `bash tests/operations_api_test.sh` | Declared routes, payload format, permissions, exchange configuration in both modes, throttle defaults/overrides, access-log configuration, and mocked discovery/probes. |
 | `bash tests/api_domain_test.sh` | Positional parsing, AWS context, certificate/domain reuse, manual DNS instructions, mapping reconciliation and read-only HTTPS probes with AWS/curl mocked. |
 | `bash tests/events_wrapper_test.sh` | Mocked Events integration with common-origin discovery. |
 | `bash tests/seat_scenarios_test.sh` | Mocked seat-tool integration with common-origin discovery. |
-| `zig build test-runtime --system zig-pkg` | Real Lambda event loop with a fake loopback Runtime API across all seven handlers. The authentication cases include GitHub device start over loopback and DynamoDB conditional updates through the SDK to a loopback peer. |
+| `zig build test-runtime --system zig-pkg` | Real Lambda event loop with a fake loopback Runtime API across all seven handlers. The authentication cases include GitHub device start and DynamoDB conditional updates through the SDK. The CLI HTTP client sends device requests to a loopback peer and handles Retry-After, redirects and stalled responses. |
 | SAM validation described in the [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md#3-validate-the-sam-template) | Template validity; no cloud enforcement evidence. |
 
 Required regression coverage includes generic HTTP behavior without AWS metadata;

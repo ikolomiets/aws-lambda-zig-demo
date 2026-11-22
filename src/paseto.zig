@@ -106,6 +106,12 @@ const TokenParts = struct {
     footer: []const u8,
 };
 
+const TokenBuffers = struct {
+    signed: [token_segment_size_max]u8,
+    footer: [footer_size_max]u8,
+    canonical: [token_size_max]u8,
+};
+
 pub fn generateKeyPair(
     random: std.Random,
     key_pair: *Ed25519.KeyPair,
@@ -173,15 +179,8 @@ pub fn verify(
     const token = std.mem.trim(u8, token_input, ascii_whitespace);
     if (token.len == 0) return error.InvalidToken;
 
-    var signed_buffer: [token_segment_size_max]u8 = undefined;
-    var footer_buffer: [footer_size_max]u8 = undefined;
-    var canonical_buffer: [token_size_max]u8 = undefined;
-    const parts = try parseTokenInto(
-        token,
-        &signed_buffer,
-        &footer_buffer,
-        &canonical_buffer,
-    );
+    var buffers: TokenBuffers = undefined;
+    const parts = try parseTokenInto(token, &buffers);
 
     const encoder = implementation.v4_public.V4Public.init(allocator);
     const payload = encoder.decode(
@@ -194,6 +193,13 @@ pub fn verify(
 
     try verifyFooter(allocator, parts.footer, public_key);
     return verifyClaims(allocator, payload, now);
+}
+
+/// Check the wire format of a token received from Operations before emitting it.
+pub fn validate_token_format(token: []const u8) Error!void {
+    var buffers: TokenBuffers = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&buffers));
+    _ = try parseTokenInto(token, &buffers);
 }
 
 pub fn writeClaims(writer: *std.Io.Writer, claims: *const Claims) !void {
@@ -380,12 +386,8 @@ fn encodeToken(
     return token;
 }
 
-fn parseTokenInto(
-    token: []const u8,
-    signed_buffer: *[token_segment_size_max]u8,
-    footer_buffer: *[footer_size_max]u8,
-    canonical_buffer: *[token_size_max]u8,
-) Error!TokenParts {
+fn parseTokenInto(token: []const u8, buffers: *TokenBuffers) Error!TokenParts {
+    if (token.len > token_size_max) return error.InvalidToken;
     var iterator = std.mem.splitScalar(u8, token, '.');
     const version = iterator.next() orelse return error.InvalidToken;
     const purpose = iterator.next() orelse return error.InvalidToken;
@@ -399,17 +401,17 @@ fn parseTokenInto(
 
     const signed = decodeBase64Url(
         signed_base64,
-        signed_buffer,
-        canonical_buffer,
+        &buffers.signed,
+        &buffers.canonical,
     ) catch return error.InvalidToken;
     const footer = decodeBase64Url(
         footer_base64,
-        footer_buffer,
-        canonical_buffer,
+        &buffers.footer,
+        &buffers.canonical,
     ) catch return error.InvalidToken;
     if (signed.len < Ed25519.Signature.encoded_length) return error.InvalidToken;
-    std.debug.assert(signed.len <= signed_buffer.len);
-    std.debug.assert(footer.len <= footer_buffer.len);
+    std.debug.assert(signed.len <= buffers.signed.len);
+    std.debug.assert(footer.len <= buffers.footer.len);
     return .{ .signed = signed, .footer = footer };
 }
 

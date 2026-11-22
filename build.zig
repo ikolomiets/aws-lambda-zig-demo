@@ -696,7 +696,9 @@ pub fn build(b: *std.Build) void {
         .root_module = cli_mod,
     });
 
-    b.installArtifact(cli_exe);
+    const install_paseto = b.addInstallArtifact(cli_exe, .{});
+    b.getInstallStep().dependOn(&install_paseto.step);
+    b.step("build-paseto", "Build the host PASETO utility").dependOn(&install_paseto.step);
 
     const persistence_cli_mod = b.createModule(.{
         .target = b.graph.host,
@@ -962,6 +964,9 @@ pub fn build(b: *std.Build) void {
         .root_module = cli_test_mod,
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
+    const cli_test_step = b.step("test-paseto-cli", "Compile the host PASETO CLI and run its tests");
+    cli_test_step.dependOn(&cli_exe.step);
+    cli_test_step.dependOn(&run_cli_tests.step);
 
     const persistence_cli_tests = b.addTest(.{
         .root_module = persistence_cli_mod,
@@ -1158,8 +1163,24 @@ pub fn build(b: *std.Build) void {
     });
     const runtime_test_step = b.step(
         "test-runtime",
-        "Run loopback Lambda runtime integration tests",
+        "Run loopback Lambda and PASETO CLI integration tests",
     );
+    const login_http_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = .safe,
+        .root_source_file = b.path("tests/paseto_device_login_http.zig"),
+        .imports = &.{
+            .{ .name = "device_login", .module = b.createModule(.{
+                .target = b.graph.host,
+                .optimize = .safe,
+                .root_source_file = b.path("src/paseto_device_login.zig"),
+                .imports = &.{.{ .name = "paseto", .module = host_paseto }},
+            }) },
+        },
+    }) });
+    const run_login_http_tests = b.addRunArtifact(login_http_tests);
+    run_login_http_tests.has_side_effects = true;
+    runtime_test_step.dependOn(&run_login_http_tests.step);
     const seat_test_support = b.createModule(.{
         .target = b.graph.host,
         .root_source_file = b.path("tests/seat_test_support.zig"),
@@ -1231,7 +1252,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_operation_persistence_tests.step);
     test_step.dependOn(&run_sqs_queue_tests.step);
     test_step.dependOn(&run_paseto_tests.step);
-    test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(cli_test_step);
     test_step.dependOn(&run_persistence_cli_tests.step);
     test_step.dependOn(&run_queue_cli_tests.step);
     test_step.dependOn(&run_tigerbeetle_tests.step);
