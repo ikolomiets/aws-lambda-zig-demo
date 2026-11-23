@@ -143,6 +143,21 @@ its temporary configuration on exit.
 )
 ```
 
+When changing how `deploy.sh` passes managed sign-in parameters to SAM, run the
+parser regression from the repository root with Bash, `jq`, and SAM CLI with
+`sam list resources --save-params` support (checked with SAM CLI 1.174.0).
+
+```sh
+bash tests/sam_parameter_overrides_test.sh
+```
+
+The check captures the arguments from the deployment phase and passes them to
+the installed SAM CLI's local resource listing with fixture credentials and a
+temporary template and configuration. It verifies exact callback URLs and
+adjacent overrides, and confirms that the old argument form loses the callback
+registration when a query contains embedded SAM parameter syntax. The listing
+runs offline without a stack name.
+
 ### Shell regression checks
 
 When changing an existing shell script, select and run the applicable checks
@@ -161,7 +176,7 @@ The independent privacy scanner still runs in CI and the optional commit hook.
 | `deploy.sh`, `wireguard-gateway-setup.sh`: gateway options, deployment, disablement, and preserved configuration | `bash tests/deploy_gateway_interface_test.sh` |
 | `deploy.sh`: package invocation, caches, compiler validation, artifact checks, and deployed function selection for code sync | `bash tests/deploy_packaging_test.sh` |
 | `deploy.sh`, `wireguard-gateway-setup.sh`, `lambda_logs.sh`: processor names, options, and selectors | `bash tests/processor_interface_test.sh` |
-| `deploy.sh`, `template.yaml`: Operations API routes, discovery, probes, throttling, access logs, and optional GitHub exchange routing and permissions | `bash tests/operations_api_test.sh` |
+| `deploy.sh`, `template.yaml`: Operations API routes, discovery, probes, throttling, access logs, GitHub sign-in wiring, storage, permissions, and CORS | `bash tests/operations_api_test.sh` |
 | `api-domain.sh`: custom-domain parsing, certificate/domain reuse, DNS instructions, mappings, and HTTPS probes | `bash tests/api_domain_test.sh` |
 | `events.sh`: credentials, HTTP origin selection, Event commands, and polling | `bash tests/events_wrapper_test.sh` |
 | `seat_scenarios.sh`: discovery, HTTP origin selection, scenarios, and evidence | `bash tests/seat_scenarios_test.sh` |
@@ -335,16 +350,17 @@ Captured publications, writes and logs use test-owned memory so assertions remai
 valid after invocation arena resets.
 
 The authentication cases drive the real entry point with simulated secrets and
-storage. The loopback GitHub peer checks the direct token check and zero-scope
-device-start requests received through the production HTTP client. The Lambda
-rejects a token issued for another OAuth App, issues a verifiable PASETO on
-successful exchange, and returns public approval instructions plus a private
-Operations code on device start. The malformed-event fallback also returns
-`Cache-Control: no-store`. The browser callback rejects conflicting payload and
-header cookies before either GitHub call and leaves the Pending Sign-in pending.
-A separate loopback DynamoDB peer checks the SDK requests and models a
-conditional consumption success and conflict.
+storage. The loopback GitHub peer checks direct exchange, zero-scope device
+start, and the browser callback PKCE exchange through the production HTTP
+client. A later device poll or browser redemption issues a verifiable PASETO
+and replay returns `410`. An expired browser code returns `410` while its row
+is still stored. Conflicting callback cookies fail before either GitHub call.
+The malformed-event fallback returns `Cache-Control: no-store`. A separate
+loopback DynamoDB peer checks the SDK requests and models a conditional
+consumption success and conflict. API Gateway CORS behavior is verified
+separately on a deployed gateway.
 [Authentication tests](../../src/authentication_lambda.zig)
+[Device sign-in tests](../../src/authentication_device_tests.zig)
 [Browser sign-in tests](../../src/authentication_browser_tests.zig)
 [Pending Sign-in adapter test](../../src/pending_sign_in.zig#L353)
 

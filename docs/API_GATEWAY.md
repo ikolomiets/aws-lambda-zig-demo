@@ -24,11 +24,23 @@ Separate deployments use separate stacks.
 | `POST /operations` | Intake | `200` with the current persisted Operation output view; execution is asynchronous. |
 | `GET /operations/{id}` | Query | `200` with the authorized Operation output view, including its Result when completed. |
 
-Both routes are always available. Deployments can also enable
-`POST /auth/github/exchange`. Unsupported public methods and paths, including the API root,
-receive a native gateway `404` without a handler invocation. CORS is disabled;
-the API targets non-browser clients. Custom domains and certificates are managed
-separately by [api-domain.sh](../api-domain.sh), with manual Cloudflare DNS.
+Both routes are always available. `EnableGitHubExchange=true` adds six named
+authentication routes to the same origin and Lambda.
+
+| Method and path | Successful response |
+| --- | --- |
+| `POST /auth/github/exchange` | `200` with a PASETO |
+| `POST /auth/github/device/start` | `200` with device approval instructions |
+| `POST /auth/github/device/poll` | `200` with a PASETO after approval |
+| `GET /auth/github/authorize` | `302` to GitHub |
+| `GET /auth/github/callback` | `302` to the registered app callback |
+| `POST /auth/github/redeem` | `200` with a PASETO |
+
+All six routes are absent by default and after disablement. Unsupported public
+methods and paths receive a native gateway `404` without a handler invocation,
+with Gateway handling CORS preflights when configured. Custom domains and
+certificates are managed separately by [api-domain.sh](../api-domain.sh), with
+manual Cloudflare DNS.
 Gateway response caching is outside the current integration.
 
 Successful responses use `Content-Type: application/json`. Both routes return
@@ -109,8 +121,8 @@ continue to work until their signed expiration.
 
 On an HTTPS Operations API origin with device sign-in enabled, a client can sign
 in using only that origin. The authentication Lambda uses the deployment's GitHub
-OAuth App and requests zero scopes. The current SAM template exposes only the
-direct exchange route. See the [device sign-in binding](DEPLOY_AWS_LAMBDA_WITH_SAM.md#device-sign-in-binding).
+OAuth App and requests zero scopes. Enable device flow in the GitHub OAuth App
+registration. [Operator setup](DEPLOY_AWS_LAMBDA_WITH_SAM.md#device-sign-in-binding)
 
 1. Send an empty request to the Operations origin.
 
@@ -203,11 +215,11 @@ and run `paseto login github` again to sign in and get a fresh token.
 
 ### Browser GitHub sign-in
 
-The authentication Lambda handles these routes on an HTTPS Operations API
-origin with browser sign-in enabled. The current SAM template exposes direct
-exchange. Browser sign-in requires the three browser routes, the Pending Sign-in
-table binding, and the browser app's origin enabled for cross-origin requests.
-See the [table binding](DEPLOY_AWS_LAMBDA_WITH_SAM.md#device-sign-in-binding).
+Browser sign-in uses the opt-in authentication Lambda and its Pending Sign-in
+table. Configure the Operations OAuth callback and the app callback URLs to
+enable the browser flow. For a browser app hosted separately from the API,
+configure its origin for cross-origin requests.
+[Operator setup](DEPLOY_AWS_LAMBDA_WITH_SAM.md#browser-sign-in-and-cors)
 
 The Lambda reads `GITHUB_OAUTH_CALLBACK_URL` for the HTTPS Operations callback
 registered with GitHub. Use the callback URL without a query or fragment.
@@ -272,6 +284,131 @@ the original ten-minute deadline. The server checks both cutoffs on access
 even while the rows remain stored. Invalid redemption input or an app binding
 mismatch returns `400`. An expired or consumed code returns `410`.
 [GitHub OAuth web application flow](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#web-application-flow)
+
+#### Cross-origin requests
+
+CORS is off by default. An enabled GitHub deployment can set
+`OperationsBrowserOrigins` to an explicit comma-separated list of HTTPS
+origins. The HTTP API answers preflights for `GET`, `POST`, and `OPTIONS`
+with `Authorization` and `Content-Type` allowed. Gateway grants the configured
+origins access to integration responses for sign-in, submission and query,
+and exposes `Retry-After` when the handler provides it. Unlisted origins
+receive no cross-origin read permission. API Gateway applies this policy.
+[HTTP API CORS](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-cors.html)
+
+Use top-level navigation for authorization and the GitHub callback. The
+Operations binding cookie is sent on that navigation. Use credential-free
+CORS fetches for redemption and send the issued PASETO explicitly in the
+Authorization header for submission and query. CORS checks the calling origin.
+Browser sign-in separately requires the exact registered callback URL and its
+PKCE proof, and Intake and Query still verify the PASETO.
+[Browser caller example](#browser-caller-example)
+
+#### Browser caller example
+
+Serve this HTML at an exactly registered app callback, such as
+`https://app.example.com/sign-in.html`, and allow `https://app.example.com`
+as an origin. Replace the example API origin, callback and lookup account
+with values for your deployment. The example submits one TigerBeetle lookup
+after successful sign-in and reads the Operation's current view.
+
+```html
+<!doctype html>
+<meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
+<title>Operations sign-in example</title>
+<button id="sign-in">Sign in with GitHub</button>
+<pre id="result"></pre>
+<script type="module">
+const api = "https://api.example.com";
+const callback = "https://app.example.com/sign-in.html";
+const attemptKey = "operations-sign-in";
+const button = document.querySelector("#sign-in");
+const output = document.querySelector("#result");
+
+function base64url(bytes) {
+  return btoa(String.fromCharCode(...bytes))
+    .replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+async function beginSignIn() {
+  sessionStorage.removeItem(attemptKey);
+  const state = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  sessionStorage.setItem(attemptKey, JSON.stringify({ state, verifier }));
+  const authorize = new URL("/auth/github/authorize", api);
+  authorize.search = new URLSearchParams({
+    redirect_uri: callback,
+    state,
+    code_challenge: base64url(new Uint8Array(digest)),
+    code_challenge_method: "S256",
+  });
+  location.assign(authorize);
+}
+
+async function request(path, options) {
+  const response = await fetch(api + path, { ...options, credentials: "omit" });
+  if (!response.ok) throw new Error(`Operations returned HTTP ${response.status}`);
+  return response.json();
+}
+
+async function finishSignIn(params) {
+  // Restore the registered callback URL, including any static query.
+  history.replaceState(null, "", callback);
+  const saved = sessionStorage.getItem(attemptKey);
+  sessionStorage.removeItem(attemptKey);
+  const attempt = saved && JSON.parse(saved);
+  if (!attempt || params.getAll("state").length !== 1 ||
+      params.get("state") !== attempt.state) {
+    throw new Error("Sign-in state did not match");
+  }
+  if (params.has("error")) throw new Error("GitHub sign-in was denied");
+  if (params.getAll("code").length !== 1 || !params.get("code")) {
+    throw new Error("Missing or ambiguous sign-in code");
+  }
+  const { access_token: token } = await request("/auth/github/redeem", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      code: params.get("code"),
+      redirect_uri: callback,
+      code_verifier: attempt.verifier,
+    }),
+  });
+
+  const authorization = { Authorization: `Bearer ${token}` };
+  const submitted = await request("/operations", {
+    method: "POST",
+    headers: { ...authorization, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id: crypto.randomUUID(),
+      name: "TigerBeetle",
+      body: { lookup_accounts: [{ id: "101" }] },
+    }),
+  });
+  const current = await request(`/operations/${encodeURIComponent(submitted.id)}`, {
+    headers: authorization,
+  });
+  output.textContent = JSON.stringify(current, null, 2);
+}
+
+function showError(error) {
+  output.textContent = error instanceof Error ? error.message : "Sign-in failed";
+  button.disabled = false;
+}
+
+button.addEventListener("click", () => {
+  button.disabled = true;
+  beginSignIn().catch(showError);
+});
+const params = new URLSearchParams(location.search);
+if (["code", "state", "error"].some((name) => params.has(name))) {
+  button.disabled = true;
+  finishSignIn(params).catch(showError).finally(() => { button.disabled = false; });
+}
+</script>
+```
 
 ### Submission, paths, and request bodies
 
@@ -368,7 +505,7 @@ the application contract is specified above.
 | --- | --- |
 | `IntakeApiPermission` | `lambda:InvokeFunction` for `apigateway.amazonaws.com`, scoped to the stack account and this API's `$default/POST/operations`. |
 | `QueryApiPermission` | Same service/account scope, restricted to this API's `$default/GET/operations/*`. |
-| `AuthenticationApiPermission` | Present with direct exchange enabled. Same service/account scope, restricted to this API's `$default/POST/auth/github/exchange`. |
+| Authentication invocation grants | One grant for each enabled authentication method and path, scoped to this API's `$default` stage, service and account. |
 | `OperationsApiAccessLogGroup` | Stack-owned log destination, seven-day retention, deletion on stack deletion or replacement. |
 | `OperationsApiAccessLogPolicy` | Stack-owned service log-delivery permission, created before the API/stage and deleted with the stack or on replacement. |
 
@@ -423,7 +560,7 @@ concrete adapter, with no transport registry or general server framework.
 ## Route throttles
 
 The default stage configures the two Operation routes independently.
-Direct GitHub exchange uses the gateway's account and Region throttle limits.
+The authentication routes use the gateway's account and Region throttle limits.
 
 | Route | Rate parameter | Default requests/second | Burst parameter | Default |
 | --- | --- | ---: | --- | ---: |
@@ -621,11 +758,11 @@ Relevant existing checks are:
 | --- | --- |
 | `zig build test-http --system zig-pkg` | Generic handler/authentication behavior plus separate AWS adapter compatibility tests. |
 | `zig build test-paseto-cli --system zig-pkg` | Terminal sign-in exit status and output, polling with a controlled clock and simulated Operations responses, and verification of the returned PASETO. |
-| `bash tests/operations_api_test.sh` | Declared routes, payload format, permissions, exchange configuration in both modes, throttle defaults/overrides, access-log configuration, and mocked discovery/probes. |
+| `bash tests/operations_api_test.sh` | Declared routes, payload format, permissions, enablement and disablement, Pending Sign-in table binding and TTL, CORS configuration and mocked deployment/discovery/probes. |
 | `bash tests/api_domain_test.sh` | Positional parsing, AWS context, certificate/domain reuse, manual DNS instructions, mapping reconciliation and read-only HTTPS probes with AWS/curl mocked. |
 | `bash tests/events_wrapper_test.sh` | Mocked Events integration with common-origin discovery. |
 | `bash tests/seat_scenarios_test.sh` | Mocked seat-tool integration with common-origin discovery. |
-| `zig build test-runtime --system zig-pkg` | Real Lambda event loop with a fake loopback Runtime API across all seven handlers. The authentication cases include GitHub device start and DynamoDB conditional updates through the SDK. The CLI HTTP client sends device requests to a loopback peer and handles Retry-After, redirects and stalled responses. |
+| `zig build test-runtime --system zig-pkg` | Real Lambda event loop with a fake loopback Runtime API across all seven handlers. The tests cover browser binding, expiry while rows remain, device and browser single-use completion, and DynamoDB conditional updates through the SDK. Intake and Query exercise authenticated and unauthorized browser requests. |
 | SAM validation described in the [deployment guide](DEPLOY_AWS_LAMBDA_WITH_SAM.md#3-validate-the-sam-template) | Template validity; no cloud enforcement evidence. |
 
 Required regression coverage includes generic HTTP behavior without AWS metadata;
@@ -636,11 +773,12 @@ whitespace, duplicate keys, Content-Type tolerance, and stable hashing; exact
 path UUID extraction and ambiguous-header rejection; matching retries, conflict,
 publication uncertainty, terminal Results, and cross-tenant warm-cache reads;
 allocation/encoding failures, response lifetime, and recovery on later invocations.
-Infrastructure coverage includes CORS/catch-all/Function URL absence and
-representative valid access-log JSON when integration fields are unavailable.
+Infrastructure coverage includes explicit CORS origins, methods and headers,
+catch-all and Function URL absence, and representative valid access-log JSON
+when integration fields are unavailable.
 
 Local checks establish application behavior and declared configuration. They do
-not establish deployed route enforcement, effective invocation permissions,
+not establish deployed route or CORS enforcement, effective invocation permissions,
 absence of live public Function URLs, actual throttle enforcement, or CloudWatch
 receipt/retention. Deployed acceptance requires separately authorized AWS checks
 of these properties and representative PASETO/tenant cases. Throttle traffic

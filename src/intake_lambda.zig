@@ -2104,8 +2104,13 @@ test "runtime integration: authenticated intake persists and publishes through t
         .token = token,
         .body = std.base64.standard.Encoder.encode(&encoded, input),
         .base64 = true,
+        .origin = "https://app.example.test",
     });
-    const unauthorized = try http_test.aws_event(allocator, .{ .body = "!", .base64 = true });
+    const unauthorized = try http_test.aws_event(allocator, .{
+        .body = "!",
+        .base64 = true,
+        .origin = "https://app.example.test",
+    });
     const malformed = try http_test.aws_event(allocator, .{
         .token = token,
         .body = "!",

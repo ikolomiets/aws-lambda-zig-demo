@@ -24,7 +24,7 @@ Seat submission sends local rejections directly to seat completion. Events and
 Ledger Counters are retained independently of the Operations TTL.
 
 The stack can also deploy an authentication Lambda on the same API for
-[direct GitHub token exchange](#direct-github-token-exchange).
+[GitHub exchange and managed sign-in](#direct-github-token-exchange).
 
 The template can also provision an optional EC2 WireGuard gateway that routes
 TigerBeetle processor traffic to TigerBeetle on a development workstation. While
@@ -273,7 +273,7 @@ Ordinary `zig build` and the offline test suite do not create or refresh ZIPs.
 
 SAM reads these paths from the matching `CodeUri` properties in `template.yaml`.
 The authentication archive is built with the others. SAM creates its function
-only when direct GitHub exchange is enabled.
+only when GitHub exchange and managed sign-in are enabled.
 The previous root-level archives with the same filenames are unused. Their
 removal remains manual; neither the build nor the deployment helper deletes them.
 
@@ -342,16 +342,21 @@ Both commands should report that `template.yaml` is valid.
 - `TigerBeetleCompletionProcessorRole`: `AWS::IAM::Role`
 - `TigerBeetleCompletionProcessorQueueMapping`: `AWS::Lambda::EventSourceMapping`
 
-When `EnableGitHubExchange=true`, the template adds these resources and the
-named `POST /auth/github/exchange` route.
+When `EnableGitHubExchange=true`, the template adds these resources and all
+[six named authentication routes](API_GATEWAY.md#public-http-contract).
 
 - `AuthenticationFunction` uses ARM64 `provided.al2023`, 128 MB of memory, and a
   15-second Lambda timeout. It runs outside the optional WireGuard VPC attachment
-  and uses HTTPS to reach GitHub and regional Secrets Manager.
+  and uses HTTPS to reach GitHub, regional Secrets Manager, and DynamoDB.
 - Its generated `AuthenticationFunctionRole` has CloudWatch execution logging
   and `secretsmanager:GetSecretValue` scoped to the two configured secret ARNs.
-- `AuthenticationApiPermission` permits API Gateway invocation from this
-  account and the API's `$default/POST/auth/github/exchange` route.
+  Its DynamoDB permissions are `GetItem`, `PutItem`, and `UpdateItem` scoped
+  to the `PendingSignInTable` ARN.
+- Six Lambda invocation grants restrict API Gateway to this account, this
+  API's `$default` stage, and the individual authentication methods and paths.
+- `PendingSignInTable` is an on-demand DynamoDB table with String partition
+  key `id` and TTL on numeric `expires_at`. The function receives the generated
+  physical table name in `PENDING_SIGN_IN_TABLE_NAME`.
 
 When `EnableWireGuardGateway=true`, the template also creates:
 
@@ -722,8 +727,10 @@ DynamoDB control-plane permission.
 
 The Operation HTTP API uses Lambda proxy payload format 2.0 and the AWS-generated
 HTTPS hostname. Its `$default` stage adds no stage prefix. Exactly `POST /operations`
-and `GET /operations/{id}` invoke the separate Intake and Query functions. There
-is no catch-all route, stack-owned custom domain, version prefix, or CORS configuration.
+and `GET /operations/{id}` invoke the separate Intake and Query functions.
+The stack uses named routes and a prefix-free AWS hostname. GitHub sign-in
+and CORS for configured browser origins are optional.
+[Browser sign-in and CORS](#browser-sign-in-and-cors)
 Unsupported public methods and paths receive native gateway `404` responses without
 invoking a handler; gateway errors keep their own body formats. Direct handler
 invocations retain their existing method checks and `Allow` headers.
@@ -1639,8 +1646,8 @@ connectivity, or delivery evidence.
 
 ### Direct GitHub token exchange
 
-New stacks leave GitHub exchange disabled and need only the existing PASETO
-public-key configuration. Enabling exchange lets **any GitHub account** that
+New stacks leave GitHub exchange and managed sign-in disabled and need only
+the existing PASETO public-key configuration. Enabling them lets **any GitHub account** that
 authorizes the deployment's OAuth App obtain a PASETO and submit configured
 Operations. Operation Tenant controls access to Operation records. Generic
 TigerBeetle commands can look up accounts and submit transfers against known
@@ -1659,11 +1666,11 @@ remain accessible under the reserved subjects. A GitHub login rename preserves
 the account's numeric ID and tenant.
 
 Register an OAuth App in GitHub's **Settings → Developer settings → OAuth Apps**.
-Use the client application's homepage and its HTTPS authorization callback.
-The client obtains the user access token for this OAuth App and sends it to
-Operations. If the client obtains the token through GitHub's device flow, enable
-that option in the OAuth App registration. The exchange needs only public
-account identity. Record the public Client ID and generate a client secret.
+Use the client application's homepage. For direct exchange from a web OAuth
+client, register the client's HTTPS callback. For managed browser sign-in,
+register the Operations callback described below.
+Enable device flow in the OAuth App settings for headless sign-in. Record the
+app's public Client ID and generate a client secret.
 [GitHub's OAuth App registration guide](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
 
 In Secrets Manager, create two **Other type of secret** entries in the stack's
@@ -1701,7 +1708,8 @@ skipping the existing Intake and Query smoke checks that require a host-side
 private key. `--dry-run` can be added to validate inputs and packages locally.
 With direct SAM deployment, set `EnableGitHubExchange=true`, `GitHubClientId`,
 `GitHubClientSecretArn`, `PasetoSigningKeySecretArn`, and the existing
-`PasetoPublicKey` parameter on the full stack deployment.
+`PasetoPublicKey` parameter on the full stack deployment. Add the browser
+settings below for managed browser sign-in.
 
 Discover the origin from the stack, then use its
 [`POST /auth/github/exchange` contract](API_GATEWAY.md#direct-github-exchange).
@@ -1716,33 +1724,107 @@ OPERATIONS_API_URL="$(
 )"
 ```
 
-To disable exchange, run a full deployment with the public key and the existing
+To disable GitHub sign-in and exchange, run a full deployment with the public key and the existing
 stack settings, using `./deploy.sh --disable-github-exchange --no-url-check` or
-`EnableGitHubExchange=false` with SAM. This removes the route, function, role,
-and invocation permission. The operator-owned secrets remain available for
-separate lifecycle management. API Gateway returns `404` for further exchanges.
+`EnableGitHubExchange=false` with SAM. This removes all six authentication
+routes and their invocation grants, the function and role, the CORS policy,
+and the Pending Sign-in table. In-flight sign-ins end. API Gateway returns
+`404` for the removed methods and paths. The operator-owned secrets remain
+available for separate lifecycle management.
 PASETOs already issued remain valid through their signed expiration. Subsequent
-invocations of `deploy.sh` without either exchange flag preserve the stack's
-configured setting.
+invocations of `deploy.sh` without either exchange flag preserve the stack's configured
+setting. Re-enabling creates a fresh Pending Sign-in table.
 
 #### Device sign-in binding
 
-The authentication bootstrap handles the
-[headless HTTP flow](API_GATEWAY.md#headless-github-sign-in). The current SAM
-template exposes direct exchange. Device sign-in requires an OAuth App with
-device flow enabled, both device POST routes bound to the authentication
-function, and a DynamoDB table bound as `PENDING_SIGN_IN_TABLE_NAME`. The
-function's execution role needs `dynamodb:PutItem`, `dynamodb:GetItem`, and
-`dynamodb:UpdateItem` scoped to that table. The function reads consistently
-and writes conditionally.
+Enable device flow in the OAuth App registration and deploy with
+`--enable-github-exchange`. The same deployment binds both device routes
+and the table used by the [headless HTTP flow](API_GATEWAY.md#headless-github-sign-in).
+Set `OPERATIONS_API_URL` from the stack output and use the
+[terminal sign-in example](API_GATEWAY.md#sign-in-from-a-terminal) to verify
+device approval and issue a PASETO.
 
-The table uses the string partition key `id`, which stores a SHA-256 digest of
-the Operations device code, and the numeric TTL attribute `expires_at` in epoch
-seconds. Rows hold the GitHub device code while pending. The function checks
-`expires_at_ms` on access and removes the GitHub code at denial, provider
-expiry, or consumption.
-TTL handles background cleanup. GitHub access tokens and PASETOs remain in the
-invocation that resolves or issues them.
+The managed flows use strongly consistent reads and conditional writes on
+the same Pending Sign-in table. The `id` key stores a SHA-256 digest of the
+private device code, upstream browser state, or Operations redemption code.
+Pending device rows contain the GitHub device code until a terminal transition
+or cleanup. Browser rows carry the binding and PKCE data needed to finish the
+attempt. The function checks `expires_at_ms` on access and uses conditional
+transitions to prevent replay. DynamoDB uses `expires_at` in epoch seconds for
+asynchronous cleanup. GitHub access tokens and issued PASETOs stay in the
+invocations that use or issue them.
+
+#### Browser sign-in and CORS
+
+1. Pick the HTTPS API origin that callers will use throughout sign-in. For a new
+   stack, deploy with GitHub disabled first to learn its `OperationsApiUrl`, or
+   use an existing [custom API domain](#custom-api-domain-and-cloudflare-dns).
+   Set the OAuth App's **Authorization callback URL** in GitHub to that origin
+   plus `/auth/github/callback`. Supply the same full URL in
+   `GITHUB_OAUTH_CALLBACK_URL`. Use that API origin for authorization so the
+   browser binding cookie returns to the same host on callback.
+2. Set `GITHUB_BROWSER_REDIRECT_URIS` to a JSON array of 1–16 exact HTTPS app
+   return URLs, each up to 2,048 bytes. Preserve paths and static queries byte
+   for byte. Exclude user info, fragments, and the reserved query names
+   `code`, `state`, and `error`. The handler validates the entire registration
+   on use. Keep the combined Lambda environment within its 4 KB limit.
+3. Set `OPERATIONS_BROWSER_ORIGINS` to a comma-separated list of the app's HTTPS
+   origins, with lowercase hostnames and any non-default ports. Omit paths,
+   trailing slashes, spaces, and wildcards. Callback registration governs the
+   navigation destination. The origin list governs which cross-origin fetches
+   can read API responses. Set both for a cross-origin app.
+
+```sh
+export GITHUB_OAUTH_CALLBACK_URL='https://api.example.com/auth/github/callback'
+export GITHUB_BROWSER_REDIRECT_URIS='["https://app.example.com/sign-in.html"]'
+export OPERATIONS_BROWSER_ORIGINS='https://app.example.com'
+./deploy.sh --profile dev --region ca-central-1 --stack-name aws-lambda-zig-demo \
+  --enable-github-exchange --no-url-check
+```
+
+With direct SAM deployment, use `GitHubOAuthCallbackUrl`,
+`GitHubBrowserRedirectUris`, and `OperationsBrowserOrigins` for those values.
+The deploy helper sends nonempty browser settings with `--enable-github-exchange`.
+On a new stack, omitted browser settings start empty. On an existing stack,
+omitted settings preserve previously deployed values. Use a full stack update
+for callback and origin changes.
+
+#### Verify browser access
+
+After an authorized full deployment, use the
+[browser example](API_GATEWAY.md#browser-caller-example) from a registered
+callback on an allowed origin. Confirm that the GitHub round trip reaches
+redemption and that the browser reads the submitted and queried Operation.
+Use the browser's network panel or send the preflights directly.
+
+```sh
+api="${OPERATIONS_API_URL%/}" # Use the stack output or the configured custom origin.
+app='https://app.example.com'
+operation_id='00112233-4455-6677-8899-aabbccddeeff'
+preflight() {
+  curl -si -X OPTIONS -H "Origin: $1" -H "Access-Control-Request-Method: $2" \
+    -H "Access-Control-Request-Headers: $3" "$api$4"
+}
+preflight "$app" POST content-type /auth/github/redeem
+preflight "$app" POST authorization,content-type /operations
+preflight "$app" GET authorization "/operations/$operation_id"
+preflight 'https://unlisted.example.com' POST content-type /auth/github/redeem
+```
+
+The first three preflights should return the app origin, the requested method,
+and the requested headers in the corresponding `Access-Control-Allow-*`
+headers. The unlisted origin receives no matching allow-origin header. Check
+the allow-origin header on the actual redemption, submission, and query
+responses as well. With the allowed origin still configured, change the app
+callback path or static query in an authorize request. The handler should
+return `400` before redirecting to GitHub. Check that submission and query
+without a PASETO return `401` even from the allowed origin.
+
+Local SAM validation and mocked deployment tests check declared routes,
+permissions, storage, and the CORS policy. Loopback tests exercise the Lambda
+wire contract, usage across invocations, and the DynamoDB SDK commands.
+Gateway-generated preflights and headers, effective IAM, TTL cleanup, and
+GitHub approval require separate checks on an authorized deployment.
 
 ### Development code updates
 
@@ -3554,8 +3636,8 @@ rmdir '<private-key-directory>'
 ## Security note
 
 This demo exposes one public HTTP API. Intake and Query require a valid
-PASETO. Optional direct GitHub exchange requires a valid user access token
-for the deployment's OAuth App and opens enrollment to GitHub accounts.
+PASETO. Optional GitHub exchange and managed sign-in open enrollment to GitHub
+accounts that authorize the deployment's OAuth App.
 Invocation grants are scoped to the API and routes. Processors are invoked
 from SQS. [GitHub exchange deployment and enrollment](#direct-github-token-exchange)
 

@@ -99,7 +99,7 @@ Parameters:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
-    Description: Whether to expose direct GitHub token exchange on the Operations API.
+    Description: Whether to expose GitHub exchange and managed sign-in on the Operations API.
   GitHubClientId:
     Type: String
     Default: ""
@@ -115,6 +115,20 @@ Parameters:
     Default: ""
     AllowedPattern: '^$|^arn:[a-z0-9-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}$'
     Description: Complete Secrets Manager ARN of the private key matching PasetoPublicKey.
+  GitHubOAuthCallbackUrl:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^https://[a-zA-Z0-9.-]+(:[0-9]{1,5})?/auth/github/callback$'
+    Description: HTTPS Operations API callback URL registered with the GitHub OAuth App.
+  GitHubBrowserRedirectUris:
+    Type: String
+    Default: ""
+    Description: JSON array of exact HTTPS app callback URLs for browser sign-in.
+  OperationsBrowserOrigins:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^https://[a-z0-9.-]+(:[0-9]{1,5})?(,https://[a-z0-9.-]+(:[0-9]{1,5})?)*$'
+    Description: Comma-separated HTTPS origins allowed to read Operations API responses.
   EnableWireGuardGateway:
     Type: String
     Default: "false"
@@ -204,6 +218,14 @@ Rules:
         AssertDescription: PasetoSigningKeySecretArn is required when GitHub exchange is enabled.
       - Assert: !Not [!Equals [!Ref GitHubClientSecretArn, !Ref PasetoSigningKeySecretArn]]
         AssertDescription: GitHub exchange requires two distinct secrets.
+      - Assert: !Or
+          - !And
+            - !Equals [!Ref GitHubOAuthCallbackUrl, ""]
+            - !Equals [!Ref GitHubBrowserRedirectUris, ""]
+          - !And
+            - !Not [!Equals [!Ref GitHubOAuthCallbackUrl, ""]]
+            - !Not [!Equals [!Ref GitHubBrowserRedirectUris, ""]]
+        AssertDescription: Configure both browser callback settings to enable browser sign-in.
   WireGuardGatewayInputsRequired:
     RuleCondition: !Equals [!Ref EnableWireGuardGateway, "true"]
     Assertions:
@@ -237,6 +259,9 @@ Rules:
 
 Conditions:
   GitHubExchangeEnabled: !Equals [!Ref EnableGitHubExchange, "true"]
+  OperationsBrowserCorsEnabled: !And
+    - !Condition GitHubExchangeEnabled
+    - !Not [!Equals [!Ref OperationsBrowserOrigins, ""]]
   OwnLedgerCounterTable: !Equals [!Ref ExistingLedgerCounterTableName, ""]
   WireGuardGatewayEnabled: !Equals [!Ref EnableWireGuardGateway, "true"]
   TigerBeetleProcessorVpcCleanupResourcesRetained: !Or
@@ -402,6 +427,13 @@ Resources:
         info:
           title: Operations
           version: '1.0'
+        x-amazon-apigateway-cors: !If
+          - OperationsBrowserCorsEnabled
+          - allowOrigins: !Split [",", !Ref OperationsBrowserOrigins]
+            allowMethods: [GET, POST, OPTIONS]
+            allowHeaders: [Authorization, Content-Type]
+            exposeHeaders: [Retry-After]
+          - !Ref AWS::NoValue
         paths:
           /operations:
             post:
@@ -420,6 +452,56 @@ Resources:
                 payloadFormatVersion: "2.0"
                 uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryFunction.Arn}/invocations
           /auth/github/exchange: !If
+            - GitHubExchangeEnabled
+            - post:
+                responses: {}
+                x-amazon-apigateway-integration:
+                  type: aws_proxy
+                  httpMethod: POST
+                  payloadFormatVersion: "2.0"
+                  uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations
+            - !Ref AWS::NoValue
+          /auth/github/device/start: !If
+            - GitHubExchangeEnabled
+            - post:
+                responses: {}
+                x-amazon-apigateway-integration:
+                  type: aws_proxy
+                  httpMethod: POST
+                  payloadFormatVersion: "2.0"
+                  uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations
+            - !Ref AWS::NoValue
+          /auth/github/device/poll: !If
+            - GitHubExchangeEnabled
+            - post:
+                responses: {}
+                x-amazon-apigateway-integration:
+                  type: aws_proxy
+                  httpMethod: POST
+                  payloadFormatVersion: "2.0"
+                  uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations
+            - !Ref AWS::NoValue
+          /auth/github/authorize: !If
+            - GitHubExchangeEnabled
+            - get:
+                responses: {}
+                x-amazon-apigateway-integration:
+                  type: aws_proxy
+                  httpMethod: POST
+                  payloadFormatVersion: "2.0"
+                  uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations
+            - !Ref AWS::NoValue
+          /auth/github/callback: !If
+            - GitHubExchangeEnabled
+            - get:
+                responses: {}
+                x-amazon-apigateway-integration:
+                  type: aws_proxy
+                  httpMethod: POST
+                  payloadFormatVersion: "2.0"
+                  uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthenticationFunction.Arn}/invocations
+            - !Ref AWS::NoValue
+          /auth/github/redeem: !If
             - GitHubExchangeEnabled
             - post:
                 responses: {}
@@ -474,11 +556,28 @@ Resources:
       SourceAccount: !Ref AWS::AccountId
       SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OperationsApi}/$default/GET/operations/*
 
+  PendingSignInTable:
+    Type: AWS::DynamoDB::Table
+    Condition: GitHubExchangeEnabled
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
   AuthenticationFunction:
     Type: AWS::Serverless::Function
     Condition: GitHubExchangeEnabled
     Properties:
-      Description: Exchanges GitHub OAuth App user credentials for Operations PASETOs.
+      Description: Handles GitHub exchange and managed sign-in for Operations PASETOs.
       CodeUri: zig-out/packages/authentication-lambda.zip
       Runtime: provided.al2023
       Handler: bootstrap
@@ -495,12 +594,21 @@ Resources:
               Resource:
                 - !Ref GitHubClientSecretArn
                 - !Ref PasetoSigningKeySecretArn
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt PendingSignInTable.Arn
       Environment:
         Variables:
           GITHUB_CLIENT_ID: !Ref GitHubClientId
           GITHUB_CLIENT_SECRET_ARN: !Ref GitHubClientSecretArn
+          GITHUB_OAUTH_CALLBACK_URL: !Ref GitHubOAuthCallbackUrl
+          GITHUB_BROWSER_REDIRECT_URIS: !Ref GitHubBrowserRedirectUris
           PASETO_SIGNING_KEY_SECRET_ARN: !Ref PasetoSigningKeySecretArn
           PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
+          PENDING_SIGN_IN_TABLE_NAME: !Ref PendingSignInTable
 
   AuthenticationApiPermission:
     Type: AWS::Lambda::Permission
@@ -511,6 +619,57 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceAccount: !Ref AWS::AccountId
       SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OperationsApi}/$default/POST/auth/github/exchange
+
+  AuthenticationDeviceStartApiPermission:
+    Type: AWS::Lambda::Permission
+    Condition: GitHubExchangeEnabled
+    Properties:
+      FunctionName: !Ref AuthenticationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OperationsApi}/$default/POST/auth/github/device/start
+
+  AuthenticationDevicePollApiPermission:
+    Type: AWS::Lambda::Permission
+    Condition: GitHubExchangeEnabled
+    Properties:
+      FunctionName: !Ref AuthenticationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OperationsApi}/$default/POST/auth/github/device/poll
+
+  AuthenticationAuthorizeApiPermission:
+    Type: AWS::Lambda::Permission
+    Condition: GitHubExchangeEnabled
+    Properties:
+      FunctionName: !Ref AuthenticationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OperationsApi}/$default/GET/auth/github/authorize
+
+  AuthenticationCallbackApiPermission:
+    Type: AWS::Lambda::Permission
+    Condition: GitHubExchangeEnabled
+    Properties:
+      FunctionName: !Ref AuthenticationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OperationsApi}/$default/GET/auth/github/callback
+
+  AuthenticationRedeemApiPermission:
+    Type: AWS::Lambda::Permission
+    Condition: GitHubExchangeEnabled
+    Properties:
+      FunctionName: !Ref AuthenticationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OperationsApi}/$default/POST/auth/github/redeem
+
 
   # Keep this role explicit so the deploy helper can retain ENI cleanup permissions
   # only between the VPC-detach and cleanup phases.

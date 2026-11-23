@@ -31,8 +31,11 @@ test "GitHub browser authorize requires exact registration and sends separate S2
     defer services.deinit();
     const allocator = std.testing.allocator;
     for ([_][]const u8{
-        "https://app.example.test/callback/",          "https://app.example.test/other",
-        "https://app.example.test.evil.test/callback", "http://app.example.test/callback",
+        "https://app.example.test/callback/",
+        "https://app.example.test/other",
+        "https://app.example.test/callback?from=wrong",
+        "https://app.example.test.evil.test/callback",
+        "http://app.example.test/callback",
     }) |redirect| {
         const query = try std.fmt.allocPrint(allocator, "redirect_uri={s}" ++
             test_authorize_fields, .{redirect});
@@ -41,13 +44,16 @@ test "GitHub browser authorize requires exact registration and sends separate S2
             .method = .GET,
             .path = "/auth/github/authorize",
             .raw_query = query,
+            .headers = &.{.{ .key = "Origin", .value = "https://app.example.test" }},
         });
         defer response.deinit();
         try std.testing.expectEqual(.bad_request, response.status);
         try std.testing.expectEqual(@as(usize, 0), response.cookies.len);
         try std.testing.expect(store.entries[0] == null);
     }
-    var response = services.invoke(&test_browser_authorize);
+    var request = test_browser_authorize;
+    request.headers = &.{.{ .key = "Origin", .value = "https://unlisted.example.test" }};
+    var response = services.invoke(&request);
     defer response.deinit();
     try std.testing.expectEqual(.found, response.status);
     const location = try testing.header(response.headers, "Location");
@@ -69,8 +75,6 @@ test "GitHub browser authorize requires exact registration and sends separate S2
     try std.testing.expect(store.entries[1] == null);
     try std.testing.expectEqual(0, services.shared.github_checks);
     try std.testing.expectEqual(0, services.browser_exchanges);
-    try std.testing.expectEqual(0, services.shared.device_starts);
-    try std.testing.expectEqual(0, services.shared.device_polls);
 }
 
 const BrowserTestStore = struct {
@@ -201,7 +205,7 @@ test "runtime integration: browser callback rejects conflicting payload and head
     try std.testing.expect(flow.store.entries[0].?.grant.state == .browser_pending);
 }
 
-test "runtime integration: browser callback exchanges its independent PKCE through GitHub HTTP" {
+test "runtime integration: browser PKCE completes through GitHub and redeems once" {
     if (comptime !runtime_tests_enabled) return error.SkipZigTest;
     const runtime = @import("runtime_test_support");
     var start_fixture: runtime.Fixture = .{};
@@ -210,6 +214,8 @@ test "runtime integration: browser callback exchanges its independent PKCE throu
     defer callback_fixture.deinit();
     var redeem_fixture: runtime.Fixture = .{};
     defer redeem_fixture.deinit();
+    var replay_fixture: runtime.Fixture = .{};
+    defer replay_fixture.deinit();
     var flow: BrowserTest = undefined;
     try flow.init();
     defer flow.deinit();
@@ -220,6 +226,7 @@ test "runtime integration: browser callback exchanges its independent PKCE throu
 
     const start = try std.json.Stringify.valueAlloc(start_fixture.allocator(), .{
         .version = "2.0",
+        .routeKey = "GET /auth/github/authorize",
         .rawPath = test_browser_authorize.path,
         .requestContext = .{ .http = .{ .method = "GET" } },
         .rawQueryString = test_browser_authorize.raw_query,
@@ -228,7 +235,11 @@ test "runtime integration: browser callback exchanges its independent PKCE throu
     try std.testing.expectEqual(302, authorization.object.get("statusCode").?.integer);
     const upstream = flow.store.entries[0].?.grant.state.browser_pending.upstream_verifier;
     const code = try runtime_browser_callback(&callback_fixture, &flow.callback, &authorization);
-    try runtime_browser_redemption(&redeem_fixture, &flow.redeem, code);
+    const result = try runtime_browser_redemption(&redeem_fixture, &flow.redeem, code);
+    try expect_runtime_browser_token(&redeem_fixture, &flow.redeem, &result);
+    const replay = try runtime_browser_redemption(&replay_fixture, &flow.redeem, code);
+    try std.testing.expectEqual(410, replay.object.get("statusCode").?.integer);
+    try std.testing.expectEqual(1, flow.redeem.shared.signing_key_reads);
     try std.testing.expect(flow.store.entries[1].?.grant.state == .consumed);
     const location = authorization.object.get("headers").?.object.get("Location").?.string;
     try capture.expect_no_credentials(&.{
@@ -242,6 +253,29 @@ test "runtime integration: browser callback exchanges its independent PKCE throu
         test_app_verifier,
         "v4.public.",
     });
+}
+
+test "runtime integration: a stored browser code expires before its row is cleaned up" {
+    if (comptime !runtime_tests_enabled) return error.SkipZigTest;
+    const runtime = @import("runtime_test_support");
+    var fixture: runtime.Fixture = .{};
+    defer fixture.deinit();
+    var flow: BrowserTest = undefined;
+    try flow.init();
+    defer flow.deinit();
+    var upstream = try BrowserRedirect.begin(&flow, &test_browser_authorize);
+    defer upstream.response.deinit();
+    var approved = try upstream.callback(&flow, "code=github-code");
+    defer approved.deinit();
+    try std.testing.expectEqual(.found, approved.status);
+    const location = try testing.header(approved.headers, "Location");
+    const code = try test_url_field(location, "code");
+
+    flow.redeem.now_offset_ms = 60_000;
+    const response = try runtime_browser_redemption(&fixture, &flow.redeem, code);
+    try std.testing.expectEqual(410, response.object.get("statusCode").?.integer);
+    try std.testing.expect(flow.store.entries[1].?.grant.state == .browser_approved);
+    try std.testing.expectEqual(0, flow.redeem.shared.signing_key_reads);
 }
 
 fn runtime_browser_callback(
@@ -276,6 +310,7 @@ fn runtime_browser_callback(
     defer github_reply.cancel(io) catch {};
     const event = try std.json.Stringify.valueAlloc(arena, .{
         .version = "2.0",
+        .routeKey = "GET /auth/github/callback",
         .rawPath = "/auth/github/callback",
         .requestContext = .{ .http = .{ .method = "GET" } },
         .rawQueryString = try std.fmt.allocPrint(
@@ -308,16 +343,25 @@ fn runtime_browser_redemption(
     fixture: *@import("runtime_test_support").Fixture,
     services: *BrowserServices,
     code: []const u8,
-) !void {
+) !std.json.Value {
     const redemption = try test_redeem(.{ .code = code });
     defer std.testing.allocator.free(redemption.body.bytes);
     const redeem_event = try std.json.Stringify.valueAlloc(fixture.allocator(), .{
         .version = "2.0",
+        .routeKey = "POST " ++ test_redeem_path,
         .rawPath = test_redeem_path,
         .requestContext = .{ .http = .{ .method = "POST" } },
+        .headers = .{ .origin = "https://app.example.test", .@"content-type" = "application/json" },
         .body = redemption.body.bytes,
     }, .{});
-    const result = try services.run_runtime(fixture, redeem_event);
+    return services.run_runtime(fixture, redeem_event);
+}
+
+fn expect_runtime_browser_token(
+    fixture: *@import("runtime_test_support").Fixture,
+    services: *const BrowserServices,
+    result: *const std.json.Value,
+) !void {
     try std.testing.expectEqual(200, result.object.get("statusCode").?.integer);
     const result_headers = result.object.get("headers").?.object;
     try std.testing.expectEqualStrings("no-store", result_headers.get("Cache-Control").?.string);

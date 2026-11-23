@@ -626,8 +626,9 @@ aws cloudformation describe-stacks \
   --region ca-central-1
 ```
 
-Deployments can enable direct GitHub token exchange on the same API origin.
-New stacks leave it disabled. [GitHub OAuth and deployment setup](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#direct-github-token-exchange)
+Deployments can enable GitHub token exchange and managed sign-in on the same
+API origin. New stacks leave them disabled.
+[GitHub OAuth and deployment setup](docs/DEPLOY_AWS_LAMBDA_WITH_SAM.md#direct-github-token-exchange)
 
 ### Connect to External TigerBeetle with an EC2 WireGuard Gateway
 
@@ -784,8 +785,10 @@ retries the failed message's source record and every later unpublished record; e
 sends remain acknowledgement-eligible. DynamoDB uncertainty replays the single Completion message.
 
 The template exposes one public HTTP API with an AWS-generated hostname, a
-prefix-free `$default` stage, and CORS disabled. API Gateway invokes Intake and
-Query through named routes and can also invoke the optional GitHub exchange.
+prefix-free `$default` stage. API Gateway invokes Intake and Query through
+named routes. The optional authentication Lambda handles GitHub exchange and
+managed sign-in. CORS is off by default and accepts configured origins when
+GitHub sign-in is enabled.
 Processors remain SQS-driven. Use a full stack update to change routes and
 public invocation permissions. Stack deletion removes the API and its grants.
 Submission and query have configurable shared, best-effort throttle targets.

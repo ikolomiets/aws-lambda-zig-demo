@@ -24,6 +24,9 @@ GITHUB_EXCHANGE_SETTING=
 GITHUB_CLIENT_ID="${GITHUB_CLIENT_ID:-}"
 GITHUB_CLIENT_SECRET_ARN="${GITHUB_CLIENT_SECRET_ARN:-}"
 PASETO_SIGNING_KEY_SECRET_ARN="${PASETO_SIGNING_KEY_SECRET_ARN:-}"
+GITHUB_OAUTH_CALLBACK_URL="${GITHUB_OAUTH_CALLBACK_URL:-}"
+GITHUB_BROWSER_REDIRECT_URIS="${GITHUB_BROWSER_REDIRECT_URIS:-}"
+OPERATIONS_BROWSER_ORIGINS="${OPERATIONS_BROWSER_ORIGINS:-}"
 LOCAL_AWS_LAMBDA_ROOT="${LOCAL_AWS_LAMBDA_ROOT:-../aws-lambda-zig}"
 DRY_RUN=0
 DEV=0
@@ -56,9 +59,9 @@ Options:
   --query-function-name NAME
                          Query Lambda name. Defaults to query-lambda.
   --enable-github-exchange
-                         Enable direct GitHub token exchange by full deployment.
+                         Enable GitHub exchange and managed sign-in by full deployment.
   --disable-github-exchange
-                         Remove direct GitHub token exchange by full deployment.
+                         Remove GitHub exchange and managed sign-in by full deployment.
                          Without either flag, preserve the deployed setting.
   --submission-throttling-rate-limit NUMBER
                          POST /operations requests/second target. Defaults to 10.
@@ -109,7 +112,8 @@ Environment overrides:
   SEAT_RESERVATION_PROCESSOR_NAME, SEAT_RESERVATION_COMPLETION_PROCESSOR_NAME,
   EXISTING_LEDGER_COUNTER_TABLE_NAME, LEDGER_COUNTER_ID,
   PASETO_PUBLIC_KEY, LOCAL_AWS_LAMBDA_ROOT,
-  GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET_ARN, PASETO_SIGNING_KEY_SECRET_ARN
+  GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET_ARN, PASETO_SIGNING_KEY_SECRET_ARN,
+  GITHUB_OAUTH_CALLBACK_URL, GITHUB_BROWSER_REDIRECT_URIS, OPERATIONS_BROWSER_ORIGINS
 
 Authentication:
   Non-dry-run deployments and cleanup require an SSO-backed AWS CLI profile. The script
@@ -238,6 +242,26 @@ validate_github_exchange_configuration() {
     done
     [ "$GITHUB_CLIENT_SECRET_ARN" != "$PASETO_SIGNING_KEY_SECRET_ARN" ] ||
         fail "GitHub exchange requires two distinct secrets"
+    validate_github_browser_configuration
+}
+
+validate_github_browser_configuration() {
+    local callback_pattern='^https://[a-zA-Z0-9.-]+(:[0-9]{1,5})?/auth/github/callback$'
+    local origin='https://[a-z0-9.-]+(:[0-9]{1,5})?'
+    [[ -z "$OPERATIONS_BROWSER_ORIGINS" || "$OPERATIONS_BROWSER_ORIGINS" =~ ^$origin(,$origin)*$ ]] ||
+        fail "OPERATIONS_BROWSER_ORIGINS must be comma-separated HTTPS origins without paths or wildcards"
+
+    if [ -z "$GITHUB_OAUTH_CALLBACK_URL" ] && [ -z "$GITHUB_BROWSER_REDIRECT_URIS" ]; then return; fi
+    [[ "$GITHUB_OAUTH_CALLBACK_URL" =~ $callback_pattern ]] ||
+        fail "GITHUB_OAUTH_CALLBACK_URL must be the HTTPS Operations /auth/github/callback URL"
+    need_command jq
+    GITHUB_BROWSER_REDIRECT_URIS="$(jq -cse '
+        select(length == 1) | .[0] |
+        select(type == "array" and length >= 1 and length <= 16) |
+        select(all(.[]; type == "string" and length <= 2048 and test("^https://[!-~]+$") and
+            (contains("\"") or contains("\\") | not)))
+    ' <<<"$GITHUB_BROWSER_REDIRECT_URIS" 2>/dev/null)" ||
+        fail "GITHUB_BROWSER_REDIRECT_URIS must be a JSON array of 1–16 HTTPS callback URLs up to 2048 bytes each"
 }
 
 load_development_function_ids() {
@@ -491,6 +515,19 @@ build_sam_parameter_overrides() {
             "GitHubClientSecretArn=$GITHUB_CLIENT_SECRET_ARN"
             "PasetoSigningKeySecretArn=$PASETO_SIGNING_KEY_SECRET_ARN"
         )
+        if [ -n "$GITHUB_OAUTH_CALLBACK_URL" ]; then
+            # Make SAM consume the full value even if a callback query contains ParameterKey=.
+            # Keep the replacement in a variable so Bash 3.2 emits one backslash.
+            local escaped_apostrophe="\\'"
+            local redirect_uris="${GITHUB_BROWSER_REDIRECT_URIS//\'/$escaped_apostrophe}"
+            SAM_PARAMETER_OVERRIDES+=(
+                "GitHubOAuthCallbackUrl=$GITHUB_OAUTH_CALLBACK_URL"
+                "ParameterKey=GitHubBrowserRedirectUris,ParameterValue='$redirect_uris'"
+            )
+        fi
+        if [ -n "$OPERATIONS_BROWSER_ORIGINS" ]; then
+            SAM_PARAMETER_OVERRIDES+=("OperationsBrowserOrigins=$OPERATIONS_BROWSER_ORIGINS")
+        fi
     fi
     if [ -n "$EXISTING_LEDGER_COUNTER_TABLE_NAME" ]; then
         SAM_PARAMETER_OVERRIDES+=("ExistingLedgerCounterTableName=$EXISTING_LEDGER_COUNTER_TABLE_NAME")

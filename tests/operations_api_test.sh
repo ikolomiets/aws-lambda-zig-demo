@@ -38,6 +38,7 @@ contains "$api" 'Type: AWS::Serverless::HttpApi'
 contains "$api" 'StageName: $default'
 contains "$api" 'DisableExecuteApiEndpoint: false'
 assert_route_integrations "$api"
+contains_line "$(route_definition "$api" /auth/github/device/start)" '            - post:'
 # Negative fixtures must fail the same assertions used for the real template.
 swapped="${api//IntakeFunction.Arn/TemporaryFunction.Arn}"
 swapped="${swapped//QueryFunction.Arn/IntakeFunction.Arn}"
@@ -53,12 +54,10 @@ wrong_method="${api/            post:/            put:}"
 if (assert_route_integrations "$wrong_method") >/dev/null 2>&1; then
     fail_test 'incorrect route method passed route checks'
 fi
-[ "$(printf '%s\n' "$api" | grep -c 'payloadFormatVersion: "2.0"')" -eq 3 ] || fail_test 'expected three payload 2.0 integrations'
-[ "$(printf '%s\n' "$api" | grep -c '^          /')" -eq 3 ] || fail_test 'expected two base paths and one conditional path'
-[ "$(printf '%s\n' "$api" | grep -c 'type: aws_proxy')" -eq 3 ] || fail_test 'expected three proxy integrations'
+[ "$(printf '%s\n' "$api" | grep -c 'payloadFormatVersion: "2.0"')" -eq 8 ] || fail_test 'expected eight payload 2.0 integrations'
+[ "$(printf '%s\n' "$api" | grep -c '^          /')" -eq 8 ] || fail_test 'expected two base paths and six conditional paths'
+[ "$(printf '%s\n' "$api" | grep -c 'type: aws_proxy')" -eq 8 ] || fail_test 'expected eight proxy integrations'
 [ "$(printf '%s\n' "$api" | grep -Ec '^            [a-z-]+:')" -eq 2 ] || fail_test 'expected exactly two route methods'
-absent "$api" 'Cors'
-absent "$api" 'cors'
 absent "$api" '$default:'
 absent "$api" 'x-amazon-apigateway-any-method'
 absent "$api" 'Auth:'
@@ -77,8 +76,15 @@ for parameter in GitHubClientId GitHubClientSecretArn PasetoSigningKeySecretArn;
     contains_line "$(template_section "$parameter")" '    Default: ""'
     contains_line "$required" "      - Assert: !Not [!Equals [!Ref $parameter, \"\"]]"
 done
-contains_line "$api" '          /auth/github/exchange: !If'
-expected_exchange="$(cat <<'YAML'
+auth_routes=(
+    'post /auth/github/exchange AuthenticationApiPermission'
+    'post /auth/github/device/start AuthenticationDeviceStartApiPermission'
+    'post /auth/github/device/poll AuthenticationDevicePollApiPermission'
+    'get /auth/github/authorize AuthenticationAuthorizeApiPermission'
+    'get /auth/github/callback AuthenticationCallbackApiPermission'
+    'post /auth/github/redeem AuthenticationRedeemApiPermission'
+)
+expected_auth_route="$(cat <<'YAML'
             - GitHubExchangeEnabled
             - post:
                 responses: {}
@@ -90,13 +96,72 @@ expected_exchange="$(cat <<'YAML'
             - !Ref AWS::NoValue
 YAML
 )"
-[ "$(route_definition "$api" /auth/github/exchange | sed '/^$/d')" = "$expected_exchange" ] ||
-    fail_test 'exchange must add only POST when enabled and omit the path when disabled'
+source_arn='arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OperationsApi}/$default'
+for auth_route in "${auth_routes[@]}"; do
+    read -r method path permission <<<"$auth_route"
+    contains_line "$api" "          $path: !If"
+    [ "$(route_definition "$api" "$path" | sed '/^$/d')" = "${expected_auth_route/- post:/- $method:}" ] ||
+        fail_test "$path must add only $method when enabled and omit the path when disabled"
+    grant="$(template_section "$permission")"
+    contains_line "$grant" '    Type: AWS::Lambda::Permission'
+    contains_line "$grant" '    Condition: GitHubExchangeEnabled'
+    contains_line "$grant" '      FunctionName: !Ref AuthenticationFunction'
+    contains_line "$grant" '      Action: lambda:InvokeFunction'
+    contains_line "$grant" '      Principal: apigateway.amazonaws.com'
+    contains_line "$grant" '      SourceAccount: !Ref AWS::AccountId'
+    case "$method" in get) method=GET ;; post) method=POST ;; esac
+    contains_line "$grant" "      SourceArn: !Sub $source_arn/$method$path"
+done
+[ "$(grep -Fc 'FunctionName: !Ref AuthenticationFunction' "$template")" -eq 6 ] ||
+    fail_test 'expected exactly six invocation grants for authentication'
+
+cors_condition="$(sed -n '/^  OperationsBrowserCorsEnabled:/,/^  [A-Za-z]/p' "$template" | sed '$d')"
+expected_cors_condition="$(cat <<'YAML'
+  OperationsBrowserCorsEnabled: !And
+    - !Condition GitHubExchangeEnabled
+    - !Not [!Equals [!Ref OperationsBrowserOrigins, ""]]
+YAML
+)"
+[ "$cors_condition" = "$expected_cors_condition" ] ||
+    fail_test 'CORS must require enabled GitHub sign-in and configured origins'
+contains_line "$(template_section OperationsBrowserOrigins)" '    Default: ""'
+expected_cors="$(cat <<'YAML'
+        x-amazon-apigateway-cors: !If
+          - OperationsBrowserCorsEnabled
+          - allowOrigins: !Split [",", !Ref OperationsBrowserOrigins]
+            allowMethods: [GET, POST, OPTIONS]
+            allowHeaders: [Authorization, Content-Type]
+            exposeHeaders: [Retry-After]
+          - !Ref AWS::NoValue
+YAML
+)"
+cors="$(sed -n '/^        x-amazon-apigateway-cors:/,/^        paths:/p' <<<"$api" | sed '$d')"
+[ "$cors" = "$expected_cors" ] || fail_test 'gateway CORS policy differs'
+
+contains_line "$(template_section PendingSignInTable)" '    Type: AWS::DynamoDB::Table'
+contains_line "$(template_section PendingSignInTable)" '    Condition: GitHubExchangeEnabled'
+contains_line "$(template_section PendingSignInTable)" '    DeletionPolicy: Delete'
+expected_table="$(cat <<'YAML'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+YAML
+)"
+[ "$(template_section PendingSignInTable | sed -n '/^    Properties:/,$p' | sed '1d;/^$/d')" = "$expected_table" ] ||
+    fail_test 'Pending Sign-in table key or TTL differs from the adapter'
 
 auth_function="$(template_section AuthenticationFunction)"
 contains_line "$auth_function" '    Type: AWS::Serverless::Function'
 contains_line "$auth_function" '    Condition: GitHubExchangeEnabled'
 contains_line "$auth_function" '      CodeUri: zig-out/packages/authentication-lambda.zip'
+contains_line "$auth_function" '      Handler: bootstrap'
 expected_auth_permissions="$(cat <<'YAML'
         - AWSLambdaBasicExecutionRole
         - Version: "2012-10-17"
@@ -106,6 +171,12 @@ expected_auth_permissions="$(cat <<'YAML'
               Resource:
                 - !Ref GitHubClientSecretArn
                 - !Ref PasetoSigningKeySecretArn
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt PendingSignInTable.Arn
 YAML
 )"
 auth_permissions="$(sed -n '/^      Policies:/,/^      Environment:/p' <<<"$auth_function" | sed '1d;$d')"
@@ -115,17 +186,17 @@ auth_permissions="$(sed -n '/^      Policies:/,/^      Environment:/p' <<<"$auth
 expected_auth_environment="$(cat <<'YAML'
           GITHUB_CLIENT_ID: !Ref GitHubClientId
           GITHUB_CLIENT_SECRET_ARN: !Ref GitHubClientSecretArn
+          GITHUB_OAUTH_CALLBACK_URL: !Ref GitHubOAuthCallbackUrl
+          GITHUB_BROWSER_REDIRECT_URIS: !Ref GitHubBrowserRedirectUris
           PASETO_SIGNING_KEY_SECRET_ARN: !Ref PasetoSigningKeySecretArn
           PASETO_PUBLIC_KEY: !Ref PasetoPublicKey
+          PENDING_SIGN_IN_TABLE_NAME: !Ref PendingSignInTable
 YAML
 )"
 [ "$(sed -n '/^        Variables:/,$p' <<<"$auth_function" | sed '1d;/^$/d')" = "$expected_auth_environment" ] ||
     fail_test 'authentication environment must contain only the public configuration and secret references'
 contains_line "$(template_section AuthenticationFunctionName)" '    Condition: GitHubExchangeEnabled'
 contains_line "$(template_section AuthenticationFunctionName)" '    Value: !Ref AuthenticationFunction'
-auth_grant="$(template_section AuthenticationApiPermission)"
-contains_line "$auth_grant" '    Condition: GitHubExchangeEnabled'
-contains_line "$auth_grant" '      SourceAccount: !Ref AWS::AccountId'
 for setting in \
     'SubmissionThrottlingRateLimit 10' 'SubmissionThrottlingBurstLimit 20' \
     'QueryThrottlingRateLimit 50' 'QueryThrottlingBurstLimit 100'
@@ -145,15 +216,13 @@ contains "$submission" 'ThrottlingBurstLimit: !Ref SubmissionThrottlingBurstLimi
 contains "$query" 'ThrottlingRateLimit: !Ref QueryThrottlingRateLimit'
 contains "$query" 'ThrottlingBurstLimit: !Ref QueryThrottlingBurstLimit'
 for pair in 'IntakeApiPermission IntakeFunction POST/operations' \
-    'QueryApiPermission QueryFunction GET/operations/*' \
-    'AuthenticationApiPermission AuthenticationFunction POST/auth/github/exchange'
+    'QueryApiPermission QueryFunction GET/operations/*'
 do
     read -r permission function route <<<"$pair"
     grant="$(sed -n "/^  $permission:/,/^  [A-Za-z]/p" "$REPOSITORY_ROOT/template.yaml" | sed '$d')"
     contains "$grant" 'Action: lambda:InvokeFunction'
     contains "$grant" 'Principal: apigateway.amazonaws.com'
     contains "$grant" "FunctionName: !Ref $function"
-    source_arn='arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${OperationsApi}/$default'
     contains_line "$grant" "      SourceArn: !Sub $source_arn/$route"
 done
 output="$(sed -n '/^Outputs:/,$p' "$REPOSITORY_ROOT/template.yaml")"
@@ -327,10 +396,66 @@ contains_line "$overrides" 'EnableGitHubExchange=true'
 contains_line "$overrides" 'GitHubClientId=FixtureClient'
 contains_line "$overrides" "GitHubClientSecretArn=$app_secret_arn"
 contains_line "$overrides" "PasetoSigningKeySecretArn=$signing_key_arn"
-overrides="$(deployment_parameters --disable-github-exchange)"
+absent "$overrides" 'OperationsBrowserOrigins='
+absent "$overrides" 'GitHubOAuthCallbackUrl='
+absent "$overrides" 'GitHubBrowserRedirectUris'
+
+managed_deployment_parameters() (
+    export GITHUB_CLIENT_ID=FixtureClient GITHUB_CLIENT_SECRET_ARN="$app_secret_arn"
+    export PASETO_SIGNING_KEY_SECRET_ARN="$signing_key_arn"
+    deployment_parameters "$@"
+)
+callback='https://operations.example.test/auth/github/callback'
+origins='https://app.example.test,https://other.example.test:8443'
+registrations="$(cat <<'JSON'
+["https://app.example.test/sign-in?next=ParameterKey=fixture,ParameterValue=one&label='demo'",
+ "https://registered.example.test/return"]
+JSON
+)"
+overrides="$(GITHUB_OAUTH_CALLBACK_URL="$callback" GITHUB_BROWSER_REDIRECT_URIS="$registrations" \
+    OPERATIONS_BROWSER_ORIGINS="$origins" managed_deployment_parameters --enable-github-exchange)"
+contains_line "$overrides" "GitHubOAuthCallbackUrl=$callback"
+registrations_argument="$(cat <<'ARGUMENT'
+ParameterKey=GitHubBrowserRedirectUris,ParameterValue='["https://app.example.test/sign-in?next=ParameterKey=fixture,ParameterValue=one&label=\'demo\'","https://registered.example.test/return"]'
+ARGUMENT
+)"
+contains_line "$overrides" "$registrations_argument"
+contains_line "$overrides" "OperationsBrowserOrigins=$origins"
+
+# The CloudFormation parameter also excludes broad or path-based matches when
+# the operator uses SAM without the deploy helper.
+origin_pattern="$(sed -n "s/^    AllowedPattern: '\\(.*\\)'$/\\1/p" \
+    <<<"$(template_section OperationsBrowserOrigins)")"
+[[ "$origins" =~ $origin_pattern ]] || fail_test 'template rejects the configured origin list'
+for invalid in '*' 'https://*' 'https://*.example.test' 'http://app.example.test' \
+    'https://app.example.test/' 'https://app.example.test/path' \
+    'https://app.example.test, https://other.example.test' 'https://app.example.test,'
+do
+    if [[ "$invalid" =~ $origin_pattern ]]; then fail_test 'template permits an invalid origin'; fi
+    if output="$(OPERATIONS_BROWSER_ORIGINS="$invalid" \
+        managed_deployment_parameters --enable-github-exchange 2>&1)"; then
+        fail_test 'deploy helper permits an invalid origin'
+    fi
+    contains "$output" 'OPERATIONS_BROWSER_ORIGINS must be comma-separated HTTPS origins'
+done
+if output="$(GITHUB_BROWSER_REDIRECT_URIS="$registrations" \
+    managed_deployment_parameters --enable-github-exchange 2>&1)"; then
+    fail_test 'accepted app callback registration without the Operations callback'
+fi
+contains "$output" 'GITHUB_OAUTH_CALLBACK_URL must be'
+if output="$(GITHUB_OAUTH_CALLBACK_URL="$callback" \
+    managed_deployment_parameters --enable-github-exchange 2>&1)"; then
+    fail_test 'accepted the Operations callback without app callback registration'
+fi
+contains "$output" 'GITHUB_BROWSER_REDIRECT_URIS must be'
+overrides="$(GITHUB_OAUTH_CALLBACK_URL="$callback" GITHUB_BROWSER_REDIRECT_URIS="$registrations" \
+    OPERATIONS_BROWSER_ORIGINS="$origins" managed_deployment_parameters --disable-github-exchange)"
 contains_line "$overrides" 'EnableGitHubExchange=false'
 absent "$overrides" 'GitHubClientId='
 absent "$overrides" 'SecretArn='
+absent "$overrides" 'GitHubOAuthCallbackUrl='
+absent "$overrides" 'GitHubBrowserRedirectUris'
+absent "$overrides" 'OperationsBrowserOrigins='
 if output="$(GITHUB_CLIENT_ID=FixtureClient GITHUB_CLIENT_SECRET_ARN="$app_secret_arn" \
     PASETO_SIGNING_KEY_SECRET_ARN='fixture-invalid-reference' \
     deployment_parameters --enable-github-exchange 2>&1)"; then

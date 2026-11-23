@@ -69,6 +69,7 @@ pub fn aws_event(allocator: std.mem.Allocator, options: struct {
     body: ?[]const u8 = null,
     base64: bool = false,
     content_type: ?[]const u8 = null,
+    origin: ?[]const u8 = null,
 }) ![]u8 {
     const bearer = if (options.token) |token|
         try std.fmt.allocPrint(allocator, "Bearer {s}", .{token})
@@ -87,6 +88,7 @@ pub fn aws_event(allocator: std.mem.Allocator, options: struct {
         .headers = .{
             .aUtHoRiZaTiOn = bearer orelse "",
             .@"content-type" = options.content_type,
+            .origin = options.origin,
         },
         .requestContext = .{
             .stage = "$default",

@@ -1422,6 +1422,7 @@ test "runtime integration: warm query preserves cache and refreshes invocation m
         .token = token,
         .body = "!",
         .base64 = true,
+        .origin = "https://app.example.test",
     });
     const function_url_event = try testQueryRequestEvent(token);
     defer std.testing.allocator.free(function_url_event);
@@ -1441,6 +1442,7 @@ test "runtime integration: warm query preserves cache and refreshes invocation m
         .method = .GET,
         .route = "GET /operations/{id}",
         .path = "/operations/00112233-4455-6677-8899-aabbccddeeff",
+        .origin = "https://app.example.test",
     });
     try fixture.init(&.{
         .{
