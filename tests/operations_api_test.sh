@@ -415,12 +415,30 @@ JSON
 overrides="$(GITHUB_OAUTH_CALLBACK_URL="$callback" GITHUB_BROWSER_REDIRECT_URIS="$registrations" \
     OPERATIONS_BROWSER_ORIGINS="$origins" managed_deployment_parameters --enable-github-exchange)"
 contains_line "$overrides" "GitHubOAuthCallbackUrl=$callback"
-registrations_argument="$(cat <<'ARGUMENT'
+IFS= read -r registrations_argument <<'ARGUMENT'
 ParameterKey=GitHubBrowserRedirectUris,ParameterValue='["https://app.example.test/sign-in?next=ParameterKey=fixture,ParameterValue=one&label=\'demo\'","https://registered.example.test/return"]'
 ARGUMENT
-)"
 contains_line "$overrides" "$registrations_argument"
 contains_line "$overrides" "OperationsBrowserOrigins=$origins"
+
+for invalid_callback in 'https://user:pass@app.example.test/return' \
+    'https://@app.example.test/return' 'https://app.example.test/return#' \
+    'https://app.example.test/return?static=one#section' 'https://app.example.test/return?code=value' \
+    'https://app.example.test/return?static=one&state' 'https://app.example.test/return?%65rr%6Fr=denied' \
+    'https://app.example.test/return?sta%74e=value' 'https://app.example.test/return?broken%2=value' \
+    'https:///return' 'https://app.example.test:65536/return' $'https://app.example.test/return\n'
+do
+    invalid_registrations="$(jq -cn --arg url "$invalid_callback" '["https://app.example.test/return", $url]')"
+    if output="$(GITHUB_OAUTH_CALLBACK_URL="$callback" GITHUB_BROWSER_REDIRECT_URIS="$invalid_registrations" \
+        managed_deployment_parameters --enable-github-exchange 2>&1)"; then
+        fail_test "accepted invalid app callback: $invalid_callback"
+    fi
+    contains "$output" 'GITHUB_BROWSER_REDIRECT_URIS must be'
+done
+punctuation_registrations='["https://app.example.test/@return?&next=code=one?state=two&&State=three&note=%23&","https://[::1]:8443/return"]'
+overrides="$(GITHUB_OAUTH_CALLBACK_URL="$callback" GITHUB_BROWSER_REDIRECT_URIS="$punctuation_registrations" \
+    managed_deployment_parameters --enable-github-exchange)"
+contains_line "$overrides" "ParameterKey=GitHubBrowserRedirectUris,ParameterValue='$punctuation_registrations'"
 
 # The CloudFormation parameter also excludes broad or path-based matches when
 # the operator uses SAM without the deploy helper.
@@ -518,3 +536,115 @@ contains "$probes" 'POST https://operations.invalid/operations/00000000-0000-400
 curl() { printf 404; }
 if (cd "$TEST_DIR"; check_operations_api) >/dev/null 2>&1; then fail_test 'accepted unmatched-route response as authentication evidence'; fi
 printf 'Operations API discovery and probe tests passed.\n'
+
+cat >"$TEST_DIR/processed-template.json" <<'JSON'
+{
+  "TemplateBody": {
+    "Conditions": {
+      "OwnLedgerCounterTable": {"Fn::Equals": [{"Ref":"ExistingLedgerCounterTableName"}, ""]},
+      "GitHubExchangeEnabled": {"Fn::Equals": [{"Ref":"EnableGitHubExchange"}, "true"]}
+    },
+    "Resources": {
+      "OperationsTable": {"Type":"AWS::DynamoDB::Table", "Properties":{
+        "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+        "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+        "TimeToLiveSpecification":{"AttributeName":"expires_at","Enabled":true}}},
+      "SeatEventsTable": {"Type":"AWS::DynamoDB::Table", "Properties":{
+        "AttributeDefinitions":[{"AttributeName":"tenant","AttributeType":"S"},{"AttributeName":"event_id","AttributeType":"S"}],
+        "KeySchema":[{"AttributeName":"tenant","KeyType":"HASH"},{"AttributeName":"event_id","KeyType":"RANGE"}]}},
+      "LedgerCounterTable": {"Type":"AWS::DynamoDB::Table", "Condition":"OwnLedgerCounterTable", "Properties":{
+        "AttributeDefinitions":[{"AttributeName":"counter_id","AttributeType":"S"}],
+        "KeySchema":[{"AttributeName":"counter_id","KeyType":"HASH"}]}},
+      "PendingSignInTable": {"Type":"AWS::DynamoDB::Table", "Condition":"GitHubExchangeEnabled",
+        "DeletionPolicy":"Delete", "Properties":{
+        "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+        "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+        "TimeToLiveSpecification":{"AttributeName":"expires_at","Enabled":true}}},
+      "SeatReservationProcessor": {"Properties":{"Environment":{"Variables":{
+        "LEDGER_COUNTER_TABLE_NAME":{"Fn::If":["OwnLedgerCounterTable",{"Ref":"LedgerCounterTable"},{"Ref":"ExistingLedgerCounterTableName"}]},
+        "LEDGER_COUNTER_ID":{"Ref":"LedgerCounterId"},
+        "EVENTS_TABLE_NAME":{"Ref":"SeatEventsTable"}}}}},
+      "SeatReservationCompletionProcessor": {"Properties":{"Environment":{"Variables":{
+        "EVENTS_TABLE_NAME":{"Ref":"SeatEventsTable"}, "OPERATIONS_TABLE_NAME":{"Ref":"OperationsTable"}}}}}
+    },
+    "Outputs": {
+      "LedgerCounterTableName":{"Value":{"Fn::If":["OwnLedgerCounterTable",{"Ref":"LedgerCounterTable"},{"Ref":"ExistingLedgerCounterTableName"}]}},
+      "LedgerCounterId":{"Value":{"Ref":"LedgerCounterId"}}
+    }
+  }
+}
+JSON
+printf '#!/bin/bash\n[ "${!#}" = read ]\n' >"$TEST_DIR/ledger-counter.sh"
+chmod +x "$TEST_DIR/ledger-counter.sh"
+
+mock_table_removal() (
+    local table="$1" proposed_setting="$2" fixture_changeset_arn
+    shift 2
+    fixture_changeset_arn="arn:aws:cloudformation:ca-central-1:$fixture_account:changeSet/fixture/fixture-id"
+    parse_deployment_options --stack-name fixture "$@"
+    sam() {
+        contains "$*" 'deploy '
+        contains "$*" ' --no-execute-changeset '
+        if [ "$GITHUB_EXCHANGE_SETTING" = false ]; then
+            contains "$*" 'EnableGitHubExchange=false'
+        fi
+        printf 'Changeset created successfully. %s\n' "$fixture_changeset_arn"
+    }
+    aws() {
+        case "$1 $2" in
+            'cloudformation describe-stacks')
+                cat <<'JSON'
+{"Stacks":[{"StackStatus":"UPDATE_COMPLETE","Outputs":[
+  {"OutputKey":"LedgerCounterTableName","OutputValue":"fixture-counter"},
+  {"OutputKey":"LedgerCounterId","OutputValue":"global"}],
+  "Parameters":[{"ParameterKey":"EnableGitHubExchange","ParameterValue":"true"}]}]}
+JSON
+                ;;
+            'cloudformation describe-stack-resource') printf 'fixture-counter\n' ;;
+            'cloudformation describe-change-set')
+                contains "$*" "--change-set-name $fixture_changeset_arn"
+                jq -n --arg id "$fixture_changeset_arn" --arg table "$table" --arg enabled "$proposed_setting" '{
+                    ChangeSetId:$id, StackName:"fixture", Status:"CREATE_COMPLETE", ExecutionStatus:"AVAILABLE",
+                    Parameters:[{ParameterKey:"LedgerCounterId",ParameterValue:"global"},
+                        {ParameterKey:"ExistingLedgerCounterTableName",ParameterValue:""},
+                        {ParameterKey:"EnableGitHubExchange",ParameterValue:$enabled}],
+                    Changes:[{Type:"Resource", ResourceChange:{
+                        ResourceType:"AWS::DynamoDB::Table", LogicalResourceId:$table, Action:"Remove"}}]
+                }'
+                ;;
+            'cloudformation get-template')
+                contains "$*" "--change-set-name $fixture_changeset_arn"
+                cat processed-template.json
+                ;;
+            'cloudformation execute-change-set')
+                contains "$*" "--change-set-name $fixture_changeset_arn"
+                printf 'execute\n' >>change-set-calls
+                ;;
+            'cloudformation wait')
+                [ "$3" = stack-update-complete ] || fail_test 'expected stack update waiter'
+                printf 'wait\n' >>change-set-calls
+                ;;
+            *) fail_test "unexpected AWS call: $*" ;;
+        esac
+    }
+    cd "$TEST_DIR"
+    deploy_stack_phase 'Deploying stack'
+)
+
+mock_table_removal PendingSignInTable false --disable-github-exchange >/dev/null
+[ "$(<"$TEST_DIR/change-set-calls")" = $'execute\nwait' ] || fail_test 'disablement did not execute and wait'
+: >"$TEST_DIR/change-set-calls"
+assert_table_removal_blocked() {
+    local output
+    if output="$(mock_table_removal "$@" 2>&1)"; then
+        fail_test "permitted unexpected table removal: $*"
+    fi
+    contains "$output" 'refusing unsafe or ambiguous change set'
+    [ ! -s "$TEST_DIR/change-set-calls" ] || fail_test 'unsafe change set executed'
+}
+for table in OperationsTable SeatEventsTable LedgerCounterTable; do
+    assert_table_removal_blocked "$table" false --disable-github-exchange
+done
+assert_table_removal_blocked PendingSignInTable false
+assert_table_removal_blocked PendingSignInTable true --disable-github-exchange
+printf 'GitHub disablement change-set tests passed.\n'

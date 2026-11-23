@@ -141,7 +141,7 @@ Use Zig 0.17.x (minimum 0.17.0). Check `zig version` reports a `0.17.*` version
 before building. The TigerBeetle processor executable requires a compatible
 patched standard library at `../zig/lib` through its `build.zig` override.
 The validated compiler and patched library pair is 0.17.1. Keep that sibling
-checkout available for builds and packaging. The other five Lambda functions
+checkout available for builds and packaging. The other six Lambda functions
 and the host tools use the compiler's bundled library.
 The build resolves the Zig 0.17-compatible Lambda runtime pinned in
 [`build.zig.zon`](../build.zig.zon). The
@@ -150,8 +150,8 @@ documents the low-worker scheduling defect, the patch, and current checks.
 
 After [provisioning the pinned packages](agents/local-checks.md#host-and-package-prerequisites),
 run the repository check gate separately before deployment. It checks Zig
-formatting and shell syntax, then runs the offline Zig tests and all eleven
-Lambda runtime integration tests:
+formatting and shell syntax, then runs the offline Zig tests, 19 Lambda and
+Pending Sign-in runtime tests, and two PASETO CLI HTTP integration tests:
 
 ```sh
 ./check.sh
@@ -170,7 +170,7 @@ with no AWS credentials or network access. Shell regression suites execute only
 when selected, outside the Zig build graph, `check.sh`, and CI. The Zig `check`
 target depends on the offline `test` and loopback `test-runtime` aggregates.
 
-To run only the Lambda runtime integration suite, use:
+To run only the loopback runtime integration suite, use:
 
 ```sh
 zig build test-runtime --summary all
@@ -1731,6 +1731,9 @@ routes and their invocation grants, the function and role, the CORS policy,
 and the Pending Sign-in table. In-flight sign-ins end. API Gateway returns
 `404` for the removed methods and paths. The operator-owned secrets remain
 available for separate lifecycle management.
+The helper allows the Pending Sign-in table removal when you explicitly disable
+GitHub and the proposed change set sets `EnableGitHubExchange=false`. It still
+rejects removal of the Operations, Seat Events, and Ledger Counter tables.
 PASETOs already issued remain valid through their signed expiration. Subsequent
 invocations of `deploy.sh` without either exchange flag preserve the stack's configured
 setting. Re-enabling creates a fresh Pending Sign-in table.
@@ -1766,8 +1769,10 @@ invocations that use or issue them.
 2. Set `GITHUB_BROWSER_REDIRECT_URIS` to a JSON array of 1–16 exact HTTPS app
    return URLs, each up to 2,048 bytes. Preserve paths and static queries byte
    for byte. Exclude user info, fragments, and the reserved query names
-   `code`, `state`, and `error`. The handler validates the entire registration
-   on use. Keep the combined Lambda environment within its 4 KB limit.
+   `code`, `state`, and `error`, including percent-encoded names. The deploy
+   helper checks every supplied URL before deployment. The handler validates
+   the entire registration on use. Keep the combined Lambda environment within
+   its 4 KB limit.
 3. Set `OPERATIONS_BROWSER_ORIGINS` to a comma-separated list of the app's HTTPS
    origins, with lowercase hostnames and any non-default ports. Omit paths,
    trailing slashes, spaces, and wildcards. Callback registration governs the
@@ -1794,7 +1799,13 @@ for callback and origin changes.
 After an authorized full deployment, use the
 [browser example](API_GATEWAY.md#browser-caller-example) from a registered
 callback on an allowed origin. Confirm that the GitHub round trip reaches
-redemption and that the browser reads the submitted and queried Operation.
+redemption. Choose **Submit and query a lookup** and confirm that the browser
+reads the submitted and queried Operation. While signed in, confirm that
+neither persistent nor tab-scoped storage contains a PASETO. Reload the page
+and confirm that it requires fresh sign-in. Sign in again and choose **Sign
+out**, then confirm that the app sends no further authenticated requests.
+On completion and denial, confirm that the app removes the returned sign-in
+parameters from the URL and clears the verifier and app state from tab storage.
 Use the browser's network panel or send the preflights directly.
 
 ```sh

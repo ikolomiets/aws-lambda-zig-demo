@@ -586,8 +586,7 @@ fn verify_github_token(
     dependencies: *const Dependencies,
     token: *const github.AccessToken,
 ) github.Error![]const u8 {
-    // An Operations credential must stay with the Operations API.
-    if (std.mem.startsWith(u8, token.bytes, "v4.public.")) return error.Unauthorized;
+    if (token.has_operations_paseto_prefix()) return error.Unauthorized;
 
     const client_secret = try authentication.read_secret(
         arena,

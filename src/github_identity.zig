@@ -41,6 +41,11 @@ pub const Error = error{ Unauthorized, Unavailable, InternalFailure };
 pub const AccessToken = struct {
     bytes: []const u8,
 
+    /// Operations credentials must stay with the Operations API.
+    pub fn has_operations_paseto_prefix(token: *const AccessToken) bool {
+        return std.mem.startsWith(u8, token.bytes, "v4.public.");
+    }
+
     pub fn parse(bytes: []const u8) error{Unauthorized}!AccessToken {
         if (bytes.len > access_token_size_max) return error.Unauthorized;
         const token = std.mem.trimEnd(u8, bytes, "=");

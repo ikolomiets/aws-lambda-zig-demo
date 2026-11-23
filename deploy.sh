@@ -256,12 +256,27 @@ validate_github_browser_configuration() {
         fail "GITHUB_OAUTH_CALLBACK_URL must be the HTTPS Operations /auth/github/callback URL"
     need_command jq
     GITHUB_BROWSER_REDIRECT_URIS="$(jq -cse '
+        def valid_authority:
+            [capture("^https://(?<host>[A-Za-z0-9.-]+|\\[[A-Fa-f0-9:.]+\\])(?::(?<port>[0-9]+))?(?:[/?]|$)")]
+            | any((.host | length <= 254) and ((.port // "0" | tonumber) <= 65535));
+        # Match decoded query names while keeping the registered URL unchanged.
+        def decode_query_name:
+            gsub("%(?<hex>[0-9A-Fa-f]{2})";
+                (.hex | ascii_downcase | explode | map(if . <= 57 then . - 48 else . - 87 end))
+                | [.[0] * 16 + .[1]] | implode);
+        def valid_query_names:
+            split("?")[1:] | join("?") | split("&") |
+            all(.[];
+                (split("=")[0] // "") |
+                (test("%(?![0-9A-Fa-f]{2})") | not) and
+                (decode_query_name | IN("code", "state", "error") | not));
         select(length == 1) | .[0] |
         select(type == "array" and length >= 1 and length <= 16) |
-        select(all(.[]; type == "string" and length <= 2048 and test("^https://[!-~]+$") and
-            (contains("\"") or contains("\\") | not)))
+        select(all(.[]; type == "string" and length <= 2048 and test("\\Ahttps://[!-~]+\\z") and
+            (contains("\"") or contains("\\") or contains("#") | not) and
+            valid_authority and valid_query_names))
     ' <<<"$GITHUB_BROWSER_REDIRECT_URIS" 2>/dev/null)" ||
-        fail "GITHUB_BROWSER_REDIRECT_URIS must be a JSON array of 1–16 HTTPS callback URLs up to 2048 bytes each"
+        fail "GITHUB_BROWSER_REDIRECT_URIS must be a JSON array of 1–16 HTTPS callback URLs up to 2048 bytes each, with no user info, fragments, or reserved query names (code, state, error)"
 }
 
 load_development_function_ids() {
@@ -671,7 +686,11 @@ inspect_deployment_changeset() {
             fail "could not inspect the proposed change set; nothing executed"
         jq -e --arg id "$changeset_id" --arg stack "$STACK_NAME" \
             --arg counter_id "$LEDGER_COUNTER_ID" \
-            --arg reference "$expected_reference" '
+            --arg reference "$expected_reference" \
+            --arg github_exchange "$GITHUB_EXCHANGE_SETTING" '
+            ($github_exchange == "false" and
+             ([.Parameters[] | select(.ParameterKey == "EnableGitHubExchange") | .ParameterValue] == ["false"]))
+                as $allow_pending_sign_in_removal |
             .ChangeSetId == $id and .StackName == $stack and
             .Status == "CREATE_COMPLETE" and .ExecutionStatus == "AVAILABLE" and
             ([.Parameters[] | select(.ParameterKey == "LedgerCounterId") | .ParameterValue] == [$counter_id]) and
@@ -681,6 +700,8 @@ inspect_deployment_changeset() {
                 .Type == "Resource" and (.ResourceChange | type == "object") and
                 (.ResourceChange | if .ResourceType == "AWS::DynamoDB::Table" then
                     .Action == "Add" or
+                    ($allow_pending_sign_in_removal and .Action == "Remove" and
+                     .LogicalResourceId == "PendingSignInTable") or
                     (.Action == "Modify" and .Replacement == "False" and
                      (.Details | type == "array" and length > 0) and
                      all(.Details[];

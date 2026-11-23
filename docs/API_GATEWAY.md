@@ -309,8 +309,13 @@ PKCE proof, and Intake and Query still verify the PASETO.
 Serve this HTML at an exactly registered app callback, such as
 `https://app.example.com/sign-in.html`, and allow `https://app.example.com`
 as an origin. Replace the example API origin, callback and lookup account
-with values for your deployment. The example submits one TigerBeetle lookup
-after successful sign-in and reads the Operation's current view.
+with values for your deployment. After signing in, choose **Submit and query
+a lookup** to submit one TigerBeetle lookup and read the Operation's current
+view. Choose **Sign out** to discard the in-memory PASETO and stop the app
+from sending authenticated requests. Reloading also requires fresh sign-in.
+Only the PKCE verifier and app state go into tab-scoped storage during the
+redirect. The app clears them on completion or denial. An independently held
+PASETO stays usable until its original signed expiration.
 
 ```html
 <!doctype html>
@@ -318,13 +323,18 @@ after successful sign-in and reads the Operation's current view.
 <meta name="referrer" content="no-referrer">
 <title>Operations sign-in example</title>
 <button id="sign-in">Sign in with GitHub</button>
+<button id="run-lookup" disabled>Submit and query a lookup</button>
+<button id="sign-out" disabled>Sign out</button>
 <pre id="result"></pre>
 <script type="module">
 const api = "https://api.example.com";
 const callback = "https://app.example.com/sign-in.html";
 const attemptKey = "operations-sign-in";
-const button = document.querySelector("#sign-in");
+const signInButton = document.querySelector("#sign-in");
+const lookupButton = document.querySelector("#run-lookup");
+const signOutButton = document.querySelector("#sign-out");
 const output = document.querySelector("#result");
+let token = null;
 
 function base64url(bytes) {
   return btoa(String.fromCharCode(...bytes))
@@ -354,10 +364,10 @@ async function request(path, options) {
 }
 
 async function finishSignIn(params) {
-  // Restore the registered callback URL, including any static query.
-  history.replaceState(null, "", callback);
   const saved = sessionStorage.getItem(attemptKey);
   sessionStorage.removeItem(attemptKey);
+  // Restore the registered callback URL, including any static query.
+  history.replaceState(null, "", callback);
   const attempt = saved && JSON.parse(saved);
   if (!attempt || params.getAll("state").length !== 1 ||
       params.get("state") !== attempt.state) {
@@ -367,7 +377,7 @@ async function finishSignIn(params) {
   if (params.getAll("code").length !== 1 || !params.get("code")) {
     throw new Error("Missing or ambiguous sign-in code");
   }
-  const { access_token: token } = await request("/auth/github/redeem", {
+  const { access_token } = await request("/auth/github/redeem", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -376,36 +386,62 @@ async function finishSignIn(params) {
       code_verifier: attempt.verifier,
     }),
   });
+  token = access_token;
+  lookupButton.disabled = false;
+  signOutButton.disabled = false;
+  output.textContent = "Signed in.";
+}
 
-  const authorization = { Authorization: `Bearer ${token}` };
-  const submitted = await request("/operations", {
-    method: "POST",
-    headers: { ...authorization, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      id: crypto.randomUUID(),
-      name: "TigerBeetle",
-      body: { lookup_accounts: [{ id: "101" }] },
-    }),
-  });
-  const current = await request(`/operations/${encodeURIComponent(submitted.id)}`, {
-    headers: authorization,
-  });
-  output.textContent = JSON.stringify(current, null, 2);
+async function runLookup() {
+  if (!token) return;
+  lookupButton.disabled = true;
+  try {
+    const submitted = await request("/operations", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: crypto.randomUUID(),
+        name: "TigerBeetle",
+        body: { lookup_accounts: [{ id: "101" }] },
+      }),
+    });
+    if (!token) return;
+    const current = await request(`/operations/${encodeURIComponent(submitted.id)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (token) output.textContent = JSON.stringify(current, null, 2);
+  } catch (error) {
+    if (token) showError(error);
+  } finally {
+    lookupButton.disabled = !token;
+  }
 }
 
 function showError(error) {
-  output.textContent = error instanceof Error ? error.message : "Sign-in failed";
-  button.disabled = false;
+  output.textContent = error instanceof Error ? error.message : "Request failed";
 }
 
-button.addEventListener("click", () => {
-  button.disabled = true;
-  beginSignIn().catch(showError);
+function showSignInError(error) {
+  showError(error);
+  signInButton.disabled = false;
+}
+
+signInButton.addEventListener("click", () => {
+  signInButton.disabled = true;
+  beginSignIn().catch(showSignInError);
+});
+lookupButton.addEventListener("click", runLookup);
+signOutButton.addEventListener("click", () => {
+  token = null;
+  lookupButton.disabled = true;
+  signOutButton.disabled = true;
+  signInButton.disabled = false;
+  output.textContent = "Signed out. Sign in to continue.";
 });
 const params = new URLSearchParams(location.search);
 if (["code", "state", "error"].some((name) => params.has(name))) {
-  button.disabled = true;
-  finishSignIn(params).catch(showError).finally(() => { button.disabled = false; });
+  signInButton.disabled = true;
+  finishSignIn(params).catch(showSignInError);
 }
 </script>
 ```

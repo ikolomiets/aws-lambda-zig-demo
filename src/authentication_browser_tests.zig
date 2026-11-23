@@ -827,6 +827,7 @@ fn expect_invalid_browser_callbacks(
 }
 
 test "a failed GitHub exchange spends the callback and hides provider details" {
+    const operations_paseto = "v4.public.operations-fixture";
     const ProviderCase = struct {
         response: github.TransportError!github.Response = .{
             .status = .ok,
@@ -840,6 +841,13 @@ test "a failed GitHub exchange spends the callback and hides provider details" {
         .{ .response = error.Unavailable, .status = .service_unavailable },
         .{
             .response = .{ .status = .too_many_requests, .body = testing.provider_token },
+            .status = .service_unavailable,
+        },
+        .{
+            .response = .{
+                .status = .ok,
+                .body = "{\"access_token\":\"" ++ operations_paseto ++ "\",\"token_type\":\"bearer\"}",
+            },
             .status = .service_unavailable,
         },
         .{
@@ -883,7 +891,8 @@ test "a failed GitHub exchange spends the callback and hides provider details" {
         try std.testing.expectEqual(case.checks, flow.callback.shared.github_checks);
         try std.testing.expectEqual(0, flow.callback.shared.signing_key_reads);
         const credentials: []const []const u8 = &.{
-            testing.provider_token, testing.client_secret, "github-secret-code", upstream.state,
+            testing.provider_token, testing.client_secret, "github-secret-code",
+            upstream.state,         operations_paseto,
         };
         for (credentials) |private| {
             try std.testing.expect(std.mem.indexOf(u8, failed.body, private) == null);

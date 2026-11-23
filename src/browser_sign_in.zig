@@ -176,7 +176,7 @@ fn complete_callback(
         error.Unauthorized => return error.BadRequest,
         else => |failure| return failure,
     };
-    if (std.mem.startsWith(u8, provider_token.bytes, "v4.public.")) return error.Unavailable;
+    if (provider_token.has_operations_paseto_prefix()) return error.Unavailable;
     const tenant = github.resolve_tenant(arena, &.{
         .client_id = config.github_client_id,
         .client_secret = client_secret,
