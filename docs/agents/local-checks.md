@@ -177,6 +177,7 @@ The independent privacy scanner still runs in CI and the optional commit hook.
 | `deploy.sh`: package invocation, caches, compiler validation, artifact checks, and deployed function selection for code sync | `bash tests/deploy_packaging_test.sh` |
 | `deploy.sh`, `wireguard-gateway-setup.sh`, `lambda_logs.sh`: processor names, options, and selectors | `bash tests/processor_interface_test.sh` |
 | `deploy.sh`, `template.yaml`: Operations API routes, discovery, probes, throttling, access logs, GitHub sign-in wiring, storage, permissions, and CORS | `bash tests/operations_api_test.sh` |
+| `deploy-demo-web.sh`: public asset selection, Cloudflare upload sessions, and Worker version deployment | `bash tests/deploy_demo_web_test.sh` |
 | `api-domain.sh`: custom-domain parsing, certificate/domain reuse, DNS instructions, mappings, and HTTPS probes | `bash tests/api_domain_test.sh` |
 | `events.sh`: credentials, HTTP origin selection, Event commands, and polling | `bash tests/events_wrapper_test.sh` |
 | `seat_scenarios.sh`: discovery, HTTP origin selection, scenarios, and evidence | `bash tests/seat_scenarios_test.sh` |

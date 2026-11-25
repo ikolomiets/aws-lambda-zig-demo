@@ -6,22 +6,39 @@ TigerBeetle account lookup through the Operations API.
 ## Hosting
 
 Cloudflare Workers Static Assets serves the demo at `https://demo.electrit.com/`.
-The [Cloudflare configuration](../cloudflare.config.ts) assigns the custom
-domain to the `electrit-demo` Worker. The
-[asset allowlist](.assetsignore) selects the public files.
+The [Cloudflare configuration](../cloudflare.config.ts) records the hosting
+settings for the `electrit-demo` Worker and its custom domain. The
+[deployment script](../deploy-demo-web.sh) publishes a new version to that
+existing Worker using the [Workers API](https://developers.cloudflare.com/workers/static-assets/direct-upload/).
+Set up the Worker and its custom domain in Cloudflare before the first run.
 
-From the repository root, use the Cloudflare CLI with access to the
-`electrit.com` zone.
+The script uses Bash, `curl`, `jq`, `file`, `shasum`, and `base64`. It publishes
+`index.html`, `style.css`, `sign-in.js`, and regular files below `assets/`,
+matching the public paths in [.assetsignore](.assetsignore).
 
-```sh
-cf auth login
-cf deploy ./demo-web
+Find the [account ID](https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/)
+for the Worker and [create a Cloudflare API token](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
+with **Workers Scripts Write** for that account. Export `CLOUDFLARE_ACCOUNT_ID`
+and `CLOUDFLARE_API_TOKEN` in the shell that runs the script. In Bash or Zsh,
+paste the token when `read` waits for input and press Enter.
+
+```bash
+export CLOUDFLARE_ACCOUNT_ID='<account-id>'
+read -rs CLOUDFLARE_API_TOKEN
+export CLOUDFLARE_API_TOKEN
+./deploy-demo-web.sh
+unset CLOUDFLARE_API_TOKEN
 ```
 
 The exact browser callback is
 `https://demo.electrit.com/`. The page derives this URL from its origin and
 always uses the root path. Preserve the callback query string through any
 hosting redirects. Keep query strings out of access logs for this host.
+
+Cloudflare Web Analytics injects its beacon on the hosted demo. The page's
+Content Security Policy allows the beacon script and same-origin reporting to
+`/cdn-cgi/rum`. In browser DevTools, check that the script loads and the
+reporting request succeeds.
 
 The frontend defaults to `https://api.electrit.com`. If the deployed API uses
 another host, update both the `operations-api-origin` meta tag and the
