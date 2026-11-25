@@ -56,5 +56,7 @@ The PASETO stays in memory. The tab stores only the temporary state and PKCE
 verifier during navigation, then clears them and removes sign-in parameters
 from the callback URL before redemption.
 
-The bundled Barlow Condensed typeface is distributed under the
+The demo bundles the [upstream WOFF2] for Barlow Condensed SemiBold under the
 [SIL Open Font License](assets/OFL.txt).
+
+[upstream WOFF2]: https://github.com/jpt/barlow/blob/main/fonts/woff2/BarlowCondensed-SemiBold.woff2
