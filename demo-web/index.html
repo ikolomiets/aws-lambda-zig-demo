@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="description" content="Sign in to the Electrit Operations demo with GitHub.">
+  <meta name="operations-api-origin" content="https://api.electrit.com">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src https://api.electrit.com; base-uri 'none'; form-action 'none'">
+  <title>Browser sign-in with GitHub · Electrit Operations</title>
+  <link rel="icon" href="./assets/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./sign-in.js"></script>
+</head>
+<body>
+  <div class="sheet">
+    <header class="title-block">
+      <div class="identity">
+        <img src="./assets/mark.svg" alt="" width="40" height="40">
+        <div>
+          <span class="wordmark">Electrit</span>
+          <span class="annotation">Operations</span>
+        </div>
+      </div>
+      <div class="drawing-id">
+        <span class="annotation">Drawing</span>
+        <span class="drawing-value">AUTH–01</span>
+      </div>
+      <div class="session-cell">
+        <span class="annotation">Session</span>
+        <span class="session-value"><span class="indicator" aria-hidden="true"></span><span id="session-state">Signed out</span></span>
+      </div>
+    </header>
+
+    <main id="main">
+      <div class="overview">
+        <section class="intro" aria-labelledby="sign-in-title">
+          <p class="section-label"><span>01</span> Authentication</p>
+          <h1 id="sign-in-title">Browser <span class="sign-in-phrase">sign-in</span> <span class="title-provider">with GitHub</span></h1>
+          <p class="intro-copy">Use your GitHub account to open a session with the Operations API.</p>
+          <div class="actions">
+            <button class="button primary" id="sign-in" type="button" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M5 3h5v5H5zm0 13h5v5H5zm9-13h5v5h-5zM7.5 8v8m0-3h4a5 5 0 0 0 5-5"/>
+              </svg>
+              Sign in with GitHub
+            </button>
+            <a class="button primary" id="open-lookup" href="#lookup" hidden>Open account lookup</a>
+            <button class="button" id="sign-out" type="button" hidden>Sign out</button>
+          </div>
+          <p class="message" id="sign-in-message" role="status">Your Operations credential stays in this tab.</p>
+          <noscript><p class="message">Enable JavaScript to sign in.</p></noscript>
+        </section>
+
+        <figure class="diagram">
+          <figcaption class="figure-label">
+            <span class="annotation">Sign-in routes</span>
+            <span class="annotation figure-number">Fig. 01</span>
+          </figcaption>
+          <svg class="schematic" viewBox="0 0 560 374" role="img" aria-labelledby="diagram-title diagram-description">
+            <title id="diagram-title">Browser sign-in route diagram</title>
+            <desc id="diagram-description">The browser starts authorization at Operations. Operations redirects to GitHub, which returns to the Operations OAuth callback. Operations returns an application code to the browser, and the browser redeems it at Operations for a PASETO.</desc>
+            <defs>
+              <pattern id="minor-grid" width="14" height="14" patternUnits="userSpaceOnUse" x="28" y="16">
+                <path d="M14 0H0v14" class="grid-line"/>
+              </pattern>
+              <pattern id="major-grid" width="56" height="56" patternUnits="userSpaceOnUse" x="28" y="16">
+                <path d="M56 0H0v56" class="grid-line major"/>
+              </pattern>
+              <marker id="arrow" viewBox="0 0 8 10" markerWidth="8" markerHeight="10" refX="7" refY="5" orient="auto">
+                <path d="M1 1l6 4-6 4" class="draft-line"/>
+              </marker>
+            </defs>
+
+            <path d="M28 16h504v336H28z" fill="url(#minor-grid)"/>
+            <path d="M28 16h504v336H28z" fill="url(#major-grid)"/>
+            <path d="M28 16h504v336H28z" class="plot-edge"/>
+            <path d="M19 16h18m-9-9v18m495-9h18m-9-9v18M19 352h18m-9-9v18m495-9h18m-9-9v18" class="draft-line"/>
+            <path d="M308 16v336" class="center-line"/>
+            <g class="axis">
+              <text x="13" y="79">A</text><text x="13" y="191">B</text><text x="13" y="303">C</text>
+              <text x="84" y="367">1</text><text x="196" y="367">2</text><text x="308" y="367">3</text><text x="420" y="367">4</text>
+            </g>
+
+            <g>
+              <path d="M280 104v52" class="route" marker-end="url(#arrow)"/>
+              <path d="M280 216v52" class="route" marker-end="url(#arrow)"/>
+              <path d="M336 268v-52" class="route" marker-end="url(#arrow)"/>
+              <path d="M336 156v-52" class="route" marker-end="url(#arrow)"/>
+              <path d="M196 74h-98v112h98" class="route redemption" marker-end="url(#arrow)"/>
+              <path d="M260 131h-57m153 0h49M260 243h-57m153 0h49" class="leader"/>
+              <g class="route-label">
+                <text x="200" y="127" text-anchor="end">01 AUTHORIZE</text>
+                <text x="363" y="127">04 APP RETURN</text>
+                <text x="200" y="239" text-anchor="end">02 REDIRECT</text>
+                <text x="363" y="239">03 OAUTH RETURN</text>
+                <text x="110" y="149">05 REDEEM</text>
+              </g>
+            </g>
+
+            <g transform="translate(196 44)">
+              <path d="M0 0h224v60H0zM56 0v60" class="node"/>
+              <path d="M16 19h24v19H16zm0 5h24m-20-2h2" class="draft-line"/>
+              <text class="node-title" x="71" y="28">Browser</text>
+              <text class="node-detail" x="71" y="45">Demo client</text>
+            </g>
+            <g transform="translate(196 156)">
+              <path d="M0 0h224v60H0zM56 0v60" class="node"/>
+              <path d="M17 17h22v8H17zm0 9h22v8H17zm0 9h22v8H17zm3-14h2m-2 9h2m-2 9h2" class="draft-line"/>
+              <text class="node-title" x="71" y="28">Operations</text>
+              <text class="node-detail" x="71" y="45">API and token issuer</text>
+            </g>
+            <g transform="translate(196 268)">
+              <path d="M0 0h224v60H0zM56 0v60" class="node"/>
+              <path d="M22 24v11m0-4h6c5 0 7-3 7-7m-16-6h6v6h-6zm0 17h6v6h-6zm13-17h6v6h-6z" class="draft-line"/>
+              <text class="node-title" x="71" y="28">GitHub</text>
+              <text class="node-detail" x="71" y="45">OAuth provider</text>
+            </g>
+          </svg>
+          <ol class="compact-routes">
+            <li><span>01</span><div><strong>Authorize</strong><p>Browser to Operations</p></div></li>
+            <li><span>02</span><div><strong>Redirect</strong><p>Operations to GitHub</p></div></li>
+            <li><span>03</span><div><strong>OAuth return</strong><p>GitHub to Operations</p></div></li>
+            <li><span>04</span><div><strong>App return</strong><p>Operations to browser</p></div></li>
+            <li><span>05</span><div><strong>Redeem code</strong><p>Browser to Operations</p></div></li>
+          </ol>
+          <div class="figure-key" aria-hidden="true">
+            <span><i></i> Browser navigation</span>
+            <span><i></i> Code redemption</span>
+          </div>
+        </figure>
+      </div>
+
+      <section class="lookup" id="lookup" aria-labelledby="lookup-title" hidden>
+        <p class="section-label"><span>02</span> Operations</p>
+        <h2 id="lookup-title" tabindex="-1">Account lookup</h2>
+        <p>Submit a TigerBeetle lookup, then check the Operation for its result.</p>
+        <form id="lookup-form">
+          <label for="account-id">Account ID</label>
+          <div class="lookup-input">
+            <input id="account-id" type="text" inputmode="numeric" maxlength="39" required
+              pattern="[0-9]{1,39}" placeholder="101" autocomplete="off" spellcheck="false"
+              aria-describedby="account-help">
+            <button class="button primary" id="submit-lookup" type="submit">Submit lookup</button>
+          </div>
+          <p class="field-help" id="account-help">Enter a decimal TigerBeetle account ID.</p>
+        </form>
+        <div class="operation" id="operation" hidden>
+          <dl class="operation-id">
+            <dt class="annotation">Operation UUID</dt>
+            <dd id="operation-id"></dd>
+          </dl>
+          <div class="actions">
+            <button class="button" id="check-operation" type="button">Check Operation</button>
+            <button class="button" id="retry-lookup" type="button" hidden>Retry submission</button>
+          </div>
+        </div>
+        <p class="message" id="operation-message" role="status"></p>
+        <pre id="operation-result" aria-label="Operation view" tabindex="0" hidden></pre>
+      </section>
+    </main>
+
+    <footer class="specification">
+      <dl aria-label="Session specification">
+        <div><dt class="annotation">Identity provider</dt><dd>GitHub OAuth</dd></div>
+        <div><dt class="annotation">Browser proof</dt><dd>PKCE / S256</dd></div>
+        <div><dt class="annotation">API credential</dt><dd>PASETO v4.public</dd></div>
+        <div class="sheet-index"><dt class="annotation">Sheet</dt><dd>01 / 01</dd></div>
+      </dl>
+    </footer>
+  </div>
+</body>
+</html>

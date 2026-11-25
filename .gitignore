@@ -7,3 +7,4 @@ zig-pkg/
 *.log
 .DS_Store
 .scratch
+/.cloudflare/

@@ -306,6 +306,9 @@ PKCE proof, and Intake and Query still verify the PASETO.
 
 #### Browser caller example
 
+The [static browser demo](../demo-web/README.md) implements this sign-in and
+lookup flow for the dedicated demo host.
+
 Serve this HTML at an exactly registered app callback, such as
 `https://app.example.com/sign-in.html`, and allow `https://app.example.com`
 as an origin. Replace the example API origin, callback and lookup account

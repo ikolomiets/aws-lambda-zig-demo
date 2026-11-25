@@ -22,6 +22,9 @@ The maintained [Operations API Gateway specification](docs/API_GATEWAY.md) defin
 the public routes, authentication, retry behavior, AWS adapter, throttles, and
 access logs, with usage and validation guidance.
 
+The [static browser demo](demo-web/README.md) signs in with GitHub and submits
+and checks a TigerBeetle account lookup through the Operations API.
+
 The TigerBeetle processor consumes minimal Processor Messages and validates their complete
 Bodies before executing requested account creations, transfers and account lookups. Each creation
 list is an independent linked chain. Replay safety requires callers to preserve each chain's
