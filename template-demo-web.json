@@ -1,0 +1,146 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Private S3 and CloudFront hosting for demo.electrit.com. Deploy in us-east-1.",
+  "Parameters": {
+    "CertificateArn": {
+      "Type": "String",
+      "Description": "Issued ACM certificate in us-east-1 that covers demo.electrit.com.",
+      "AllowedPattern": "arn:aws:acm:us-east-1:[0-9]{12}:certificate/[0-9a-f-]+"
+    },
+    "EnableFreePricingPlan": {
+      "Type": "String",
+      "AllowedValues": ["false", "true"],
+      "Description": "Set false for initial hosting creation, then true to subscribe the deployed distribution."
+    }
+  },
+  "Conditions": {
+    "SubscribeToFreePlan": { "Fn::Equals": [{ "Ref": "EnableFreePricingPlan" }, "true"] }
+  },
+  "Resources": {
+    "AssetsBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "OwnershipControls": { "Rules": [{ "ObjectOwnership": "BucketOwnerEnforced" }] },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        }
+      }
+    },
+    "AssetsOriginAccessControl": {
+      "Type": "AWS::CloudFront::OriginAccessControl",
+      "Properties": {
+        "OriginAccessControlConfig": {
+          "Name": { "Ref": "AWS::StackName" },
+          "OriginAccessControlOriginType": "s3",
+          "SigningBehavior": "always",
+          "SigningProtocol": "sigv4"
+        }
+      }
+    },
+    "AssetsCachePolicy": {
+      "Type": "AWS::CloudFront::CachePolicy",
+      "Properties": {
+        "CachePolicyConfig": {
+          "Name": { "Ref": "AWS::StackName" },
+          "MinTTL": 0,
+          "DefaultTTL": 0,
+          "MaxTTL": 3600,
+          "ParametersInCacheKeyAndForwardedToOrigin": {
+            "CookiesConfig": { "CookieBehavior": "none" },
+            "HeadersConfig": { "HeaderBehavior": "none" },
+            "QueryStringsConfig": { "QueryStringBehavior": "none" },
+            "EnableAcceptEncodingGzip": true,
+            "EnableAcceptEncodingBrotli": true
+          }
+        }
+      }
+    },
+    "DemoWebAcl": {
+      "Type": "AWS::WAFv2::WebACL",
+      "Properties": {
+        "Scope": "CLOUDFRONT",
+        "DefaultAction": { "Allow": {} },
+        "VisibilityConfig": {
+          "MetricName": "DemoWeb",
+          "CloudWatchMetricsEnabled": false,
+          "SampledRequestsEnabled": false
+        }
+      }
+    },
+    "Distribution": {
+      "Type": "AWS::CloudFront::Distribution",
+      "Properties": {
+        "DistributionConfig": {
+          "Enabled": true,
+          "Aliases": ["demo.electrit.com"],
+          "DefaultRootObject": "index.html",
+          "HttpVersion": "http2and3",
+          "IPV6Enabled": true,
+          "WebACLId": { "Fn::GetAtt": ["DemoWebAcl", "Arn"] },
+          "ViewerCertificate": {
+            "AcmCertificateArn": { "Ref": "CertificateArn" },
+            "SslSupportMethod": "sni-only",
+            "MinimumProtocolVersion": "TLSv1.2_2021"
+          },
+          "Origins": [{
+            "Id": "assets",
+            "DomainName": { "Fn::GetAtt": ["AssetsBucket", "RegionalDomainName"] },
+            "OriginAccessControlId": { "Fn::GetAtt": ["AssetsOriginAccessControl", "Id"] },
+            "S3OriginConfig": { "OriginAccessIdentity": "" }
+          }],
+          "DefaultCacheBehavior": {
+            "TargetOriginId": "assets",
+            "ViewerProtocolPolicy": "redirect-to-https",
+            "AllowedMethods": ["GET", "HEAD"],
+            "CachedMethods": ["GET", "HEAD"],
+            "Compress": true,
+            "CachePolicyId": { "Ref": "AssetsCachePolicy" }
+          }
+        }
+      }
+    },
+    "AssetsBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": { "Ref": "AssetsBucket" },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "Service": "cloudfront.amazonaws.com" },
+            "Action": "s3:GetObject",
+            "Resource": { "Fn::Sub": "${AssetsBucket.Arn}/*" },
+            "Condition": {
+              "StringEquals": {
+                "AWS:SourceArn": { "Fn::Sub": "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}" }
+              }
+            }
+          }]
+        }
+      }
+    },
+    "FreePricingPlan": {
+      "Type": "AWS::PricingPlanManager::Subscription",
+      "Condition": "SubscribeToFreePlan",
+      "Properties": {
+        "PlanFamily": "CloudFront",
+        "PlanTier": "FREE",
+        "UsageLevel": "DEFAULT",
+        "ResourceArns": [
+          { "Fn::Sub": "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}" },
+          { "Fn::GetAtt": ["DemoWebAcl", "Arn"] }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "AssetsBucketName": { "Value": { "Ref": "AssetsBucket" } },
+    "AssetsBucketDomainName": { "Value": { "Fn::GetAtt": ["AssetsBucket", "RegionalDomainName"] } },
+    "DistributionId": { "Value": { "Ref": "Distribution" } },
+    "DistributionDomainName": { "Value": { "Fn::GetAtt": ["Distribution", "DomainName"] } },
+    "PricingPlanArn": { "Condition": "SubscribeToFreePlan", "Value": { "Ref": "FreePricingPlan" } }
+  }
+}
